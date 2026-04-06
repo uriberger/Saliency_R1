@@ -1,7 +1,7 @@
 # Saliency-R1: Enforcing Interpretable and Faithful  Vision-language Reasoning via Saliency-map Alignment Reward
 
 Implementation for CVPR 2026 paper Saliency-R1: Enforcing Interpretable and Faithful  Vision-language Reasoning via Saliency-map Alignment Reward
-by [Shizhan Gong](https://peterant330.github.io/), Minda Hu, Qiyuan Zhang, Chen Ma, and [Qi Dou](https://www.cse.cuhk.edu.hk/~qdou/).
+by [Shizhan Gong](https://peterant330.github.io/), [Minda Hu](https://scholar.google.com/citations?user=uQlkNn8AAAAJ&hl=zh-CN), [Qiyuan Zhang](https://scholar.google.com/citations?user=7LZAo0EAAAAJ&hl=zh-CN), [Chen Ma](https://allenjack.github.io/), and [Qi Dou](https://www.cse.cuhk.edu.hk/~qdou/).
 
 <img align="center" src="assets/result.jpg" width="750">
 
@@ -32,10 +32,10 @@ git clone --depth 1 https://github.com/hiyouga/LLaMA-Factory.git
 cd LLaMA-Factory
 pip install -e ".[torch,metrics]" --no-build-isolation
 ```
-- Replace the `dataset_dir` in `train/cold_start/vision_r1_full_Qwen2.5-VL-3B-Instruct_sft_epoch2_lr5e6_warm005_8GPU/train.yaml` with `path/to/saliency_r1_data_filt` (the saving directory of the previous step).
+- Replace the `dataset_dir` in `train/cold_start/vision_r1_full_Qwen2.5-VL-7B-Instruct_sft_epoch2_lr5e6_warm005_8GPU/train.yaml` with `path/to/saliency_r1_data_filt` (the saving directory of the previous step).
 - Start training
 ```commandline
-llamafactory-cli train train/cold_start/vision_r1_full_Qwen2.5-VL-3B-Instruct_sft_epoch2_lr5e6_warm005_8GPU/train.yaml
+llamafactory-cli train train/cold_start/vision_r1_full_Qwen2.5-VL-7B-Instruct_sft_epoch2_lr5e6_warm005_8GPU/train.yaml
 ```
 
 ## GRPO
