@@ -1,6 +1,6 @@
 # Saliency-R1: Enforcing Interpretable and Faithful  Vision-language Reasoning via Saliency-map Alignment Reward
 
-Implementation for CVPR 2026 paper Saliency-R1: Enforcing Interpretable and Faithful  Vision-language Reasoning via Saliency-map Alignment Reward
+Implementation for CVPR 2026 paper [Saliency-R1: Enforcing Interpretable and Faithful  Vision-language Reasoning via Saliency-map Alignment Reward](http://arxiv.org/abs/2604.04500)
 by [Shizhan Gong](https://peterant330.github.io/), [Minda Hu](https://scholar.google.com/citations?user=uQlkNn8AAAAJ&hl=zh-CN), [Qiyuan Zhang](https://scholar.google.com/citations?user=7LZAo0EAAAAJ&hl=zh-CN), [Chen Ma](https://allenjack.github.io/), and [Qi Dou](https://www.cse.cuhk.edu.hk/~qdou/).
 
 <img align="center" src="assets/result.jpg" width="750">
@@ -79,7 +79,19 @@ accelerate launch     --config_file examples/accelerate_configs/deepspeed_zero3.
 
 We use [lmms-eval](https://github.com/evolvinglmms-lab/lmms-eval) for evaluation.
 
+## Bibtex
+If you find this work helpful, you can cite our paper as follows:
+
+```commandline
+@article{gong2026saliency,
+  title={Saliency-R1: Enforcing Interpretable and Faithful  Vision-language Reasoning via Saliency-map Alignment Reward},
+  author={Gong, Shizhan and Hu, Minda and Zhang, Qiyuan and Ma, Chen and Dou, Qi},
+  journal={arXiv preprint arXiv:2604.04500},
+  year={2026}
+}
+```
 
 ## Contact
 
 For any questions, please contact [szgong22@cse.cuhk.edu.hk](szgong22@cse.cuhk.edu.hk).
+
