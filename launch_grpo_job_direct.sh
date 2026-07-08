@@ -72,6 +72,11 @@ export WANDB_API_KEY=${WANDB_API_KEY:-}
 [ -z "$WANDB_API_KEY" ] && export WANDB_MODE=offline
 export WANDB_PROJECT=vlm_reasoning
 export WANDB_ENTITY=nvr-israel
+# Pin a stable wandb run id (per-model) so a crash + relaunch continues the SAME
+# wandb run instead of forking a new one. Override WANDB_RUN_ID to fold an existing
+# (already-crashed) run into the resume — pass its id from the wandb UI url.
+export WANDB_RUN_ID=${WANDB_RUN_ID:-grpo-${MODEL_SLUG}-saliency-r1}
+export WANDB_RESUME=${WANDB_RESUME:-allow}
 # Only export if set — exporting an empty OPENAI_BASE_URL would override the
 # Python default (the NVIDIA endpoint) with "".
 [ -n "${NVIDIA_API_KEY:-}" ] && export NVIDIA_API_KEY
@@ -80,9 +85,13 @@ export WANDB_ENTITY=nvr-israel
 [ -n "${JUDGE_MODEL:-}" ] && export JUDGE_MODEL
 cd "$REPO/trl_repo"
 
-# Resume only if a checkpoint already exists.
+# Resume from the latest checkpoint if one exists. Pass the explicit checkpoint
+# PATH, not "True": HfArgumentParser types resume_from_checkpoint as a str, so
+# "--resume_from_checkpoint True" is taken as a directory literally named "True"
+# (-> FileNotFoundError: True/trainer_state.json) rather than "auto-find latest".
 RESUME_FLAG=""
-ls -d "$OUTPUT_DIR"/checkpoint-* >/dev/null 2>&1 && RESUME_FLAG="--resume_from_checkpoint True"
+LATEST_CKPT=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoint-||' | sort -n | tail -1)
+[ -n "$LATEST_CKPT" ] && RESUME_FLAG="--resume_from_checkpoint $OUTPUT_DIR/checkpoint-$LATEST_CKPT"
 
 accelerate launch \
     --config_file examples/accelerate_configs/deepspeed_zero3.yaml \
@@ -103,6 +112,7 @@ accelerate launch \
     --gradient_accumulation_steps 2 \
     --num_generations 8 \
     --report_to wandb \
+    --logging_steps 5 \
     --save_steps 200 \
     --num_train_epochs 3 \
     --temperature 1 \
