@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+
+# Nested HuggingFace TRL clone — tracked as its own git repo, not a submodule.
+trl_repo/

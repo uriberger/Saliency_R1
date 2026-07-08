@@ -1908,6 +1908,12 @@ class GRPOTrainer(Trainer):
             self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+        # Overall (weighted-sum) reward mean/std across ALL rollouts, in the same
+        # rewards/* namespace and same "across rollouts" semantics as the per-function
+        # stats above. Note: this /std differs from `reward_std`, which is the mean
+        # within-group std used for GRPO advantage normalization.
+        self._metrics[mode]["rewards/overall/mean"].append(torch.nanmean(rewards).item())
+        self._metrics[mode]["rewards/overall/std"].append(nanstd(rewards).item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
         # Log prompt and completion texts
