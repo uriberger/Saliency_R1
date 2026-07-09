@@ -62,7 +62,6 @@ accelerate launch \
 
 """
 
-import re
 import torch
 from datasets import load_dataset
 from latex2sympy2_extended import NormalizationConfig
@@ -159,11 +158,9 @@ if __name__ == "__main__":
 
         rewards = []
         contents = [completion[0]["content"] for completion in completions]
+        print(completions[0])
+        print(contents[0])
         for content, sol in zip(contents, solution):
-            # Extract answer portion after </think>; fall back to full content
-            m = re.search(r"</think>\s*(.*?)\s*$", content, re.DOTALL)
-            answer_text = m.group(1).strip() if m else content.strip()
-
             try:
                 gold_parsed = parse(sol, extraction_mode="first_match")
             except Exception:
@@ -173,7 +170,7 @@ if __name__ == "__main__":
                 # Try parsing predicted answer too
                 try:
                     answer_parsed = parse(
-                        answer_text,
+                        content,
                         extraction_config=[
                             LatexExtractionConfig(
                                 normalization_config=NormalizationConfig(
@@ -191,11 +188,11 @@ if __name__ == "__main__":
                     )
                     reward = float(verify(gold_parsed, answer_parsed))
                 except Exception as e:
-                    print(f"verify failed: {e}, answer: {answer_text}, gold: {sol}")
+                    print(f"verify failed: {e}, answer: {content}, gold: {sol}")
                     reward = None
             else:
                 # fallback to text match
-                reward = float(answer_text.lower() == sol.strip().lower())
+                reward = float(content.strip().lower() == sol.strip().lower())
 
             rewards.append(reward)
 
