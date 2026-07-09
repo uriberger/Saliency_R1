@@ -113,6 +113,7 @@ submit_job \
             --gradient_accumulation_steps 2 \
             --num_generations 8 \
             --report_to wandb \
+            --logging_steps 5 \
             --save_steps 200 \
             --num_train_epochs 3 \
             --temperature 1 \
