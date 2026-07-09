@@ -562,8 +562,12 @@ class GRPOTrainer(Trainer):
             model = self._enable_gradient_checkpointing(model, args)
         self.is_gradient_checkpointing = args.gradient_checkpointing
 
-        self.NUM_LAYER = len(model.language_model.layers)
-        self.NUM_GROUP = model.language_model.layers[0].self_attn.k_proj.in_features // model.language_model.layers[
+        # Qwen3-VL (transformers 5.13): `language_model` lives inside the Qwen3VLModel
+        # (`model.model.language_model`), not on the generation wrapper as in Qwen2.5-VL
+        # (transformers 4.55, where `model.language_model` resolved directly).
+        lang_model = model.model.language_model
+        self.NUM_LAYER = len(lang_model.layers)
+        self.NUM_GROUP = lang_model.layers[0].self_attn.k_proj.in_features // lang_model.layers[
             0].self_attn.k_proj.out_features
         self.DIMS = model.lm_head.in_features
 
@@ -1831,8 +1835,8 @@ class GRPOTrainer(Trainer):
                     token_attn = token_attn[:, :, :think_attn.shape[-1], :]
                     agg_attn = (think_attn @ token_attn).transpose(2, 3)
                     sv = (agg_attn * value_states).transpose(1, 2).reshape(len(think_attn), -1, self.DIMS)
-                    logits += self.model.language_model.layers[layers].self_attn.o_proj(sv)
-                logits = self.model.language_model.norm(logits) * logits.norm(dim=-1, keepdim=True)
+                    logits += self.model.model.language_model.layers[layers].self_attn.o_proj(sv)
+                logits = self.model.model.language_model.norm(logits) * logits.norm(dim=-1, keepdim=True)
                 hidden_norm = torch.cat([outputs.hidden_states[answer_token][-1][[case_id]] for answer_token in \
                            range(answer_start[case_id], answer_end[case_id] + 1)], dim=0).norm(dim=-1, keepdim=True)
                 logits = logits / hidden_norm
