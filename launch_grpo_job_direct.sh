@@ -113,7 +113,7 @@ accelerate launch \
     --num_generations 8 \
     --report_to wandb \
     --logging_steps 5 \
-    --save_steps 200 \
+    --save_steps 10 \
     --num_train_epochs 3 \
     --temperature 1 \
     $RESUME_FLAG \
