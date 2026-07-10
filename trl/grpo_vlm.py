@@ -62,10 +62,77 @@ accelerate launch \
 
 """
 
+import os
+import re
+import shutil
+
 import torch
 from datasets import load_dataset
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
+
+from transformers import TrainerCallback
+
+
+class SyncSaveStepsCallback(TrainerCallback):
+    """Fix save_steps in TrainerState after a resume.
+
+    When resuming, Trainer replaces self.state with the JSON loaded from the
+    checkpoint.  That JSON carries the *old* save_steps value, but
+    DefaultFlowCallback uses state.save_steps (not args.save_steps) to decide
+    when to save.  on_train_begin fires after the JSON is loaded, so we can
+    patch the value here to match the current --save_steps arg.
+    """
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        state.save_steps = args.save_steps
+
+
+class TieredCheckpointCallback(TrainerCallback):
+    """Keep every `milestone_steps` checkpoint permanently; for all other
+    `frequent_steps` checkpoints, keep only the most recent one.
+
+    Example: frequent_steps=10, milestone_steps=200
+      step 620 saved  -> last_frequent=620
+      step 630 saved  -> delete checkpoint-620, last_frequent=630
+      step 200 saved  -> delete last_frequent (190), last_frequent=None (permanent)
+      step 210 saved  -> last_frequent=210 (nothing to delete, 200 was permanent)
+    """
+
+    def __init__(self, output_dir, frequent_steps=10, milestone_steps=200):
+        self.output_dir = output_dir
+        self.frequent_steps = frequent_steps
+        self.milestone_steps = milestone_steps
+        # On init (including after resume), find the most recent frequent
+        # (non-milestone) checkpoint so we can delete it on the next save.
+        self._last_frequent_step = self._scan_last_frequent()
+
+    def _scan_last_frequent(self):
+        if not os.path.isdir(self.output_dir):
+            return None
+        candidates = []
+        for name in os.listdir(self.output_dir):
+            m = re.fullmatch(r"checkpoint-(\d+)", name)
+            if m:
+                step = int(m.group(1))
+                if step % self.frequent_steps == 0 and step % self.milestone_steps != 0:
+                    candidates.append(step)
+        return max(candidates) if candidates else None
+
+    def on_save(self, args, state, control, **kwargs):
+        if args.process_index != 0:
+            return
+        step = state.global_step
+        if self._last_frequent_step is not None:
+            ckpt = os.path.join(self.output_dir, f"checkpoint-{self._last_frequent_step}")
+            if os.path.isdir(ckpt):
+                shutil.rmtree(ckpt)
+                print(f"[TieredCheckpoint] deleted checkpoint-{self._last_frequent_step}")
+        if step % self.milestone_steps != 0:
+            self._last_frequent_step = step
+        else:
+            self._last_frequent_step = None
+
 
 from trl import (
     GRPOConfig,
@@ -78,6 +145,79 @@ from trl import (
     get_quantization_config,
 )
 from trl.rewards import think_format_reward, think_saliency_reward, openai_reward
+
+
+def maybe_wandb_rewind(trainer, training_args):
+    """When resuming from a checkpoint, rewind the existing wandb run back to the
+    checkpoint's step so the reloaded curve overwrites the doomed pre-crash tail —
+    yielding one clean run "as if it never crashed" instead of a fork or a run
+    with a visible seam.
+
+    Works by pre-initializing wandb with `resume_from` before the Trainer's
+    WandbCallback runs; the callback then reuses the existing run (it only calls
+    wandb.init when wandb.run is None). No-op unless we're resuming, wandb
+    reporting is on/online, we're the main process, and WANDB_RUN_ID is set.
+    """
+    # Opt-in only: wandb's resume_from (rewind) is a private-preview feature and
+    # returns HTTP 400 unless enabled on the account. Skip it by default and rely
+    # on WANDB_RESUME=allow (set in the launch script) to continue the same run.
+    # Set WANDB_REWIND=1 to attempt the clean truncated rewind once you have access.
+    if os.environ.get("WANDB_REWIND", "").lower() not in ("1", "true", "yes"):
+        return
+    if not training_args.resume_from_checkpoint:
+        return
+    report_to = training_args.report_to or []
+    if isinstance(report_to, str):
+        report_to = [report_to]
+    if "wandb" not in report_to:
+        return
+    if os.environ.get("WANDB_MODE", "").lower() == "offline":
+        return
+    if not trainer.is_world_process_zero():
+        return
+    run_id = os.environ.get("WANDB_RUN_ID")
+    if not run_id:
+        return
+
+    # Resolve the step of the checkpoint we're resuming from (latest checkpoint-<N>
+    # in output_dir, unless an explicit checkpoint path was given).
+    resume = training_args.resume_from_checkpoint
+    ckpt_dir = resume if isinstance(resume, str) and os.path.isdir(resume) else None
+    if ckpt_dir is None:
+        candidates = []
+        for name in os.listdir(training_args.output_dir):
+            m = re.fullmatch(r"checkpoint-(\d+)", name)
+            if m and os.path.isdir(os.path.join(training_args.output_dir, name)):
+                candidates.append((int(m.group(1)), name))
+        if not candidates:
+            return
+        _, name = max(candidates)
+        ckpt_dir = os.path.join(training_args.output_dir, name)
+    m = re.search(r"checkpoint-(\d+)", os.path.basename(ckpt_dir))
+    if not m:
+        return
+    step = int(m.group(1))
+
+    try:
+        import wandb
+    except ImportError:
+        return
+
+    # resume_from (rewind) and resume are mutually exclusive; drop the env resume
+    # flag we set in the launch script so wandb.init doesn't reject the call.
+    os.environ.pop("WANDB_RESUME", None)
+    try:
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT"),
+            entity=os.environ.get("WANDB_ENTITY"),
+            resume_from=f"{run_id}?_step={step}",
+        )
+        print(f"[wandb-rewind] rewound run {run_id} to step {step}; Trainer will reuse this run.")
+    except Exception as e:
+        # Older wandb without rewind support, or a bad id -> fall back to plain
+        # resume so we at least continue the same run (with a seam).
+        os.environ["WANDB_RESUME"] = "allow"
+        print(f"[wandb-rewind] rewind unavailable ({e}); falling back to WANDB_RESUME=allow.")
 
 
 if __name__ == "__main__":
@@ -158,9 +298,11 @@ if __name__ == "__main__":
 
         rewards = []
         contents = [completion[0]["content"] for completion in completions]
-        print(completions[0])
-        print(contents[0])
         for content, sol in zip(contents, solution):
+            # Extract answer portion after </think>; fall back to full content
+            m = re.search(r"</think>\s*(.*?)\s*$", content, re.DOTALL)
+            answer_text = m.group(1).strip() if m else content.strip()
+
             try:
                 gold_parsed = parse(sol, extraction_mode="first_match")
             except Exception:
@@ -170,7 +312,7 @@ if __name__ == "__main__":
                 # Try parsing predicted answer too
                 try:
                     answer_parsed = parse(
-                        content,
+                        answer_text,
                         extraction_config=[
                             LatexExtractionConfig(
                                 normalization_config=NormalizationConfig(
@@ -188,11 +330,11 @@ if __name__ == "__main__":
                     )
                     reward = float(verify(gold_parsed, answer_parsed))
                 except Exception as e:
-                    print(f"verify failed: {e}, answer: {content}, gold: {sol}")
+                    print(f"verify failed: {e}, answer: {answer_text}, gold: {sol}")
                     reward = None
             else:
                 # fallback to text match
-                reward = float(content.strip().lower() == sol.strip().lower())
+                reward = float(answer_text.lower() == sol.strip().lower())
 
             rewards.append(reward)
 
@@ -204,11 +346,15 @@ if __name__ == "__main__":
     trainer = GRPOTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
-        reward_funcs=[think_format_reward, think_saliency_reward, openai_reward],
+        reward_funcs=[accuracy_reward, think_format_reward, think_saliency_reward, openai_reward],
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
     )
+    trainer.add_callback(SyncSaveStepsCallback())
+    trainer.add_callback(TieredCheckpointCallback(training_args.output_dir))
+
+    maybe_wandb_rewind(trainer, training_args)
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
