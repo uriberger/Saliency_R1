@@ -18,8 +18,10 @@ import openai
 from retrying import retry
 import os
 
-client = openai.OpenAI(api_key="xxx",
-                       base_url="xxx")
+client = openai.OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY") or os.environ.get("NVIDIA_API_KEY"),
+    base_url=os.environ.get("OPENAI_BASE_URL", "https://inference-api.nvidia.com/v1"),
+)
 
 @retry(wait_exponential_multiplier=200, wait_exponential_max=2000, retry_on_exception=lambda e: isinstance(e, openai.RateLimitError) or isinstance(e, openai.APIConnectionError))
 def openai_reward(completions, solution, problem, **kwargs):
