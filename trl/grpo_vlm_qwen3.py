@@ -204,7 +204,7 @@ if __name__ == "__main__":
     trainer = GRPOTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
-        reward_funcs=[think_format_reward, think_saliency_reward, openai_reward],
+        reward_funcs=[think_format_reward, think_saliency_reward, accuracy_reward, openai_reward],
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
