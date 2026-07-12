@@ -114,7 +114,7 @@ accelerate launch \
     --learning_rate 1e-5 \
     --torch_dtype bfloat16 \
     --max_prompt_length 2048 \
-    --max_completion_length 2048 \
+    --max_completion_length 1024 \
     --use_peft \
     --lora_target_modules q_proj v_proj \
     --log_completions \
