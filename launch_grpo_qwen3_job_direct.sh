@@ -79,6 +79,30 @@ RESUME_FLAG=""
 LATEST_CKPT=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoint-||' | sort -n | tail -1)
 [ -n "$LATEST_CKPT" ] && RESUME_FLAG="--resume_from_checkpoint $OUTPUT_DIR/checkpoint-$LATEST_CKPT"
 
+# Background loop: keep every-200-step checkpoints permanently; delete older
+# non-200-step checkpoints as soon as a newer one is saved.
+_cleanup_checkpoints() {
+    local output_dir="$1"
+    local prev_latest=""
+    while true; do
+        sleep 30
+        local latest
+        latest=$(ls -d "$output_dir"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoint-||' | sort -n | tail -1)
+        if [[ -n "$latest" && "$latest" != "$prev_latest" ]]; then
+            prev_latest="$latest"
+            ls -d "$output_dir"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoint-||' | sort -n | while read -r step; do
+                if (( step % 200 != 0 )) && [[ "$step" != "$latest" ]]; then
+                    echo "[checkpoint cleanup] Removing $output_dir/checkpoint-$step"
+                    rm -rf "$output_dir/checkpoint-$step"
+                fi
+            done
+        fi
+    done
+}
+_cleanup_checkpoints "$OUTPUT_DIR" &
+CLEANUP_PID=$!
+trap "kill $CLEANUP_PID 2>/dev/null; wait $CLEANUP_PID 2>/dev/null" EXIT
+
 accelerate launch \
     --config_file examples/accelerate_configs/deepspeed_zero3.yaml \
     --num_processes "$NUM_GPUS" \
