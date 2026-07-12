@@ -105,9 +105,12 @@ _cleanup_checkpoints "$OUTPUT_DIR" &
 CLEANUP_PID=$!
 trap "kill $CLEANUP_PID 2>/dev/null; wait $CLEANUP_PID 2>/dev/null" EXIT
 
+MASTER_PORT=${MASTER_PORT:-$(shuf -i 29500-65000 -n 1)}
+
 accelerate launch \
     --config_file examples/accelerate_configs/deepspeed_zero3.yaml \
     --num_processes "$NUM_GPUS" \
+    --main_process_port "$MASTER_PORT" \
     examples/scripts/grpo_vlm_qwen3.py \
     --model_name_or_path "$MODEL" \
     --attn_implementation sdpa \
