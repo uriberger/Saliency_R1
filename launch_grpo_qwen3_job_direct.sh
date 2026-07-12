@@ -118,7 +118,7 @@ accelerate launch \
     --use_peft \
     --lora_target_modules q_proj v_proj \
     --log_completions \
-    --per_device_train_batch_size 4 \
+    --per_device_train_batch_size 2 \
     --gradient_accumulation_steps 4 \
     --num_generations 8 \
     --report_to wandb \
