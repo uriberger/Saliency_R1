@@ -60,6 +60,7 @@ conda activate "$CONDA_ENV"
 export CUDA_HOME=${CUDA_HOME:-/cm/shared/apps/cuda12.4/toolkit/12.4.1}
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export HF_HOME
 export HF_TOKEN=${HF_TOKEN:-}
@@ -117,8 +118,8 @@ accelerate launch \
     --use_peft \
     --lora_target_modules q_proj v_proj \
     --log_completions \
-    --per_device_train_batch_size 8 \
-    --gradient_accumulation_steps 2 \
+    --per_device_train_batch_size 4 \
+    --gradient_accumulation_steps 4 \
     --num_generations 8 \
     --report_to wandb \
     --logging_steps 5 \
