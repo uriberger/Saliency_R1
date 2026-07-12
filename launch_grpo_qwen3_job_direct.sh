@@ -63,6 +63,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export HF_HOME
+export HF_HUB_OFFLINE=1
 export HF_TOKEN=${HF_TOKEN:-}
 export WANDB_API_KEY=${WANDB_API_KEY:-}
 [ -z "$WANDB_API_KEY" ] && export WANDB_MODE=offline
@@ -114,7 +115,7 @@ accelerate launch \
     --learning_rate 1e-5 \
     --torch_dtype bfloat16 \
     --max_prompt_length 2048 \
-    --max_completion_length 1024 \
+    --max_completion_length 2048 \
     --use_peft \
     --lora_target_modules q_proj v_proj \
     --log_completions \

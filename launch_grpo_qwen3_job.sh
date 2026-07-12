@@ -78,6 +78,7 @@ submit_job \
         export PATH=\$CUDA_HOME/bin:\$PATH;
         export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\${LD_LIBRARY_PATH:-};
         export HF_HOME=$HF_HOME;
+        export HF_HUB_OFFLINE=1;
         export HF_TOKEN=${HF_TOKEN:-};
         export WANDB_API_KEY=${WANDB_API_KEY:-};
         [ -z \"\$WANDB_API_KEY\" ] && export WANDB_MODE=offline;
