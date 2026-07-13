@@ -43,7 +43,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-(( MAX_COMPLETION_LENGTH > 1024 )) && REFORWARD_SALIENCY=True || REFORWARD_SALIENCY=False
+REFORWARD_SALIENCY=True
 
 MODEL_SLUG=$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g')
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$REPO/checkpoint/grpo-${MODEL_SLUG}-saliency-r1-qwen3"
@@ -117,7 +117,7 @@ accelerate launch \
     --main_process_port "$MASTER_PORT" \
     examples/scripts/grpo_vlm_qwen3.py \
     --model_name_or_path "$MODEL" \
-    --attn_implementation flash_attention_2 \
+    --attn_implementation sdpa \
     --output_dir "$OUTPUT_DIR" \
     --learning_rate 1e-5 \
     --torch_dtype bfloat16 \
