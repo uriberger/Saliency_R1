@@ -25,21 +25,25 @@ HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 MODEL="Qwen/Qwen3-VL-8B-Instruct"
 NUM_GPUS=1
 OUTPUT_DIR=""
+MAX_COMPLETION_LENGTH=1024
 EXTRA_ARGS=""
 
 # ---------- parse args ----------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model)          MODEL="$2";          shift 2 ;;
-        --num-gpus)       NUM_GPUS="$2";       shift 2 ;;
-        --output-dir)     OUTPUT_DIR="$2";     shift 2 ;;
-        --nvidia-api-key) NVIDIA_API_KEY="$2"; shift 2 ;;
-        --openai-api-key) OPENAI_API_KEY="$2"; shift 2 ;;
-        --wandb-api-key)  WANDB_API_KEY="$2";  shift 2 ;;
-        --hf-token)       HF_TOKEN="$2";       shift 2 ;;
-        *)                EXTRA_ARGS="$EXTRA_ARGS $1"; shift ;;
+        --model)                  MODEL="$2";                  shift 2 ;;
+        --num-gpus)               NUM_GPUS="$2";               shift 2 ;;
+        --output-dir)             OUTPUT_DIR="$2";             shift 2 ;;
+        --nvidia-api-key)         NVIDIA_API_KEY="$2";         shift 2 ;;
+        --openai-api-key)         OPENAI_API_KEY="$2";         shift 2 ;;
+        --wandb-api-key)          WANDB_API_KEY="$2";          shift 2 ;;
+        --hf-token)               HF_TOKEN="$2";               shift 2 ;;
+        --max-completion-length)  MAX_COMPLETION_LENGTH="$2";  shift 2 ;;
+        *)                        EXTRA_ARGS="$EXTRA_ARGS $1"; shift ;;
     esac
 done
+
+(( MAX_COMPLETION_LENGTH > 1024 )) && REFORWARD_SALIENCY=True || REFORWARD_SALIENCY=False
 
 MODEL_SLUG=$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g')
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$REPO/checkpoint/grpo-${MODEL_SLUG}-saliency-r1-qwen3"
@@ -118,7 +122,8 @@ accelerate launch \
     --learning_rate 1e-5 \
     --torch_dtype bfloat16 \
     --max_prompt_length 2048 \
-    --max_completion_length 2048 \
+    --max_completion_length "$MAX_COMPLETION_LENGTH" \
+    --reforward_saliency "$REFORWARD_SALIENCY" \
     --use_peft \
     --lora_target_modules q_proj v_proj \
     --log_completions \
