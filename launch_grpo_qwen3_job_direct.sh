@@ -117,7 +117,7 @@ accelerate launch \
     --main_process_port "$MASTER_PORT" \
     examples/scripts/grpo_vlm_qwen3.py \
     --model_name_or_path "$MODEL" \
-    --attn_implementation sdpa \
+    --attn_implementation flash_attention_2 \
     --output_dir "$OUTPUT_DIR" \
     --learning_rate 1e-5 \
     --torch_dtype bfloat16 \
