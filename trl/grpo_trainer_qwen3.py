@@ -18,6 +18,8 @@ import os
 import re
 import textwrap
 import warnings
+
+import numpy as np
 from collections import defaultdict, deque
 from collections.abc import Sequence, Sized
 from contextlib import nullcontext
@@ -509,7 +511,26 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        reforward_saliency: bool = True,
+        reward_variant: str = "saliency_r1",
+        overlap_layer: int = 22,
+        overlap_heads=(28, 31),
+        token_reduction: str = "mean",
     ):
+        self.reforward_saliency = reforward_saliency
+        # --- attention-overlap reward config (reward_variant="ours") ---
+        self.reward_variant = reward_variant
+        self.overlap_layer = int(overlap_layer)
+        if isinstance(overlap_heads, str):
+            overlap_heads = [int(h) for h in overlap_heads.split(",") if h.strip() != ""]
+        self.overlap_heads = list(overlap_heads)
+        self.token_reduction = token_reduction
+        self._overlap_clf = None  # lazily loaded FLAN-T5 steps classifier
+        if self.reward_variant == "ours" and not self.reforward_saliency:
+            # The "ours" extraction needs full per-token attention over the whole
+            # prompt+completion, which only the re-forward path provides.
+            self.reforward_saliency = True
+
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
@@ -561,6 +582,16 @@ class GRPOTrainer(Trainer):
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
         self.is_gradient_checkpointing = args.gradient_checkpointing
+
+        # FA2 cannot return attention weights, so reforward_saliency is required with it.
+        if getattr(model.config, "_attn_implementation", None) == "flash_attention_2" and not self.reforward_saliency:
+            import warnings
+            warnings.warn(
+                "flash_attention_2 does not support output_attentions=True during generate; "
+                "forcing reforward_saliency=True.",
+                UserWarning,
+            )
+            self.reforward_saliency = True
 
         # Qwen3-VL (transformers 5.13): `language_model` lives inside the Qwen3VLModel
         # (`raw_model.model.language_model`). After get_peft_model(), `model.model` resolves
@@ -1030,9 +1061,18 @@ class GRPOTrainer(Trainer):
         image_grid_thw=None,
         pixel_attention_mask=None,
         image_sizes=None,
+        mm_token_type_ids=None,
     ):
         if is_peft_model(unwrapped_model):
             unwrapped_model = unwrapped_model.base_model.model
+
+        # mm_token_type_ids comes from prompt_inputs only; pad with zeros (text type) to cover completion tokens
+        if mm_token_type_ids is not None and mm_token_type_ids.size(1) < input_ids.size(1):
+            pad_len = input_ids.size(1) - mm_token_type_ids.size(1)
+            mm_token_type_ids = torch.cat(
+                [mm_token_type_ids, torch.zeros(mm_token_type_ids.size(0), pad_len, dtype=mm_token_type_ids.dtype, device=mm_token_type_ids.device)],
+                dim=1,
+            )
 
         # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -1049,6 +1089,9 @@ class GRPOTrainer(Trainer):
         # For LLaVa-Next
         if image_sizes is not None:
             model_inputs["image_sizes"] = image_sizes
+        # For Qwen3-VL M-RoPE
+        if mm_token_type_ids is not None:
+            model_inputs["mm_token_type_ids"] = mm_token_type_ids
 
         # Only add logits_to_keep if the model supports it
         if "logits_to_keep" in self.model_kwarg_keys:
@@ -1104,9 +1147,17 @@ class GRPOTrainer(Trainer):
         image_grid_thw=None,
         pixel_attention_mask=None,
         image_sizes=None,
+        mm_token_type_ids=None,
     ) -> dict[str, Optional[torch.Tensor]]:
         """Compute log-probs and (optionally) entropies for each token."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
+        # mm_token_type_ids comes from prompt_inputs only; pad with zeros (text type) to cover completion tokens
+        if mm_token_type_ids is not None and mm_token_type_ids.size(1) < input_ids.size(1):
+            pad_len = input_ids.size(1) - mm_token_type_ids.size(1)
+            mm_token_type_ids = torch.cat(
+                [mm_token_type_ids, torch.zeros(mm_token_type_ids.size(0), pad_len, dtype=mm_token_type_ids.dtype, device=mm_token_type_ids.device)],
+                dim=1,
+            )
         all_logps = []
         all_entropies = []
         for start in range(0, input_ids.size(0), batch_size):
@@ -1127,6 +1178,8 @@ class GRPOTrainer(Trainer):
                 model_inputs["pixel_attention_mask"] = pixel_attention_mask[start : start + batch_size]
             if image_sizes is not None:
                 model_inputs["image_sizes"] = image_sizes[start : start + batch_size]
+            if mm_token_type_ids is not None:
+                model_inputs["mm_token_type_ids"] = mm_token_type_ids[start : start + batch_size]
 
             # Only add logits_to_keep if the model supports it
             if "logits_to_keep" in self.model_kwarg_keys:
@@ -1369,6 +1422,126 @@ class GRPOTrainer(Trainer):
         # completions may be distributed across processes
         rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
+
+    # ------------------------------------------------------------------
+    # Attention-overlap reward (reward_variant="ours")
+    # ------------------------------------------------------------------
+    def _get_overlap_classifier(self):
+        """Lazily load the FLAN-T5 observe-step classifier (once per process)."""
+        if self._overlap_clf is None:
+            from .overlap_steps import OverlapStepsClassifier
+            # Keep the tiny FLAN-T5-base on CPU by default (frees GPU for the policy);
+            # override with OVERLAP_STEPS_DEVICE.
+            dev = os.environ.get("OVERLAP_STEPS_DEVICE", "cpu")
+            self._overlap_clf = OverlapStepsClassifier.load(device=dev)
+        return self._overlap_clf
+
+    def _compute_overlap_step_maps(
+        self, inputs, images, prompt_inputs, prompt_completion_ids, attention_mask,
+        prompt_ids, prompt_length, completion_ids, output_text,
+        think_start_idx, think_end_idx, think_start, think_end, invalid, out, device,
+    ):
+        """Per completion -> list of {"map": (grid_h, grid_w) float32, "text": str} for
+        each grounded-able observe step. Raw attention at self.overlap_layer, mean over
+        self.overlap_heads, ReLU, token-reduced (self.token_reduction) over the step's
+        tokens. Segmentation via sentence-split + FLAN-T5 observe classifier. The reward
+        fn (think_overlap_reward) does the DINO grounding + mean_in metric.
+        """
+        from .overlap_steps import segment_observe_steps
+
+        clf = self._get_overlap_classifier()
+        L = self.overlap_layer
+        heads = self.overlap_heads
+        tr = self.token_reduction
+
+        thw = prompt_inputs.get("image_grid_thw")  # [batch, 3]
+        patch_offsets = [0]
+        if thw is not None:
+            for _i in range(thw.shape[0]):
+                patch_offsets.append(patch_offsets[-1] + int(thw[_i].prod().item()))
+
+        results = [[] for _ in range(len(images))]
+
+        with (
+            unwrap_model_for_generation(
+                self.model_wrapped, self.accelerator,
+                gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+            ) as _unwrapped,
+            torch.no_grad(),
+            FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
+        ):
+            _saved_attn_impl = _unwrapped.config._attn_implementation
+            if _saved_attn_impl == "flash_attention_2":
+                _unwrapped.config._attn_implementation = "sdpa"
+
+            for case_id in range(len(images)):
+                ts, te = think_start[case_id], think_end[case_id]
+                # Skip malformed / empty think spans (reward -> masked/neutral).
+                if not invalid[case_id] or te <= ts:
+                    continue
+
+                _case_inputs = {
+                    "input_ids": prompt_completion_ids[case_id:case_id + 1],
+                    "attention_mask": attention_mask[case_id:case_id + 1],
+                }
+                if thw is not None:
+                    _case_inputs["pixel_values"] = prompt_inputs["pixel_values"][
+                        patch_offsets[case_id]:patch_offsets[case_id + 1]
+                    ]
+                    _case_inputs["image_grid_thw"] = thw[case_id:case_id + 1]
+                if prompt_inputs.get("mm_token_type_ids") is not None:
+                    _compl_zeros = torch.zeros(1, completion_ids.size(1), dtype=torch.long, device=device)
+                    _case_inputs["mm_token_type_ids"] = torch.cat(
+                        [prompt_inputs["mm_token_type_ids"][case_id:case_id + 1], _compl_zeros], dim=1
+                    )
+
+                _fwd = _unwrapped(**_case_inputs, output_attentions=True, output_hidden_states=False)
+
+                _image_mask = prompt_ids[case_id] == 151655
+                # [1, heads, think_len, n_patches] : observe-token query rows -> image-patch key cols
+                raw = _fwd.attentions[L][
+                    :, heads,
+                    prompt_length + ts:prompt_length + te + 1,
+                    :prompt_length,
+                ][:, :, :, _image_mask]
+                # [n_heads_sel, think_len, n_patches]; ReLU is a no-op on softmax weights but kept per spec
+                per_tok = torch.relu(raw)[0].float().cpu().numpy()
+                del _fwd, raw
+
+                gh = int(thw[case_id, 1].item()) // 2
+                gw = int(thw[case_id, 2].item()) // 2
+
+                question = inputs[case_id].get("problem", "") if isinstance(inputs[case_id], dict) else ""
+                steps = segment_observe_steps(
+                    output_text[case_id], think_start_idx[case_id], think_end_idx[case_id],
+                    out, case_id, ts, te, question, clf,
+                )
+
+                step_maps = []
+                for step_text, tok_a, tok_b in steps:
+                    la = tok_a - ts
+                    lb = tok_b - ts
+                    if lb <= la:
+                        continue
+                    seg = per_tok[:, la:lb, :]  # [n_heads, span_len, n_patches]
+                    # token-reduce per head over the step's tokens, THEN mean over heads
+                    # (order matters for max/min; matches the offline attn_tr_* reference).
+                    if tr == "max":
+                        red = seg.max(axis=1)
+                    elif tr == "min":
+                        red = seg.min(axis=1)
+                    else:
+                        red = seg.mean(axis=1)
+                    m = np.maximum(red.mean(axis=0), 0.0)  # [n_patches]
+                    if m.size != gh * gw:
+                        continue
+                    step_maps.append({"map": m.reshape(gh, gw).astype(np.float32), "text": step_text})
+                results[case_id] = step_maps
+
+            if _saved_attn_impl == "flash_attention_2":
+                _unwrapped.config._attn_implementation = _saved_attn_impl
+
+        return results
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
@@ -1635,31 +1808,26 @@ class GRPOTrainer(Trainer):
             ):
                 if self.is_gradient_checkpointing:
                     unwrapped_model.base_model.gradient_checkpointing_disable()
-                # 设置 prompt 输入，确保正确传递给模型
                 prompt_inputs["input_ids"], prompt_inputs["attention_mask"] = prompt_ids, prompt_mask
-                # 调用 generate 方法并启用 return_dict_in_generate 和 output_attentions
-                #self.generation_config.temperature = 1.0
-                outputs = unwrapped_model.generate(
-                    **prompt_inputs,
+                _gen_kwargs = dict(
                     generation_config=self.generation_config,
                     temperature=1.0,
                     use_cache=True,
                     output_hidden_states=True,
-                    return_dict_in_generate=True,  # 返回字典格式的结果
-                    output_attentions=True  # 输出 attention weights
+                    return_dict_in_generate=True,
                 )
+                if not self.reforward_saliency:
+                    _gen_kwargs["output_attentions"] = True
+                outputs = unwrapped_model.generate(**prompt_inputs, **_gen_kwargs)
                 if self.is_gradient_checkpointing:
                     unwrapped_model.base_model.gradient_checkpointing_enable()
 
-            # 提取生成的 tokens 和 attention weights
-            prompt_completion_ids = outputs.sequences  # 从 outputs 中获取生成的序列
-            attentions = outputs.attentions  # 提取 attention weights
-            #print(attentions[0])
-
-            # 计算 prompt 长度并分割生成的序列
+            prompt_completion_ids = outputs.sequences
+            if not self.reforward_saliency:
+                attentions = outputs.attentions
             prompt_length = prompt_ids.size(1)
-            prompt_ids = prompt_completion_ids[:, :prompt_length]  # 提取 prompt 部分
-            completion_ids = prompt_completion_ids[:, prompt_length:]  # 提取 completion 部分
+            prompt_ids = prompt_completion_ids[:, :prompt_length]
+            completion_ids = prompt_completion_ids[:, prompt_length:]
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.eos_token_id
@@ -1706,6 +1874,7 @@ class GRPOTrainer(Trainer):
                     image_grid_thw=prompt_inputs.get("image_grid_thw"),
                     pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
                     image_sizes=prompt_inputs.get("image_sizes"),
+                    mm_token_type_ids=prompt_inputs.get("mm_token_type_ids"),
                 )
             else:
                 old_per_token_logps = None
@@ -1723,6 +1892,7 @@ class GRPOTrainer(Trainer):
                         image_grid_thw=prompt_inputs.get("image_grid_thw"),
                         pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
                         image_sizes=prompt_inputs.get("image_sizes"),
+                        mm_token_type_ids=prompt_inputs.get("mm_token_type_ids"),
                     )
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
@@ -1736,6 +1906,7 @@ class GRPOTrainer(Trainer):
                             image_grid_thw=prompt_inputs.get("image_grid_thw"),
                             pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
                             image_sizes=prompt_inputs.get("image_sizes"),
+                            mm_token_type_ids=prompt_inputs.get("mm_token_type_ids"),
                         )
             else:
                 ref_per_token_logps = None
@@ -1779,9 +1950,10 @@ class GRPOTrainer(Trainer):
         answer_start = [out.char_to_token(b, i) if i >= 0 else -1 for b, i in enumerate(answer_start_idx)]
         answer_end = [out.char_to_token(b, i) if i >= 0 else -1 for b, i in enumerate(answer_end_idx)]
 
+        _max_completion_idx = (len(attentions) - 1) if not self.reforward_saliency else (completion_ids.size(1) - 1)
         think_end = [i if j else 0 for i, j in zip(think_end, invalid)]
         think_start = [min(i, z) if j else 0 for i, j, z in zip(think_start, invalid, think_end)]
-        answer_end = [min(i, len(attentions) - 1) if j else 1 for i, j in zip(answer_end, invalid)]
+        answer_end = [min(i, _max_completion_idx) if j else 1 for i, j in zip(answer_end, invalid)]
         answer_start = [min(z, i) if j else 1 for i, j, z in zip(answer_start, invalid, answer_end)]
 
 
@@ -1822,39 +1994,152 @@ class GRPOTrainer(Trainer):
         '''
         attn_batch = []
 
-        with torch.no_grad():
-            for case_id in range(len(images)):
-                logits = 0
-                for layers in range(self.NUM_LAYER):
-                    value_states = outputs.past_key_values.layers[layers].values.clone().detach()[[case_id]]
-                    value_states = repeat_v(value_states, self.NUM_GROUP)
-                    value_states = value_states[:, :, :prompt_length, :]
-                    value_states = value_states[:, :, prompt_ids[case_id] == 151655, :]
-                    think_attn = torch.cat([attentions[answer_token][layers] \
-                                                [[case_id], :, -1:,
-                                            prompt_length + think_start[case_id]:prompt_length + think_end[case_id] + 1] \
-                                            for answer_token in range(answer_start[case_id], answer_end[case_id] + 1)],
-                                           dim=0)
-                    token_attn = torch.cat([attentions[i][layers][[case_id]][:, :, -1:,
-                                            prompt_completion_ids[case_id, :i + prompt_length] == 151655] \
-                                            for i in range(think_start[case_id], think_end[case_id] + 1)], dim=2)
-                    token_attn = token_attn[:, :, :think_attn.shape[-1], :]
-                    agg_attn = (think_attn @ token_attn).transpose(2, 3)
-                    sv = (agg_attn * value_states).transpose(1, 2).reshape(len(think_attn), -1, self.DIMS)
-                    logits += self._qwen3_lang_model.layers[layers].self_attn.o_proj(sv)
-                logits = self._qwen3_lang_model.norm(logits) * logits.norm(dim=-1, keepdim=True)
-                hidden_norm = torch.cat([outputs.hidden_states[answer_token][-1][[case_id]] for answer_token in \
-                           range(answer_start[case_id], answer_end[case_id] + 1)], dim=0).norm(dim=-1, keepdim=True)
-                logits = logits / hidden_norm
-                out = self.model.lm_head(logits)
-                indices = [completion_ids[case_id][answer_token] for answer_token in
-                           range(answer_start[case_id], answer_end[case_id] + 1)]
-                out = out[torch.arange(out.size(0)), :, torch.tensor(indices)].sum(dim=0).reshape(
-                    prompt_inputs.get("image_grid_thw")[case_id, 1]//2,
-                    prompt_inputs.get("image_grid_thw")[case_id, 2]//2)
-                saliency = torch.relu(out).detach().cpu().float().numpy()
-                saliency = cv2.resize(saliency, images[case_id].size)
-                attn_batch.append(saliency)
+        if self.reward_variant == "ours":
+            # --- Attention-overlap reward: raw per-head observe->patch attention at a
+            # single layer, per observe step, instead of the whole-completion rollout. ---
+            attn_batch = self._compute_overlap_step_maps(
+                inputs, images, prompt_inputs, prompt_completion_ids, attention_mask,
+                prompt_ids, prompt_length, completion_ids, output_text,
+                think_start_idx, think_end_idx, think_start, think_end, invalid, out, device,
+            )
+        elif self.reforward_saliency:
+            # --- Re-forward path: generate without output_attentions, then do a cheap
+            # per-case forward pass to extract attention slices for saliency. ---
+            thw = prompt_inputs.get("image_grid_thw")  # [batch, 3]
+            patch_offsets = [0]
+            if thw is not None:
+                for _i in range(thw.shape[0]):
+                    patch_offsets.append(patch_offsets[-1] + int(thw[_i].prod().item()))
+
+            # Phase 1: one full-sequence re-forward per case; extract small attention
+            # slices and immediately free the large attention tensor.
+            all_think_attns = []  # list[list[Tensor]]  per case, per layer
+            all_token_attns = []
+            all_image_masks = []
+
+            with (
+                unwrap_model_for_generation(
+                    self.model_wrapped, self.accelerator,
+                    gather_deepspeed3_params=self.args.ds3_gather_for_generation
+                ) as _unwrapped,
+                torch.no_grad(),
+                FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
+            ):
+                # FA2 can't return attention weights; temporarily use SDPA for the
+                # re-forward passes (dispatch is resolved at forward time from config).
+                _saved_attn_impl = _unwrapped.config._attn_implementation
+                if _saved_attn_impl == "flash_attention_2":
+                    _unwrapped.config._attn_implementation = "sdpa"
+                for case_id in range(len(images)):
+                    _case_inputs = {
+                        "input_ids": prompt_completion_ids[case_id:case_id + 1],
+                        "attention_mask": attention_mask[case_id:case_id + 1],
+                    }
+                    if thw is not None:
+                        _case_inputs["pixel_values"] = prompt_inputs["pixel_values"][
+                            patch_offsets[case_id]:patch_offsets[case_id + 1]
+                        ]
+                        _case_inputs["image_grid_thw"] = thw[case_id:case_id + 1]
+                    if prompt_inputs.get("mm_token_type_ids") is not None:
+                        _compl_zeros = torch.zeros(
+                            1, completion_ids.size(1), dtype=torch.long, device=device
+                        )
+                        _case_inputs["mm_token_type_ids"] = torch.cat(
+                            [prompt_inputs["mm_token_type_ids"][case_id:case_id + 1], _compl_zeros], dim=1
+                        )
+
+                    _fwd = _unwrapped(**_case_inputs, output_attentions=True, output_hidden_states=False)
+
+                    _image_mask = prompt_ids[case_id] == 151655
+                    _think_per_layer, _token_per_layer = [], []
+                    for _l in range(self.NUM_LAYER):
+                        _attn = _fwd.attentions[_l]  # [1, heads, full_len, full_len]
+                        _think_per_layer.append(_attn[
+                            :, :,
+                            prompt_length + answer_start[case_id]:prompt_length + answer_end[case_id] + 1,
+                            prompt_length + think_start[case_id]:prompt_length + think_end[case_id] + 1,
+                        ].clone())
+                        _token_per_layer.append(_attn[
+                            :, :,
+                            prompt_length + think_start[case_id]:prompt_length + think_end[case_id] + 1,
+                            :prompt_length,
+                        ][:, :, :, _image_mask].clone())
+                    del _fwd
+                    all_think_attns.append(_think_per_layer)
+                    all_token_attns.append(_token_per_layer)
+                    all_image_masks.append(_image_mask)
+                if _saved_attn_impl == "flash_attention_2":
+                    _unwrapped.config._attn_implementation = _saved_attn_impl
+
+            # Phase 2: saliency computation using extracted slices (same math as
+            # original, adapted for the [1, heads, n_ans, think_len] slice shape).
+            with torch.no_grad():
+                for case_id in range(len(images)):
+                    _image_mask = all_image_masks[case_id]
+                    logits = 0
+                    for layers in range(self.NUM_LAYER):
+                        value_states = outputs.past_key_values.layers[layers].values.clone().detach()[[case_id]]
+                        value_states = repeat_v(value_states, self.NUM_GROUP)
+                        value_states = value_states[:, :, :prompt_length, :]
+                        value_states = value_states[:, :, _image_mask, :]
+
+                        think_attn = all_think_attns[case_id][layers]   # [1, heads, n_ans, think_len]
+                        token_attn = all_token_attns[case_id][layers]   # [1, heads, think_len, n_img]
+                        token_attn = token_attn[:, :, :think_attn.shape[-1], :]
+                        num_answer = think_attn.shape[2]
+                        # permute to [n_ans, heads, n_img, 1] — same shape as original agg_attn
+                        agg_attn = (think_attn @ token_attn).permute(2, 1, 3, 0)
+                        sv = (agg_attn * value_states).transpose(1, 2).reshape(num_answer, -1, self.DIMS)
+                        logits += self._qwen3_lang_model.layers[layers].self_attn.o_proj(sv)
+                    logits = self._qwen3_lang_model.norm(logits) * logits.norm(dim=-1, keepdim=True)
+                    hidden_norm = torch.cat([outputs.hidden_states[answer_token][-1][[case_id]] for answer_token in
+                               range(answer_start[case_id], answer_end[case_id] + 1)], dim=0).norm(dim=-1, keepdim=True)
+                    logits = logits / hidden_norm
+                    out = self.model.lm_head(logits)
+                    indices = [completion_ids[case_id][answer_token] for answer_token in
+                               range(answer_start[case_id], answer_end[case_id] + 1)]
+                    out = out[torch.arange(out.size(0)), :, torch.tensor(indices)].sum(dim=0).reshape(
+                        prompt_inputs.get("image_grid_thw")[case_id, 1] // 2,
+                        prompt_inputs.get("image_grid_thw")[case_id, 2] // 2)
+                    saliency = torch.relu(out).detach().cpu().float().numpy()
+                    saliency = cv2.resize(saliency, images[case_id].size)
+                    attn_batch.append(saliency)
+
+        else:
+            # --- Original path: attentions stored during generate (output_attentions=True). ---
+            with torch.no_grad():
+                for case_id in range(len(images)):
+                    logits = 0
+                    for layers in range(self.NUM_LAYER):
+                        value_states = outputs.past_key_values.layers[layers].values.clone().detach()[[case_id]]
+                        value_states = repeat_v(value_states, self.NUM_GROUP)
+                        value_states = value_states[:, :, :prompt_length, :]
+                        value_states = value_states[:, :, prompt_ids[case_id] == 151655, :]
+                        think_attn = torch.cat([attentions[answer_token][layers]
+                                                    [[case_id], :, -1:,
+                                                prompt_length + think_start[case_id]:prompt_length + think_end[case_id] + 1]
+                                                for answer_token in range(answer_start[case_id], answer_end[case_id] + 1)],
+                                               dim=0)
+                        token_attn = torch.cat([attentions[i][layers][[case_id]][:, :, -1:,
+                                                prompt_completion_ids[case_id, :i + prompt_length] == 151655]
+                                                for i in range(think_start[case_id], think_end[case_id] + 1)], dim=2)
+                        token_attn = token_attn[:, :, :think_attn.shape[-1], :]
+                        agg_attn = (think_attn @ token_attn).transpose(2, 3)
+                        sv = (agg_attn * value_states).transpose(1, 2).reshape(len(think_attn), -1, self.DIMS)
+                        logits += self._qwen3_lang_model.layers[layers].self_attn.o_proj(sv)
+                    logits = self._qwen3_lang_model.norm(logits) * logits.norm(dim=-1, keepdim=True)
+                    hidden_norm = torch.cat([outputs.hidden_states[answer_token][-1][[case_id]] for answer_token in
+                               range(answer_start[case_id], answer_end[case_id] + 1)], dim=0).norm(dim=-1, keepdim=True)
+                    logits = logits / hidden_norm
+                    out = self.model.lm_head(logits)
+                    indices = [completion_ids[case_id][answer_token] for answer_token in
+                               range(answer_start[case_id], answer_end[case_id] + 1)]
+                    out = out[torch.arange(out.size(0)), :, torch.tensor(indices)].sum(dim=0).reshape(
+                        prompt_inputs.get("image_grid_thw")[case_id, 1] // 2,
+                        prompt_inputs.get("image_grid_thw")[case_id, 2] // 2)
+                    saliency = torch.relu(out).detach().cpu().float().numpy()
+                    saliency = cv2.resize(saliency, images[case_id].size)
+                    attn_batch.append(saliency)
 
         torch.cuda.empty_cache()
 
@@ -1955,6 +2240,8 @@ class GRPOTrainer(Trainer):
             output["pixel_attention_mask"] = prompt_inputs["pixel_attention_mask"]
         if "image_sizes" in prompt_inputs:
             output["image_sizes"] = prompt_inputs["image_sizes"]
+        if "mm_token_type_ids" in prompt_inputs:
+            output["mm_token_type_ids"] = prompt_inputs["mm_token_type_ids"]
         return output
 
     def compute_liger_loss(self, unwrapped_model, inputs):
@@ -1975,6 +2262,7 @@ class GRPOTrainer(Trainer):
             inputs.get("image_grid_thw"),
             inputs.get("pixel_attention_mask"),
             inputs.get("image_sizes"),
+            inputs.get("mm_token_type_ids"),
         )
 
         # compute loss and metrics using liger grpo loss
@@ -2029,6 +2317,7 @@ class GRPOTrainer(Trainer):
             image_grid_thw=inputs.get("image_grid_thw"),
             pixel_attention_mask=inputs.get("pixel_attention_mask"),
             image_sizes=inputs.get("image_sizes"),
+            mm_token_type_ids=inputs.get("mm_token_type_ids"),
         )
 
         if self.top_entropy_quantile < 1.0:

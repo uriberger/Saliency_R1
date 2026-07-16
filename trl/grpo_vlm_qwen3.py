@@ -155,12 +155,15 @@ if __name__ == "__main__":
         - If both gold and prediction are parseable → use math verification.
         - If not parseable → compare as normalized text.
         """
+        import re as _re
 
         rewards = []
         contents = [completion[0]["content"] for completion in completions]
-        print(completions[0])
-        print(contents[0])
         for content, sol in zip(contents, solution):
+            # Extract only the answer portion after </think>
+            m = _re.search(r"</think>\s*(.*)", content, _re.DOTALL)
+            answer_text = m.group(1).strip() if m else content.strip()
+
             try:
                 gold_parsed = parse(sol, extraction_mode="first_match")
             except Exception:
@@ -170,7 +173,7 @@ if __name__ == "__main__":
                 # Try parsing predicted answer too
                 try:
                     answer_parsed = parse(
-                        content,
+                        answer_text,
                         extraction_config=[
                             LatexExtractionConfig(
                                 normalization_config=NormalizationConfig(
@@ -188,15 +191,33 @@ if __name__ == "__main__":
                     )
                     reward = float(verify(gold_parsed, answer_parsed))
                 except Exception as e:
-                    print(f"verify failed: {e}, answer: {content}, gold: {sol}")
+                    print(f"verify failed: {e}, answer: {answer_text}, gold: {sol}")
                     reward = None
             else:
                 # fallback to text match
-                reward = float(content.strip().lower() == sol.strip().lower())
+                reward = float(answer_text.lower() == sol.strip().lower())
 
             rewards.append(reward)
 
         return rewards
+
+    ################
+    # Reward function selection (flag-selectable: their saliency reward vs ours)
+    ################
+    # Keep reward_funcs order stable so --reward_weights lines up:
+    #   [format, <saliency|overlap>, accuracy, judge]
+    if script_args.reward_variant == "ours":
+        from trl.rewards.overlap_rewards import configure as configure_overlap
+        from trl.rewards.overlap_rewards import think_overlap_reward
+
+        configure_overlap(
+            box_threshold=script_args.box_threshold,
+            max_box_area=script_args.max_box_area,
+            dino_api_base=script_args.dino_api_base,
+        )
+        reward_funcs = [think_format_reward, think_overlap_reward, accuracy_reward, openai_reward]
+    else:
+        reward_funcs = [think_format_reward, think_saliency_reward, accuracy_reward, openai_reward]
 
     ################
     # Training
@@ -204,10 +225,15 @@ if __name__ == "__main__":
     trainer = GRPOTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
-        reward_funcs=[think_format_reward, think_saliency_reward, accuracy_reward, openai_reward],
+        reward_funcs=reward_funcs,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
+        reforward_saliency=script_args.reforward_saliency,
+        reward_variant=script_args.reward_variant,
+        overlap_layer=script_args.overlap_layer,
+        overlap_heads=script_args.overlap_heads,
+        token_reduction=script_args.token_reduction,
     )
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
