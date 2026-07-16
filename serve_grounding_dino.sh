@@ -20,7 +20,7 @@ HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 HOST=0.0.0.0
 PORT=8100
 GPU=0
-SERVER_BATCH=${DINO_SERVER_BATCH:-32}
+SERVER_BATCH=${DINO_SERVER_BATCH:-8}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -40,6 +40,9 @@ export CUDA_HOME=/cm/shared/apps/cuda12.4/toolkit/12.4.1
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 export CUDA_VISIBLE_DEVICES="$GPU"
+# Avoid caching-allocator fragmentation OOMs when back-to-back reward calls send
+# variably sized image batches through the Swin backbone.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export HF_HOME
 export HF_HUB_OFFLINE=1
 export HF_TOKEN=${HF_TOKEN:-}

@@ -40,8 +40,10 @@ from pydantic import BaseModel
 
 GROUNDING_DINO_HF_ID = "IDEA-Research/grounding-dino-base"
 # Cap the per-forward batch so a large rollout can't OOM the DINO card; the endpoint
-# still accepts an arbitrarily long request and chunks it internally.
-SERVER_BATCH = int(os.environ.get("DINO_SERVER_BATCH", "32"))
+# still accepts an arbitrarily long request and chunks it internally. Grounding-DINO-base
+# (Swin-B + deformable encoder) with the processor's ~800x1333 resize and padding-to-max
+# needs several GB/image, so 32 can OOM an 80 GB card -- keep this conservative.
+SERVER_BATCH = int(os.environ.get("DINO_SERVER_BATCH", "8"))
 
 app = FastAPI(title="grounding-dino-overlap-reward")
 _STATE: dict = {"proc": None, "model": None, "device": None}
@@ -103,6 +105,11 @@ def _ground_batch(images, texts, box_threshold, text_threshold):
                 x1, y1, x2, y2 = box
                 boxes.append([x1 / w, y1 / h, x2 / w, y2 / h])
             out_boxes[start + j] = boxes
+        # Release the chunk's activations/cache so back-to-back reward calls with
+        # variably sized images don't accumulate fragmentation into an OOM.
+        del inputs, outputs, results
+        if device != "cpu":
+            torch.cuda.empty_cache()
     return out_boxes
 
 
