@@ -12,7 +12,23 @@
 #   checkpoint/_smoketest_vllm/sidecar_logs/dino.log     (Grounding-DINO server)
 set -e
 
-export PATH="/lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface/21.1_2026-04-15_21-25-57:$PATH"
+# Locate the ADLR submit_job wrapper robustly: existing PATH, then the 'latest' symlink,
+# then the newest versioned build. (Hardcoding one version breaks on hosts where it's absent.)
+if ! command -v submit_job >/dev/null 2>&1; then
+    CI_ROOT=/lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface
+    if [ -x "$CI_ROOT/latest/submit_job" ]; then
+        export PATH="$CI_ROOT/latest:$PATH"
+    else
+        _ci=$(ls -1dt "$CI_ROOT"/*/submit_job 2>/dev/null | head -1)
+        [ -n "$_ci" ] && export PATH="$(dirname "$_ci"):$PATH"
+    fi
+fi
+if ! command -v submit_job >/dev/null 2>&1; then
+    echo "ERROR: submit_job not found on this host." >&2
+    echo "  Is lustre mounted here?  ls /lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface/latest/submit_job" >&2
+    echo "  Or is it provided by a module?  which submit_job" >&2
+    exit 1
+fi
 
 ACCOUNT=nvr_israel_rlop
 PARTITION=${PARTITION:-batch_singlenode}   # single-node (localhost sidecars); override for faster queue
