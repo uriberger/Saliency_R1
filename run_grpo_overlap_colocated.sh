@@ -35,6 +35,11 @@ NUM_GENERATIONS=8
 GRAD_ACCUM=8
 PER_DEVICE_BATCH=1
 LEARNING_RATE=1e-5
+# Checkpointing: save every SAVE_STEPS, but the background cleanup keeps every
+# CKPT_KEEP_EVERY-th checkpoint permanently and deletes older non-kept ones once a newer
+# one exists (e.g. at step 630 -> {200,400,600,630}).
+SAVE_STEPS=${SAVE_STEPS:-10}
+CKPT_KEEP_EVERY=${CKPT_KEEP_EVERY:-200}
 EXTRA_ARGS=""
 
 # ---------- overlap-reward (swept) defaults ----------
@@ -240,7 +245,7 @@ _cleanup_checkpoints() {
         if [[ -n "$latest" && "$latest" != "$prev_latest" ]]; then
             prev_latest="$latest"
             ls -d "$output_dir"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoint-||' | sort -n | while read -r step; do
-                if (( step % 200 != 0 )) && [[ "$step" != "$latest" ]]; then
+                if (( step % CKPT_KEEP_EVERY != 0 )) && [[ "$step" != "$latest" ]]; then
                     echo "[checkpoint cleanup] Removing $output_dir/checkpoint-$step"
                     rm -rf "$output_dir/checkpoint-$step"
                 fi
@@ -294,7 +299,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --num_generations "$NUM_GENERATIONS" \
     --report_to wandb \
     --logging_steps 5 \
-    --save_steps 200 \
+    --save_steps "$SAVE_STEPS" \
     --num_train_epochs 3 \
     --temperature 1 \
     $RESUME_FLAG \
