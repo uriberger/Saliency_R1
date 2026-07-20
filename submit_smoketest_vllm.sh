@@ -12,21 +12,24 @@
 #   checkpoint/_smoketest_vllm/sidecar_logs/dino.log     (Grounding-DINO server)
 set -e
 
-# Locate the ADLR submit_job wrapper robustly: existing PATH, then the 'latest' symlink,
-# then the newest versioned build. (Hardcoding one version breaks on hosts where it's absent.)
+# Locate the ADLR submit_job wrapper robustly. The cluster-interface tree is mounted under
+# /lustre/fs1 on some hosts and /lustre/fsw on others, so try both; within each, prefer the
+# 'latest' symlink, else the newest versioned build. `[ -x ]` follows symlinks, so a broken
+# cross-filesystem symlink is skipped automatically.
 if ! command -v submit_job >/dev/null 2>&1; then
-    CI_ROOT=/lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface
-    if [ -x "$CI_ROOT/latest/submit_job" ]; then
-        export PATH="$CI_ROOT/latest:$PATH"
-    else
-        _ci=$(ls -1dt "$CI_ROOT"/*/submit_job 2>/dev/null | head -1)
-        [ -n "$_ci" ] && export PATH="$(dirname "$_ci"):$PATH"
-    fi
+    for CI_ROOT in \
+        /lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface \
+        /lustre/fsw/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface; do
+        for CAND in "$CI_ROOT/latest" $(ls -1dt "$CI_ROOT"/*/ 2>/dev/null); do
+            if [ -x "${CAND%/}/submit_job" ]; then
+                export PATH="${CAND%/}:$PATH"; break 2
+            fi
+        done
+    done
 fi
 if ! command -v submit_job >/dev/null 2>&1; then
-    echo "ERROR: submit_job not found on this host." >&2
-    echo "  Is lustre mounted here?  ls /lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface/latest/submit_job" >&2
-    echo "  Or is it provided by a module?  which submit_job" >&2
+    echo "ERROR: submit_job not found under /lustre/fs1 or /lustre/fsw cluster-interface paths." >&2
+    echo "  which submit_job    # is it perhaps provided by a module?" >&2
     exit 1
 fi
 
