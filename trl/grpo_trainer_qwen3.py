@@ -1449,6 +1449,12 @@ class GRPOTrainer(Trainer):
         """
         from .overlap_steps import segment_observe_steps
 
+        # Bisection switch: skip the entire overlap re-forward (and the T5/DINO work it
+        # feeds) to test whether this path is what corrupts the later training forward.
+        # Overlap reward then sees no maps -> contributes 0, but training should survive.
+        if os.environ.get("DISABLE_OVERLAP_FORWARD") == "1":
+            return [[] for _ in range(len(images))]
+
         clf = self._get_overlap_classifier()
         L = self.overlap_layer
         heads = self.overlap_heads
