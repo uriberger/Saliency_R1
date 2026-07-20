@@ -51,8 +51,13 @@ VLLM_PORT=${VLLM_PORT:-8000}
 VLLM_GPU_MEM=${VLLM_GPU_MEM:-0.90}          # vLLM has its GPU to itself -> can be high
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-4096}   # >= max_prompt_length(2048)+max_completion(1024)
 VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-False}  # set True if CUDA-graph capture misbehaves
-# FLAN-T5 observe-step classifier: run on the training GPU (was cpu -> a serial bottleneck)
-OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cuda}
+# FLAN-T5 observe-step classifier device. MUST be cpu under DeepSpeed ZeRO-3: with zero3
+# enabled, transformers.from_pretrained auto-partitions ANY model it loads (incl. this
+# auxiliary classifier), so on cuda its embedding weight is a sharded non-2-D placeholder
+# -> "RuntimeError: 'weight' must be 2-D". Running it on cpu sidesteps zero3 entirely.
+# (Moving it to GPU for speed needs a `deepspeed.zero.Init(enabled=False)` guard around the
+# load -- see the trainer's _get_overlap_classifier; tracked as a follow-up optimization.)
+OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cpu}
 
 # ---------- parse args ----------
 while [[ $# -gt 0 ]]; do
@@ -157,8 +162,12 @@ cleanup() {
         pkill -TERM -P "$pid" 2>/dev/null || true
         kill -TERM "$pid" 2>/dev/null || true
     done
-    # belt-and-suspenders: vLLM spawns detached workers
+    # belt-and-suspenders: vLLM spawns detached workers (the EngineCore worker holds the GPU
+    # memory and does NOT match the serve cmdline, so kill it explicitly or it orphans GPU 1).
     pkill -TERM -u "$USER" -f "trl.scripts.vllm_serve --model $MODEL" 2>/dev/null || true
+    pkill -TERM -u "$USER" -f "VLLM::EngineCore" 2>/dev/null || true
+    sleep 2
+    pkill -KILL -u "$USER" -f "VLLM::EngineCore" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -168,6 +177,15 @@ wait_for_health() {   # $1=url  $2=name  $3=timeout_s  $4=pid
     until curl -sf "$url" >/dev/null 2>&1; do
         if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
             echo "[health] ERROR: $name process (pid $pid) died before becoming healthy." >&2
+            echo "[health] --- last 40 lines of its log ---" >&2
+            tail -40 "$LOG_DIR/${name}.log" >&2 2>/dev/null || true
+            exit 1
+        fi
+        # vLLM's parent process survives when its engine-core worker dies, so a PID check
+        # isn't enough -- detect a fatal error in the log and abort (so the cleanup trap
+        # fires and frees the GPUs instead of hanging until the health timeout).
+        if grep -qE "Engine core initialization failed|EngineCore failed to start|Traceback \(most recent call last\)" "$LOG_DIR/${name}.log" 2>/dev/null; then
+            echo "[health] ERROR: $name logged a fatal error (worker died); aborting." >&2
             echo "[health] --- last 40 lines of its log ---" >&2
             tail -40 "$LOG_DIR/${name}.log" >&2 2>/dev/null || true
             exit 1
@@ -218,7 +236,7 @@ _cleanup_checkpoints() {
     local output_dir="$1" prev_latest="" latest step
     while true; do
         sleep 30
-        latest=$(ls -d "$output_dir"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoint-||' | sort -n | tail -1)
+        latest=$(ls -d "$output_dir"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoint-||' | sort -n | tail -1 || true)
         if [[ -n "$latest" && "$latest" != "$prev_latest" ]]; then
             prev_latest="$latest"
             ls -d "$output_dir"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoint-||' | sort -n | while read -r step; do
@@ -234,7 +252,9 @@ _cleanup_checkpoints "$OUTPUT_DIR" &
 CLEANUP_PID=$!
 
 RESUME_FLAG=""
-LATEST_CKPT=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoint-||' | sort -n | tail -1)
+# `|| true`: on a fresh run `ls` fails (no checkpoints); under `set -o pipefail` that would
+# otherwise propagate a non-zero status into the assignment and trip `set -e`.
+LATEST_CKPT=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoint-||' | sort -n | tail -1 || true)
 [ -n "$LATEST_CKPT" ] && RESUME_FLAG="--resume_from_checkpoint $OUTPUT_DIR/checkpoint-$LATEST_CKPT"
 
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 29500-65000 -n 1)}

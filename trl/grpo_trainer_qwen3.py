@@ -873,7 +873,10 @@ class GRPOTrainer(Trainer):
                     max_num_batched_tokens=4096,
                     model_impl=self.args.vllm_model_impl,
                 )
-            else:
+            elif self.vllm_mode not in ("server", "colocate"):
+                # In server mode only the main process sets up the client (the condition
+                # above is `server and is_main_process`); non-main ranks legitimately fall
+                # through here and must NOT raise. Only a genuinely invalid mode is an error.
                 raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.vllm_mode}'.")
 
             # vLLM specific sampling arguments
@@ -1433,7 +1436,24 @@ class GRPOTrainer(Trainer):
             # Keep the tiny FLAN-T5-base on CPU by default (frees GPU for the policy);
             # override with OVERLAP_STEPS_DEVICE.
             dev = os.environ.get("OVERLAP_STEPS_DEVICE", "cpu")
-            self._overlap_clf = OverlapStepsClassifier.load(device=dev)
+            # Load with DeepSpeed ZeRO-3 hidden from transformers: when zero3 is enabled,
+            # from_pretrained applies zero.Init and PARTITIONS this auxiliary model's params
+            # (embed_tokens.weight -> non-2-D), which then fails its own forward with
+            # "RuntimeError: 'weight' must be 2-D" (it is not a DeepSpeed-managed module).
+            # Temporarily clear the global HfDeepSpeedConfig so the classifier is built
+            # unpartitioned on any device, then restore it.
+            try:
+                import transformers.integrations.deepspeed as _ds_int
+                _saved_ref = _ds_int._hf_deepspeed_config_weak_ref
+                _ds_int._hf_deepspeed_config_weak_ref = None
+            except Exception:
+                _ds_int = None
+                _saved_ref = None
+            try:
+                self._overlap_clf = OverlapStepsClassifier.load(device=dev)
+            finally:
+                if _ds_int is not None:
+                    _ds_int._hf_deepspeed_config_weak_ref = _saved_ref
         return self._overlap_clf
 
     def _compute_overlap_step_maps(
@@ -1834,6 +1854,13 @@ class GRPOTrainer(Trainer):
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
+
+        # prompt_length is assigned only inside the HF-generate branch; the live vLLM and
+        # transformers_paged paths don't set it. Set it here for ALL paths so the saliency
+        # re-forward (which splits prompt vs completion by prompt_length) doesn't hit an
+        # UnboundLocalError. prompt_ids is the un-sliced prompt in vLLM/paged, and in the HF
+        # branch it was already sliced to prompt_length, so this is consistent either way.
+        prompt_length = prompt_ids.size(1)
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.eos_token_id
