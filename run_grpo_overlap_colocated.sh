@@ -63,6 +63,10 @@ VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-False}  # set True if CUDA-graph captur
 # (Moving it to GPU for speed needs a `deepspeed.zero.Init(enabled=False)` guard around the
 # load -- see the trainer's _get_overlap_classifier; tracked as a follow-up optimization.)
 OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cpu}
+# FLAN-T5 observe-step classifier checkpoint. Local (fs12) copy; the in-code default
+# (overlap_steps.py _DEFAULT_CKPT) points at /lustre/fs1, which is NOT mounted on this
+# cluster. Layout: best/{encoder/,tokenizer/,head.pt,cfg.json}. Override via env if moved.
+OVERLAP_STEPS_CKPT=${OVERLAP_STEPS_CKPT:-$REPO/checkpoint/steps_classifier/best}
 
 # ---------- parse args ----------
 while [[ $# -gt 0 ]]; do
@@ -120,7 +124,7 @@ echo "Generation:       vLLM server mode  127.0.0.1:$VLLM_PORT  gpu_mem=$VLLM_GP
 echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_box_area=$MAX_BOX_AREA"
 echo "Overlap reward:   layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
 echo "Batch:            per_device=$PER_DEVICE_BATCH num_generations=$NUM_GENERATIONS grad_accum=$GRAD_ACCUM  (gen_batch=$(( PER_DEVICE_BATCH * TRAIN_N * GRAD_ACCUM )))"
-echo "T5 step clf:      $OVERLAP_STEPS_DEVICE"
+echo "T5 step clf:      $OVERLAP_STEPS_DEVICE  ckpt=$OVERLAP_STEPS_CKPT"
 echo "Run name:         $RUN_NAME"
 echo "Output dir:       $OUTPUT_DIR"
 echo "Judge key:        $([[ -n "${NVIDIA_API_KEY:-}${OPENAI_API_KEY:-}" ]] && echo '(set)' || echo '(MISSING - openai_reward will fail)')"
@@ -148,6 +152,8 @@ export WANDB_RUN_ID=${WANDB_RUN_ID:-$RUN_NAME}
 export WANDB_NAME=${WANDB_NAME:-$RUN_NAME}
 export WANDB_RESUME=${WANDB_RESUME:-allow}
 export OVERLAP_STEPS_DEVICE
+export OVERLAP_STEPS_CKPT
+[ -d "$OVERLAP_STEPS_CKPT/encoder" ] || { echo "ERROR: steps-classifier ckpt not found at $OVERLAP_STEPS_CKPT (need encoder/ tokenizer/ head.pt). Set OVERLAP_STEPS_CKPT to a valid path." >&2; exit 1; }
 [ -n "${NVIDIA_API_KEY:-}" ] && export NVIDIA_API_KEY
 [ -n "${OPENAI_API_KEY:-}" ] && export OPENAI_API_KEY
 [ -n "${OPENAI_BASE_URL:-}" ] && export OPENAI_BASE_URL
