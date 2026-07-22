@@ -20,6 +20,7 @@ grpo-reward-port-plan memory, TODO 2) — this module does not block on that.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -27,6 +28,33 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+
+@contextlib.contextmanager
+def _no_deepspeed_zero3_init():
+    """Temporarily hide HF's global ZeRO-3 config from ``from_pretrained``.
+
+    Under DeepSpeed ZeRO-3 (accelerate ``zero3_init_flag: true``) transformers
+    registers a process-global HfDeepSpeedConfig; every subsequent
+    ``from_pretrained`` — including this auxiliary T5 encoder — then gets wrapped
+    in ``deepspeed.zero.Init`` and has its parameters partitioned into 1-D shards.
+    A sharded ``embed_tokens.weight`` is no longer 2-D, so the encoder's embedding
+    lookup raises ``RuntimeError: 'weight' must be 2-D`` at inference. This
+    classifier is a small, frozen, single-device model that must be fully
+    materialised, so we null the weakref for the duration of the load and restore
+    it afterwards (no-op if transformers has no deepspeed integration).
+    """
+    try:
+        import transformers.integrations.deepspeed as _ds
+    except Exception:
+        yield
+        return
+    saved = getattr(_ds, "_hf_deepspeed_config_weak_ref", None)
+    _ds._hf_deepspeed_config_weak_ref = None
+    try:
+        yield
+    finally:
+        _ds._hf_deepspeed_config_weak_ref = saved
 
 # POD taxonomy + catch-all. Order must match steps_classifier training (LABELS).
 LABELS = ("plan", "observe", "deduce", "none")
@@ -105,7 +133,11 @@ class OverlapStepsClassifier(nn.Module):
                         x = x.to(self.weight.dtype)
                     return self.weight * x
             _t5_mod.T5LayerNorm = _FallbackT5LN
-        encoder = T5EncoderModel.from_pretrained(ckpt / "encoder")
+        # Load fully materialised: never let DeepSpeed ZeRO-3 partition this
+        # auxiliary encoder (would 1-D-shard embed_tokens.weight -> "'weight'
+        # must be 2-D" in the embedding lookup).
+        with _no_deepspeed_zero3_init():
+            encoder = T5EncoderModel.from_pretrained(ckpt / "encoder")
         if _apex_broken:
             _t5_mod.T5LayerNorm = _orig_t5_ln
 

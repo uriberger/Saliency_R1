@@ -41,11 +41,40 @@ trainer via --reward_weights, not here.
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import numpy as np
 
 GROUNDING_DINO_HF_ID = "IDEA-Research/grounding-dino-base"
+
+
+@contextlib.contextmanager
+def _no_deepspeed_zero3_init():
+    """Temporarily hide HF's global ZeRO-3 config from ``from_pretrained``.
+
+    The trainer runs under DeepSpeed ZeRO-3 (accelerate ``zero3_init_flag: true``),
+    which registers a process-global HfDeepSpeedConfig. Every subsequent
+    ``from_pretrained`` — including this auxiliary Grounding-DINO model — would then
+    be wrapped in ``deepspeed.zero.Init`` and have its parameters partitioned into
+    1-D shards, so a sharded weight is no longer 2-D and the forward pass raises
+    ``RuntimeError: 'weight' must be 2-D``. DINO is a small, frozen, single-device
+    model that must be fully materialised, so we null the weakref for the duration
+    of the load and restore it (no-op if transformers lacks deepspeed integration).
+    Mirrors overlap_steps._no_deepspeed_zero3_init (kept local to avoid importing
+    the trainer package from the rewards package).
+    """
+    try:
+        import transformers.integrations.deepspeed as _ds
+    except Exception:
+        yield
+        return
+    saved = getattr(_ds, "_hf_deepspeed_config_weak_ref", None)
+    _ds._hf_deepspeed_config_weak_ref = None
+    try:
+        yield
+    finally:
+        _ds._hf_deepspeed_config_weak_ref = saved
 
 # Config, set by grpo_vlm_qwen3.py via configure() from the CLI flags. box_threshold /
 # max_box_area default to the flagship offline filter (honest |r|~0.22 combo).
@@ -79,7 +108,10 @@ def _load_dino_local():
 
         device = _CFG.get("dino_device") or ("cuda" if torch.cuda.is_available() else "cpu")
         proc = AutoProcessor.from_pretrained(GROUNDING_DINO_HF_ID)
-        model = AutoModelForZeroShotObjectDetection.from_pretrained(GROUNDING_DINO_HF_ID).to(device).eval()
+        # Load fully materialised: never let DeepSpeed ZeRO-3 partition this auxiliary
+        # detector (would 1-D-shard its weights -> "'weight' must be 2-D" at forward).
+        with _no_deepspeed_zero3_init():
+            model = AutoModelForZeroShotObjectDetection.from_pretrained(GROUNDING_DINO_HF_ID).to(device).eval()
         _DINO.update(proc=proc, model=model, device=device)
     return _DINO["proc"], _DINO["model"], _DINO["device"]
 
