@@ -68,7 +68,7 @@ VLLM_PORT=${VLLM_PORT:-8000}
 VLLM_GPU_MEM=${VLLM_GPU_MEM:-0.90}
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-4096}
 VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-False}
-OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cpu}
+OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cuda}   # T5 step-classifier on the training GPU (CPU was the dominant per-step cost)
 OVERLAP_STEPS_CKPT=${OVERLAP_STEPS_CKPT:-$REPO/checkpoint/steps_classifier/best}
 
 # ---------- parse args ----------

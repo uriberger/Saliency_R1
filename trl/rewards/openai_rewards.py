@@ -17,6 +17,11 @@ import ast
 import openai
 from retrying import retry
 import os
+from concurrent.futures import ThreadPoolExecutor
+
+# API errors worth retrying (transient). Everything else (e.g. a 400 content_filter
+# from Azure) is deterministic -> fail fast and mask that sample rather than crash.
+_TRANSIENT = (openai.RateLimitError, openai.APIConnectionError, openai.APITimeoutError)
 
 client = openai.OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY") or os.environ.get("NVIDIA_API_KEY"),
@@ -37,7 +42,8 @@ def openai_reward(completions, solution, problem, **kwargs):
     prediction_list = [re.search(r"</think>\s*([^<]*(?:(?!<think>|</think>).)*?)\s*$", i, re.DOTALL | re.MULTILINE) for i in contents]
     #prediction_list = [re.search(r"<answer>\s*(.*?)\s*</answer>", i, re.DOTALL | re.MULTILINE) for i in contents]
     prediction_list = [i.group(1) if i else None for i in prediction_list]
-    @retry(stop_max_attempt_number=5, wait_exponential_multiplier=200)
+    @retry(stop_max_attempt_number=5, wait_exponential_multiplier=200,
+           retry_on_exception=lambda e: isinstance(e, _TRANSIENT))
     def query_gpt4o(question, ground_truth, prediction):
         # Compute the correctness score
         chat_completion = client.chat.completions.create(
@@ -76,4 +82,20 @@ def openai_reward(completions, solution, problem, **kwargs):
             score = (int(score_match.group(1)) - 1.0) / 4.0
             return score
 
-    return [query_gpt4o(question, ground_truth, prediction) if prediction else 0 for question, ground_truth, prediction in zip(problem_list, ground_truth_list, prediction_list)]
+    def _score(args):
+        question, ground_truth, prediction = args
+        if not prediction:
+            return 0
+        try:
+            return query_gpt4o(question, ground_truth, prediction)
+        except Exception as e:
+            # Non-retryable judge failure (e.g. Azure content_filter 400) must never
+            # crash training. Mask this sample's judge reward -> None -> NaN downstream.
+            print(f"[openai_reward] judge failed, masking sample: "
+                  f"{type(e).__name__}: {str(e)[:160]}", flush=True)
+            return None
+
+    args_list = list(zip(problem_list, ground_truth_list, prediction_list))
+    max_workers = max(1, int(os.environ.get("JUDGE_MAX_WORKERS", "8")))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        return list(ex.map(_score, args_list))

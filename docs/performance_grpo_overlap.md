@@ -38,16 +38,38 @@ Smaller, also on the path: FLAN-T5 classifier on CPU per completion; DINO HTTP.
 
 | # | Change | Status |
 |---|--------|--------|
-| 1 | **Layer-22 only**: recompute attention for just layer 22, keep the fast attn impl for the other 35 layers | ✅ done (this branch) |
-| 2 | **Batch the re-forward**: the per-completion `for` loop does 48 separate forwards on equal-length padded seqs — batch them | pending |
-| 3 | **Fuse into an existing forward**: attach the layer-22 capture to the logprob forward GRPO already runs and drop `reforward_saliency` (check the `--reforward_saliency False` path first) | pending |
-| 4 | **Judge**: run the 48 API calls concurrently (thread pool / async) and drop `max_tokens` to ~8 (only needs `Score: <1-5>`) | pending |
-| 5 | **T5 classifier off CPU / batched**: move to a GPU or batch all sentences in one forward | pending |
+| 1 | **Layer-22 only**: recompute attention for just layer 22, keep the fast attn impl for the other 35 layers | ✅ done — real but minor (step time unchanged) |
+| 5 | **T5 classifier off CPU + batched**: one padded encoder forward per completion, on the training GPU (`OVERLAP_STEPS_DEVICE` default cpu→cuda) | ✅ done — **the big win** |
+| 4 | **Judge**: hardened (mask non-retryable failures like Azure `content_filter` instead of crashing; fail-fast) + parallelized (ThreadPool, `JUDGE_MAX_WORKERS`) | ✅ done |
+| 2 | **Batch the re-forward**: the per-completion `for` loop does up to 48 separate forwards — batch them | candidate (see cons below) |
+| 3 | **Fuse into an existing forward**: attach the layer-22 capture to the logprob forward GRPO already runs and drop `reforward_saliency` | candidate — fewer downsides than #2 |
 | 6 | **Cap image resolution** (`max_pixels`): fewer image patches speeds generation, the training forward, *and* the attention re-forward's key dim | pending |
 
+### Measured results (2026-07-22)
+Per-step wall time **~148 s → ~65 s (~2.3×)**; ETA ~160 h → ~72 h. Profiling accounting
+(148 s step): profiled phases summed to only ~33 s (judge 13, generate 11, weight-sync 2,
+logps 0.5, overlap-reward-grounding 4.85); the other ~115 s was the unprofiled
+`_compute_overlap_step_maps`, dominated by the **CPU FLAN-T5 segmentation** (hundreds of
+serial encoder forwards/step). Moving T5 to GPU + batching removed it; #1 alone had not
+moved total time, confirming the forwards were not the dominant term.
+
+### #2 (batch the re-forward) — cons
+- **Peak GPU memory scales with batch.** The layer-22 hook materializes `[B, heads, seq, seq]`
+  eager attention (+ an fp32 softmax transient); at B≈8, seq≈2.3k that's ~8 GB on top of the
+  ZeRO-3-gathered 8B — OOM risk on the shared training GPU. Forces small chunks and/or
+  capturing only heads [28,31] and the think-token query rows.
+- **Correctness risk assembling Qwen3-VL batched multimodal inputs** — per-sample image grids,
+  **M-RoPE position ids**, `mm_token_type_ids`, and 4D padding masks must be built exactly; a
+  subtle mistake silently corrupts the attention → wrong saliency reward. Batch-1 sidesteps all of it.
+- **Sublinear speedup** — variable completion lengths (mean 219, max 603) mean padding waste.
+- **Not clearly the bottleneck anymore** — after the T5 fix, need `OVERLAP_PROFILE=1` numbers first.
+  **#3 (fuse capture into the existing logp forward)** achieves the same "no separate forward"
+  goal without the memory blowup, and is likely the better next step.
+
 ### Attribution kill-switches
-- `DISABLE_OVERLAP_FORWARD=1` — skips the whole re-forward (overlap reward → 0); isolates cost #1.
-- Zero the judge reward weight — isolates cost #2.
+- `DISABLE_OVERLAP_FORWARD=1` — skips the whole re-forward (overlap reward → 0); isolates the re-forward cost.
+- `OVERLAP_PROFILE=1` — prints per-step `[overlap-profile] hook={active|FALLBACK} fwd=..s t5-segment=..s`.
+- Zero the judge reward weight — isolates the judge cost.
 
 ## #1 — implemented
 

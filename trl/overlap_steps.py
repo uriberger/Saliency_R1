@@ -151,14 +151,25 @@ class OverlapStepsClassifier(nn.Module):
 
     @torch.no_grad()
     def predict(self, step_text: str, chain: str, question: str) -> str:
-        inp = _build_input(step_text, chain, question, self.include_chain)
-        enc = self._tokenizer(inp, return_tensors="pt", truncation=True, max_length=512)
+        return self.predict_many([step_text], chain, question)[0]
+
+    @torch.no_grad()
+    def predict_many(self, step_texts: list[str], chain: str, question: str) -> list[str]:
+        """Batched equivalent of predict(): one padded encoder forward for all
+        sentences of a completion instead of one forward per sentence. Masked
+        mean-pooling makes this numerically identical to per-item inference."""
+        if not step_texts:
+            return []
+        inps = [_build_input(t, chain, question, self.include_chain) for t in step_texts]
+        enc = self._tokenizer(
+            inps, return_tensors="pt", truncation=True, max_length=512, padding=True
+        )
         device = next(self.parameters()).device
         logits = self(
             input_ids=enc["input_ids"].to(device),
             attention_mask=enc["attention_mask"].to(device),
         )
-        return ID2LABEL[int(logits.argmax(dim=-1).item())]
+        return [ID2LABEL[int(i)] for i in logits.argmax(dim=-1).tolist()]
 
 
 # ---------------------------------------------------------------------------
@@ -229,9 +240,12 @@ def segment_observe_steps(
         return []
 
     total_chars = len(output_text)
+    # One batched classifier forward for all sentences of this completion (was one
+    # per sentence -> hundreds of serial CPU T5 forwards per step).
+    labels = classifier.predict_many([s for s, _, _ in sentences], think_text, question)
     result = []
-    for sent_text, cs, ce in sentences:
-        if classifier.predict(sent_text, think_text, question) != "observe":
+    for (sent_text, cs, ce), label in zip(sentences, labels):
+        if label != "observe":
             continue
         tok_a = _char_to_tok(out, case_id, cs, total_chars)
         tok_b_incl = out.char_to_token(case_id, ce - 1)
