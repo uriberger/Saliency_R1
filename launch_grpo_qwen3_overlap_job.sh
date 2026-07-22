@@ -152,7 +152,12 @@ fi
 
 # ---------- direct path ----------
 source "$CONDA_SH"
+# conda activate + activate.d hooks (e.g. cuda-nvcc's, which expands
+# $NVCC_PREPEND_FLAGS with no default) assume nounset is OFF; our set -u makes
+# that a fatal "unbound variable". Disable nounset for activation only.
+set +u
 conda activate "$CONDA_ENV"
+set -u
 # Activating across conda installs -- e.g. when this script is launched (bash)
 # from a fish shell that already had a different env active -- can leave a stale
 # env's bin/ ahead of ours on PATH, so `python` resolves to the WRONG interpreter
@@ -166,9 +171,7 @@ if [ "$(command -v python)" != "$CONDA_PREFIX/bin/python" ]; then
     exit 1
 fi
 
-export CUDA_HOME=${CUDA_HOME:-/cm/shared/apps/cuda12.4/toolkit/12.4.1}
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+source "$REPO/setup_cuda_home.sh"
 bash "$REPO/check_cuda_home.sh" || exit 1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export DS_BUILD_OPS=0

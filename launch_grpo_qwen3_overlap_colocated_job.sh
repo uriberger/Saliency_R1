@@ -232,33 +232,7 @@ if [ "$(command -v python)" != "$CONDA_PREFIX/bin/python" ]; then
     exit 1
 fi
 
-# Derive CUDA_HOME automatically. Preference order:
-#   1. explicit CUDA_HOME from the environment (manual override still wins)
-#   2. the active conda env, if it ships nvcc -- the normal, self-consistent
-#      case: install nvcc into the training env (e.g. `mamba install -n <env>
-#      -c nvidia cuda-nvcc cuda-cudart-dev cuda-cccl`) so toolkit and runtime
-#      are ONE env and no cross-env CUDA_HOME juggling is needed.
-#   3. a system toolkit on the node, if one exists.
-#   4. legacy hardcoded fallback (check_cuda_home.sh fails fast if it's absent).
-if [ -z "${CUDA_HOME:-}" ]; then
-    if [ -x "${CONDA_PREFIX:-}/bin/nvcc" ]; then
-        export CUDA_HOME="$CONDA_PREFIX"
-    elif [ -x /usr/local/cuda/bin/nvcc ]; then
-        export CUDA_HOME=/usr/local/cuda
-    fi
-fi
-export CUDA_HOME="${CUDA_HOME:-/cm/shared/apps/cuda12.4/toolkit/12.4.1}"
-echo "Using CUDA_HOME=$CUDA_HOME"
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-# On offline nodes the only CUDA toolkit (nvcc) lives inside a *conda env* (e.g.
-# saliency_r1_qwen3), so CUDA_HOME often points at an env that also has its own
-# python/pip/accelerate in bin/. Prepending $CUDA_HOME/bin above would then
-# shadow our active env's interpreter -- re-breaking the guard from lines above.
-# Re-assert the active env's bin at the FRONT so python/torchrun/etc always
-# resolve to $CONDA_ENV regardless of which nvcc-bearing env CUDA_HOME points at.
-export PATH="$CONDA_PREFIX/bin:$PATH"
-hash -r
+source "$REPO/setup_cuda_home.sh"
 if [ "$(command -v python)" != "$CONDA_PREFIX/bin/python" ]; then
     echo "ERROR: after CUDA_HOME setup, python resolves to '$(command -v python)', expected '$CONDA_PREFIX/bin/python' (env '$CONDA_ENV'). CUDA_HOME='$CUDA_HOME' shadowed it." >&2
     exit 1

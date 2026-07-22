@@ -26,9 +26,7 @@ echo ""
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
 
-export CUDA_HOME=/cm/shared/apps/cuda12.4/toolkit/12.4.1
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+source "$REPO/setup_cuda_home.sh"
 
 python "$REPO/merge_lora.py" \
     --adapter "$ADAPTER" \

@@ -13,10 +13,13 @@ CONDA_ENV=${CONDA_ENV:-saliency_r1_qwen3_vllm}
 NUM_GPUS=${NUM_GPUS:-8}
 
 source "$CONDA_SH"
+# conda activate + activate.d hooks (e.g. cuda-nvcc's, which expands
+# $NVCC_PREPEND_FLAGS with no default) assume nounset is OFF; our set -u makes
+# that a fatal "unbound variable". Disable nounset for activation only.
+set +u
 conda activate "$CONDA_ENV"
-export CUDA_HOME=${CUDA_HOME:-/cm/shared/apps/cuda12.4/toolkit/12.4.1}
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+set -u
+source "$REPO/setup_cuda_home.sh"
 export WANDB_MODE=offline     # throwaway run -- do not pollute wandb
 
 echo "==================== STAGE A: torch 2.8 / cu128 driver check ===================="
