@@ -1,5 +1,9 @@
 # Claude Code Instructions
 
+## Shell
+
+- The user works in the **fish** shell. Always write shell commands and snippets in fish syntax (e.g. `set -x VAR value`, `set -e VAR`, `set -q VAR`, `command; and command2`), not bash/POSIX syntax.
+
 ## Git Workflow
 
 - The canonical branch is `main`. All finished work lives there.

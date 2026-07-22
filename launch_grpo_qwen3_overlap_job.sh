@@ -153,6 +153,11 @@ fi
 # ---------- direct path ----------
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
+if [ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV" ]; then
+    echo "ERROR: expected conda env '$CONDA_ENV' but active env is '${CONDA_DEFAULT_ENV:-<none>}'." >&2
+    echo "       'conda activate $CONDA_ENV' did not take effect (deactivate any stacked env and retry)." >&2
+    exit 1
+fi
 
 export CUDA_HOME=${CUDA_HOME:-/cm/shared/apps/cuda12.4/toolkit/12.4.1}
 export PATH="$CUDA_HOME/bin:$PATH"

@@ -17,7 +17,7 @@
 #   bash launch_grpo_qwen3_overlap_colocated_job.sh --direct --num-gpus 8
 #
 # Environment overrides:
-#   PARTITION=batch_singlenode   DURATION=4 (hours)   CONDA_ENV=saliency_r1_qwen3_vllm
+#   PARTITION=batch_singlenode   DURATION=4 (hours)
 #   SAVE_STEPS=10   CKPT_KEEP_EVERY=200
 #   DINO_PORT=8100   VLLM_PORT=8000   VLLM_GPU_MEM=0.90   VLLM_MAX_MODEL_LEN=4096
 #   VLLM_ENFORCE_EAGER=False
@@ -29,7 +29,10 @@ set -euo pipefail
 SCRIPT_PATH="$(realpath "$0")"
 REPO=/home/uberger/scratch/research/saliency_r1
 CONDA_SH=/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh
-CONDA_ENV=${CONDA_ENV:-saliency_r1_qwen3_vllm}
+# This colocated job runs both the vLLM server and the trainer in ONE env, so it
+# MUST use the vllm-enabled env. Hardcoded (not overridable) to prevent picking up
+# a stray CONDA_ENV from the shell, which silently breaks the vLLM sidecar.
+CONDA_ENV=saliency_r1_qwen3_vllm
 HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 
 # ---------- SLURM defaults ----------
@@ -209,6 +212,11 @@ fi
 # ---------- direct path ----------
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
+if [ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV" ]; then
+    echo "ERROR: expected conda env '$CONDA_ENV' but active env is '${CONDA_DEFAULT_ENV:-<none>}'." >&2
+    echo "       'conda activate $CONDA_ENV' did not take effect (deactivate any stacked env and retry)." >&2
+    exit 1
+fi
 
 export CUDA_HOME=${CUDA_HOME:-/cm/shared/apps/cuda12.4/toolkit/12.4.1}
 export PATH="$CUDA_HOME/bin:$PATH"
