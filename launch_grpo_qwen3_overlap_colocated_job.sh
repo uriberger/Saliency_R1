@@ -226,7 +226,23 @@ if [ "$(command -v python)" != "$CONDA_PREFIX/bin/python" ]; then
     exit 1
 fi
 
-export CUDA_HOME=${CUDA_HOME:-/cm/shared/apps/cuda12.4/toolkit/12.4.1}
+# Derive CUDA_HOME automatically. Preference order:
+#   1. explicit CUDA_HOME from the environment (manual override still wins)
+#   2. the active conda env, if it ships nvcc -- the normal, self-consistent
+#      case: install nvcc into the training env (e.g. `mamba install -n <env>
+#      -c nvidia cuda-nvcc cuda-cudart-dev cuda-cccl`) so toolkit and runtime
+#      are ONE env and no cross-env CUDA_HOME juggling is needed.
+#   3. a system toolkit on the node, if one exists.
+#   4. legacy hardcoded fallback (check_cuda_home.sh fails fast if it's absent).
+if [ -z "${CUDA_HOME:-}" ]; then
+    if [ -x "${CONDA_PREFIX:-}/bin/nvcc" ]; then
+        export CUDA_HOME="$CONDA_PREFIX"
+    elif [ -x /usr/local/cuda/bin/nvcc ]; then
+        export CUDA_HOME=/usr/local/cuda
+    fi
+fi
+export CUDA_HOME="${CUDA_HOME:-/cm/shared/apps/cuda12.4/toolkit/12.4.1}"
+echo "Using CUDA_HOME=$CUDA_HOME"
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 # On offline nodes the only CUDA toolkit (nvcc) lives inside a *conda env* (e.g.
