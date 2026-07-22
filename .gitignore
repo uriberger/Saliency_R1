@@ -1,6 +1,11 @@
 __pycache__/
 *.py[cod]
 
+# Emacs autosave / lock / backup files
+\#*\#
+.\#*
+*~
+
 # Nested HuggingFace TRL clone — tracked as its own git repo, not a submodule.
 trl_repo/
 
