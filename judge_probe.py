@@ -20,7 +20,7 @@ for model in ["gpt-4o-mini", "azure/openai/gpt-4o-mini"]:
     print(f"\n--- chat.completions with model={model!r} ---")
     try:
         r = client.chat.completions.create(
-            model=model, temperature=0, max_tokens=8,
+            model=model, temperature=0, max_tokens=16,
             messages=[{"role": "user", "content": "reply with the word ok"}],
         )
         print("  OK:", r.choices[0].message.content)

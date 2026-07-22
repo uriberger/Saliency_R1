@@ -84,10 +84,11 @@ echo "  copied grpo_trainer_qwen3.py -> $DST"
 # Keep these tracked-source files in sync with the live trl_repo tree.
 cp "$REPO/trl/overlap_steps.py"           "$TRL_REPO/trl/trainer/overlap_steps.py"
 cp "$REPO/trl/rewards/overlap_rewards.py" "$TRL_REPO/trl/rewards/overlap_rewards.py"
+cp "$REPO/trl/rewards/openai_rewards.py"  "$TRL_REPO/trl/rewards/openai_rewards.py"
 cp "$REPO/trl/rewards/__init__.py"        "$TRL_REPO/trl/rewards/__init__.py"
 cp "$REPO/trl/scripts/utils.py"           "$TRL_REPO/trl/scripts/utils.py"
 cp "$REPO/trl/grpo_vlm_qwen3.py"          "$TRL_REPO/examples/scripts/grpo_vlm_qwen3.py"
-echo "  copied overlap-reward files (overlap_steps, overlap_rewards, rewards/__init__, scripts/utils, grpo_vlm_qwen3)"
+echo "  copied overlap-reward files (overlap_steps, overlap_rewards, openai_rewards, rewards/__init__, scripts/utils, grpo_vlm_qwen3)"
 
 # ── 3a. trl/trainer/__init__.py ─────────────────────────────────────────────
 TINIT="$TRL_REPO/trl/trainer/__init__.py"

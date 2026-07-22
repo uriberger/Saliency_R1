@@ -20,8 +20,13 @@ import os
 
 client = openai.OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY") or os.environ.get("NVIDIA_API_KEY"),
-    base_url=os.environ.get("OPENAI_BASE_URL", "https://inference-api.nvidia.com/v1"),
+    base_url=os.environ.get("OPENAI_BASE_URL", "https://inference-api.nvidia.com"),
 )
+
+# The NVIDIA inference gateway requires provider-prefixed model names
+# (e.g. "azure/openai/gpt-4o-mini"); the bare "gpt-4o-mini" alias returns a
+# 403 key_model_access_denied. Override with the JUDGE_MODEL env var.
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "azure/openai/gpt-4o-mini")
 
 @retry(wait_exponential_multiplier=200, wait_exponential_max=2000, retry_on_exception=lambda e: isinstance(e, openai.RateLimitError) or isinstance(e, openai.APIConnectionError))
 def openai_reward(completions, solution, problem, **kwargs):
@@ -36,7 +41,7 @@ def openai_reward(completions, solution, problem, **kwargs):
     def query_gpt4o(question, ground_truth, prediction):
         # Compute the correctness score
         chat_completion = client.chat.completions.create(
-            model="gpt-4o-mini",  # "deepseek-reasoner", "gpt-4o"
+            model=JUDGE_MODEL,  # override via JUDGE_MODEL env, e.g. "azure/openai/gpt-4o"
             temperature=0,
             max_tokens=512,
             messages=[
