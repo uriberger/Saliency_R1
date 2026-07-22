@@ -153,9 +153,16 @@ fi
 # ---------- direct path ----------
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
-if [ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV" ]; then
-    echo "ERROR: expected conda env '$CONDA_ENV' but active env is '${CONDA_DEFAULT_ENV:-<none>}'." >&2
-    echo "       'conda activate $CONDA_ENV' did not take effect (deactivate any stacked env and retry)." >&2
+# Activating across conda installs -- e.g. when this script is launched (bash)
+# from a fish shell that already had a different env active -- can leave a stale
+# env's bin/ ahead of ours on PATH, so `python` resolves to the WRONG interpreter
+# even though CONDA_DEFAULT_ENV/CONDA_PREFIX are correct. Force this env's bin to
+# the front and clear bash's command hash so the right python/torchrun are used.
+[ -n "${CONDA_PREFIX:-}" ] || { echo "ERROR: 'conda activate $CONDA_ENV' failed (no CONDA_PREFIX)." >&2; exit 1; }
+export PATH="$CONDA_PREFIX/bin:$PATH"
+hash -r
+if [ "$(command -v python)" != "$CONDA_PREFIX/bin/python" ]; then
+    echo "ERROR: python resolves to '$(command -v python)', expected '$CONDA_PREFIX/bin/python' (env '$CONDA_ENV')." >&2
     exit 1
 fi
 
