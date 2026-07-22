@@ -30,6 +30,11 @@ fail() {
     exit 1
 }
 
+if [ "${DS_BUILD_OPS:-0}" = "0" ]; then
+    echo "CUDA_HOME check skipped on $(hostname): DS_BUILD_OPS=0, no JIT compilation will occur."
+    exit 0
+fi
+
 [ -n "${CUDA_HOME:-}" ]      || fail "CUDA_HOME is empty/unset."
 [ -d "$CUDA_HOME" ]          || fail "CUDA_HOME directory does not exist."
 [ -x "$CUDA_HOME/bin/nvcc" ] || fail "No executable nvcc at \$CUDA_HOME/bin/nvcc."

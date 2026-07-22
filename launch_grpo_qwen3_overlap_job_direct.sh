@@ -89,11 +89,12 @@ echo ""
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
 
-export CUDA_HOME=/cm/shared/apps/cuda12.4/toolkit/12.4.1
+export CUDA_HOME=${CUDA_HOME:-/cm/shared/apps/cuda12.4/toolkit/12.4.1}
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 bash "$REPO/check_cuda_home.sh" || exit 1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export DS_BUILD_OPS=0
 
 export HF_HOME
 export HF_HUB_OFFLINE=1
@@ -107,6 +108,11 @@ export WANDB_NAME=${WANDB_NAME:-$RUN_NAME}
 export WANDB_RESUME=${WANDB_RESUME:-allow}
 # FLAN-T5 observe-step classifier stays on CPU by default (frees GPU for the policy).
 export OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cpu}
+# FLAN-T5 observe-step classifier checkpoint. Local (fs12) copy; the in-code default
+# (overlap_steps.py _DEFAULT_CKPT) points at /lustre/fs1, which is NOT mounted on this
+# cluster. Layout: best/{encoder/,tokenizer/,head.pt,cfg.json}. Override via env if moved.
+export OVERLAP_STEPS_CKPT=${OVERLAP_STEPS_CKPT:-$REPO/checkpoint/steps_classifier/best}
+[ -d "$OVERLAP_STEPS_CKPT/encoder" ] || { echo "ERROR: steps-classifier ckpt not found at $OVERLAP_STEPS_CKPT (need encoder/ tokenizer/ head.pt). Set OVERLAP_STEPS_CKPT to a valid path." >&2; exit 1; }
 [ -n "${NVIDIA_API_KEY:-}" ] && export NVIDIA_API_KEY
 [ -n "${OPENAI_API_KEY:-}" ] && export OPENAI_API_KEY
 [ -n "${OPENAI_BASE_URL:-}" ] && export OPENAI_BASE_URL
