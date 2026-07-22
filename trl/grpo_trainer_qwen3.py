@@ -1496,8 +1496,54 @@ class GRPOTrainer(Trainer):
             torch.no_grad(),
             FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
         ):
+            # --- Layer-L attention capture (single-layer fast path) ------------------
+            # output_attentions=True would run EAGER attention for ALL 36 layers and
+            # materialize every layer's [heads, seq, seq] map, then use only layer L.
+            # Instead we keep the base attn impl for the forward (flash/sdpa, no weights)
+            # and recompute ONLY layer L's weights via a forward hook that re-runs that
+            # one attention module in eager mode. It reuses the module's own q/k/v proj,
+            # q_norm/k_norm and rotary, so the weights are numerically identical to the
+            # all-layer path; we just supply an explicit causal+padding mask because the
+            # fast attention paths may hand the layer a None mask. Net cost per case:
+            # ~1 fast forward + 1 layer of eager attention (was: 1 all-eager forward).
+            _cap = {"attn": None}
+            _mask_holder = {"m": None}
+            _reentry = {"in": False}
+            _mdtype = next(_unwrapped.parameters()).dtype
+            _min_val = torch.finfo(_mdtype).min
+
+            _attn_mod = None
+            for _m in _unwrapped.modules():
+                if type(_m).__name__ == "Qwen3VLTextAttention" and getattr(_m, "layer_idx", None) == L:
+                    _attn_mod = _m
+                    break
+
+            def _capture_hook(module, args, kwargs, output):
+                # Re-run this single attention module in eager mode to recover its
+                # softmax weights (the base flash/sdpa forward returns None for them).
+                if _reentry["in"]:
+                    return
+                _reentry["in"] = True
+                _kw = dict(kwargs)
+                _kw["attention_mask"] = _mask_holder["m"]
+                _kw["past_key_values"] = None  # avoid double-updating the KV cache
+                _kw["use_cache"] = False
+                _prev_impl = module.config._attn_implementation
+                module.config._attn_implementation = "eager"
+                try:
+                    _cap["attn"] = module(*args, **_kw)[1]
+                finally:
+                    module.config._attn_implementation = _prev_impl
+                    _reentry["in"] = False
+
+            _hook_handle = (
+                _attn_mod.register_forward_hook(_capture_hook, with_kwargs=True)
+                if _attn_mod is not None else None
+            )
+
+            # Fallback: unexpected model layout -> old all-layer eager path.
             _saved_attn_impl = _unwrapped.config._attn_implementation
-            if _saved_attn_impl == "flash_attention_2":
+            if _hook_handle is None and _saved_attn_impl == "flash_attention_2":
                 _unwrapped.config._attn_implementation = "sdpa"
 
             for case_id in range(len(images)):
@@ -1521,18 +1567,38 @@ class GRPOTrainer(Trainer):
                         [prompt_inputs["mm_token_type_ids"][case_id:case_id + 1], _compl_zeros], dim=1
                     )
 
-                _fwd = _unwrapped(**_case_inputs, output_attentions=True, output_hidden_states=False)
+                if _hook_handle is not None:
+                    # Build the additive causal+padding mask the eager re-run needs
+                    # (0 where attended, finfo.min where masked): the fast forward may
+                    # hand layer L a None mask.
+                    _am2d = _case_inputs["attention_mask"]  # [1, seq]
+                    _seq = _am2d.shape[-1]
+                    _masked = torch.triu(
+                        torch.ones(_seq, _seq, dtype=torch.bool, device=device), diagonal=1
+                    ) | (_am2d[0] == 0)[None, :]
+                    _add = torch.zeros(_seq, _seq, dtype=_mdtype, device=device)
+                    _add.masked_fill_(_masked, _min_val)
+                    _mask_holder["m"] = _add[None, None]
+
+                    _cap["attn"] = None
+                    _unwrapped(**_case_inputs)  # triggers _capture_hook at layer L
+                    _attn_L = _cap["attn"]
+                    del _add, _masked
+                else:
+                    _fwd = _unwrapped(**_case_inputs, output_attentions=True, output_hidden_states=False)
+                    _attn_L = _fwd.attentions[L]
+                    del _fwd
 
                 _image_mask = prompt_ids[case_id] == 151655
                 # [1, heads, think_len, n_patches] : observe-token query rows -> image-patch key cols
-                raw = _fwd.attentions[L][
+                raw = _attn_L[
                     :, heads,
                     prompt_length + ts:prompt_length + te + 1,
                     :prompt_length,
                 ][:, :, :, _image_mask]
                 # [n_heads_sel, think_len, n_patches]; ReLU is a no-op on softmax weights but kept per spec
                 per_tok = torch.relu(raw)[0].float().cpu().numpy()
-                del _fwd, raw
+                del _attn_L, raw
 
                 gh = int(thw[case_id, 1].item()) // 2
                 gw = int(thw[case_id, 2].item()) // 2
@@ -1564,7 +1630,9 @@ class GRPOTrainer(Trainer):
                     step_maps.append({"map": m.reshape(gh, gw).astype(np.float32), "text": step_text})
                 results[case_id] = step_maps
 
-            if _saved_attn_impl == "flash_attention_2":
+            if _hook_handle is not None:
+                _hook_handle.remove()
+            elif _saved_attn_impl == "flash_attention_2":
                 _unwrapped.config._attn_implementation = _saved_attn_impl
 
         return results
