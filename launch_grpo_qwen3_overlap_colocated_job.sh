@@ -212,7 +212,13 @@ fi
 # ---------- direct path ----------
 source "$CONDA_SH"
 echo "Activating conda env $CONDA_ENV"
+# conda activate and package activate.d hooks (e.g. cuda-nvcc's, which expands
+# $NVCC_PREPEND_FLAGS with no default) assume nounset is OFF. Our `set -u` makes
+# any such unguarded expansion a fatal "unbound variable". Disable nounset for
+# the duration of activation only, then restore it.
+set +u
 conda activate "$CONDA_ENV"
+set -u
 # Activating across conda installs -- e.g. when this script is launched (bash)
 # from a fish shell that already had a different env active -- can leave a stale
 # env's bin/ ahead of ours on PATH, so `python` resolves to the WRONG interpreter
