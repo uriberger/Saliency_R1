@@ -178,6 +178,10 @@ if ! $DIRECT; then
             export CONDA_ENV=$CONDA_ENV;
             export HF_HOME=$HF_HOME;
             export WANDB_API_KEY=${WANDB_API_KEY:-};
+            export WANDB_DATA_DIR=${WANDB_DATA_DIR:-/home/uberger/scratch/cache/wandb_data};
+            export WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-/home/uberger/scratch/cache/wandb_cache};
+            export VLLM_NO_USAGE_STATS=1;
+            export DO_NOT_TRACK=1;
             ${HF_TOKEN:+export HF_TOKEN=$HF_TOKEN;}
             ${NVIDIA_API_KEY:+export NVIDIA_API_KEY=$NVIDIA_API_KEY;}
             ${OPENAI_API_KEY:+export OPENAI_API_KEY=$OPENAI_API_KEY;}
@@ -249,6 +253,14 @@ export WANDB_ENTITY=nvr-israel
 export WANDB_RUN_ID=${WANDB_RUN_ID:-$RUN_NAME}
 export WANDB_NAME=${WANDB_NAME:-$RUN_NAME}
 export WANDB_RESUME=${WANDB_RESUME:-allow}
+# Keep wandb artifact staging/cache OFF the tiny /home partition (10G quota); it
+# otherwise piles up under ~/.local/share/wandb and ~/.cache/wandb and fills /home.
+export WANDB_DATA_DIR=${WANDB_DATA_DIR:-/home/uberger/scratch/cache/wandb_data}
+export WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-/home/uberger/scratch/cache/wandb_cache}
+mkdir -p "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR"
+# Don't write vLLM usage stats into ~/.config (also on /home).
+export VLLM_NO_USAGE_STATS=1
+export DO_NOT_TRACK=1
 export OVERLAP_STEPS_DEVICE
 export OVERLAP_STEPS_CKPT
 [ -d "$OVERLAP_STEPS_CKPT/encoder" ] || {
