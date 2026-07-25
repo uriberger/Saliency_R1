@@ -95,8 +95,10 @@ class ScriptArguments:
         metadata={
             "help": "Which reward + attention-extraction mode to use. 'saliency_r1' = the paper's "
             "whole-completion rollout saliency reward. 'ours' = raw per-head observe->patch "
-            "attention overlap reward (layer 22, 2-head mean, per observe step, DINO-grounded).",
-            "choices": ["saliency_r1", "ours"],
+            "attention overlap reward (layer 22, 2-head mean, per observe step, DINO-grounded). "
+            "'none' = accuracy + judge + format only (no saliency/overlap reward; skips the "
+            "attention re-forward pass entirely).",
+            "choices": ["saliency_r1", "ours", "none"],
         },
     )
     token_reduction: str = field(

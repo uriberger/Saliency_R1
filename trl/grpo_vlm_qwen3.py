@@ -205,7 +205,8 @@ if __name__ == "__main__":
     # Reward function selection (flag-selectable: their saliency reward vs ours)
     ################
     # Keep reward_funcs order stable so --reward_weights lines up:
-    #   [format, <saliency|overlap>, accuracy, judge]
+    #   [format, <saliency|overlap>, accuracy, judge]   (saliency_r1 / ours)
+    #   [format, accuracy, judge]                        (none)
     if script_args.reward_variant == "ours":
         from trl.rewards.overlap_rewards import configure as configure_overlap
         from trl.rewards.overlap_rewards import think_overlap_reward
@@ -216,6 +217,9 @@ if __name__ == "__main__":
             dino_api_base=script_args.dino_api_base,
         )
         reward_funcs = [think_format_reward, think_overlap_reward, accuracy_reward, openai_reward]
+    elif script_args.reward_variant == "none":
+        # Drop the saliency/overlap reward entirely: accuracy + judge + format only.
+        reward_funcs = [think_format_reward, accuracy_reward, openai_reward]
     else:
         reward_funcs = [think_format_reward, think_saliency_reward, accuracy_reward, openai_reward]
 

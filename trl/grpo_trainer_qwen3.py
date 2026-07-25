@@ -2027,7 +2027,11 @@ class GRPOTrainer(Trainer):
         '''
         attn_batch = []
 
-        if self.reward_variant == "ours":
+        if self.reward_variant == "none":
+            # No saliency/overlap reward: skip all attention extraction. attn_batch stays
+            # [] -- the remaining reward funcs (accuracy/judge/format) ignore saliency_map.
+            pass
+        elif self.reward_variant == "ours":
             # --- Attention-overlap reward: raw per-head observe->patch attention at a
             # single layer, per observe step, instead of the whole-completion rollout. ---
             attn_batch = self._compute_overlap_step_maps(
