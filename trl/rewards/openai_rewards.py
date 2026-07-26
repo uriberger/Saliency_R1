@@ -23,8 +23,22 @@ from concurrent.futures import ThreadPoolExecutor
 # from Azure) is deterministic -> fail fast and mask that sample rather than crash.
 _TRANSIENT = (openai.RateLimitError, openai.APIConnectionError, openai.APITimeoutError)
 
+# LLM-as-judge via the NVIDIA inference API. Key is supplied at run time through
+# NVIDIA_API_KEY (falls back to OPENAI_API_KEY). NVIDIA_API_KEY wins because the
+# default base_url is the NVIDIA gateway: a stale OPENAI_API_KEY in the shell must
+# not be sent there. Endpoint/model overridable via env.
+_JUDGE_KEY = os.environ.get("NVIDIA_API_KEY") or os.environ.get("OPENAI_API_KEY")
+if not _JUDGE_KEY:
+    # openai.OpenAI() raises on a None key, and this module is imported whether or
+    # not the judge reward is actually used -- a missing key must not kill the run
+    # at import. Use a placeholder and warn; every judged sample then masks to None.
+    print("[openai_reward] WARNING: neither NVIDIA_API_KEY nor OPENAI_API_KEY is set. "
+          "If openai_reward is among the reward funcs, every sample's judge reward "
+          "will be masked (401).", flush=True)
+    _JUDGE_KEY = "xxx"
+
 client = openai.OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY") or os.environ.get("NVIDIA_API_KEY"),
+    api_key=_JUDGE_KEY,
     base_url=os.environ.get("OPENAI_BASE_URL", "https://inference-api.nvidia.com"),
 )
 
