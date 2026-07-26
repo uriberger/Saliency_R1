@@ -59,12 +59,7 @@ echo ""
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
 
-# DeepSpeed's op builder requires CUDA_HOME to locate nvcc for JIT compilation.
-# The cluster ships a CUDA toolkit under /cm/shared; torch is built for cu126 but
-# 12.4 shares the same major version, which is all DeepSpeed checks.
-export CUDA_HOME=${CUDA_HOME:-/cm/shared/apps/cuda12.4/toolkit/12.4.1}
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+source "$REPO/setup_cuda_home.sh"
 bash "$REPO/check_cuda_home.sh" || exit 1
 
 export HF_HOME

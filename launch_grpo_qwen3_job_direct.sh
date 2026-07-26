@@ -61,9 +61,7 @@ echo ""
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
 
-export CUDA_HOME=/cm/shared/apps/cuda12.4/toolkit/12.4.1
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+source "$REPO/setup_cuda_home.sh"
 bash "$REPO/check_cuda_home.sh" || exit 1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 

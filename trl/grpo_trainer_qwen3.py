@@ -1433,9 +1433,10 @@ class GRPOTrainer(Trainer):
         """Lazily load the FLAN-T5 observe-step classifier (once per process)."""
         if self._overlap_clf is None:
             from .overlap_steps import OverlapStepsClassifier
-            # Keep the tiny FLAN-T5-base on CPU by default (frees GPU for the policy);
-            # override with OVERLAP_STEPS_DEVICE.
-            dev = os.environ.get("OVERLAP_STEPS_DEVICE", "cpu")
+            # Run the tiny FLAN-T5-base on GPU by default: on CPU it was hundreds of
+            # serial encoder forwards per step (the dominant overlap-reward cost).
+            # ~0.5 GB on the training GPU; override with OVERLAP_STEPS_DEVICE=cpu.
+            dev = os.environ.get("OVERLAP_STEPS_DEVICE", "cuda")
             # Load with DeepSpeed ZeRO-3 hidden from transformers: when zero3 is enabled,
             # from_pretrained applies zero.Init and PARTITIONS this auxiliary model's params
             # (embed_tokens.weight -> non-2-D), which then fails its own forward with
@@ -1456,6 +1457,7 @@ class GRPOTrainer(Trainer):
                     _ds_int._hf_deepspeed_config_weak_ref = _saved_ref
         return self._overlap_clf
 
+    @profiling_decorator
     def _compute_overlap_step_maps(
         self, inputs, images, prompt_inputs, prompt_completion_ids, attention_mask,
         prompt_ids, prompt_length, completion_ids, output_text,
@@ -1496,9 +1498,62 @@ class GRPOTrainer(Trainer):
             torch.no_grad(),
             FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
         ):
+            # --- Layer-L attention capture (single-layer fast path) ------------------
+            # output_attentions=True would run EAGER attention for ALL 36 layers and
+            # materialize every layer's [heads, seq, seq] map, then use only layer L.
+            # Instead we keep the base attn impl for the forward (flash/sdpa, no weights)
+            # and recompute ONLY layer L's weights via a forward hook that re-runs that
+            # one attention module in eager mode. It reuses the module's own q/k/v proj,
+            # q_norm/k_norm and rotary, so the weights are numerically identical to the
+            # all-layer path; we just supply an explicit causal+padding mask because the
+            # fast attention paths may hand the layer a None mask. Net cost per case:
+            # ~1 fast forward + 1 layer of eager attention (was: 1 all-eager forward).
+            _cap = {"attn": None}
+            _mask_holder = {"m": None}
+            _reentry = {"in": False}
+            _mdtype = next(_unwrapped.parameters()).dtype
+            _min_val = torch.finfo(_mdtype).min
+
+            _attn_mod = None
+            for _m in _unwrapped.modules():
+                if type(_m).__name__ == "Qwen3VLTextAttention" and getattr(_m, "layer_idx", None) == L:
+                    _attn_mod = _m
+                    break
+
+            def _capture_hook(module, args, kwargs, output):
+                # Re-run this single attention module in eager mode to recover its
+                # softmax weights (the base flash/sdpa forward returns None for them).
+                if _reentry["in"]:
+                    return
+                _reentry["in"] = True
+                _kw = dict(kwargs)
+                _kw["attention_mask"] = _mask_holder["m"]
+                _kw["past_key_values"] = None  # avoid double-updating the KV cache
+                _kw["use_cache"] = False
+                _prev_impl = module.config._attn_implementation
+                module.config._attn_implementation = "eager"
+                try:
+                    _cap["attn"] = module(*args, **_kw)[1]
+                finally:
+                    module.config._attn_implementation = _prev_impl
+                    _reentry["in"] = False
+
+            _hook_handle = (
+                _attn_mod.register_forward_hook(_capture_hook, with_kwargs=True)
+                if _attn_mod is not None else None
+            )
+
+            # Fallback: unexpected model layout -> old all-layer eager path.
             _saved_attn_impl = _unwrapped.config._attn_implementation
-            if _saved_attn_impl == "flash_attention_2":
+            if _hook_handle is None and _saved_attn_impl == "flash_attention_2":
                 _unwrapped.config._attn_implementation = "sdpa"
+
+            # OVERLAP_PROFILE=1 -> split this method into forward(capture) vs T5-segment
+            # time and confirm the layer-L hook is active. One line/step on main proc.
+            import time as _time
+            _prof = os.environ.get("OVERLAP_PROFILE") == "1"
+            _t_fwd = _t_seg = 0.0
+            _n_fwd = 0
 
             for case_id in range(len(images)):
                 ts, te = think_start[case_id], think_end[case_id]
@@ -1521,27 +1576,55 @@ class GRPOTrainer(Trainer):
                         [prompt_inputs["mm_token_type_ids"][case_id:case_id + 1], _compl_zeros], dim=1
                     )
 
-                _fwd = _unwrapped(**_case_inputs, output_attentions=True, output_hidden_states=False)
+                if _prof:
+                    torch.cuda.synchronize(device); _ts = _time.perf_counter()
+                if _hook_handle is not None:
+                    # Build the additive causal+padding mask the eager re-run needs
+                    # (0 where attended, finfo.min where masked): the fast forward may
+                    # hand layer L a None mask.
+                    _am2d = _case_inputs["attention_mask"]  # [1, seq]
+                    _seq = _am2d.shape[-1]
+                    _masked = torch.triu(
+                        torch.ones(_seq, _seq, dtype=torch.bool, device=device), diagonal=1
+                    ) | (_am2d[0] == 0)[None, :]
+                    _add = torch.zeros(_seq, _seq, dtype=_mdtype, device=device)
+                    _add.masked_fill_(_masked, _min_val)
+                    _mask_holder["m"] = _add[None, None]
+
+                    _cap["attn"] = None
+                    _unwrapped(**_case_inputs)  # triggers _capture_hook at layer L
+                    _attn_L = _cap["attn"]
+                    del _add, _masked
+                else:
+                    _fwd = _unwrapped(**_case_inputs, output_attentions=True, output_hidden_states=False)
+                    _attn_L = _fwd.attentions[L]
+                    del _fwd
 
                 _image_mask = prompt_ids[case_id] == 151655
                 # [1, heads, think_len, n_patches] : observe-token query rows -> image-patch key cols
-                raw = _fwd.attentions[L][
+                raw = _attn_L[
                     :, heads,
                     prompt_length + ts:prompt_length + te + 1,
                     :prompt_length,
                 ][:, :, :, _image_mask]
                 # [n_heads_sel, think_len, n_patches]; ReLU is a no-op on softmax weights but kept per spec
                 per_tok = torch.relu(raw)[0].float().cpu().numpy()
-                del _fwd, raw
+                del _attn_L, raw
+                if _prof:
+                    torch.cuda.synchronize(device); _t_fwd += _time.perf_counter() - _ts; _n_fwd += 1
 
                 gh = int(thw[case_id, 1].item()) // 2
                 gw = int(thw[case_id, 2].item()) // 2
 
                 question = inputs[case_id].get("problem", "") if isinstance(inputs[case_id], dict) else ""
+                if _prof:
+                    _tg = _time.perf_counter()
                 steps = segment_observe_steps(
                     output_text[case_id], think_start_idx[case_id], think_end_idx[case_id],
                     out, case_id, ts, te, question, clf,
                 )
+                if _prof:
+                    _t_seg += _time.perf_counter() - _tg
 
                 step_maps = []
                 for step_text, tok_a, tok_b in steps:
@@ -1564,8 +1647,19 @@ class GRPOTrainer(Trainer):
                     step_maps.append({"map": m.reshape(gh, gw).astype(np.float32), "text": step_text})
                 results[case_id] = step_maps
 
-            if _saved_attn_impl == "flash_attention_2":
+            if _hook_handle is not None:
+                _hook_handle.remove()
+            elif _saved_attn_impl == "flash_attention_2":
                 _unwrapped.config._attn_implementation = _saved_attn_impl
+
+            if _prof and self.accelerator.is_main_process:
+                import sys as _sys
+                print(
+                    f"[overlap-profile] layer{L}-hook={'active' if _hook_handle is not None else 'FALLBACK'} "
+                    f"cases={_n_fwd} fwd(capture)={_t_fwd:.1f}s t5-segment={_t_seg:.1f}s "
+                    f"t5-dev={next(self._get_overlap_classifier().parameters()).device}",
+                    file=_sys.stderr, flush=True,
+                )
 
         return results
 

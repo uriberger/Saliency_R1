@@ -17,7 +17,7 @@
 #   bash launch_grpo_qwen3_overlap_colocated_job.sh --direct --num-gpus 8
 #
 # Environment overrides:
-#   PARTITION=batch_singlenode   DURATION=4 (hours)   CONDA_ENV=saliency_r1_qwen3_vllm
+#   PARTITION=batch_singlenode   DURATION=4 (hours)
 #   SAVE_STEPS=10   CKPT_KEEP_EVERY=200
 #   DINO_PORT=8100   VLLM_PORT=8000   VLLM_GPU_MEM=0.90   VLLM_MAX_MODEL_LEN=4096
 #   VLLM_ENFORCE_EAGER=False
@@ -29,7 +29,10 @@ set -euo pipefail
 SCRIPT_PATH="$(realpath "$0")"
 REPO=/home/uberger/scratch/research/saliency_r1
 CONDA_SH=/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh
-CONDA_ENV=${CONDA_ENV:-saliency_r1_qwen3_vllm}
+# This colocated job runs both the vLLM server and the trainer in ONE env, so it
+# MUST use the vllm-enabled env. Hardcoded (not overridable) to prevent picking up
+# a stray CONDA_ENV from the shell, which silently breaks the vLLM sidecar.
+CONDA_ENV=saliency_r1_qwen3_vllm
 HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 
 # ---------- SLURM defaults ----------
@@ -65,7 +68,7 @@ VLLM_PORT=${VLLM_PORT:-8000}
 VLLM_GPU_MEM=${VLLM_GPU_MEM:-0.90}
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-4096}
 VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-False}
-OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cpu}
+OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cuda}   # T5 step-classifier on the training GPU (CPU was the dominant per-step cost)
 OVERLAP_STEPS_CKPT=${OVERLAP_STEPS_CKPT:-$REPO/checkpoint/steps_classifier/best}
 
 # ---------- parse args ----------
@@ -208,11 +211,32 @@ fi
 
 # ---------- direct path ----------
 source "$CONDA_SH"
+echo "Activating conda env $CONDA_ENV"
+# conda activate and package activate.d hooks (e.g. cuda-nvcc's, which expands
+# $NVCC_PREPEND_FLAGS with no default) assume nounset is OFF. Our `set -u` makes
+# any such unguarded expansion a fatal "unbound variable". Disable nounset for
+# the duration of activation only, then restore it.
+set +u
 conda activate "$CONDA_ENV"
+set -u
+# Activating across conda installs -- e.g. when this script is launched (bash)
+# from a fish shell that already had a different env active -- can leave a stale
+# env's bin/ ahead of ours on PATH, so `python` resolves to the WRONG interpreter
+# even though CONDA_DEFAULT_ENV/CONDA_PREFIX are correct. Force this env's bin to
+# the front and clear bash's command hash so the right python/torchrun are used.
+[ -n "${CONDA_PREFIX:-}" ] || { echo "ERROR: 'conda activate $CONDA_ENV' failed (no CONDA_PREFIX)." >&2; exit 1; }
+export PATH="$CONDA_PREFIX/bin:$PATH"
+hash -r
+if [ "$(command -v python)" != "$CONDA_PREFIX/bin/python" ]; then
+    echo "ERROR: python resolves to '$(command -v python)', expected '$CONDA_PREFIX/bin/python' (env '$CONDA_ENV')." >&2
+    exit 1
+fi
 
-export CUDA_HOME=${CUDA_HOME:-/cm/shared/apps/cuda12.4/toolkit/12.4.1}
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+source "$REPO/setup_cuda_home.sh"
+if [ "$(command -v python)" != "$CONDA_PREFIX/bin/python" ]; then
+    echo "ERROR: after CUDA_HOME setup, python resolves to '$(command -v python)', expected '$CONDA_PREFIX/bin/python' (env '$CONDA_ENV'). CUDA_HOME='$CUDA_HOME' shadowed it." >&2
+    exit 1
+fi
 bash "$REPO/check_cuda_home.sh" || exit 1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HOME
@@ -293,6 +317,7 @@ DINO_PID=$!
 # ---------- 2. vLLM generation server on GPU 1 ----------
 cd "$REPO/trl_repo"
 echo "[start] vLLM server on cuda:$VLLM_GPU -> 127.0.0.1:$VLLM_PORT"
+which python
 VLLM_EAGER_FLAG=""
 case "$VLLM_ENFORCE_EAGER" in
     True|true|1) VLLM_EAGER_FLAG="--enforce_eager True" ;;

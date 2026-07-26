@@ -34,9 +34,7 @@ fi
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
 
-export CUDA_HOME=/cm/shared/apps/cuda12.4/toolkit/12.4.1
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+source "$REPO/setup_cuda_home.sh"
 
 # Read the base model path recorded in the adapter config.
 BASE="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_model_name_or_path"])' "$ADAPTER/adapter_config.json")"
