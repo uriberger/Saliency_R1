@@ -13,10 +13,12 @@
 
 I'm replicating a research repo, **Saliency-R1** (CVPR-2026 baseline I reproduce and then
 swap their saliency reward for my attention-overlap reward), from another NVIDIA cluster
-onto this one. It was fully set up there and pushed to my fork. Reproduce that setup here,
-step by step, verifying as you go. **Do all setup on a login node — no GPU / no `nvcc`
-needed. Do NOT launch any training jobs.** The goal is a working, import-verified
-environment. Give me a short status at each env boundary.
+onto this one. It was fully set up there and pushed to my fork. **Actually run this setup
+here** — clone, create the four conda envs, install, patch, and verify — don't just review
+the steps. Work through it in order, checking each command's output before moving on.
+**Do all setup on a login node — no GPU / no `nvcc` needed. Do NOT launch any training
+jobs.** The end state is a working, import-verified environment. Give me a short status at
+each env boundary, and stop and ask if a step fails or a version lands off-pin.
 
 ## Step 0 — Verify prerequisites and adapt paths BEFORE anything else
 
@@ -48,6 +50,21 @@ cd <REPO> && git checkout main
 This is my fork; `main` is the working branch (NOT `saliency-r1-setup`, which is stale).
 Read `SETUP_NOTES.md`, `README.md`, and `CLAUDE.md` in the repo first — they explain the
 design, the reward seam, and the gotchas.
+
+**Only if the paths differ** from the table in Step 0, rewrite the hardcoded ones and show
+me `git diff --stat` before continuing:
+
+```bash
+for f in $(grep -rl '/home/uberger/scratch/research/saliency_r1' *.sh *.py train/cold_start/*/*.yaml); do
+    sed -i "s|/home/uberger/scratch/research/saliency_r1|$REPO|g" "$f"; done
+for f in $(grep -rl '/home/uberger/scratch/miniconda3' *.sh); do
+    sed -i "s|/home/uberger/scratch/miniconda3|$CONDA_ROOT|g" "$f"; done
+for f in $(grep -rl '/home/uberger/scratch/cache/hf_cache' *.sh); do
+    sed -i "s|/home/uberger/scratch/cache/hf_cache|$HF_HOME|g" "$f"; done
+```
+
+Also check `ACCOUNT=nvr_israel_rlop` / `PARTITION=batch_singlenode` in the launchers against
+this cluster's SLURM setup, and tell me if either needs changing (don't change them silently).
 
 ## What we're building — four conda envs
 
