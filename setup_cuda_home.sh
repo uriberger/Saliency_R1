@@ -37,3 +37,14 @@ if [ -n "${CONDA_PREFIX:-}" ]; then
     export PATH="$CONDA_PREFIX/bin:$PATH"
     hash -r 2>/dev/null || true
 fi
+
+# Native-thread caps. On many-core aarch64 nodes (e.g. the 96-core Grace login /
+# 144-core GB200 compute nodes) the BLAS/OpenMP runtimes bundled with scipy, numpy,
+# torch, pyarrow and opencv each spin up a thread pool sized to the core count. With
+# the full stack loaded this makes `from trl import GRPOTrainer` hang effectively
+# forever inside scipy's OpenBLAS init (observed: >2h at ~97% CPU, vs 69s with the
+# caps set). One thread per process is also the right default for multi-process
+# training anyway -- torchrun/accelerate set OMP_NUM_THREADS=1 themselves otherwise.
+# Overridable: set either var before launching to keep your own value.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"

@@ -18,11 +18,11 @@
 set -e
 
 # ADLR cluster-interface tools (submit_job, etc.) on PATH.
-export PATH="/lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface/21.1_2026-04-15_21-25-57:$PATH"
+export PATH="/lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface/latest:$PATH"
 
 # ---------- cluster / project constants ----------
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-batch_block1}
+PARTITION=${PARTITION:-batch_long}
 DURATION=${DURATION:-4}
 REPO=/home/uberger/scratch/research/saliency_r1
 CONDA_SH=/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh

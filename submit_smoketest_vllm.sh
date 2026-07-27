@@ -34,7 +34,7 @@ if ! command -v submit_job >/dev/null 2>&1; then
 fi
 
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-batch_singlenode}   # single-node (localhost sidecars); override for faster queue
+PARTITION=${PARTITION:-batch_long}   # single-node (localhost sidecars); override for faster queue
 DURATION=${DURATION:-1}
 NUM_GPUS=${NUM_GPUS:-8}
 REPO=/home/uberger/scratch/research/saliency_r1

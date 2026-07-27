@@ -53,9 +53,12 @@ echo "  tokenizer.py: $TOK"
 echo "  qwen3_vl.py:  $QV"
 echo "  config.py:    $CFGPY"
 
+# NOTE: vLLM 0.11.1 refactored get_cached_tokenizer -- the attribute is now read into a
+# local instead of being passed inline, so the 0.11.0 needle (which ended in ")") no longer
+# matches. Needle below targets the 0.11.1 form.
 py_patch "$TOK" \
-    "tokenizer.all_special_tokens_extended)" \
-    'getattr(tokenizer, "all_special_tokens_extended", tokenizer.all_special_tokens))  # transformers 5.x compat' \
+    "= tokenizer.all_special_tokens_extended" \
+    '= getattr(tokenizer, "all_special_tokens_extended", tokenizer.all_special_tokens)  # transformers 5.x compat' \
     'all_special_tokens_extended", tokenizer.all_special_tokens'
 
 py_patch "$QV" \

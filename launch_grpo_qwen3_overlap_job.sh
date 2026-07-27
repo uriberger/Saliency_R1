@@ -24,7 +24,7 @@ HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 
 # ---------- SLURM defaults ----------
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-batch_singlenode}
+PARTITION=${PARTITION:-batch_long}
 DURATION=${DURATION:-4}
 
 # ---------- training defaults ----------
