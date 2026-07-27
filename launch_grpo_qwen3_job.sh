@@ -18,12 +18,14 @@
 #   HF_TOKEN                    for gated model/dataset downloads
 set -e
 
-# ADLR cluster-interface tools (submit_job, etc.) on PATH.
-export PATH="/lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface/latest:$PATH"
+# ADLR cluster-interface tools (submit_job, etc.) on PATH. Resolved at run time --
+# the pinned release differs per cluster, so do not hardcode a version here.
+source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/cluster_env.sh"
+sr1_find_submit_job || { echo "ERROR: submit_job not found under the cluster-interface paths." >&2; exit 1; }
 
 # ---------- cluster / project constants ----------
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-batch_long}
+PARTITION=${PARTITION:-$(sr1_pick_partition batch_block1 batch_long batch)}
 DURATION=${DURATION:-4}
 REPO=/home/uberger/scratch/research/saliency_r1
 CONDA_SH=/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh

@@ -23,8 +23,9 @@ CONDA_ENV=saliency_r1_qwen3
 HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 
 # ---------- SLURM defaults ----------
+source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/cluster_env.sh"
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-batch_long}
+PARTITION=${PARTITION:-$(sr1_pick_partition batch_singlenode batch_long batch)}
 DURATION=${DURATION:-4}
 
 # ---------- training defaults ----------

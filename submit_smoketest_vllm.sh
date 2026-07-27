@@ -33,8 +33,9 @@ if ! command -v submit_job >/dev/null 2>&1; then
     exit 1
 fi
 
+source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/cluster_env.sh"
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-batch_long}   # single-node (localhost sidecars); override for faster queue
+PARTITION=${PARTITION:-$(sr1_pick_partition batch_singlenode batch_long batch)}   # single-node (localhost sidecars); override for faster queue
 DURATION=${DURATION:-1}
 NUM_GPUS=${NUM_GPUS:-8}
 REPO=/home/uberger/scratch/research/saliency_r1
