@@ -120,6 +120,34 @@ class ScriptArguments:
             "together (default the fixed 2-head (22,28)+(22,31) option)."
         },
     )
+    overlap_metric: str = field(
+        default="mean_in",
+        metadata={
+            "help": "reward_variant='ours': how to score a step's map against its box union. "
+            "'mean_in' (default, the incumbent) = mean of the MAX-normalized map inside the "
+            "box; it divides by the map's own peak, so a map that merely FLATTENS scores "
+            "higher (measured: 32x more movement under flattening than under real "
+            "grounding). 'auroc' = P(in-box patch outranks out-box patch), which depends "
+            "only on patch order and is therefore exactly invariant to that flattening, and "
+            "predicts correctness more stably (mean |r| 0.238 vs 0.181, sd 0.028 vs 0.089). "
+            "Sweep dimension — appears in the model/wandb name.",
+            "choices": ["mean_in", "auroc"],
+        },
+    )
+    mass_floor_tau: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "reward_variant='ours': if set, multiply each step's score by "
+            "min(1, image_mass/tau), where image_mass is the fraction of the attention row "
+            "spent on image tokens. Closes the one hole a rank-based metric cannot see — a "
+            "model withdrawing attention from the image while keeping a good ranking. Also "
+            "raises the correctness correlation (0.227 -> 0.238) because image_mass is "
+            "itself predictive. Recommended 0.0022 = the 10th percentile of the reference "
+            "model's image_mass. Keep near p10: much above p25 it stops being a floor and "
+            "'raise image attention uniformly' becomes its own exploitable direction. "
+            "Sweep dimension — appears in the model/wandb name.",
+        },
+    )
     box_threshold: float = field(
         default=0.10,
         metadata={"help": "reward_variant='ours': Grounding-DINO confidence threshold for per-step boxes."},
