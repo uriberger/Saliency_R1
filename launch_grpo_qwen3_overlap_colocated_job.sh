@@ -22,6 +22,32 @@
 #   WANDB_API_KEY=... NVIDIA_API_KEY=... bash launch_grpo_qwen3_overlap_colocated_job.sh [OPTIONS]
 #   bash launch_grpo_qwen3_overlap_colocated_job.sh --direct --num-gpus 8
 #
+# THE HACK-RESISTANT REWARD -- one flag, nothing else to set:
+#
+#   bash launch_grpo_qwen3_overlap_colocated_job.sh --overlap-metric auroc
+#
+# Identical semantics to the non-colocated launcher (only the generation path differs),
+# so the same defaults and the same evidence apply. Why: mean_in divides by the map's own
+# PEAK, so a map that merely FLATTENS scores higher without attending the box any better
+# -- 32x more movement under flattening than under real grounding, and that is what the
+# wov0.2/wov0.4 runs did (their MMStar gain vanishes once chance-corrected). auroc depends
+# only on patch ORDER, so that route is closed by construction. Derivation + evidence:
+# vlm_reasoning/wiki/hack-resistant-overlap-reward-plan.md
+#
+# --overlap-metric auroc also switches two coupled defaults, because neither transfers
+# from mean_in. Both are still overridable, and both appear in the run name, so a name
+# always states what actually ran.
+#
+#   mass_floor_tau  ->  0.0022   Not optional: auroc is rank-based and so blind to a
+#                                model withdrawing attention from the image. 0.0022 =
+#                                p10 of the reference model's image_mass.
+#   w_overlap       ->  0.11     GRPO normalises advantages within the group, so what
+#                                matters is the reward term's SPREAD, and the auroc
+#                                composite has ~3.6x the per-sample sd of mean_in
+#                                (0.13 vs 0.036). 0.11 reproduces the pressure of
+#                                mean_in's wov0.4. Reusing 0.2/0.4 here would apply
+#                                ~3.6x the intended pressure.
+#
 # Environment overrides:
 #   PARTITION=batch_singlenode   DURATION=4 (hours)
 #   SAVE_STEPS=10   CKPT_KEEP_EVERY=200
@@ -64,12 +90,17 @@ EXTRA_ARGS=""
 DIRECT=false
 
 # ---------- overlap-reward defaults ----------
+# W_OVERLAP and MASS_FLOOR_TAU are metric-dependent; the auroc values are applied
+# after arg parsing, only if the user did not set them explicitly (see below).
 W_OVERLAP=0.2
 TOKEN_REDUCTION=mean
 OVERLAP_HEADS="28,31"
 OVERLAP_LAYER=22
 BOX_THRESHOLD=0.10
 MAX_BOX_AREA=0.5
+OVERLAP_METRIC=mean_in   # mean_in (incumbent default) | auroc (hack-resistant; see above)
+MASS_FLOOR_TAU=""        # unset -> off for mean_in, 0.0022 for auroc (see below).
+                         # Pass 0 to force it off explicitly.
 
 # ---------- sidecar defaults ----------
 DINO_PORT=${DINO_PORT:-8100}
@@ -107,12 +138,14 @@ while [[ $# -gt 0 ]]; do
         --grad-accum)             GRAD_ACCUM="$2";              shift 2 ;;
         --per-device-batch)       PER_DEVICE_BATCH="$2";        shift 2 ;;
         --learning-rate)          LEARNING_RATE="$2";           shift 2 ;;
-        --w-overlap)              W_OVERLAP="$2";               shift 2 ;;
+        --w-overlap)              W_OVERLAP="$2"; W_OVERLAP_SET=1; shift 2 ;;
         --token-reduction)        TOKEN_REDUCTION="$2";         shift 2 ;;
         --overlap-heads)          OVERLAP_HEADS="$2";           shift 2 ;;
         --overlap-layer)          OVERLAP_LAYER="$2";           shift 2 ;;
         --box-threshold)          BOX_THRESHOLD="$2";           shift 2 ;;
         --max-box-area)           MAX_BOX_AREA="$2";            shift 2 ;;
+        --overlap-metric)         OVERLAP_METRIC="$2";          shift 2 ;;
+        --mass-floor-tau)         MASS_FLOOR_TAU="$2";          shift 2 ;;
         --dino-port)              DINO_PORT="$2";               shift 2 ;;
         --vllm-port)              VLLM_PORT="$2";               shift 2 ;;
         --vllm-gpu-mem)           VLLM_GPU_MEM="$2";            shift 2 ;;
@@ -161,9 +194,23 @@ fi
 
 REFORWARD_SALIENCY=True
 
+# --overlap-metric auroc is a complete, self-sufficient configuration: it carries the
+# two settings that do not transfer from mean_in, so the only change needed from a
+# previous run is the metric flag itself. An explicit --w-overlap / --mass-floor-tau
+# still wins (pass --mass-floor-tau 0 to force the floor off). mean_in is untouched,
+# so a bare invocation is still bit-identical to the runs already trained.
+if [[ "$OVERLAP_METRIC" == "auroc" ]]; then
+    [[ -z "$MASS_FLOOR_TAU" ]] && MASS_FLOOR_TAU=0.0022
+    [[ -z "${W_OVERLAP_SET:-}" ]] && W_OVERLAP=0.11
+fi
+
 # ---------- naming: every swept HP appears in the model AND wandb name ----------
 N_HEADS=$(echo "$OVERLAP_HEADS" | awk -F, '{print NF}')
 SUFFIX="__wov${W_OVERLAP}_${N_HEADS}head_tr${TOKEN_REDUCTION}"
+# Only non-default metric settings extend the suffix, so existing mean_in run names
+# (and the checkpoints already on disk) stay exactly as they are.
+[[ "$OVERLAP_METRIC" != "mean_in" ]] && SUFFIX="${SUFFIX}_${OVERLAP_METRIC}"
+[[ -n "$MASS_FLOOR_TAU" ]] && SUFFIX="${SUFFIX}_mf${MASS_FLOOR_TAU}"
 MODEL_SLUG=$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g')
 RUN_NAME="grpo-${MODEL_SLUG}-overlap${SUFFIX}"
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$REPO/checkpoint/${RUN_NAME}"
@@ -177,6 +224,7 @@ echo "GPUs (total $NUM_GPUS):  DINO=cuda:$DINO_GPU  vLLM=cuda:$VLLM_GPU  train=c
 echo "Generation:       vLLM server  127.0.0.1:$VLLM_PORT  gpu_mem=$VLLM_GPU_MEM  max_len=$VLLM_MAX_MODEL_LEN"
 echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_box_area=$MAX_BOX_AREA"
 echo "Overlap reward:   layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
+echo "Metric:           $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " mass_floor_tau=$MASS_FLOOR_TAU" || echo " (no mass floor)")"
 echo "Batch:            per_device=$PER_DEVICE_BATCH num_generations=$NUM_GENERATIONS grad_accum=$GRAD_ACCUM  (gen_batch=$(( PER_DEVICE_BATCH * TRAIN_N * GRAD_ACCUM )))"
 echo "T5 step clf:      $OVERLAP_STEPS_DEVICE  ckpt=$OVERLAP_STEPS_CKPT"
 echo "Run name:         $RUN_NAME"
@@ -239,6 +287,8 @@ if ! $DIRECT; then
                 --overlap-layer $OVERLAP_LAYER \
                 --box-threshold $BOX_THRESHOLD \
                 --max-box-area $MAX_BOX_AREA \
+                --overlap-metric $OVERLAP_METRIC \
+                ${MASS_FLOOR_TAU:+--mass-floor-tau $MASS_FLOOR_TAU} \
                 --dino-port $DINO_PORT \
                 --vllm-port $VLLM_PORT \
                 --vllm-gpu-mem $VLLM_GPU_MEM \
@@ -407,6 +457,13 @@ LATEST_CKPT=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoin
 
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 29500-65000 -n 1)}
 
+# Omitted entirely when unset, so the dataclass default (None = floor off) applies.
+# A value of 0 is still passed through: _mass_gate treats tau<=0 as "off", so an
+# explicit --mass-floor-tau 0 disables the floor without falling back to the auroc
+# default above.
+MASS_FLOOR_FLAG=""
+[[ -n "$MASS_FLOOR_TAU" ]] && MASS_FLOOR_FLAG="--mass_floor_tau $MASS_FLOOR_TAU"
+
 # ---------- 4. GRPO training on GPUs 2..N-1 ----------
 echo "[start] training on cuda:[$TRAIN_GPUS] ($TRAIN_N procs)"
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
@@ -428,6 +485,8 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --token_reduction "$TOKEN_REDUCTION" \
     --box_threshold "$BOX_THRESHOLD" \
     --max_box_area "$MAX_BOX_AREA" \
+    --overlap_metric "$OVERLAP_METRIC" \
+    $MASS_FLOOR_FLAG \
     --dino_api_base "http://127.0.0.1:$DINO_PORT" \
     --reward_weights $REWARD_WEIGHTS \
     --use_vllm \
