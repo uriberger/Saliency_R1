@@ -5,6 +5,12 @@
 #     GPU 1         vLLM generation server         (127.0.0.1:$VLLM_PORT)
 #     GPU 2..N-1    GRPO training, DeepSpeed ZeRO-3  (N-2 processes)
 #
+# --share-sidecar-gpu puts DINO and vLLM together on GPU 0, giving N-1 training processes:
+#     GPU 0         Grounding-DINO + vLLM  (vllm_gpu_mem default drops 0.90 -> 0.85)
+#     GPU 1..N-1    GRPO training                    (N-1 processes)
+# OFF by default. On a 4-GPU node this is 3 training procs instead of 2 (+50%). Justified by
+# job 5627435 on GB200: DINO peaked at 1.6 GB of 185 GB (1%), so a dedicated GPU is waste.
+#
 # vLLM replaces the slow HF generate() path -- this is the main speedup over the
 # non-colocated launcher. The policy is LoRA; the trainer merges the adapter and
 # pushes weights to the vLLM server over NCCL every step.
@@ -19,7 +25,9 @@
 # Environment overrides:
 #   PARTITION=batch_singlenode   DURATION=4 (hours)
 #   SAVE_STEPS=10   CKPT_KEEP_EVERY=200
-#   DINO_PORT=8100   VLLM_PORT=8000   VLLM_GPU_MEM=0.90   VLLM_MAX_MODEL_LEN=4096
+#   DINO_PORT=8100   VLLM_PORT=8000   VLLM_MAX_MODEL_LEN=4096
+#   VLLM_GPU_MEM     (default 0.90, or 0.85 with --share-sidecar-gpu)
+#   SHARE_SIDECAR_GPU=true   (same as --share-sidecar-gpu; --no-share-sidecar-gpu to force off)
 #   VLLM_ENFORCE_EAGER=False
 #   OVERLAP_STEPS_DEVICE=cpu   OVERLAP_STEPS_CKPT=<path>
 #   NVIDIA_API_KEY / OPENAI_API_KEY / OPENAI_BASE_URL / JUDGE_MODEL
@@ -65,7 +73,16 @@ MAX_BOX_AREA=0.5
 # ---------- sidecar defaults ----------
 DINO_PORT=${DINO_PORT:-8100}
 VLLM_PORT=${VLLM_PORT:-8000}
-VLLM_GPU_MEM=${VLLM_GPU_MEM:-0.90}
+# VLLM_GPU_MEM default is resolved AFTER arg parsing -- it depends on whether the two
+# sidecars share a GPU (see SHARE_SIDECAR_GPU below). Leaving it empty here preserves
+# both override paths: the VLLM_GPU_MEM env var and the --vllm-gpu-mem flag.
+VLLM_GPU_MEM=${VLLM_GPU_MEM:-}
+# Put Grounding-DINO on the SAME GPU as vLLM, freeing one GPU for training. Measured on
+# GB200 (job 5627435): DINO peaked at 1.6 GB of 185 GB (1%), while vLLM's 89% was simply
+# gpu_memory_utilization=0.90 taking what it is allowed. Dedicating a whole GPU to DINO is
+# therefore mostly waste -- on a 4-GPU node this turns 2 training procs into 3 (+50%).
+# OFF by default: it changes GPU placement, so opt in explicitly.
+SHARE_SIDECAR_GPU=${SHARE_SIDECAR_GPU:-false}
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-4096}
 VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-False}
 OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cuda}   # T5 step-classifier on the training GPU (CPU was the dominant per-step cost)
@@ -98,14 +115,21 @@ while [[ $# -gt 0 ]]; do
         --dino-port)              DINO_PORT="$2";               shift 2 ;;
         --vllm-port)              VLLM_PORT="$2";               shift 2 ;;
         --vllm-gpu-mem)           VLLM_GPU_MEM="$2";            shift 2 ;;
+        --share-sidecar-gpu)      SHARE_SIDECAR_GPU=true;       shift ;;
+        --no-share-sidecar-gpu)   SHARE_SIDECAR_GPU=false;      shift ;;
         --vllm-max-model-len)     VLLM_MAX_MODEL_LEN="$2";      shift 2 ;;
         --vllm-enforce-eager)     VLLM_ENFORCE_EAGER="$2";      shift 2 ;;
         *)                        EXTRA_ARGS="$EXTRA_ARGS $1";  shift ;;
     esac
 done
 
-if (( NUM_GPUS < 3 )); then
-    echo "ERROR: need >=3 GPUs (1 DINO + 1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
+if [ "$SHARE_SIDECAR_GPU" = true ]; then MIN_GPUS=2; else MIN_GPUS=3; fi
+if (( NUM_GPUS < MIN_GPUS )); then
+    if [ "$SHARE_SIDECAR_GPU" = true ]; then
+        echo "ERROR: need >=2 GPUs with --share-sidecar-gpu (1 shared DINO+vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
+    else
+        echo "ERROR: need >=3 GPUs (1 DINO + 1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
+    fi
     exit 1
 fi
 if (( NUM_GPUS > 8 )); then
@@ -113,10 +137,26 @@ if (( NUM_GPUS > 8 )); then
     exit 1
 fi
 
+# Sidecar placement. Shared: both servers on GPU 0, training on 1..N-1. Separate (default):
+# DINO on 0, vLLM on 1, training on 2..N-1.
 DINO_GPU=0
-VLLM_GPU=1
-TRAIN_N=$(( NUM_GPUS - 2 ))
-TRAIN_GPUS=$(seq -s, 2 $(( NUM_GPUS - 1 )))
+if [ "$SHARE_SIDECAR_GPU" = true ]; then
+    VLLM_GPU=0
+    TRAIN_N=$(( NUM_GPUS - 1 ))
+    TRAIN_GPUS=$(seq -s, 1 $(( NUM_GPUS - 1 )))
+else
+    VLLM_GPU=1
+    TRAIN_N=$(( NUM_GPUS - 2 ))
+    TRAIN_GPUS=$(seq -s, 2 $(( NUM_GPUS - 1 )))
+fi
+
+# vLLM sizes its KV cache as a fraction of TOTAL GPU memory, but DINO starts first and is
+# already resident, so 0.90 can over-subscribe a shared GPU. 0.85 of 185 GB still leaves
+# ~28 GB -- ample for DINO's measured 1.6 GB plus fragmentation. An explicit
+# --vllm-gpu-mem / VLLM_GPU_MEM always wins over both defaults.
+if [ -z "$VLLM_GPU_MEM" ]; then
+    if [ "$SHARE_SIDECAR_GPU" = true ]; then VLLM_GPU_MEM=0.85; else VLLM_GPU_MEM=0.90; fi
+fi
 
 REFORWARD_SALIENCY=True
 
@@ -132,7 +172,7 @@ REWARD_WEIGHTS="1.0 ${W_OVERLAP} 1.0 1.0"
 
 echo "=========================================================================="
 echo "Model:            $MODEL"
-echo "GPUs (total $NUM_GPUS):  DINO=cuda:$DINO_GPU  vLLM=cuda:$VLLM_GPU  train=cuda:[$TRAIN_GPUS] ($TRAIN_N procs)"
+echo "GPUs (total $NUM_GPUS):  DINO=cuda:$DINO_GPU  vLLM=cuda:$VLLM_GPU  train=cuda:[$TRAIN_GPUS] ($TRAIN_N procs)$([ "$SHARE_SIDECAR_GPU" = true ] && echo '  [sidecars SHARED on cuda:0]')"
 echo "Generation:       vLLM server  127.0.0.1:$VLLM_PORT  gpu_mem=$VLLM_GPU_MEM  max_len=$VLLM_MAX_MODEL_LEN"
 echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_box_area=$MAX_BOX_AREA"
 echo "Overlap reward:   layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
@@ -203,6 +243,7 @@ if ! $DIRECT; then
                 --vllm-gpu-mem $VLLM_GPU_MEM \
                 --vllm-max-model-len $VLLM_MAX_MODEL_LEN \
                 --vllm-enforce-eager $VLLM_ENFORCE_EAGER \
+                $([ "$SHARE_SIDECAR_GPU" = true ] && echo --share-sidecar-gpu) \
                 $EXTRA_ARGS
         '"
     echo "Submitted $RUN_NAME"
