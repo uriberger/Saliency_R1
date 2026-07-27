@@ -1,19 +1,29 @@
 __pycache__/
 *.py[cod]
 
+# Disposable change-work worktrees (see worktree.sh)
+.worktrees/
+
 # Emacs autosave / lock / backup files
 \#*\#
 .\#*
 *~
 
+# NOTE: patterns for paths listed in .worktree-links must NOT end in "/", so
+# that they also match the symlinks worktree.sh creates for them (git sees a
+# symlink as a file, and "foo/" only matches a real directory).
+
 # Nested HuggingFace TRL clone — tracked as its own git repo, not a submodule.
-trl_repo/
+trl_repo
 
 # Cold-start downloaded/derived data (keep only the prep scripts in cold_data/)
-cold_data/LLaVA-CoT-100k/
-cold_data/Mulberry-SFT/
-cold_data/Saliency-R1-cold/
+cold_data/LLaVA-CoT-100k
+cold_data/Mulberry-SFT
+cold_data/Saliency-R1-cold
 cold_data/_verify_out*/
-checkpoint/
-outputs/
+checkpoint
+outputs
 del_me*.png
+
+# Claude Code project settings
+.claude

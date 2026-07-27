@@ -18,12 +18,14 @@
 #   PARTITION=batch_block1   DURATION=4 (hours)   HF_TOKEN=...   WANDB_API_KEY=...
 set -e
 
-# ADLR cluster-interface tools (submit_job, etc.) on PATH.
-export PATH="/lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface/21.1_2026-04-15_21-25-57:$PATH"
+# ADLR cluster-interface tools (submit_job, etc.) on PATH. Resolved at run time --
+# the pinned release differs per cluster, so do not hardcode a version here.
+source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/cluster_env.sh"
+sr1_find_submit_job || { echo "ERROR: submit_job not found under the cluster-interface paths." >&2; exit 1; }
 
 # ---------- cluster / project constants ----------
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-batch_block1}
+PARTITION=${PARTITION:-$(sr1_pick_partition batch_block1 batch_long batch)}
 DURATION=${DURATION:-4}
 REPO=/home/uberger/scratch/research/saliency_r1
 LF_DIR=/home/uberger/scratch/research/LLaMA-Factory

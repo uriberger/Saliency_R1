@@ -1,0 +1,24 @@
+# Gitignored paths that ./worktree.sh symlinks from the central tree into every
+# new worktree. One repo-relative path per line; missing or git-tracked paths
+# are skipped with a warning.
+#
+# These are SHARED, not copies. Writing to them from a worktree is visible to
+# the central tree, to every other worktree, and to running jobs.
+
+# The TRL clone that actually executes (tracked trl/ is only the source copy).
+# Shared on purpose so a worktree runs the same code as everything else --
+# which also means patch_trl_qwen3.sh from a worktree patches it for everyone.
+trl_repo
+
+# Downloaded / derived cold-start data
+cold_data/LLaVA-CoT-100k
+cold_data/Mulberry-SFT
+cold_data/Saliency-R1-cold
+
+# Training artifacts. Point run scripts at a per-branch subdirectory so two
+# sessions don't clobber each other's checkpoints and logs.
+checkpoint
+outputs
+
+# Claude Code project settings (permissions, hooks) -- not tracked
+.claude

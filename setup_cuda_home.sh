@@ -37,3 +37,30 @@ if [ -n "${CONDA_PREFIX:-}" ]; then
     export PATH="$CONDA_PREFIX/bin:$PATH"
     hash -r 2>/dev/null || true
 fi
+
+# Same shadowing hazard as the PATH fix above, but for SHARED LIBRARIES. The GB200
+# compute-node images ship a system PyTorch under /usr/local/lib/python3.12/dist-packages
+# and put its lib/ on LD_LIBRARY_PATH. torch's _C extension finds libtorch_python.so via
+# RUNPATH ($ORIGIN/lib), and the loader consults LD_LIBRARY_PATH *before* RUNPATH -- so the
+# system copy wins and a CPython 3.12 build gets loaded into our 3.10 interpreter:
+#     ImportError: .../libtorch_python.so: undefined symbol: PyObject_CallOneArg
+# Prepending the active env's own torch/lib puts every torch library (libtorch_python,
+# libtorch, libc10, ...) ahead of the system set. Globbed rather than derived from
+# `import torch`, which is precisely what is broken when this matters.
+if [ -n "${CONDA_PREFIX:-}" ]; then
+    for _TORCH_LIB in "$CONDA_PREFIX"/lib/python*/site-packages/torch/lib; do
+        [ -d "$_TORCH_LIB" ] && export LD_LIBRARY_PATH="$_TORCH_LIB:${LD_LIBRARY_PATH:-}"
+    done
+    unset _TORCH_LIB
+fi
+
+# Native-thread caps. On many-core aarch64 nodes (e.g. the 96-core Grace login /
+# 144-core GB200 compute nodes) the BLAS/OpenMP runtimes bundled with scipy, numpy,
+# torch, pyarrow and opencv each spin up a thread pool sized to the core count. With
+# the full stack loaded this makes `from trl import GRPOTrainer` hang effectively
+# forever inside scipy's OpenBLAS init (observed: >2h at ~97% CPU, vs 69s with the
+# caps set). One thread per process is also the right default for multi-process
+# training anyway -- torchrun/accelerate set OMP_NUM_THREADS=1 themselves otherwise.
+# Overridable: set either var before launching to keep your own value.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"

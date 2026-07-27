@@ -1,8 +1,8 @@
 #!/bin/bash
 # Fail-fast smoke test for the vLLM-colocated overlap GRPO pipeline.
-#   Stage A: verify torch 2.8.0+cu128 actually runs a CUDA kernel on THIS node's driver
+#   Stage A: verify the installed torch+cu128 build actually runs a CUDA kernel on THIS node's driver
 #            (cheap ~10s fail if the cu126->cu128 bump is incompatible with the driver).
-#   Stage B: run run_grpo_overlap_colocated.sh for 3 steps -> exercises DINO + vLLM server
+#   Stage B: run launch_grpo_qwen3_overlap_colocated_job.sh --direct for 3 steps -> exercises DINO + vLLM server
 #            + weight-sync + Qwen3-VL image generation + saliency reforward + overlap reward.
 # Runs on an 8-GPU node -- directly, or (usually) via submit_smoketest_vllm.sh.
 set -euo pipefail
@@ -22,7 +22,7 @@ set -u
 source "$REPO/setup_cuda_home.sh"
 export WANDB_MODE=offline     # throwaway run -- do not pollute wandb
 
-echo "==================== STAGE A: torch 2.8 / cu128 driver check ===================="
+echo "==================== STAGE A: torch cu128 driver check ===================="
 python - <<'PY'
 import sys, torch
 print("torch:", torch.__version__, "| cuda build:", torch.version.cuda)
@@ -39,7 +39,9 @@ PY
 echo ""
 echo "==================== STAGE B: 3-step colocated pipeline ===================="
 cd "$REPO"
-exec bash run_grpo_overlap_colocated.sh \
+# --direct is REQUIRED: we are already inside the allocation, so the launcher must run
+# in-place rather than submitting a nested job via submit_job.
+exec bash launch_grpo_qwen3_overlap_colocated_job.sh --direct \
     --num-gpus "$NUM_GPUS" \
     --output-dir "$REPO/checkpoint/_smoketest_vllm" \
     --max_steps 3 \

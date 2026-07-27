@@ -5,6 +5,12 @@
 #     GPU 1         vLLM generation server         (127.0.0.1:$VLLM_PORT)
 #     GPU 2..N-1    GRPO training, DeepSpeed ZeRO-3  (N-2 processes)
 #
+# --share-sidecar-gpu puts DINO and vLLM together on GPU 0, giving N-1 training processes:
+#     GPU 0         Grounding-DINO + vLLM  (vllm_gpu_mem default drops 0.90 -> 0.85)
+#     GPU 1..N-1    GRPO training                    (N-1 processes)
+# OFF by default. On a 4-GPU node this is 3 training procs instead of 2 (+50%). Justified by
+# job 5627435 on GB200: DINO peaked at 1.6 GB of 185 GB (1%), so a dedicated GPU is waste.
+#
 # vLLM replaces the slow HF generate() path -- this is the main speedup over the
 # non-colocated launcher. The policy is LoRA; the trainer merges the adapter and
 # pushes weights to the vLLM server over NCCL every step.
@@ -16,10 +22,38 @@
 #   WANDB_API_KEY=... NVIDIA_API_KEY=... bash launch_grpo_qwen3_overlap_colocated_job.sh [OPTIONS]
 #   bash launch_grpo_qwen3_overlap_colocated_job.sh --direct --num-gpus 8
 #
+# THE HACK-RESISTANT REWARD -- one flag, nothing else to set:
+#
+#   bash launch_grpo_qwen3_overlap_colocated_job.sh --overlap-metric auroc
+#
+# Identical semantics to the non-colocated launcher (only the generation path differs),
+# so the same defaults and the same evidence apply. Why: mean_in divides by the map's own
+# PEAK, so a map that merely FLATTENS scores higher without attending the box any better
+# -- 32x more movement under flattening than under real grounding, and that is what the
+# wov0.2/wov0.4 runs did (their MMStar gain vanishes once chance-corrected). auroc depends
+# only on patch ORDER, so that route is closed by construction. Derivation + evidence:
+# vlm_reasoning/wiki/hack-resistant-overlap-reward-plan.md
+#
+# --overlap-metric auroc also switches two coupled defaults, because neither transfers
+# from mean_in. Both are still overridable, and both appear in the run name, so a name
+# always states what actually ran.
+#
+#   mass_floor_tau  ->  0.0022   Not optional: auroc is rank-based and so blind to a
+#                                model withdrawing attention from the image. 0.0022 =
+#                                p10 of the reference model's image_mass.
+#   w_overlap       ->  0.11     GRPO normalises advantages within the group, so what
+#                                matters is the reward term's SPREAD, and the auroc
+#                                composite has ~3.6x the per-sample sd of mean_in
+#                                (0.13 vs 0.036). 0.11 reproduces the pressure of
+#                                mean_in's wov0.4. Reusing 0.2/0.4 here would apply
+#                                ~3.6x the intended pressure.
+#
 # Environment overrides:
 #   PARTITION=batch_singlenode   DURATION=4 (hours)
 #   SAVE_STEPS=10   CKPT_KEEP_EVERY=200
-#   DINO_PORT=8100   VLLM_PORT=8000   VLLM_GPU_MEM=0.90   VLLM_MAX_MODEL_LEN=4096
+#   DINO_PORT=8100   VLLM_PORT=8000   VLLM_MAX_MODEL_LEN=4096
+#   VLLM_GPU_MEM     (default 0.90, or 0.85 with --share-sidecar-gpu)
+#   SHARE_SIDECAR_GPU=true   (same as --share-sidecar-gpu; --no-share-sidecar-gpu to force off)
 #   VLLM_ENFORCE_EAGER=False
 #   OVERLAP_STEPS_DEVICE=cpu   OVERLAP_STEPS_CKPT=<path>
 #   NVIDIA_API_KEY / OPENAI_API_KEY / OPENAI_BASE_URL / JUDGE_MODEL
@@ -36,8 +70,9 @@ CONDA_ENV=saliency_r1_qwen3_vllm
 HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 
 # ---------- SLURM defaults ----------
+source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/cluster_env.sh"
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-batch_singlenode}
+PARTITION=${PARTITION:-$(sr1_pick_partition batch_singlenode batch_long batch)}
 DURATION=${DURATION:-4}
 
 # ---------- training defaults ----------
@@ -55,17 +90,31 @@ EXTRA_ARGS=""
 DIRECT=false
 
 # ---------- overlap-reward defaults ----------
+# W_OVERLAP and MASS_FLOOR_TAU are metric-dependent; the auroc values are applied
+# after arg parsing, only if the user did not set them explicitly (see below).
 W_OVERLAP=0.2
 TOKEN_REDUCTION=mean
 OVERLAP_HEADS="28,31"
 OVERLAP_LAYER=22
 BOX_THRESHOLD=0.10
 MAX_BOX_AREA=0.5
+OVERLAP_METRIC=mean_in   # mean_in (incumbent default) | auroc (hack-resistant; see above)
+MASS_FLOOR_TAU=""        # unset -> off for mean_in, 0.0022 for auroc (see below).
+                         # Pass 0 to force it off explicitly.
 
 # ---------- sidecar defaults ----------
 DINO_PORT=${DINO_PORT:-8100}
 VLLM_PORT=${VLLM_PORT:-8000}
-VLLM_GPU_MEM=${VLLM_GPU_MEM:-0.90}
+# VLLM_GPU_MEM default is resolved AFTER arg parsing -- it depends on whether the two
+# sidecars share a GPU (see SHARE_SIDECAR_GPU below). Leaving it empty here preserves
+# both override paths: the VLLM_GPU_MEM env var and the --vllm-gpu-mem flag.
+VLLM_GPU_MEM=${VLLM_GPU_MEM:-}
+# Put Grounding-DINO on the SAME GPU as vLLM, freeing one GPU for training. Measured on
+# GB200 (job 5627435): DINO peaked at 1.6 GB of 185 GB (1%), while vLLM's 89% was simply
+# gpu_memory_utilization=0.90 taking what it is allowed. Dedicating a whole GPU to DINO is
+# therefore mostly waste -- on a 4-GPU node this turns 2 training procs into 3 (+50%).
+# OFF by default: it changes GPU placement, so opt in explicitly.
+SHARE_SIDECAR_GPU=${SHARE_SIDECAR_GPU:-false}
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-4096}
 VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-False}
 OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cuda}   # T5 step-classifier on the training GPU (CPU was the dominant per-step cost)
@@ -89,23 +138,32 @@ while [[ $# -gt 0 ]]; do
         --grad-accum)             GRAD_ACCUM="$2";              shift 2 ;;
         --per-device-batch)       PER_DEVICE_BATCH="$2";        shift 2 ;;
         --learning-rate)          LEARNING_RATE="$2";           shift 2 ;;
-        --w-overlap)              W_OVERLAP="$2";               shift 2 ;;
+        --w-overlap)              W_OVERLAP="$2"; W_OVERLAP_SET=1; shift 2 ;;
         --token-reduction)        TOKEN_REDUCTION="$2";         shift 2 ;;
         --overlap-heads)          OVERLAP_HEADS="$2";           shift 2 ;;
         --overlap-layer)          OVERLAP_LAYER="$2";           shift 2 ;;
         --box-threshold)          BOX_THRESHOLD="$2";           shift 2 ;;
         --max-box-area)           MAX_BOX_AREA="$2";            shift 2 ;;
+        --overlap-metric)         OVERLAP_METRIC="$2";          shift 2 ;;
+        --mass-floor-tau)         MASS_FLOOR_TAU="$2";          shift 2 ;;
         --dino-port)              DINO_PORT="$2";               shift 2 ;;
         --vllm-port)              VLLM_PORT="$2";               shift 2 ;;
         --vllm-gpu-mem)           VLLM_GPU_MEM="$2";            shift 2 ;;
+        --share-sidecar-gpu)      SHARE_SIDECAR_GPU=true;       shift ;;
+        --no-share-sidecar-gpu)   SHARE_SIDECAR_GPU=false;      shift ;;
         --vllm-max-model-len)     VLLM_MAX_MODEL_LEN="$2";      shift 2 ;;
         --vllm-enforce-eager)     VLLM_ENFORCE_EAGER="$2";      shift 2 ;;
         *)                        EXTRA_ARGS="$EXTRA_ARGS $1";  shift ;;
     esac
 done
 
-if (( NUM_GPUS < 3 )); then
-    echo "ERROR: need >=3 GPUs (1 DINO + 1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
+if [ "$SHARE_SIDECAR_GPU" = true ]; then MIN_GPUS=2; else MIN_GPUS=3; fi
+if (( NUM_GPUS < MIN_GPUS )); then
+    if [ "$SHARE_SIDECAR_GPU" = true ]; then
+        echo "ERROR: need >=2 GPUs with --share-sidecar-gpu (1 shared DINO+vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
+    else
+        echo "ERROR: need >=3 GPUs (1 DINO + 1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
+    fi
     exit 1
 fi
 if (( NUM_GPUS > 8 )); then
@@ -113,16 +171,46 @@ if (( NUM_GPUS > 8 )); then
     exit 1
 fi
 
+# Sidecar placement. Shared: both servers on GPU 0, training on 1..N-1. Separate (default):
+# DINO on 0, vLLM on 1, training on 2..N-1.
 DINO_GPU=0
-VLLM_GPU=1
-TRAIN_N=$(( NUM_GPUS - 2 ))
-TRAIN_GPUS=$(seq -s, 2 $(( NUM_GPUS - 1 )))
+if [ "$SHARE_SIDECAR_GPU" = true ]; then
+    VLLM_GPU=0
+    TRAIN_N=$(( NUM_GPUS - 1 ))
+    TRAIN_GPUS=$(seq -s, 1 $(( NUM_GPUS - 1 )))
+else
+    VLLM_GPU=1
+    TRAIN_N=$(( NUM_GPUS - 2 ))
+    TRAIN_GPUS=$(seq -s, 2 $(( NUM_GPUS - 1 )))
+fi
+
+# vLLM sizes its KV cache as a fraction of TOTAL GPU memory, but DINO starts first and is
+# already resident, so 0.90 can over-subscribe a shared GPU. 0.85 of 185 GB still leaves
+# ~28 GB -- ample for DINO's measured 1.6 GB plus fragmentation. An explicit
+# --vllm-gpu-mem / VLLM_GPU_MEM always wins over both defaults.
+if [ -z "$VLLM_GPU_MEM" ]; then
+    if [ "$SHARE_SIDECAR_GPU" = true ]; then VLLM_GPU_MEM=0.85; else VLLM_GPU_MEM=0.90; fi
+fi
 
 REFORWARD_SALIENCY=True
+
+# --overlap-metric auroc is a complete, self-sufficient configuration: it carries the
+# two settings that do not transfer from mean_in, so the only change needed from a
+# previous run is the metric flag itself. An explicit --w-overlap / --mass-floor-tau
+# still wins (pass --mass-floor-tau 0 to force the floor off). mean_in is untouched,
+# so a bare invocation is still bit-identical to the runs already trained.
+if [[ "$OVERLAP_METRIC" == "auroc" ]]; then
+    [[ -z "$MASS_FLOOR_TAU" ]] && MASS_FLOOR_TAU=0.0022
+    [[ -z "${W_OVERLAP_SET:-}" ]] && W_OVERLAP=0.11
+fi
 
 # ---------- naming: every swept HP appears in the model AND wandb name ----------
 N_HEADS=$(echo "$OVERLAP_HEADS" | awk -F, '{print NF}')
 SUFFIX="__wov${W_OVERLAP}_${N_HEADS}head_tr${TOKEN_REDUCTION}"
+# Only non-default metric settings extend the suffix, so existing mean_in run names
+# (and the checkpoints already on disk) stay exactly as they are.
+[[ "$OVERLAP_METRIC" != "mean_in" ]] && SUFFIX="${SUFFIX}_${OVERLAP_METRIC}"
+[[ -n "$MASS_FLOOR_TAU" ]] && SUFFIX="${SUFFIX}_mf${MASS_FLOOR_TAU}"
 MODEL_SLUG=$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g')
 RUN_NAME="grpo-${MODEL_SLUG}-overlap${SUFFIX}"
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$REPO/checkpoint/${RUN_NAME}"
@@ -132,10 +220,11 @@ REWARD_WEIGHTS="1.0 ${W_OVERLAP} 1.0 1.0"
 
 echo "=========================================================================="
 echo "Model:            $MODEL"
-echo "GPUs (total $NUM_GPUS):  DINO=cuda:$DINO_GPU  vLLM=cuda:$VLLM_GPU  train=cuda:[$TRAIN_GPUS] ($TRAIN_N procs)"
+echo "GPUs (total $NUM_GPUS):  DINO=cuda:$DINO_GPU  vLLM=cuda:$VLLM_GPU  train=cuda:[$TRAIN_GPUS] ($TRAIN_N procs)$([ "$SHARE_SIDECAR_GPU" = true ] && echo '  [sidecars SHARED on cuda:0]')"
 echo "Generation:       vLLM server  127.0.0.1:$VLLM_PORT  gpu_mem=$VLLM_GPU_MEM  max_len=$VLLM_MAX_MODEL_LEN"
 echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_box_area=$MAX_BOX_AREA"
 echo "Overlap reward:   layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
+echo "Metric:           $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " mass_floor_tau=$MASS_FLOOR_TAU" || echo " (no mass floor)")"
 echo "Batch:            per_device=$PER_DEVICE_BATCH num_generations=$NUM_GENERATIONS grad_accum=$GRAD_ACCUM  (gen_batch=$(( PER_DEVICE_BATCH * TRAIN_N * GRAD_ACCUM )))"
 echo "T5 step clf:      $OVERLAP_STEPS_DEVICE  ckpt=$OVERLAP_STEPS_CKPT"
 echo "Run name:         $RUN_NAME"
@@ -202,11 +291,14 @@ if ! $DIRECT; then
                 --overlap-layer $OVERLAP_LAYER \
                 --box-threshold $BOX_THRESHOLD \
                 --max-box-area $MAX_BOX_AREA \
+                --overlap-metric $OVERLAP_METRIC \
+                ${MASS_FLOOR_TAU:+--mass-floor-tau $MASS_FLOOR_TAU} \
                 --dino-port $DINO_PORT \
                 --vllm-port $VLLM_PORT \
                 --vllm-gpu-mem $VLLM_GPU_MEM \
                 --vllm-max-model-len $VLLM_MAX_MODEL_LEN \
                 --vllm-enforce-eager $VLLM_ENFORCE_EAGER \
+                $([ "$SHARE_SIDECAR_GPU" = true ] && echo --share-sidecar-gpu) \
                 $EXTRA_ARGS
         '"
     echo "Submitted $RUN_NAME"
@@ -377,6 +469,13 @@ LATEST_CKPT=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoin
 
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 29500-65000 -n 1)}
 
+# Omitted entirely when unset, so the dataclass default (None = floor off) applies.
+# A value of 0 is still passed through: _mass_gate treats tau<=0 as "off", so an
+# explicit --mass-floor-tau 0 disables the floor without falling back to the auroc
+# default above.
+MASS_FLOOR_FLAG=""
+[[ -n "$MASS_FLOOR_TAU" ]] && MASS_FLOOR_FLAG="--mass_floor_tau $MASS_FLOOR_TAU"
+
 # ---------- 4. GRPO training on GPUs 2..N-1 ----------
 echo "[start] training on cuda:[$TRAIN_GPUS] ($TRAIN_N procs)"
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
@@ -398,6 +497,8 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --token_reduction "$TOKEN_REDUCTION" \
     --box_threshold "$BOX_THRESHOLD" \
     --max_box_area "$MAX_BOX_AREA" \
+    --overlap_metric "$OVERLAP_METRIC" \
+    $MASS_FLOOR_FLAG \
     --dino_api_base "http://127.0.0.1:$DINO_PORT" \
     --reward_weights $REWARD_WEIGHTS \
     --use_vllm \
