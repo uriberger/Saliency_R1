@@ -102,7 +102,15 @@ if __name__ == "__main__":
     ################
     # Dataset
     ################
-    dataset = load_dataset("peterant330/saliency-r1-8k", split="train")
+    # Defaults to the paper's corpus, so existing launchers keep working unchanged.
+    # --dataset_name points the same pipeline at any other VQA corpus exposing the
+    # columns this script consumes: `problem`, `solution` and `image`, plus `bbox`
+    # when --reward_variant saliency_r1.
+    dataset = load_dataset(
+        script_args.dataset_name or "peterant330/saliency-r1-8k",
+        name=script_args.dataset_config,
+        split=script_args.dataset_train_split,
+    )
     dataset = dataset.train_test_split(test_size=100, seed=42)
     '''
     SYSTEM_PROMPT = (
