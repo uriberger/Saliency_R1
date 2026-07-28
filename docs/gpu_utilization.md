@@ -30,7 +30,7 @@ exists for the offline runs and for diffing runs against each other.
 | Column | Meaning | Trap |
 |---|---|---|
 | `SM util %` | fraction of sampled time ≥1 kernel was resident | **not** how well the SMs are fed; a single tiny kernel reads 100% |
-| `MemBW %` | memory-controller read/write activity | low + high SM util ⇒ compute-bound or spinning |
+| `MemBW %` | percent of time memory was being read or written | same time-occupancy trap — 34% is **not** 34% of the 3.35 TB/s peak |
 | `HBM %` | peak HBM used | sizing headroom |
 | `Power W` | board draw vs the 700 W limit | the honest occupancy proxy — a GPU spinning in an NCCL all-reduce reads 100% SM util but draws ~150 W |
 | `busy frac` | % of samples above `--busy-threshold` (default 5%) | separates "slow" from "idle half the time" |
@@ -72,16 +72,36 @@ per-rank efficiency, not skew.
  3-7 |      46.5-51.1    |  150-156|  ~56%     | training
 ```
 
-Two things worth acting on, both visible only per-GPU:
+Mean power is the wrong statistic for a bursty workload — it blends idle and active time and
+makes every GPU here look equally lukewarm. Split it by whether the GPU was actually running
+anything (`util > 5%`) and the run reads completely differently:
 
-1. **The sidecars are nearly idle.** GPU 1 (vLLM) averages 11.5% and 164 W of a 700 W limit;
-   GPU 0 (DINO) 27%. This is the measured case for `--share-sidecar-gpu`, which collapses
-   both onto GPU 0 and buys a seventh training rank. The launcher comment already argues this
-   from DINO's 1.6 GB memory footprint; utilization says the same thing about compute.
-2. **Training ranks sit near 150 W — 21% of the power limit — while reporting ~48% SM util.**
-   That gap is the signature of ranks spinning in collectives rather than computing, i.e.
-   waiting on the vLLM generation round-trip. It is a pipelining problem, not a kernel
-   problem, and it is the larger of the two effects.
+| GPU | role | idle samples | idle W | active samples | **active W** | max W |
+|---|---|---|---|---|---|---|
+| 0 | DINO | 643 | 132 | 270 | **527** | 675 |
+| 1 | vLLM | 763 | 127 | 150 | **351** | 498 |
+| 3 | training | 397 | 130 | 516 | **176** | 440 |
+
+Reproduce with `--csv` and group `powerWatts` on `gpu`; the idle column also gives you this
+node's true idle floor, ~130 W, which you need before any of these numbers mean anything.
+
+Two conclusions, and note that the naive reading of the first table gets both backwards:
+
+1. **The sidecars are bursty, not weak.** vLLM pulls 351 W when it runs and DINO 527 W,
+   peaking at 675 W of a 700 W limit. They idle 84–90% of the time because they are each
+   needed in one phase of the GRPO step, not because they are underloaded when called. This
+   still supports `--share-sidecar-gpu`, but for a reason the memory-footprint argument in the
+   launcher comment misses: generate → reward → train is *sequential*, so vLLM's bursts and
+   DINO's bursts do not collide. Two GPUs each idle ~85% of the time, busy in non-overlapping
+   phases, is the ideal co-residency case. The binding constraint is memory (GPU 1 peaks at
+   87% HBM from vLLM's preallocated KV cache), which is why `VLLM_GPU_MEM` drops to 0.85 when
+   sharing.
+2. **The training ranks are where the allocation is actually burning.** A rank marked active —
+   SM util above 50% for 484 of its samples — draws **176 W against a 130 W idle floor**.
+   46 W above doing nothing, while DINO on the same node pulls 527 W. The SMs are occupied and
+   almost no arithmetic is happening: that is spin-waiting in collectives. So the six training
+   GPUs are idle ~44% of the time and spinning through much of the rest. This is a pipelining
+   problem, and it dominates anything recoverable from the sidecars.
 
 GPU 2 running ~18 points below ranks 3–7 is unexplained and worth a look — rank 0 carries the
 LoRA merge and the NCCL weight push to vLLM, so it may simply be the odd rank out.
