@@ -65,6 +65,7 @@ accelerate launch \
 import torch
 from datasets import load_dataset
 from latex2sympy2_extended import NormalizationConfig
+from PIL import Image
 from math_verify import LatexExtractionConfig, parse, verify
 
 from trl import (
@@ -128,21 +129,28 @@ if __name__ == "__main__":
 
     dataset = dataset.map(make_conversation)
 
-    # Filter have big images
-    def filter_big_images(example):
-        image = example["image"]
-        return image.size[0] <= 512 and image.size[1] <= 512
+    # Cap the long side at 512px, preserving aspect ratio. saliency-r1-8k ships
+    # pre-resized within this bound, but larger sources (full Visual-CoT, V*,
+    # VisDrone) do not -- dropping oversized samples would silently discard most
+    # of such a dataset, so downscale instead of filtering. Boxes in the `bbox`
+    # column are normalized to [0, 1], so they survive the resize unchanged.
+    MAX_IMAGE_SIDE = 512
 
-    dataset = dataset.filter(filter_big_images)
-
-    def convert_to_rgb(example):
+    def prepare_image(example):
         image = example["image"]
+        width, height = image.size
+        if max(width, height) > MAX_IMAGE_SIDE:
+            scale = MAX_IMAGE_SIDE / max(width, height)
+            image = image.resize(
+                (max(1, round(width * scale)), max(1, round(height * scale))),
+                Image.BICUBIC,
+            )
         if image.mode != "RGB":
             image = image.convert("RGB")
         example["image"] = image
         return example
 
-    dataset = dataset.map(convert_to_rgb)
+    dataset = dataset.map(prepare_image)
 
     train_dataset = dataset["train"]
     eval_dataset = dataset["test"] if training_args.eval_strategy != "no" else None

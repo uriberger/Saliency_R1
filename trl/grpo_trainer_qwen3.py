@@ -1381,7 +1381,19 @@ class GRPOTrainer(Trainer):
         # This allows for dynamic reward shaping based on training progress.
         reward_kwargs["trainer_state"] = self.state
 
-        bbox_list = [i['bbox'] for i in inputs]
+        # Only the saliency reward consumes ground-truth boxes. The "ours" (attention
+        # overlap) and "none" variants derive their signal from the attention map and
+        # Grounding-DINO alone, so datasets without box annotations are usable there.
+        if "bbox" in inputs[0]:
+            bbox_list = [i["bbox"] for i in inputs]
+        elif self.reward_variant == "saliency_r1":
+            raise KeyError(
+                "reward_variant='saliency_r1' requires a 'bbox' column in the dataset, "
+                "but none was found. Use --reward_variant ours|none to train on data "
+                "without box annotations."
+            )
+        else:
+            bbox_list = [None] * len(inputs)
         question_list = [i['problem'] for i in inputs]
 
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
