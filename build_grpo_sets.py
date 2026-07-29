@@ -336,7 +336,7 @@ def load_virl(group, parquet_path):
 # Image resolution
 # ---------------------------------------------------------------------------
 class ChainedReader(io.RawIOBase):
-    """Concatenate several shard files into one continuous readable stream."""
+    """Sequential view over several shard files concatenated in order."""
 
     def __init__(self, paths):
         self.paths, self.idx = list(paths), 0
@@ -355,6 +355,78 @@ class ChainedReader(io.RawIOBase):
             if self.idx >= len(self.paths):
                 return 0
             self.fh = open(self.paths[self.idx], "rb")
+
+
+class ChainedFile(io.RawIOBase):
+    """Random-access view over shard files concatenated in order.
+
+    Visual-CoT's shards reassemble into an *uncompressed* tar, so members can be
+    seeked to rather than streamed through. That turns extraction from a 139 GB
+    sequential read into reading the ~30K wanted files plus header hops.
+    """
+
+    def __init__(self, paths):
+        self.paths = [str(p) for p in paths]
+        self.sizes = [os.path.getsize(p) for p in self.paths]
+        self.starts, acc = [], 0
+        for s in self.sizes:
+            self.starts.append(acc)
+            acc += s
+        self.total, self.pos = acc, 0
+        self._idx, self._fh = None, None
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def _fh_for(self, idx):
+        if self._idx != idx:
+            if self._fh:
+                self._fh.close()
+            self._fh = open(self.paths[idx], "rb")
+            self._idx = idx
+        return self._fh
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_SET:
+            self.pos = offset
+        elif whence == io.SEEK_CUR:
+            self.pos += offset
+        else:
+            self.pos = self.total + offset
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def readinto(self, b):
+        if self.pos >= self.total:
+            return 0
+        import bisect
+
+        idx = bisect.bisect_right(self.starts, self.pos) - 1
+        local = self.pos - self.starts[idx]
+        fh = self._fh_for(idx)
+        fh.seek(local)
+        n = fh.readinto(memoryview(b)[: min(len(b), self.sizes[idx] - local)])
+        self.pos += n
+        return n
+
+    def close(self):
+        if self._fh:
+            self._fh.close()
+        super().close()
+
+
+def open_chained_tar(paths):
+    """Open one-or-many shards as a tar, seeking when the stream is uncompressed."""
+    with open(str(paths[0]), "rb") as fh:
+        gzipped = fh.read(2) == b"\x1f\x8b"
+    if gzipped:
+        return tarfile.open(fileobj=io.BufferedReader(ChainedReader(paths)), mode="r|*")
+    return tarfile.open(fileobj=io.BufferedReader(ChainedFile(paths)), mode="r:")
 
 
 def probe_archives(entries, n_show=8):
@@ -380,12 +452,8 @@ def probe_archives(entries, n_show=8):
                 print(f"    {n}")
             continue
 
-        # Single .tar.gz, or a set of shards that concatenate into one gzip stream.
-        mode = "r|gz" if len(paths) > 1 else "r|*"
-        fobj = io.BufferedReader(ChainedReader(paths)) if len(paths) > 1 else None
         try:
-            tf = tarfile.open(fileobj=fobj, mode=mode) if fobj else tarfile.open(first, mode=mode)
-            with tf:
+            with open_chained_tar(paths) as tf:
                 shown = 0
                 for m in tf:
                     if not m.isfile():
@@ -409,8 +477,7 @@ def extract_from_tar_stream(part_paths, wanted, out_dir):
     remaining = dict(wanted)  # basename -> destination filename
     found = {}
 
-    stream = io.BufferedReader(ChainedReader(part_paths))
-    with tarfile.open(fileobj=stream, mode="r|gz") as tf:
+    with open_chained_tar(part_paths) as tf:
         for member in tf:
             if not remaining:
                 break
@@ -425,7 +492,10 @@ def extract_from_tar_stream(part_paths, wanted, out_dir):
             dest = out_dir / remaining.pop(base)
             with open(dest, "wb") as out:
                 out.write(fh.read())
-            found[base] = dest
+            # Keep the archive path: Visual-CoT nests as cot_image_data/<source>/...,
+            # which lets the caller confirm each image came from the sub-dataset its
+            # metadata claims, catching a basename collision with an unreferenced file.
+            found[base] = (dest, member.name)
     return found, remaining
 
 
@@ -619,10 +689,30 @@ def do_build(args):
         if not shards:
             raise SystemExit("Visual-CoT image shards absent; run --download --with-viscot-images")
         print(f"Streaming {len(shards)} Visual-CoT shards for {len(viscot_wanted)} images ...")
-        _, missing = extract_from_tar_stream(shards, viscot_wanted, viscot_cache)
+        found, missing = extract_from_tar_stream(shards, viscot_wanted, viscot_cache)
         if missing:
             print(f"  [warn] {len(missing)} images not found in the archive "
                   f"(e.g. {list(missing)[:3]}); those rows will be dropped")
+
+        # Confirm each image came from the sub-dataset its metadata claims. A
+        # mismatch means a basename collided with an unreferenced archive file and
+        # the wrong picture was paired with the question -- silent data corruption.
+        expected = {
+            os.path.basename(r["_ref"][1]): r["dataset"]
+            for r in all_records
+            if r["_ref"][0] == "viscot"
+        }
+        mismatched = [
+            (b, expected[b], name)
+            for b, (_, name) in found.items()
+            if f"/{expected[b]}/" not in f"/{name}"
+        ]
+        if mismatched:
+            print(f"  [warn] {len(mismatched)} images came from an unexpected source dir:")
+            for b, want, name in mismatched[:5]:
+                print(f"           {b}: expected .../{want}/..., got {name}")
+        else:
+            print(f"  source-directory check passed for all {len(found)} images")
 
     treevgr_wanted = {
         os.path.basename(r["_ref"][1]): os.path.basename(r["_ref"][1])
