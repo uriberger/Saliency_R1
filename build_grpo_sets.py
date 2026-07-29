@@ -138,6 +138,27 @@ def union_bbox(boxes, width, height):
     return f"[{round(x1, 3)}, {round(y1, 3)}, {round(x2, 3)}, {round(y2, 3)}]"
 
 
+_IMAGE_SCAFFOLD = re.compile(
+    r"^[ \t]*The (?:above|below) problem is with the following images:[ \t]*$", re.M
+)
+
+
+def strip_image_placeholder(text):
+    """Remove the <image> placeholder and the scaffolding that only made sense with it.
+
+    A literal "<image>" left in `problem` reaches the chat template as text, where it
+    either survives as a bogus string or collides with the processor's own vision
+    token accounting. ViRL39K puts it leading (31,602 rows), trailing (3,141) and
+    mid-text (987) -- never more than once -- and often pairs it with a "The
+    above/below problem is with the following images:" line and a literal "/n"
+    separator. Anchoring on the exact scaffolding sentence leaves genuine questions
+    such as "Which of the following images ..." untouched.
+    """
+    text = re.sub(r"\s*<image>\s*(?:/n)?\s*", "\n", str(text))
+    text = _IMAGE_SCAFFOLD.sub("", text)
+    return re.sub(r"\n{2,}", "\n", text).strip()
+
+
 def prepare_image(img):
     """Cap the long side at MAX_IMAGE_SIDE and force RGB, as the trainer does."""
     w, h = img.size
@@ -306,7 +327,7 @@ def load_visdrone(parquet_path):
             {
                 "dataset": "visdrone",
                 "question_id": int(i),
-                "problem": re.sub(r"^<image>\s*", "", str(r["problem"])).strip(),
+                "problem": strip_image_placeholder(r["problem"]),
                 "solution": answer.strip("()").upper(),
                 # Absolute boxes; normalized once the image is opened (no w/h in parquet).
                 "_boxes_abs": boxes,
@@ -335,7 +356,7 @@ def load_virl(group, parquet_path):
             {
                 "dataset": group,
                 "question_id": int(i),
-                "problem": re.sub(r"^<image>\s*/?n?\s*", "", str(r["question"])).strip(),
+                "problem": strip_image_placeholder(r["question"]),
                 "solution": str(r["answer"]).strip(),
                 "bbox": "",  # ViRL39K ships no boxes
                 "natural": False,
