@@ -34,6 +34,7 @@ import json
 import os
 import random
 import re
+import sys
 import tarfile
 import zipfile
 import zlib
@@ -135,17 +136,80 @@ def prepare_image(img):
     return img
 
 
-def hf_snapshot(repo_id, allow_patterns=None):
+def hf_snapshot(repo_id, allow_patterns=None, local_only=False):
     from huggingface_hub import snapshot_download
 
-    return Path(snapshot_download(repo_id, repo_type="dataset", allow_patterns=allow_patterns))
+    return Path(
+        snapshot_download(
+            repo_id,
+            repo_type="dataset",
+            allow_patterns=allow_patterns,
+            local_files_only=local_only,
+        )
+    )
+
+
+def require_deps():
+    """Fail loudly if run with an interpreter that lacks the project packages.
+
+    The login node's default python is /cm/local/apps/python3, which happens to
+    have PIL but not huggingface_hub or datasets -- enough for this module to
+    import cleanly and then fail deep inside a helper.
+    """
+    import importlib
+
+    missing = [m for m in ("huggingface_hub", "datasets", "pandas", "PIL")
+               if not importlib.util.find_spec(m)]
+    if missing:
+        raise SystemExit(
+            f"missing required package(s): {', '.join(missing)}\n"
+            f"current interpreter: {sys.executable}\n"
+            f"This needs the project environment:\n"
+            f"    conda activate saliency_r1_qwen3_vllm"
+        )
+
+
+def resolve_cached(repo_id, allow_patterns, glob_pat):
+    """Locate already-downloaded files WITHOUT triggering a download.
+
+    Returns (paths, error). A probe that downloads 6 GB to tell you what it found
+    is not a probe, so this is strictly local-cache lookup.
+    """
+    try:
+        root = hf_snapshot(repo_id, allow_patterns, local_only=True)
+    except Exception as e:
+        return [], f"{type(e).__name__}: {str(e)[:200]}"
+    paths = sorted(root.glob(glob_pat))
+    if not paths:
+        return [], f"not in local cache (no {glob_pat!r} under {root}) -- run --download"
+    return paths, None
 
 
 # ---------------------------------------------------------------------------
 # Candidate loaders -- each returns a list of dicts WITHOUT the decoded image.
 # `_ref` carries whatever the image resolver needs to fetch the pixels later.
 # ---------------------------------------------------------------------------
-def load_viscot(source, meta_dir):
+def viscot_ambiguous_basenames(meta_dir):
+    """Basenames claimed by more than one Visual-CoT sub-dataset.
+
+    The metadata references images by bare basename, and the image archive holds
+    all 12 sub-datasets, so a name owned by two sources cannot be resolved
+    unambiguously by basename alone. 181 such names touch the sources we use --
+    all openimages names also referenced by textcap/textvqa, which are built on
+    OpenImages and so almost certainly point at the same picture. "Almost
+    certainly" is not a basis for silently picking one, and 181 rows out of 43K
+    candidates is not worth the risk, so they are dropped.
+    """
+    owners = defaultdict(set)
+    for path in sorted(meta_dir.glob("*_cot_train.jsonl")):
+        src = path.name.replace("_cot_train.jsonl", "")
+        with open(path) as fh:
+            for line in fh:
+                owners[os.path.basename(json.loads(line)["image"])].add(src)
+    return {name for name, srcs in owners.items() if len(srcs) > 1}
+
+
+def load_viscot(source, meta_dir, ambiguous=frozenset()):
     """Read one Visual-CoT metadata jsonl and keep the verifiable rows."""
     path = meta_dir / f"{source}_cot_train.jsonl"
     if not path.exists():
@@ -156,6 +220,8 @@ def load_viscot(source, meta_dir):
         for i, line in enumerate(fh):
             r = json.loads(line)
             if not is_verifiable(r.get("answer")):
+                continue
+            if os.path.basename(r["image"]) in ambiguous:
                 continue
             out.append(
                 {
@@ -269,23 +335,67 @@ def load_virl(group, parquet_path):
 # ---------------------------------------------------------------------------
 # Image resolution
 # ---------------------------------------------------------------------------
-def probe_archives(paths):
-    """Print the first members of each archive so layouts can be confirmed up front."""
-    for label, p in paths.items():
-        print(f"\n=== {label}: {p} ===")
-        if not p or not Path(p).exists():
-            print("  (not present -- run --download)")
+class ChainedReader(io.RawIOBase):
+    """Concatenate several shard files into one continuous readable stream."""
+
+    def __init__(self, paths):
+        self.paths, self.idx = list(paths), 0
+        self.fh = open(self.paths[0], "rb")
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        while True:
+            n = self.fh.readinto(b)
+            if n:
+                return n
+            self.fh.close()
+            self.idx += 1
+            if self.idx >= len(self.paths):
+                return 0
+            self.fh = open(self.paths[self.idx], "rb")
+
+
+def probe_archives(entries, n_show=8):
+    """Print the first members of each archive so layouts can be confirmed up front.
+
+    `entries` maps a label to the (paths, error) pair returned by resolve_cached().
+    Errors are printed rather than swallowed -- the whole point is diagnosis.
+    """
+    for label, (paths, err) in entries.items():
+        print(f"\n=== {label} ===")
+        if err:
+            print(f"  UNAVAILABLE: {err}")
             continue
-        if str(p).endswith(".zip"):
-            with zipfile.ZipFile(p) as z:
+        total = sum(Path(p).stat().st_size for p in paths)
+        print(f"  {len(paths)} file(s), {total / 1e9:.2f} GB")
+
+        first = str(paths[0])
+        if first.endswith(".zip"):
+            with zipfile.ZipFile(first) as z:
                 names = z.namelist()
-                print(f"  {len(names)} members; first 5: {names[:5]}")
-        else:
-            with tarfile.open(p, "r|*") as tf:
-                for i, m in enumerate(tf):
-                    if i >= 5:
+            print(f"  {len(names)} members. First {n_show}:")
+            for n in names[:n_show]:
+                print(f"    {n}")
+            continue
+
+        # Single .tar.gz, or a set of shards that concatenate into one gzip stream.
+        mode = "r|gz" if len(paths) > 1 else "r|*"
+        fobj = io.BufferedReader(ChainedReader(paths)) if len(paths) > 1 else None
+        try:
+            tf = tarfile.open(fileobj=fobj, mode=mode) if fobj else tarfile.open(first, mode=mode)
+            with tf:
+                shown = 0
+                for m in tf:
+                    if not m.isfile():
+                        continue
+                    print(f"    {m.name}    (basename: {os.path.basename(m.name)})")
+                    shown += 1
+                    if shown >= n_show:
                         break
-                    print(f"  {m.name}")
+        except Exception as e:
+            print(f"  FAILED to read archive: {type(e).__name__}: {str(e)[:200]}")
 
 
 def extract_from_tar_stream(part_paths, wanted, out_dir):
@@ -299,28 +409,7 @@ def extract_from_tar_stream(part_paths, wanted, out_dir):
     remaining = dict(wanted)  # basename -> destination filename
     found = {}
 
-    class _Chained(io.RawIOBase):
-        """Concatenate the shard files into one continuous readable stream."""
-
-        def __init__(self, paths):
-            self.paths, self.idx = list(paths), 0
-            self.fh = open(self.paths[0], "rb")
-
-        def readable(self):
-            return True
-
-        def readinto(self, b):
-            while True:
-                n = self.fh.readinto(b)
-                if n:
-                    return n
-                self.fh.close()
-                self.idx += 1
-                if self.idx >= len(self.paths):
-                    return 0
-                self.fh = open(self.paths[self.idx], "rb")
-
-    stream = io.BufferedReader(_Chained(part_paths))
+    stream = io.BufferedReader(ChainedReader(part_paths))
     with tarfile.open(fileobj=stream, mode="r|gz") as tf:
         for member in tf:
             if not remaining:
@@ -370,8 +459,10 @@ def gather_candidates(meta_dir, treevgr_parquet, virl_parquet):
     """Load every candidate pool, keyed by the recipe name that consumes it."""
     pools, aokvqa_ds = {}, None
 
+    ambiguous = viscot_ambiguous_basenames(meta_dir)
+    print(f"  dropping {len(ambiguous)} Visual-CoT basenames owned by >1 sub-dataset")
     for src in VISCOT_SOURCES:
-        pools[src] = load_viscot(src, meta_dir)
+        pools[src] = load_viscot(src, meta_dir, ambiguous)
 
     aok, aokvqa_ds = load_aokvqa()
     pools["aokvqa"] = aok
@@ -603,16 +694,22 @@ def main():
                    help="assume --viscot-cache is already populated")
     args = p.parse_args()
 
+    require_deps()
+
     if args.probe:
-        try:
-            virl = hf_snapshot(VIRL_REPO, [VIRL_PARQUET, "images.zip"]) / "images.zip"
-        except Exception:
-            virl = None
-        try:
-            tg = hf_snapshot(TREEVGR_REPO, ["images.tar.gz"]) / "images.tar.gz"
-        except Exception:
-            tg = None
-        probe_archives({"ViRL39K images.zip": virl, "TreeVGR images.tar.gz": tg})
+        probe_archives(
+            {
+                "ViRL39K images.zip": resolve_cached(VIRL_REPO, ["images.zip"], "images.zip"),
+                "TreeVGR images.tar.gz": resolve_cached(
+                    TREEVGR_REPO, ["images.tar.gz"], "images.tar.gz"
+                ),
+                "Visual-CoT image shards": resolve_cached(
+                    VISCOT_REPO,
+                    ["cot_images_tar_split/*"],
+                    "cot_images_tar_split/cot_images_*",
+                ),
+            }
+        )
         return
     if args.download:
         do_download(args)
