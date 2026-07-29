@@ -34,6 +34,7 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
 import tarfile
 import zipfile
@@ -74,6 +75,18 @@ VIRL_CATEGORIES = {
 }
 
 VISCOT_SOURCES = {"gqa", "visual7w", "openimages", "vsr", "docvqa", "infographicsvqa"}
+
+# The archive's per-source directory names do not always match the metadata file
+# names: visual7w_cot_train.jsonl indexes images stored under cot_image_data/v7w/.
+# (saliency-r1-8k labels that source "v7w" too.) Used only by the source-directory
+# cross-check, so an unlisted mismatch is reported rather than silently accepted.
+SOURCE_DIR_ALIASES = {"visual7w": "v7w"}
+
+# Rows are converted to Arrow in batches of this size. Measured on real data, a
+# 512px q95 JPEG averages 78.6 KB, so a full 50K set is ~4 GB of bytes and
+# Dataset.from_list peaks near 8 GB converting it in one shot. Chunking caps the
+# peak at roughly CHUNK_ROWS * 160 KB regardless of set size.
+CHUNK_ROWS = 4000
 
 SEED = 42
 MAX_IMAGE_SIDE = 512  # matches prepare_image() in trl/grpo_vlm_qwen3.py
@@ -474,8 +487,36 @@ def extract_from_tar_stream(part_paths, wanted, out_dir):
     extracting the full 139 GB.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    remaining = dict(wanted)  # basename -> destination filename
-    found = {}
+
+    # Resume: anything already on disk and recorded in the manifest is skipped, so
+    # re-running after a later failure costs nothing. The manifest keeps each
+    # image's archive path, which is what the source-directory cross-check needs --
+    # without it a resumed run would lose that verification.
+    manifest_path = out_dir / ".manifest.json"
+    manifest = {}
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except Exception:
+            manifest = {}
+
+    found, remaining, unverified = {}, {}, 0
+    for base, dest_name in wanted.items():
+        dest = out_dir / dest_name
+        if dest.exists():
+            # A file extracted before the manifest existed is still reusable; its
+            # archive path is simply unknown, so the source check skips it.
+            if base not in manifest:
+                unverified += 1
+            found[base] = (dest, manifest.get(base))
+        else:
+            remaining[base] = dest_name
+    if found:
+        print(f"  resuming: {len(found)} images already extracted, {len(remaining)} to go")
+    if unverified:
+        print(f"  ({unverified} predate the manifest -- source-directory check skipped for those)")
+    if not remaining:
+        return found, {}
 
     with open_chained_tar(part_paths) as tf:
         for member in tf:
@@ -496,6 +537,9 @@ def extract_from_tar_stream(part_paths, wanted, out_dir):
             # which lets the caller confirm each image came from the sub-dataset its
             # metadata claims, catching a basename collision with an unreferenced file.
             found[base] = (dest, member.name)
+            manifest[base] = member.name
+
+    manifest_path.write_text(json.dumps(manifest))
     return found, remaining
 
 
@@ -702,17 +746,27 @@ def do_build(args):
             for r in all_records
             if r["_ref"][0] == "viscot"
         }
+        # Only images whose archive path was recorded can be checked. Reporting a
+        # blanket "passed" when every entry was skipped would claim verification
+        # that never happened, so verified and skipped counts are always separate.
+        verifiable = {b: name for b, (_, name) in found.items() if name}
+        skipped = len(found) - len(verifiable)
         mismatched = [
             (b, expected[b], name)
-            for b, (_, name) in found.items()
-            if f"/{expected[b]}/" not in f"/{name}"
+            for b, name in verifiable.items()
+            if f"/{SOURCE_DIR_ALIASES.get(expected[b], expected[b])}/" not in f"/{name}"
         ]
         if mismatched:
-            print(f"  [warn] {len(mismatched)} images came from an unexpected source dir:")
+            print(f"  [warn] source-directory check: {len(mismatched)} of {len(verifiable)} "
+                  f"images came from an unexpected source dir:")
             for b, want, name in mismatched[:5]:
                 print(f"           {b}: expected .../{want}/..., got {name}")
+        elif verifiable:
+            print(f"  source-directory check: {len(verifiable)} verified, {skipped} skipped")
         else:
-            print(f"  source-directory check passed for all {len(found)} images")
+            print(f"  source-directory check: NOT RUN -- none of the {skipped} images has a "
+                  f"recorded archive path (they predate the manifest). To verify, re-extract "
+                  f"into an empty --viscot-cache.")
 
     treevgr_wanted = {
         os.path.basename(r["_ref"][1]): os.path.basename(r["_ref"][1])
@@ -749,19 +803,43 @@ def do_build(args):
         }
     )
 
+    from datasets import concatenate_datasets, load_from_disk
+
     for name, groups in (
         ("set_a", [set_a_draw]),
         ("set_b", [set_b_natural, set_b_nonnat]),
     ):
         records = [r for g in groups for v in g.values() for r in v]
         print(f"\nMaterializing {name} ({len(records)} records) ...")
-        rows, failed = materialize(records, resolver, "train")
-        if failed:
-            print(f"  dropped {failed} rows with unreadable images")
-        summarize(name, rows)
-        ds = Dataset.from_list(rows, features=features)
+
+        # Convert in chunks and spill each to disk. Holding all 50K rows and then
+        # handing them to Dataset.from_list peaks near 8 GB of RSS, which is what
+        # got the first run OOM-killed; this keeps the peak at roughly
+        # CHUNK_ROWS * 160 KB.
+        shard_root = out_dir / f"_{name}_shards"
+        shard_root.mkdir(parents=True, exist_ok=True)
+        shard_paths, stats, failed_total = [], [], 0
+        for start in range(0, len(records), CHUNK_ROWS):
+            chunk = records[start : start + CHUNK_ROWS]
+            rows, failed = materialize(chunk, resolver, "train")
+            failed_total += failed
+            stats.extend({k: r[k] for k in ("dataset", "natural", "bbox")} for r in rows)
+            shard_dir = shard_root / f"{start // CHUNK_ROWS:04d}"
+            Dataset.from_list(rows, features=features).save_to_disk(str(shard_dir))
+            shard_paths.append(shard_dir)
+            del rows
+            print(f"    {min(start + CHUNK_ROWS, len(records)):6d}/{len(records)} rows", flush=True)
+
+        if failed_total:
+            print(f"  dropped {failed_total} rows with unreadable images")
+        summarize(name, stats)
+
+        # Shards are memory-mapped, so concatenating and writing stays cheap.
+        merged = concatenate_datasets([load_from_disk(str(p)) for p in shard_paths])
         dest = out_dir / name
-        ds.save_to_disk(str(dest))
+        merged.save_to_disk(str(dest))
+        del merged
+        shutil.rmtree(shard_root)
         print(f"  saved -> {dest}")
 
     print("\nTrain with:")
