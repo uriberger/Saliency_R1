@@ -186,7 +186,10 @@ def load_aokvqa():
     ds = load_dataset(AOKVQA_REPO, split="train")
     letters = "ABCD"
     out = []
-    for i, r in enumerate(ds):
+    # Iterate without the image column: indexing a row decodes every column, and
+    # decoding 17K images just to read the question text is pure waste. The
+    # resolver pulls pixels from `ds` lazily, one row at a time, later on.
+    for i, r in enumerate(ds.remove_columns(["image"])):
         choices = list(r["choices"])
         idx = r["correct_choice_idx"]
         if idx is None or idx >= len(letters) or len(choices) > len(letters):
@@ -403,7 +406,13 @@ def draw(pools, recipe, rng_seed):
 
 
 def materialize(records, resolver, split_name):
-    """Decode, resize and finalize rows into the output schema."""
+    """Decode, resize and finalize rows into the output schema.
+
+    Images are re-encoded to JPEG bytes rather than kept as PIL objects. Holding
+    50K decoded 512px images costs ~18 GB of RSS (measured); as encoded bytes the
+    same set is ~2.5 GB, which keeps the build inside a login-node memory budget.
+    The Image feature accepts the {"bytes", "path"} form directly.
+    """
     rows, failed = [], 0
     for r in records:
         try:
@@ -414,6 +423,9 @@ def materialize(records, resolver, split_name):
                 # so they can only be normalized once the image is open.
                 bbox = union_bbox(r["_boxes_abs"], img.size[0], img.size[1])
             img = prepare_image(img)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=95)
+            img.close()
         except Exception as e:  # a missing or corrupt image must not kill the build
             failed += 1
             if failed <= 5:
@@ -428,7 +440,7 @@ def materialize(records, resolver, split_name):
                 "problem": r["problem"],
                 "bbox": bbox,
                 "solution": r["solution"],
-                "image": img,
+                "image": {"bytes": buf.getvalue(), "path": None},
                 "natural": r["natural"],
             }
         )
