@@ -32,7 +32,12 @@ if [ ! -f "$ADAPTER/adapter_config.json" ]; then
 fi
 
 source "$CONDA_SH"
+# conda activate + activate.d hooks (e.g. cuda-nvcc's, which expands
+# $NVCC_PREPEND_FLAGS with no default) assume nounset is OFF; our set -u makes
+# that a fatal "unbound variable". Disable nounset for activation only.
+set +u
 conda activate "$CONDA_ENV"
+set -u
 
 source "$REPO/setup_cuda_home.sh"
 
