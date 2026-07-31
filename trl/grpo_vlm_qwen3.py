@@ -62,8 +62,10 @@ accelerate launch \
 
 """
 
+import os
+
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from latex2sympy2_extended import NormalizationConfig
 from PIL import Image
 from math_verify import LatexExtractionConfig, parse, verify
@@ -106,11 +108,25 @@ if __name__ == "__main__":
     # --dataset_name points the same pipeline at any other VQA corpus exposing the
     # columns this script consumes: `problem`, `solution` and `image`, plus `bbox`
     # when --reward_variant saliency_r1.
-    dataset = load_dataset(
-        script_args.dataset_name or "peterant330/saliency-r1-8k",
-        name=script_args.dataset_config,
-        split=script_args.dataset_train_split,
-    )
+    dataset_name = script_args.dataset_name or "peterant330/saliency-r1-8k"
+    # A directory written by Dataset.save_to_disk (what build_grpo_sets.py produces)
+    # is not a load_dataset() input: load_dataset would fall back to the generic
+    # arrow builder, which ignores dataset_info.json and so hands back `image` as a
+    # raw {bytes, path} struct instead of a decoded PIL image, after copying the
+    # whole corpus into the HF cache. Detect that layout and load it properly.
+    if os.path.isfile(os.path.join(dataset_name, "dataset_info.json")) or os.path.isfile(
+        os.path.join(dataset_name, "dataset_dict.json")
+    ):
+        dataset = load_from_disk(dataset_name)
+        # save_to_disk on a DatasetDict keeps the splits; take the requested one.
+        if not hasattr(dataset, "train_test_split"):
+            dataset = dataset[script_args.dataset_train_split]
+    else:
+        dataset = load_dataset(
+            dataset_name,
+            name=script_args.dataset_config,
+            split=script_args.dataset_train_split,
+        )
     dataset = dataset.train_test_split(test_size=100, seed=42)
     '''
     SYSTEM_PROMPT = (

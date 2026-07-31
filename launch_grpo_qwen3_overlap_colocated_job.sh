@@ -153,6 +153,14 @@ while [[ $# -gt 0 ]]; do
         --no-share-sidecar-gpu)   SHARE_SIDECAR_GPU=false;      shift ;;
         --vllm-max-model-len)     VLLM_MAX_MODEL_LEN="$2";      shift 2 ;;
         --vllm-enforce-eager)     VLLM_ENFORCE_EAGER="$2";      shift 2 ;;
+        # The training command runs from $REPO/trl_repo, so a relative dataset path
+        # given on the command line would be resolved against the wrong directory.
+        # Absolutize it here, while we are still in the invocation cwd; anything
+        # that is not an existing local path (a Hub id, say) is passed through.
+        --dataset_name|--dataset-name)
+            _ds="$2"
+            [[ -e "$_ds" ]] && _ds="$(cd "$(dirname "$_ds")" && pwd)/$(basename "$_ds")"
+            EXTRA_ARGS="$EXTRA_ARGS --dataset_name $_ds"; shift 2 ;;
         *)                        EXTRA_ARGS="$EXTRA_ARGS $1";  shift ;;
     esac
 done
