@@ -39,6 +39,14 @@ while [[ $# -gt 0 ]]; do
         --wandb-api-key)          WANDB_API_KEY="$2";          shift 2 ;;
         --hf-token)               HF_TOKEN="$2";               shift 2 ;;
         --max-completion-length)  MAX_COMPLETION_LENGTH="$2";  shift 2 ;;
+        # The training command runs from $REPO/trl_repo, so a relative dataset path
+        # given on the command line would be resolved against the wrong directory.
+        # Absolutize it here, while we are still in the invocation cwd; anything
+        # that is not an existing local path (a Hub id, say) is passed through.
+        --dataset_name|--dataset-name)
+            _ds="$2"
+            [[ -e "$_ds" ]] && _ds="$(cd "$(dirname "$_ds")" && pwd)/$(basename "$_ds")"
+            EXTRA_ARGS="$EXTRA_ARGS --dataset_name $_ds"; shift 2 ;;
         *)                        EXTRA_ARGS="$EXTRA_ARGS $1"; shift ;;
     esac
 done
