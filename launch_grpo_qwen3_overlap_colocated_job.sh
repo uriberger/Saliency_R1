@@ -50,7 +50,7 @@
 #
 # Environment overrides:
 #   PARTITION=batch_singlenode   DURATION=4 (hours)
-#   SAVE_STEPS=10   CKPT_KEEP_EVERY=200
+#   SAVE_STEPS=10   CKPT_KEEP_EVERY=500
 #   DINO_PORT=8100   VLLM_PORT=8000   VLLM_MAX_MODEL_LEN=4096
 #   VLLM_GPU_MEM     (default 0.90, or 0.85 with --share-sidecar-gpu)
 #   SHARE_SIDECAR_GPU=true   (same as --share-sidecar-gpu; --no-share-sidecar-gpu to force off)
@@ -85,7 +85,7 @@ GRAD_ACCUM=8
 PER_DEVICE_BATCH=1
 LEARNING_RATE=1e-5
 SAVE_STEPS=${SAVE_STEPS:-10}
-CKPT_KEEP_EVERY=${CKPT_KEEP_EVERY:-200}
+CKPT_KEEP_EVERY=${CKPT_KEEP_EVERY:-500}
 EXTRA_ARGS=""
 DIRECT=false
 
