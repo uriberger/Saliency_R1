@@ -15,7 +15,7 @@
 # override, e.g.:  bash launch_coldstart_job.sh per_device_train_batch_size=4
 #
 # Environment overrides:
-#   PARTITION=batch_block1   DURATION=4 (hours)   HF_TOKEN=...   WANDB_API_KEY=...
+#   PARTITION=batch_singlenode   DURATION=4 (hours)   HF_TOKEN=...   WANDB_API_KEY=...
 set -e
 
 # ADLR cluster-interface tools (submit_job, etc.) on PATH. Resolved at run time --
@@ -25,7 +25,7 @@ sr1_find_submit_job || { echo "ERROR: submit_job not found under the cluster-int
 
 # ---------- cluster / project constants ----------
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-$(sr1_pick_partition batch_block1 batch_long batch)}
+PARTITION=${PARTITION:-$(sr1_pick_partition batch_singlenode batch_long batch)}
 DURATION=${DURATION:-4}
 REPO=/home/uberger/scratch/research/saliency_r1
 LF_DIR=/home/uberger/scratch/research/LLaMA-Factory

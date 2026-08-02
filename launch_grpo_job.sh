@@ -11,7 +11,7 @@
 # Any flag not parsed below is forwarded verbatim to grpo_vlm.py via EXTRA_ARGS.
 #
 # Environment overrides:
-#   PARTITION=batch_block1      DURATION=4 (hours)
+#   PARTITION=batch_singlenode  DURATION=4 (hours)
 #   OPENAI_API_KEY / OPENAI_BASE_URL   consumed by trl/rewards/openai_rewards.py (LLM-as-judge)
 #   WANDB_API_KEY                       omit -> WANDB_MODE=offline
 #   HF_TOKEN                            for gated model/dataset downloads
@@ -24,7 +24,7 @@ sr1_find_submit_job || { echo "ERROR: submit_job not found under the cluster-int
 
 # ---------- cluster / project constants ----------
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-$(sr1_pick_partition batch_block1 batch_long batch)}
+PARTITION=${PARTITION:-$(sr1_pick_partition batch_singlenode batch_long batch)}
 DURATION=${DURATION:-4}
 REPO=/home/uberger/scratch/research/saliency_r1
 CONDA_SH=/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh
