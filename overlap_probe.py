@@ -406,12 +406,19 @@ def score_steps(all_step_maps, images_per_completion):
         }
         if mask is None:
             rec.update(grounded=False, box_area_frac=None, score=None,
+                       mean_in_raw=None, auroc_raw=None,
                        note="DINO could not ground this step (or union degenerate) -> SKIPPED, not scored 0")
         else:
+            # `score` is the configured metric (with the mass gate) and is what the
+            # reward uses. Both metrics are also recorded ungated on every step, so the
+            # two can be compared on identical maps and masks -- a paired comparison of
+            # metrics rather than one across runs with different completions.
             rec.update(
                 grounded=True,
                 box_area_frac=float(mask.sum()) / float(mask.size),
                 score=OREW._step_score(smap, mask),
+                mean_in_raw=OREW._mean_in(smap, mask),
+                auroc_raw=OREW._auroc(smap, mask),
                 note="",
             )
         detail[c].append(rec)
@@ -597,6 +604,8 @@ def main():
     p.add_argument("--judge", action=argparse.BooleanOptionalAction, default=False,
                    help="query the LLM judge for openai_reward (needs NVIDIA_API_KEY)")
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--skip-base", action="store_true",
+                   help="evaluate only the adapters, not the un-adapted base model")
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--out-dir", default=str(REPO / "outputs/overlap_probe"))
@@ -640,7 +649,9 @@ def main():
     # --trained-adapter takes a comma-separated list so several checkpoints are compared
     # on identical prompts in one pass; the label comes from the adapter directory name
     # rather than being hardcoded, so a report can't silently mislabel which step it is.
-    specs = [{"name": "base_coldstart", "path": args.base_model, "adapter": None}]
+    # --skip-base still loads the base weights (the LoRA needs them) but does not
+    # evaluate the un-adapted model, which is a third of the run when it isn't needed.
+    specs = [] if args.skip_base else [{"name": "base_coldstart", "path": args.base_model, "adapter": None}]
     for ad in (a.strip() for a in (args.trained_adapter or "").split(",")):
         if not ad or ad.lower() == "none":
             continue
