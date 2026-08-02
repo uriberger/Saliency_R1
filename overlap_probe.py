@@ -628,8 +628,10 @@ def main():
     # can interleave and leave a truncated file.
     for r in mine:
         f = out_dir / "images" / f"{r['dataset']}_{r['question_id']}.png"
-        tmp_f = f.with_suffix(f".tmp{args.shard}")
-        r["image"].save(tmp_f)
+        # Suffix the whole name, not with_suffix(): that would replace ".png" and PIL
+        # then cannot infer the format. Pass format explicitly regardless.
+        tmp_f = f.with_name(f.name + f".tmp{args.shard}")
+        r["image"].save(tmp_f, format="PNG")
         os.replace(tmp_f, f)
     print(f"[probe] shard {args.shard}/{args.num_shards}: {len(mine)}/{len(rows)} samples", flush=True)
     if not mine:
@@ -657,7 +659,10 @@ def main():
 def render(out_dir: Path):
     shards = sorted(out_dir.glob("probe_shard*.json"))
     if not shards:
-        raise SystemExit(f"no probe_shard*.json in {out_dir}")
+        # Return rather than raise: the launcher renders unconditionally, and aborting
+        # here under `set -e` would swallow its own "shard N failed" summary.
+        print(f"[render] nothing to merge: no probe_shard*.json in {out_dir}")
+        return
     merged, cfg = {}, None
     for s in shards:
         d = json.loads(s.read_text())
