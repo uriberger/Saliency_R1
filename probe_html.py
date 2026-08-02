@@ -215,6 +215,11 @@ def write_html(merged: dict, out_path: Path, validator: Path | None = None) -> P
       <option value="abs">absolute (shared) — shows dimming</option>
       <option value="own">each map's own peak — shows shape</option>
     </select></label>
+    <label>Boxes <select id="fBoxes">
+      <option value="kept">scored boxes only</option>
+      <option value="all">all DINO boxes</option>
+      <option value="none">none — mask outline only</option>
+    </select></label>
     <label>Sort <select id="fSort">
       <option value="row">dataset order</option>
       <option value="dup">duplicate steps</option>
@@ -266,7 +271,7 @@ const fmt = (v, n = 3) => (v === null || v === undefined || Number.isNaN(v)) ? '
 const norm = s => s.trim().toLowerCase().replace(/\\s+/g, ' ');
 
 // ---------- state ----------
-const S = {{ model: MODELS[0], metric: 'score', sort: 'row', dupOnly: false, q: '', table: false, heat: 'abs' }};
+const S = {{ model: MODELS[0], metric: 'score', sort: 'row', dupOnly: false, q: '', table: false, heat: 'abs', boxes: 'kept' }};
 
 // ---------- derived ----------
 function steps(c) {{ return (c.observe_steps || []); }}
@@ -574,12 +579,38 @@ function drawStep(cv, st, src) {{
         ctx.fillRect(x * cw, y * chh, cw + 0.6, chh + 0.6);
       }}
     }}
-    const kept = new Set((st.boxes_kept || []).map(bb => bb.join(',')));
-    for (const bb of (st.boxes_raw || [])) {{
-      const isKept = kept.has(bb.join(','));
-      ctx.lineWidth = isKept ? 2 : 1;
-      ctx.strokeStyle = isKept ? css('--s2') : css('--muted');
-      ctx.strokeRect(bb[0] * W, bb[1] * H, (bb[2] - bb[0]) * W, (bb[3] - bb[1]) * H);
+    // DINO returns 16-19 boxes on a typical step; drawn as 19 solid rectangles on a
+    // 168px thumbnail that is an unreadable tangle. So the bold mark is the union mask
+    // -- the patches that actually entered the score -- and the individual boxes are
+    // thin and optional underneath it.
+    const [gh2, gw2] = st.grid || [0, 0];
+    const cw2 = gw2 ? W / gw2 : 0, ch2 = gh2 ? H / gh2 : 0;
+    if (S.boxes !== 'none') {{
+      const kept = new Set((st.boxes_kept || []).map(bb => bb.join(',')));
+      for (const bb of (st.boxes_raw || [])) {{
+        const isKept = kept.has(bb.join(','));
+        if (!isKept && S.boxes !== 'all') continue;
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = isKept ? css('--s2') : css('--muted');
+        ctx.globalAlpha = isKept ? 0.55 : 0.35;
+        ctx.strokeRect(bb[0] * W, bb[1] * H, (bb[2] - bb[0]) * W, (bb[3] - bb[1]) * H);
+      }}
+      ctx.globalAlpha = 1;
+    }}
+    if (st.mask_q && gh2 && gw2) {{
+      // outline of the scored region: every mask cell edge that borders a non-mask cell
+      const mk = b64u8(st.mask_q);
+      const on = (y, x) => y >= 0 && x >= 0 && y < gh2 && x < gw2 && mk[y * gw2 + x];
+      ctx.strokeStyle = css('--s2'); ctx.lineWidth = 2; ctx.beginPath();
+      for (let y = 0; y < gh2; y++) for (let x = 0; x < gw2; x++) {{
+        if (!on(y, x)) continue;
+        const X = x * cw2, Y = y * ch2;
+        if (!on(y - 1, x)) {{ ctx.moveTo(X, Y); ctx.lineTo(X + cw2, Y); }}
+        if (!on(y + 1, x)) {{ ctx.moveTo(X, Y + ch2); ctx.lineTo(X + cw2, Y + ch2); }}
+        if (!on(y, x - 1)) {{ ctx.moveTo(X, Y); ctx.lineTo(X, Y + ch2); }}
+        if (!on(y, x + 1)) {{ ctx.moveTo(X + cw2, Y); ctx.lineTo(X + cw2, Y + ch2); }}
+      }}
+      ctx.stroke();
     }}
   }};
   if (im.complete && im.naturalWidth) go(); else im.addEventListener('load', go, {{ once: true }});
@@ -610,8 +641,11 @@ function mapLegend() {{
   return el('div', {{ class: 'maplegend' }},
     el('span', {{}}, el('i', {{ class: 'sw', style: `background:${{grad}}` }}),
       S.heat === 'abs' ? `attention, shared scale 0 → ${{fmt(ABS_REF, 5)}}` : "attention, each map's own peak"),
-    el('span', {{}}, el('i', {{ class: 'bx', style: `border:2px solid ${{css('--s2')}}` }}), 'DINO box scored'),
-    el('span', {{}}, el('i', {{ class: 'bx', style: `border:1px solid ${{css('--muted')}}` }}),
+    el('span', {{}}, el('i', {{ class: 'bx', style: `border:2px solid ${{css('--s2')}}` }}),
+      'scored region (union mask)'),
+    el('span', {{}}, el('i', {{ class: 'bx', style: `border:1px solid ${{css('--s2')}};opacity:.55` }}),
+      'DINO box kept'),
+    el('span', {{}}, el('i', {{ class: 'bx', style: `border:1px solid ${{css('--muted')}};opacity:.35` }}),
       `dropped by max_box_area=${{CFG.max_box_area}}`),
     el('span', {{}}, 'base image desaturated so the overlay reads'));
 }}
@@ -774,6 +808,7 @@ $('#fModel').value = S.model;
 $('#fModel').onchange = e => {{ S.model = e.target.value; renderAll(); }};
 $('#fMetric').onchange = e => {{ S.metric = e.target.value; renderRepeat(); renderSamples(); }};
 $('#fHeat').onchange = e => {{ S.heat = e.target.value; renderSamples(); }};
+$('#fBoxes').onchange = e => {{ S.boxes = e.target.value; renderSamples(); }};
 $('#fSort').onchange = e => {{ S.sort = e.target.value; renderSamples(); }};
 $('#fDup').onchange = e => {{ S.dupOnly = e.target.checked; renderSamples(); }};
 let qt; $('#fQ').oninput = e => {{ clearTimeout(qt); qt = setTimeout(() => {{ S.q = e.target.value; renderSamples(); }}, 180); }};

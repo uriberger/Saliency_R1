@@ -91,6 +91,6 @@ fi
 
 echo "[render] merging shards"
 python overlap_probe.py --render --out-dir "$OUT_DIR"
-echo "Report: $OUT_DIR/probe_report.md"
+echo "Report: $OUT_DIR/probe_report.html"
 [[ $fail -eq 0 ]] || echo "WARNING: at least one shard failed; the report covers the shards that finished." >&2
 exit 0
