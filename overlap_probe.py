@@ -591,7 +591,11 @@ def main():
     p.add_argument("--dino-api-base", default=None)
     p.add_argument("--steps-device", default=None)
     p.add_argument("--steps-ckpt", default=os.environ.get("OVERLAP_STEPS_CKPT", str(repo_path("checkpoint/steps_classifier/best"))))
-    p.add_argument("--judge", action="store_true", help="query the LLM judge (needs NVIDIA_API_KEY)")
+    # BooleanOptionalAction gives both --judge and --no-judge, so this matches the
+    # spelling launch_overlap_probe.sh accepts (the two interfaces drifting apart is
+    # exactly what made the hand-run commands fail).
+    p.add_argument("--judge", action=argparse.BooleanOptionalAction, default=False,
+                   help="query the LLM judge for openai_reward (needs NVIDIA_API_KEY)")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num-shards", type=int, default=1)
