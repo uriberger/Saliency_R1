@@ -215,6 +215,11 @@ def write_html(merged: dict, out_path: Path, validator: Path | None = None) -> P
       <option value="abs">absolute (shared) — shows dimming</option>
       <option value="own">each map's own peak — shows shape</option>
     </select></label>
+    <label>Overlay <select id="fOverlay">
+      <option value="strong">strong</option>
+      <option value="normal">normal</option>
+      <option value="subtle">subtle</option>
+    </select></label>
     <label>Boxes <select id="fBoxes">
       <option value="kept">scored boxes only</option>
       <option value="all">all DINO boxes</option>
@@ -271,7 +276,7 @@ const fmt = (v, n = 3) => (v === null || v === undefined || Number.isNaN(v)) ? '
 const norm = s => s.trim().toLowerCase().replace(/\\s+/g, ' ');
 
 // ---------- state ----------
-const S = {{ model: MODELS[0], metric: 'score', sort: 'row', dupOnly: false, q: '', table: false, heat: 'abs', boxes: 'kept' }};
+const S = {{ model: MODELS[0], metric: 'score', sort: 'row', dupOnly: false, q: '', table: false, heat: 'abs', boxes: 'kept', overlay: 'strong' }};
 
 // ---------- derived ----------
 function steps(c) {{ return (c.observe_steps || []); }}
@@ -530,6 +535,7 @@ function segmentsFor(c) {{
 }}
 
 // ---------- attention-map thumbnails ----------
+const OPACITY = {{ subtle: 0.75, normal: 1.0, strong: 1.4 }};
 const IMGCACHE = new Map();
 function getImage(src) {{
   if (!IMGCACHE.has(src)) {{ const im = new Image(); im.src = src; IMGCACHE.set(src, im); }}
@@ -548,10 +554,20 @@ function computeAbsRef() {{
     .map(s => s.map_max).filter(x => x != null).sort((a, b) => a - b);
   ABS_REF = v.length ? (v[Math.floor(0.95 * (v.length - 1))] || 1) : 1;
 }}
+// Sequential ramp as RGB triples. A single hue at varying alpha was too faint to read
+// over a photo, so value drives BOTH the ramp step and the opacity, and a gamma lifts
+// the mid range — most patches sit near zero, so a linear map leaves everything but the
+// peak invisible, which is exactly the range the flattening lives in.
+const HEAT_GAMMA = 0.55;
+function seqRamp() {{
+  const out = [];
+  for (let i = 0; i < 13; i++) {{
+    const hex = css('--seq-' + i).replace('#', '');
+    out.push([0, 2, 4].map(k => parseInt(hex.slice(k, k + 2), 16)));
+  }}
+  return out;
+}}
 function heatRGB() {{
-  // single-hue sequential overlay; the base image is drawn desaturated underneath so
-  // the hue reads regardless of what the photo happens to contain (a blue heat over a
-  // blue sky would otherwise be invisible — and sky sentences are the whole story here)
   const hex = css('--s1').replace('#', '');
   return [0, 2, 4].map(i => parseInt(hex.slice(i, i + 2), 16));
 }}
@@ -564,18 +580,22 @@ function drawStep(cv, st, src) {{
     const ctx = cv.getContext('2d');
     ctx.clearRect(0, 0, W, H);
     ctx.save();
-    try {{ ctx.filter = 'grayscale(1) contrast(0.72) brightness(1.12)'; }} catch (e) {{}}
+    // Wash the photo out hard: the overlay has to win against arbitrary image content.
+    try {{ ctx.filter = 'grayscale(1) contrast(0.45) brightness(1.35)'; }} catch (e) {{}}
     ctx.drawImage(im, 0, 0, W, H);
     ctx.restore();
     if (st.map_q && st.grid) {{
       const [gh, gw] = st.grid, q = b64u8(st.map_q);
-      const cw = W / gw, chh = H / gh, [r, g, b] = heatRGB();
+      const cw = W / gw, chh = H / gh, RAMP = seqRamp(), K = OPACITY[S.overlay];
       for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {{
         let v = q[y * gw + x] / 255;
         if (S.heat === 'abs') v = v * (st.map_max || 0) / (ABS_REF || 1);
         v = Math.max(0, Math.min(1, v));
-        if (v <= 0.02) continue;
-        ctx.fillStyle = `rgba(${{r}},${{g}},${{b}},${{(0.88 * v).toFixed(3)}})`;
+        if (v <= 0.015) continue;
+        const t = Math.pow(v, HEAT_GAMMA);
+        const [r, g, b] = RAMP[Math.min(12, Math.round(t * 12))];
+        const a = Math.min(1, (0.30 + 0.70 * t) * K);
+        ctx.fillStyle = `rgba(${{r}},${{g}},${{b}},${{a.toFixed(3)}})`;
         ctx.fillRect(x * cw, y * chh, cw + 0.6, chh + 0.6);
       }}
     }}
@@ -636,8 +656,9 @@ function mapCell(st, src, label) {{
   return cell;
 }}
 function mapLegend() {{
-  const [r, g, b] = heatRGB();
-  const grad = `linear-gradient(90deg, rgba(${{r}},${{g}},${{b}},0.04), rgba(${{r}},${{g}},${{b}},0.88))`;
+  const RAMP = seqRamp();
+  const grad = 'linear-gradient(90deg,' + RAMP.map((c, i) =>
+    `rgba(${{c[0]}},${{c[1]}},${{c[2]}},${{(0.30 + 0.70 * i / 12).toFixed(2)}}) ${{Math.round(100 * i / 12)}}%`).join(',') + ')';
   return el('div', {{ class: 'maplegend' }},
     el('span', {{}}, el('i', {{ class: 'sw', style: `background:${{grad}}` }}),
       S.heat === 'abs' ? `attention, shared scale 0 → ${{fmt(ABS_REF, 5)}}` : "attention, each map's own peak"),
@@ -809,6 +830,7 @@ $('#fModel').onchange = e => {{ S.model = e.target.value; renderAll(); }};
 $('#fMetric').onchange = e => {{ S.metric = e.target.value; renderRepeat(); renderSamples(); }};
 $('#fHeat').onchange = e => {{ S.heat = e.target.value; renderSamples(); }};
 $('#fBoxes').onchange = e => {{ S.boxes = e.target.value; renderSamples(); }};
+$('#fOverlay').onchange = e => {{ S.overlay = e.target.value; renderSamples(); }};
 $('#fSort').onchange = e => {{ S.sort = e.target.value; renderSamples(); }};
 $('#fDup').onchange = e => {{ S.dupOnly = e.target.checked; renderSamples(); }};
 let qt; $('#fQ').oninput = e => {{ clearTimeout(qt); qt = setTimeout(() => {{ S.q = e.target.value; renderSamples(); }}, 180); }};

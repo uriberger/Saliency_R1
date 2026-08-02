@@ -686,10 +686,17 @@ def main():
     # --skip-base still loads the base weights (the LoRA needs them) but does not
     # evaluate the un-adapted model, which is a third of the run when it isn't needed.
     specs = [] if args.skip_base else [{"name": "base_coldstart", "path": args.base_model, "adapter": None}]
-    for ad in (a.strip() for a in (args.trained_adapter or "").split(",")):
-        if not ad or ad.lower() == "none":
+    # Each entry may be written NAME=PATH: these directory names differ only by a
+    # trailing suffix, so the auto-label is ambiguous and a report could silently
+    # mislabel which run a column belongs to.
+    for entry in (a.strip() for a in (args.trained_adapter or "").split(",")):
+        if not entry or entry.lower() == "none":
             continue
-        specs.append({"name": "grpo_" + Path(ad).name, "path": args.base_model, "adapter": ad})
+        name, sep, path = entry.partition("=")
+        name, path = (name.strip(), path.strip()) if sep else ("", entry)
+        if not os.path.isfile(os.path.join(path, "adapter_config.json")):
+            raise SystemExit(f"not a LoRA adapter directory (no adapter_config.json): {path}")
+        specs.append({"name": name or ("grpo_" + Path(path).name), "path": args.base_model, "adapter": path})
 
     result = {"config": vars(args), "models": {}}
     for spec in specs:
