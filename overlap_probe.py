@@ -637,9 +637,14 @@ def main():
     if not mine:
         return
 
+    # --trained-adapter takes a comma-separated list so several checkpoints are compared
+    # on identical prompts in one pass; the label comes from the adapter directory name
+    # rather than being hardcoded, so a report can't silently mislabel which step it is.
     specs = [{"name": "base_coldstart", "path": args.base_model, "adapter": None}]
-    if args.trained_adapter and args.trained_adapter.lower() != "none":
-        specs.append({"name": "grpo_step2000", "path": args.base_model, "adapter": args.trained_adapter})
+    for ad in (a.strip() for a in (args.trained_adapter or "").split(",")):
+        if not ad or ad.lower() == "none":
+            continue
+        specs.append({"name": "grpo_" + Path(ad).name, "path": args.base_model, "adapter": ad})
 
     result = {"config": vars(args), "models": {}}
     for spec in specs:
