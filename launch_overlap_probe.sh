@@ -19,15 +19,27 @@ JUDGE="--judge"
 OUT_DIR="$REPO/outputs/overlap_probe/$(date +%Y%m%d-%H%M%S)"
 EXTRA=()
 
+SMOKE=0
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --n-samples) N_SAMPLES="$2"; shift 2 ;;
         --gpus)      GPUS="$2";      shift 2 ;;
         --out-dir)   OUT_DIR="$2";   shift 2 ;;
         --no-judge)  JUDGE="";       shift   ;;
+        # One GPU, two samples, no judge: exercises model+adapter load, generation,
+        # the layer-L hook, DINO and the step classifier before committing 8 GPUs.
+        --smoke)     SMOKE=1;        shift   ;;
         *)           EXTRA+=("$1");  shift   ;;
     esac
 done
+
+if [[ $SMOKE -eq 1 ]]; then
+    N_SAMPLES=2
+    GPUS=1
+    JUDGE=""
+    OUT_DIR="$REPO/outputs/overlap_probe/smoke-$(date +%Y%m%d-%H%M%S)"
+fi
 
 CONDA_ENV=${CONDA_ENV:-saliency_r1_qwen3_vllm}
 CONDA_ROOT=${CONDA_ROOT:-/lustre/fs12/portfolios/nvr/projects/nvr_israel_rlop/users/uberger/research/miniforge3}
@@ -70,6 +82,12 @@ for i in "${!pids[@]}"; do
         fail=1
     fi
 done
+
+if [[ $SMOKE -eq 1 ]]; then
+    echo "---------------- smoke shard log (tail) ----------------"
+    tail -40 "$OUT_DIR/shard0.log"
+    echo "--------------------------------------------------------"
+fi
 
 echo "[render] merging shards"
 python overlap_probe.py --render --out-dir "$OUT_DIR"
