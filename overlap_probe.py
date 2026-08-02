@@ -39,6 +39,26 @@ import torch
 
 REPO = Path(__file__).resolve().parent
 
+
+def repo_path(rel: str) -> Path:
+    """Resolve a repo-relative path, falling back to the central tree.
+
+    Worktrees only symlink the paths in .worktree-links; gitignored corpora such as
+    cold_data/grpo_sets/ are untracked in the central tree, so they exist neither in
+    the worktree checkout nor as a link. Resolve those against the central tree
+    (.worktrees/<branch>/ -> two levels up) instead of failing with a confusing
+    "couldn't find any data file" from load_dataset.
+    """
+    p = REPO / rel
+    if p.exists():
+        return p
+    if REPO.parent.name == ".worktrees":
+        alt = REPO.parent.parent / rel
+        if alt.exists():
+            return alt
+    return p
+
+
 # The trainer's SYSTEM_PROMPT (grpo_vlm_qwen3.py). Must match or the model is
 # off-distribution and the probe measures the wrong thing.
 SYSTEM_PROMPT = (
@@ -135,18 +155,32 @@ def prepare_image(image):
     return image
 
 
-def load_samples(dataset_path: str, n: int, seed: int):
+def load_samples(dataset_path: str, n: int, seed: int, cache_tag: str = ""):
     from datasets import load_dataset, load_from_disk
 
     if os.path.isfile(os.path.join(dataset_path, "state.json")):
         ds = load_from_disk(dataset_path)
         if hasattr(ds, "keys"):
             ds = ds["train"]
-    else:
+    elif os.path.isdir(dataset_path):
         ds = load_dataset(dataset_path, split="train")
+    else:
+        raise SystemExit(
+            f"dataset not found: {dataset_path}\n"
+            "If you are running from a worktree, cold_data/ is untracked and is not "
+            "symlinked in -- pass --dataset with an absolute path to the central tree."
+        )
     # The trainer holds out 100 rows with seed 42 before training; sample from the
     # same train side so the probe sees prompts the model actually trained on.
-    ds = ds.train_test_split(test_size=100, seed=42)["train"]
+    # Per-shard indices cache files: 8 concurrent shards writing the dataset's shared
+    # cache-*.arrow would race on the same filenames.
+    tmp = Path(os.environ.get("TMPDIR", "/tmp")) / f"probe_split{cache_tag}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    ds = ds.train_test_split(
+        test_size=100, seed=42,
+        train_indices_cache_file_name=str(tmp / "train.arrow"),
+        test_indices_cache_file_name=str(tmp / "test.arrow"),
+    )["train"]
     rng = np.random.default_rng(seed)
     idx = sorted(rng.choice(len(ds), size=min(n, len(ds)), replace=False).tolist())
     rows = []
@@ -536,11 +570,11 @@ def run_model(spec, rows, args, device):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", default=str(REPO / "cold_data/grpo_sets/set_a"))
+    p.add_argument("--dataset", default=str(repo_path("cold_data/grpo_sets/set_a")))
     p.add_argument("--n-samples", type=int, default=30)
     p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--base-model", default=str(REPO / "checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged"))
-    p.add_argument("--trained-adapter", default=str(REPO / "checkpoint/grpo-coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged-overlap__wov0.4_2head_trmean_50k_set_a/checkpoint-2000"))
+    p.add_argument("--base-model", default=str(repo_path("checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged")))
+    p.add_argument("--trained-adapter", default=str(repo_path("checkpoint/grpo-coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged-overlap__wov0.4_2head_trmean_50k_set_a/checkpoint-2000")))
     p.add_argument("--num-generations", type=int, default=8)
     p.add_argument("--max-new-tokens", type=int, default=1024)
     p.add_argument("--temperature", type=float, default=1.0)
@@ -556,7 +590,7 @@ def main():
     p.add_argument("--dino-device", default=None)
     p.add_argument("--dino-api-base", default=None)
     p.add_argument("--steps-device", default=None)
-    p.add_argument("--steps-ckpt", default=os.environ.get("OVERLAP_STEPS_CKPT", str(REPO / "checkpoint/steps_classifier/best")))
+    p.add_argument("--steps-ckpt", default=os.environ.get("OVERLAP_STEPS_CKPT", str(repo_path("checkpoint/steps_classifier/best"))))
     p.add_argument("--judge", action="store_true", help="query the LLM judge (needs NVIDIA_API_KEY)")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--shard", type=int, default=0)
@@ -584,12 +618,15 @@ def main():
     if args.steps_device is None:
         args.steps_device = args.device
 
-    rows = load_samples(args.dataset, args.n_samples, args.seed)
-    for r in rows:
-        f = out_dir / "images" / f"{r['dataset']}_{r['question_id']}.png"
-        if not f.exists():
-            r["image"].save(f)
+    rows = load_samples(args.dataset, args.n_samples, args.seed, cache_tag=f"_s{args.shard}")
     mine = [r for i, r in enumerate(rows) if i % args.num_shards == args.shard]
+    # Each shard exports only its own images: concurrent shards writing the same PNG
+    # can interleave and leave a truncated file.
+    for r in mine:
+        f = out_dir / "images" / f"{r['dataset']}_{r['question_id']}.png"
+        tmp_f = f.with_suffix(f".tmp{args.shard}")
+        r["image"].save(tmp_f)
+        os.replace(tmp_f, f)
     print(f"[probe] shard {args.shard}/{args.num_shards}: {len(mine)}/{len(rows)} samples", flush=True)
     if not mine:
         return
