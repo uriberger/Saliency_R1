@@ -157,6 +157,29 @@ details > summary {{ cursor: pointer; color: var(--ink2); font-size: 12px; margi
 .tip td {{ border: 0; padding: 1px 4px; }}
 .hidden {{ display: none !important; }}
 .note {{ font-size: 12px; color: var(--muted); margin-top: 6px; }}
+
+/* --- attention-map thumbnails ----------------------------------------------- */
+.maps {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }}
+.mapcell {{ width: 168px; }}
+.mapcell canvas {{
+  width: 168px; height: auto; display: block; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--page);
+}}
+.mapcell .cap {{ font-size: 11px; color: var(--ink2); margin-top: 3px; line-height: 1.35;
+                 font-variant-numeric: tabular-nums; }}
+.mapcell .cap b {{ color: var(--ink); }}
+.mapcell .txt {{ font-size: 11px; color: var(--muted); overflow: hidden;
+                 display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }}
+.repeatrow {{
+  border-left: 2px solid var(--s2); padding-left: 10px; margin: 12px 0;
+}}
+.repeatrow > .rtitle {{ font-size: 12px; color: var(--ink2); margin-bottom: 4px; }}
+.maplegend {{ display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+              font-size: 11px; color: var(--muted); margin-top: 8px; }}
+.maplegend .sw {{ width: 42px; height: 10px; display: inline-block; border-radius: 3px;
+                  vertical-align: middle; margin-right: 5px; }}
+.maplegend .bx {{ width: 12px; height: 10px; display: inline-block; vertical-align: middle;
+                  margin-right: 5px; }}
 """
 
 
@@ -187,6 +210,10 @@ def write_html(merged: dict, out_path: Path, validator: Path | None = None) -> P
       <option value="score">score (reward metric)</option>
       <option value="mean_in_raw">mean_in</option>
       <option value="auroc_raw">auroc</option>
+    </select></label>
+    <label>Map scale <select id="fHeat">
+      <option value="abs">absolute (shared) — shows dimming</option>
+      <option value="own">each map's own peak — shows shape</option>
     </select></label>
     <label>Sort <select id="fSort">
       <option value="row">dataset order</option>
@@ -239,7 +266,7 @@ const fmt = (v, n = 3) => (v === null || v === undefined || Number.isNaN(v)) ? '
 const norm = s => s.trim().toLowerCase().replace(/\\s+/g, ' ');
 
 // ---------- state ----------
-const S = {{ model: MODELS[0], metric: 'score', sort: 'row', dupOnly: false, q: '', table: false }};
+const S = {{ model: MODELS[0], metric: 'score', sort: 'row', dupOnly: false, q: '', table: false, heat: 'abs' }};
 
 // ---------- derived ----------
 function steps(c) {{ return (c.observe_steps || []); }}
@@ -497,6 +524,105 @@ function segmentsFor(c) {{
   }});
 }}
 
+// ---------- attention-map thumbnails ----------
+const IMGCACHE = new Map();
+function getImage(src) {{
+  if (!IMGCACHE.has(src)) {{ const im = new Image(); im.src = src; IMGCACHE.set(src, im); }}
+  return IMGCACHE.get(src);
+}}
+function b64u8(s) {{
+  const bin = atob(s), a = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
+  return a;
+}}
+// Absolute reference for the shared scale: p95 of map peaks across this model, so one
+// bright step doesn't crush every other map to black.
+let ABS_REF = 1;
+function computeAbsRef() {{
+  const v = DATA.models[S.model].samples.flatMap(s => s.completions).flatMap(steps)
+    .map(s => s.map_max).filter(x => x != null).sort((a, b) => a - b);
+  ABS_REF = v.length ? (v[Math.floor(0.95 * (v.length - 1))] || 1) : 1;
+}}
+function heatRGB() {{
+  // single-hue sequential overlay; the base image is drawn desaturated underneath so
+  // the hue reads regardless of what the photo happens to contain (a blue heat over a
+  // blue sky would otherwise be invisible — and sky sentences are the whole story here)
+  const hex = css('--s1').replace('#', '');
+  return [0, 2, 4].map(i => parseInt(hex.slice(i, i + 2), 16));
+}}
+function drawStep(cv, st, src) {{
+  const im = getImage(src);
+  const go = () => {{
+    const nw = im.naturalWidth || 1, nh = im.naturalHeight || 1;
+    const W = 336, H = Math.max(1, Math.round(W * nh / nw));
+    cv.width = W; cv.height = H;
+    const ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, W, H);
+    ctx.save();
+    try {{ ctx.filter = 'grayscale(1) contrast(0.72) brightness(1.12)'; }} catch (e) {{}}
+    ctx.drawImage(im, 0, 0, W, H);
+    ctx.restore();
+    if (st.map_q && st.grid) {{
+      const [gh, gw] = st.grid, q = b64u8(st.map_q);
+      const cw = W / gw, chh = H / gh, [r, g, b] = heatRGB();
+      for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {{
+        let v = q[y * gw + x] / 255;
+        if (S.heat === 'abs') v = v * (st.map_max || 0) / (ABS_REF || 1);
+        v = Math.max(0, Math.min(1, v));
+        if (v <= 0.02) continue;
+        ctx.fillStyle = `rgba(${{r}},${{g}},${{b}},${{(0.88 * v).toFixed(3)}})`;
+        ctx.fillRect(x * cw, y * chh, cw + 0.6, chh + 0.6);
+      }}
+    }}
+    const kept = new Set((st.boxes_kept || []).map(bb => bb.join(',')));
+    for (const bb of (st.boxes_raw || [])) {{
+      const isKept = kept.has(bb.join(','));
+      ctx.lineWidth = isKept ? 2 : 1;
+      ctx.strokeStyle = isKept ? css('--s2') : css('--muted');
+      ctx.strokeRect(bb[0] * W, bb[1] * H, (bb[2] - bb[0]) * W, (bb[3] - bb[1]) * H);
+    }}
+  }};
+  if (im.complete && im.naturalWidth) go(); else im.addEventListener('load', go, {{ once: true }});
+}}
+function mapCell(st, src, label) {{
+  const cv = el('canvas', {{ role: 'img',
+    'aria-label': `attention map for step ${{st.step_index}}: ${{st.text.slice(0, 80)}}` }});
+  const cell = el('div', {{ class: 'mapcell' }}, cv,
+    el('div', {{ class: 'cap' }}, label ? label + ' · ' : '',
+      'score ', el('b', {{}}, st.grounded ? fmt(st.score, 4) : 'skipped'),
+      ' · peak ', fmt(st.map_max, 5), ' · flat ', fmt(st.map_mean / st.map_max, 3)),
+    el('div', {{ class: 'txt' }}, st.text));
+  drawStep(cv, st, src);
+  bindTip(cell, `<b>step ${{st.step_index}}</b><table>
+    <tr><td>score</td><td>${{st.grounded ? fmt(st.score, 4) : 'skipped'}}</td></tr>
+    ${{st.mean_in_raw != null ? `<tr><td>mean_in</td><td>${{fmt(st.mean_in_raw, 4)}}</td></tr>` : ''}}
+    ${{st.auroc_raw != null ? `<tr><td>auroc</td><td>${{fmt(st.auroc_raw, 4)}}</td></tr>` : ''}}
+    <tr><td>image mass</td><td>${{fmt(st.image_mass, 5)}}</td></tr>
+    <tr><td>map peak</td><td>${{fmt(st.map_max, 5)}}</td></tr>
+    <tr><td>flatness mean/max</td><td>${{fmt(st.map_mean / st.map_max, 4)}}</td></tr>
+    <tr><td>boxes raw/kept</td><td>${{st.n_boxes_raw}}/${{st.n_boxes_kept}}</td></tr>
+    <tr><td>box area frac</td><td>${{fmt(st.box_area_frac, 3)}}</td></tr></table>`);
+  return cell;
+}}
+function mapLegend() {{
+  const [r, g, b] = heatRGB();
+  const grad = `linear-gradient(90deg, rgba(${{r}},${{g}},${{b}},0.04), rgba(${{r}},${{g}},${{b}},0.88))`;
+  return el('div', {{ class: 'maplegend' }},
+    el('span', {{}}, el('i', {{ class: 'sw', style: `background:${{grad}}` }}),
+      S.heat === 'abs' ? `attention, shared scale 0 → ${{fmt(ABS_REF, 5)}}` : "attention, each map's own peak"),
+    el('span', {{}}, el('i', {{ class: 'bx', style: `border:2px solid ${{css('--s2')}}` }}), 'DINO box scored'),
+    el('span', {{}}, el('i', {{ class: 'bx', style: `border:1px solid ${{css('--muted')}}` }}),
+      `dropped by max_box_area=${{CFG.max_box_area}}`),
+    el('span', {{}}, 'base image desaturated so the overlay reads'));
+}}
+function repeatGroups(c) {{
+  const g = new Map();
+  for (const st of steps(c)) {{
+    const k = norm(st.text); if (!g.has(k)) g.set(k, []); g.get(k).push(st);
+  }}
+  return [...g.values()].filter(v => v.length > 1);
+}}
+
 function renderCompletion(c, sample, lo, hi) {{
   const r = c.rewards;
   const dup = dupFrac(c);
@@ -560,8 +686,39 @@ function renderCompletion(c, sample, lo, hi) {{
       el('td', {{ class: 'num' }}, fmt(s.auroc_raw, 4)),
       el('td', {{ class: 'num' }}, s.grounded ? fmt(s.score, 4) : 'skipped')))));
 
+  // Attention maps, drawn only when opened: a 30-sample run has thousands of steps and
+  // eagerly rasterising every one would stall the page.
+  const hasMaps = steps(c).some(s => s.map_q);
+  let mapsBox = null;
+  if (hasMaps) {{
+    const reps = repeatGroups(c);
+    const det = el('details', {{}}, el('summary', {{}},
+      `attention maps — ${{steps(c).length}} steps${{reps.length ? `, ${{reps.length}} repeated sentence${{reps.length > 1 ? 's' : ''}}` : ''}}`));
+    let built = false;
+    det.addEventListener('toggle', () => {{
+      if (!det.open || built) return;
+      built = true;
+      det.append(mapLegend());
+      // repeated sentences first, in occurrence order: this is the comparison that
+      // shows the peak collapsing while the shape spreads
+      for (const grp of reps) {{
+        det.append(el('div', {{ class: 'repeatrow' }},
+          el('div', {{ class: 'rtitle' }},
+            `repeated ${{grp.length}}× — "${{grp[0].text.slice(0, 90)}}"`),
+          el('div', {{ class: 'maps' }},
+            ...grp.map((st, i) => mapCell(st, sample.image_file, `occurrence ${{i + 1}}`)))));
+      }}
+      det.append(el('div', {{ class: 'rtitle', style: 'font-size:12px;color:var(--ink2);margin-top:10px' }},
+        'all observe steps, in order'));
+      det.append(el('div', {{ class: 'maps' }},
+        ...steps(c).map(st => mapCell(st, sample.image_file, `#${{st.step_index}}`))));
+    }});
+    mapsBox = det;
+  }}
+
   return el('div', {{ class: 'compl' }}, chips, body,
     ans ? el('div', {{ class: 'answer' }}, el('span', {{ class: 'chip' }}, 'answer'), ' ', ans) : null,
+    mapsBox,
     el('details', {{}}, el('summary', {{}}, `per-step table (${{steps(c).length}} steps)`), stepTbl));
 }}
 
@@ -604,7 +761,7 @@ function applyTableView() {{
   document.querySelectorAll('.tv').forEach(t => t.classList.toggle('hidden', !S.table));
   document.querySelectorAll('#repeat svg, #dist svg, #dist .legend').forEach(s => s.classList.toggle('hidden', S.table));
 }}
-function renderAll() {{ renderSummary(); renderRepeat(); renderDist(); renderSamples(); }}
+function renderAll() {{ computeAbsRef(); renderSummary(); renderRepeat(); renderDist(); renderSamples(); }}
 
 // ---------- wire up ----------
 $('#runsub').textContent =
@@ -616,6 +773,7 @@ $('#fModel').replaceChildren(...MODELS.map(m => el('option', {{ value: m }}, m))
 $('#fModel').value = S.model;
 $('#fModel').onchange = e => {{ S.model = e.target.value; renderAll(); }};
 $('#fMetric').onchange = e => {{ S.metric = e.target.value; renderRepeat(); renderSamples(); }};
+$('#fHeat').onchange = e => {{ S.heat = e.target.value; renderSamples(); }};
 $('#fSort').onchange = e => {{ S.sort = e.target.value; renderSamples(); }};
 $('#fDup').onchange = e => {{ S.dupOnly = e.target.checked; renderSamples(); }};
 let qt; $('#fQ').oninput = e => {{ clearTimeout(qt); qt = setTimeout(() => {{ S.q = e.target.value; renderSamples(); }}, 180); }};

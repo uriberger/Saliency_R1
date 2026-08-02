@@ -369,7 +369,28 @@ def step_maps_from_attention(per_tok, steps, gh, gw, token_reduction):
 # ---------------------------------------------------------------------------
 # per-step scoring (think_overlap_reward, but retaining the per-step values)
 # ---------------------------------------------------------------------------
-def score_steps(all_step_maps, images_per_completion):
+def _b64_u8(arr) -> str:
+    return base64.b64encode(np.ascontiguousarray(arr, dtype=np.uint8).tobytes()).decode("ascii")
+
+
+def quantize_map(smap):
+    """uint8 map normalised to its OWN peak, base64'd, row-major (gh, gw).
+
+    Peak-normalised rather than absolute so one byte spans the full within-map range;
+    `map_max` is stored alongside, so the absolute value of a patch is exactly
+    `q / 255 * map_max`. Keeping both is the point: the flattening this probe is
+    chasing shows up as a *shape* change under peak-normalisation and as a *dimming*
+    on the absolute scale, and the viewer needs to switch between the two.
+    """
+    mx = float(smap.max())
+    if mx <= 0:
+        q = np.zeros(smap.shape, dtype=np.uint8)
+    else:
+        q = np.clip(np.rint(255.0 * (smap / mx)), 0, 255).astype(np.uint8)
+    return _b64_u8(q)
+
+
+def score_steps(all_step_maps, images_per_completion, store_maps=True):
     """all_step_maps: list (per completion) of step dicts. Returns per-completion detail.
 
     One batched DINO call over every (completion, step) pair, exactly like
@@ -404,6 +425,16 @@ def score_steps(all_step_maps, images_per_completion):
             "map_max": float(smap.max()),
             "map_mean": float(smap.mean()),
         }
+        if store_maps:
+            # Everything the viewer needs to redraw this step over the image: the
+            # patch grid, the peak-normalised map, and the DINO boxes both as proposed
+            # and as they survive the max_box_area filter (only `kept` feeds the mask,
+            # so seeing what was thrown away explains a low box_area_frac).
+            rec["grid"] = [int(gh), int(gw)]
+            rec["map_q"] = quantize_map(smap)
+            rec["boxes_raw"] = [[round(float(v), 5) for v in b] for b in (boxes or [])]
+            rec["boxes_kept"] = [[round(float(v), 5) for v in b] for b in kept]
+            rec["mask_q"] = _b64_u8(mask.astype(np.uint8)) if mask is not None else None
         if mask is None:
             rec.update(grounded=False, box_area_frac=None, score=None,
                        mean_in_raw=None, auroc_raw=None,
@@ -502,7 +533,7 @@ def run_model(spec, rows, args, device):
             all_maps.append(step_maps_from_attention(per_tok, steps, gh, gw, args.token_reduction))
             del per_tok
 
-        detail = score_steps(all_maps, [row["image"]] * len(comp_ids))
+        detail = score_steps(all_maps, [row["image"]] * len(comp_ids), store_maps=args.store_maps)
         overlap = []
         for c in range(len(comp_ids)):
             ov, _ = overlap_from_detail(detail[c], fmt_valid[c])
@@ -604,6 +635,8 @@ def main():
     p.add_argument("--judge", action=argparse.BooleanOptionalAction, default=False,
                    help="query the LLM judge for openai_reward (needs NVIDIA_API_KEY)")
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--store-maps", action=argparse.BooleanOptionalAction, default=True,
+                   help="persist each step's quantised attention map + DINO boxes for the viewer")
     p.add_argument("--skip-base", action="store_true",
                    help="evaluate only the adapters, not the un-adapted base model")
     p.add_argument("--shard", type=int, default=0)
