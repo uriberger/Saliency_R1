@@ -610,11 +610,12 @@ def main():
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--out-dir", default=str(REPO / "outputs/overlap_probe"))
     p.add_argument("--render", action="store_true", help="merge shard JSONs into a report and exit")
+    p.add_argument("--markdown", action="store_true", help="also emit the old probe_report.md")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
     if args.render:
-        render(out_dir)
+        render(out_dir, markdown=args.markdown)
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -672,7 +673,7 @@ def main():
 # ---------------------------------------------------------------------------
 # report
 # ---------------------------------------------------------------------------
-def render(out_dir: Path):
+def render(out_dir: Path, markdown: bool = False):
     shards = sorted(out_dir.glob("probe_shard*.json"))
     if not shards:
         # Return rather than raise: the launcher renders unconditionally, and aborting
@@ -689,7 +690,17 @@ def render(out_dir: Path):
     for m in merged.values():
         m["samples"].sort(key=lambda x: x["row_index"])
 
-    (out_dir / "probe_merged.json").write_text(json.dumps({"config": cfg, "models": merged}, indent=1))
+    payload = {"config": cfg, "models": merged}
+    (out_dir / "probe_merged.json").write_text(json.dumps(payload, indent=1))
+
+    # HTML is the primary report: the thing worth looking at is which sentences became
+    # scored observe steps and what each was worth, shown in place in the text.
+    from probe_html import write_html
+
+    write_html(payload, out_dir / "probe_report.html", REPO / "assets/validate_palette.js")
+    print(f"wrote {out_dir / 'probe_report.html'} and probe_merged.json")
+    if not markdown:
+        return
 
     def f(v, nd=4):
         return "None" if v is None else f"{float(v):.{nd}f}"
@@ -762,7 +773,7 @@ def render(out_dir: Path):
                              f"{f(d['score']) if d['grounded'] else 'SKIPPED (ungrounded)'} |")
                 L.append("")
     (out_dir / "probe_report.md").write_text("\n".join(L))
-    print(f"wrote {out_dir / 'probe_report.md'} and probe_merged.json")
+    print(f"wrote {out_dir / 'probe_report.md'}")
 
 
 if __name__ == "__main__":
