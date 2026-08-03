@@ -43,6 +43,16 @@ nan-summed out).
       wov0.4 runs did exactly that: their MMStar gain disappears once chance-corrected.
       See wiki/lmms-eval-overlap-comparison.md in the vlm_reasoning repo.
 
+      CONFIRMED ONLINE: the wov0.4 / trmean / 50k set_a run took this route at ~step
+      1200. It doubled the overlap reward (0.044 -> 0.085) by repeating observe steps,
+      and its cp_2000 scores BELOW the cold-start parent on the benchmarks (p3 60.7 ->
+      34.3, i.e. chance; mme 715 -> 642) while the training accuracy reward barely moved
+      -- the hack costs 0.006 accuracy on set_a and lives inside <think>, which
+      accuracy_reward never parses. See wiki/overlap-reward-hack-set-a.md (same repo)
+      for the full mechanism, and note the enabling condition is not the metric alone:
+      with scale_rewards=True, groups whose accuracy has saturated hand the overlap term
+      the entire, std-renormalized advantage (75% of groups by step 1500).
+
   mean_in_v2  (--overlap_metric mean_in_v2)
       mean over the box divided by the mean over the WHOLE map, i.e. the same numerator
       as mean_in but normalized by the map's average instead of its peak. Chance = 1.0
@@ -106,6 +116,14 @@ no correctness signal (r -0.004..-0.022), so an anti-brevity multiplier costs 24
 the reward's predictive value and a hard gate costs 50-70%, to close a step-dropping
 hole that is already ~5x smaller under auroc (0.20) than under mean_in (1.07). Monitor
 the observe-step count as a training diagnostic instead.
+
+The hole that actually opened online was the opposite one: DUPLICATED steps. The score
+is a mean over grounded steps, so re-quoting one trivially-groundable generic sentence
+pulls it up and dilutes the genuine, hard perception steps -- which is what the wov0.4 /
+set_a run learned (duplicate-sentence fraction 0.00 -> 0.19 over steps 1000-2000, mean
+completion length 163 -> 356 tokens). Log the duplicate fraction alongside the step
+count, and consider deduping identical steps before the mean.
+See wiki/overlap-reward-hack-set-a.md.
 
 Natural-images-only gating (--overlap_natural_only, OFF by default):
 
