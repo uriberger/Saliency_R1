@@ -1610,13 +1610,10 @@ class GRPOTrainer(Trainer):
                 if not invalid[case_id] or te <= ts:
                     continue
                 # --overlap_natural_only: this row's overlap reward is masked anyway, so
-                # its capture forward + T5 segmentation + DINO grounding would be pure
-                # waste. Skip the per-case work ONLY -- never the enclosing
-                # unwrap_model_for_generation, whose ZeRO-3 parameter gather is a
-                # collective that every rank must enter the same number of times, and
-                # ranks do not see the same natural/non-natural mix in their batch.
-                if self.overlap_natural_only and not self._row_is_natural(inputs, case_id):
-                    continue
+                # its T5 segmentation + DINO grounding are pure waste. The skip happens
+                # AFTER the capture forward below -- see the note there for why the
+                # forward itself cannot be skipped.
+                _skip_row = self.overlap_natural_only and not self._row_is_natural(inputs, case_id)
 
                 _case_inputs = {
                     "input_ids": prompt_completion_ids[case_id:case_id + 1],
@@ -1656,6 +1653,21 @@ class GRPOTrainer(Trainer):
                     _fwd = _unwrapped(**_case_inputs, output_attentions=True, output_hidden_states=False)
                     _attn_L = _fwd.attentions[L]
                     del _fwd
+
+                # --overlap_natural_only: bail out here, not before the forward above.
+                # `_unwrapped` is the very module DeepSpeed ZeRO-3 hangs its offload
+                # hooks on, so each capture forward fires _start_of_forward_hook ->
+                # param_coordinator.reset_step() (an allgather) and appends a full pass
+                # to the coordinator's __submodule_order. ZeRO-3 asserts that trace is
+                # byte-identical across ranks; ranks do not see the same
+                # natural/non-natural mix, so skipping the forward makes the traces
+                # diverge and the next training forward dies in reset_step with
+                # "disagreement between rank0 and rankN" (then a 30-min NCCL timeout).
+                # Everything below -- the CPU copy, T5 segmentation, and the DINO
+                # grounding it feeds -- is rank-local and safe to skip.
+                if _skip_row:
+                    del _attn_L
+                    continue
 
                 _image_mask = prompt_ids[case_id] == 151655
                 # [1, heads, think_len, n_patches] : observe-token query rows -> image-patch key cols
