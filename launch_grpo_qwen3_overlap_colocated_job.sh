@@ -49,13 +49,31 @@
 #                                ~3.6x the intended pressure.
 #
 # --overlap-metric mean_in_v2 is the third option: the same mean over the box, divided
-# by the mean over the WHOLE map instead of by its peak. Chance is 1.0 and it is
-# unbounded above, so it carries NO coupled defaults -- it keeps whatever --w-overlap
-# and --mass-floor-tau you pass, and the mean_in weights do not transfer (its per-step
-# spread is larger). Set --w-overlap deliberately, and consider --mass-floor-tau 0.0022
-# for the same reason auroc needs it: a ratio of two means is blind to the model
-# withdrawing attention from the image. Untested offline -- unlike mean_in and auroc it
-# has no attack/utility screen behind it.
+# by the mean over the WHOLE map instead of by its peak. Chance is 1.0, and it is
+# unbounded above only in principle -- measured over 1074 grounded steps of the
+# cold-start policy on set_a it runs p10 0.41 / median 0.74 / p99 1.36 / max 2.33,
+# because the median DINO box union already covers 56% of the image and the ceiling
+# (n_patches/n_in) is ~1.8 there. No clamp needed.
+#
+# It carries ONE coupled default, and unlike auroc's it was measured here rather than
+# taken from the offline screen (overlap_metric_spread.py on a 40-sample probe):
+#
+#   w_overlap       ->  0.033    Its per-sample sd is 0.105 vs mean_in's 0.0086, i.e.
+#                                12x the spread, so 0.4 x 0.0086/0.105 ~ 0.033
+#                                reproduces the pressure of mean_in's wov0.4. Reusing
+#                                0.2/0.4 would apply ~6-12x the intended pressure. The
+#                                same script re-derives auroc's weight as 0.089 against
+#                                the documented 0.11, so treat 0.033 as +-25%.
+#
+# The mass floor stays OFF: a ratio of two means is blind to the model withdrawing
+# attention from the image (the hole auroc's floor closes), but auroc's tau=0.0022 does
+# not fit this corpus -- p10 of image_mass here is 0.00078 and 0.0022 bites on 30% of
+# steps, well past the p25 the reward docstring warns about. If you enable it anyway,
+# the floor RAISES the spread (0.105 -> 0.143), so pass --w-overlap 0.024 with it.
+#
+# Two caveats it does have and mean_in does not: it is more coupled to DINO box size
+# (r +0.38 vs mean_in's +0.17), though that pull dies at 1.0 rather than diverging, and
+# it has no offline attack/utility screen behind it.
 #
 # MIXED CORPORA -- restrict the overlap reward to photographs:
 #
@@ -239,6 +257,13 @@ REFORWARD_SALIENCY=True
 if [[ "$OVERLAP_METRIC" == "auroc" ]]; then
     [[ -z "$MASS_FLOOR_TAU" ]] && MASS_FLOOR_TAU=0.0022
     [[ -z "${W_OVERLAP_SET:-}" ]] && W_OVERLAP=0.11
+fi
+# mean_in_v2 carries only the weight -- 0.033, measured (see the header). No mass floor
+# by default: the tau that fits this corpus is not auroc's 0.0022 (p10 of image_mass on
+# set_a is 0.00078, and 0.0022 bites on 30% of steps here), and 0.033 was measured with
+# the floor OFF. If you pass --mass-floor-tau anyway, drop the weight to ~0.024.
+if [[ "$OVERLAP_METRIC" == "mean_in_v2" ]]; then
+    [[ -z "${W_OVERLAP_SET:-}" ]] && W_OVERLAP=0.033
 fi
 
 # ---------- naming: every swept HP appears in the model AND wandb name ----------

@@ -53,10 +53,28 @@ nan-summed out).
       numerator and the denominator are means, so any rescale m -> c*m cancels exactly,
       and a uniform flattening moves the score TOWARD 1.0 rather than up. Unlike auroc
       it still sees magnitudes, so a map that concentrates more mass in the box (not
-      just ranks it higher) is rewarded for it. Unlike mean_in it is NOT bounded by 1,
-      so its spread differs — retune --reward_weights rather than reusing the mean_in
-      w_overlap. Not covered by the offline attack/utility screen that produced the
-      mean_in and auroc numbers below; treat it as untested.
+      just ranks it higher) is rewarded for it.
+
+      MEASURED (overlap_metric_spread.py over 1074 grounded steps of the cold-start
+      policy on set_a, 40 samples x 8 generations):
+
+        range      p10 0.41 / median 0.74 / p99 1.36 / max 2.33. Unbounded in principle,
+                   but the median box union covers 56% of the image, which puts the
+                   ceiling n/k at ~1.8 -- no clamp is needed in practice.
+        spread     per-sample sd 0.105, i.e. 12x mean_in's 0.0086, so w_overlap 0.033
+                   reproduces mean_in's wov0.4 pressure (the launchers apply this).
+                   The same script re-derives auroc's documented 0.11 as 0.089, so
+                   treat 0.033 as +-25%.
+        box size   r +0.38 with the box area fraction, vs +0.17 for mean_in and -0.11
+                   for auroc. Growing the box union does raise the score while the map
+                   is BELOW chance, but that pull dies at 1.0 instead of diverging: full
+                   coverage gives exactly 1.0. (Dividing by the outside SUM rather than
+                   the overall mean removes that limit -- it equals
+                   (mean_in/mean_out)/(n-k), which diverges as the union grows and has
+                   no fixed chance level. That is why the denominator is the whole map.)
+
+      Not covered by the offline attack/utility screen that produced the mean_in and
+      auroc correlation numbers below.
 
   auroc  (--overlap_metric auroc)
       P(a random in-box patch outranks a random out-box patch), average ranks for ties.
