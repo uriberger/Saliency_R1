@@ -89,17 +89,22 @@
 #
 # Two independent monitors, both landing in the same WandB run:
 #
-#   validation   Every --eval-steps (100) steps the trainer scores val_natural and
-#                val_nonnatural -- 256 held-out rows each, whose images appear in
-#                neither set_a nor set_b -- and logs them as separate curves
-#                (eval_val_natural_*, eval_val_nonnatural_*). Build them once with
-#                `python build_grpo_sets.py --build-val`. Costs ~11% of training
-#                throughput; --no-eval turns it off.
+#   validation   At step 0 and every --eval-steps (100) steps, val_natural and
+#                val_nonnatural are scored on ANSWER ACCURACY ONLY -- 256 held-out
+#                rows each, whose images appear in neither set_a nor set_b -- and
+#                logged as val/<set>/accuracy. Build them once with
+#                `python build_grpo_sets.py --build-val`; --no-eval turns it off.
+#
+#                One greedy completion per prompt in a single batched vLLM call: no
+#                DINO, no saliency re-forward, no judge, no log-prob pass, and the
+#                policy never runs a forward. Routing this through the Trainer's
+#                evaluation loop instead re-runs the entire reward pipeline and
+#                measured 21.6 min per set -- ~90% of training throughput at a
+#                100-step cadence, which is what made the cheap path necessary.
 #
 #   benchmarks   13 of the test benchmarks -- all but the three that need an LLM
 #                judge to score (see eval_mini/benchmarks.py) -- cut to 100 docs
-#                and split
-#                into a natural and a non-natural suite, run on every kept
+#                and split into a natural and a non-natural suite, run on every kept
 #                checkpoint by a separate 4-GPU job. watch_bench_evals.sh starts
 #                with the run, holds no GPUs itself, and submits a job only when a
 #                checkpoint is waiting and none is already in flight. It submits
@@ -117,7 +122,7 @@
 #   PARTITION=batch_singlenode   DURATION=4 (hours)
 #   NATURAL_ONLY=true            (same as --natural-only; --no-natural-only to force off)
 #   SAVE_STEPS=10   CKPT_KEEP_EVERY=100
-#   EVAL_STEPS=100   VAL_SETS_DIR=<dir>   EVAL_BATCH=<n>   AUTO_BENCH=true  BENCH_GPUS=4
+#   EVAL_STEPS=100   VAL_SETS_DIR=<dir>   AUTO_BENCH=true   BENCH_GPUS=4
 #   DINO_PORT=8100   VLLM_PORT=8000   VLLM_MAX_MODEL_LEN=4096
 #   VLLM_GPU_MEM     (default 0.90, or 0.85 with --share-sidecar-gpu)
 #   SHARE_SIDECAR_GPU=true   (same as --share-sidecar-gpu; --no-share-sidecar-gpu to force off)
@@ -161,10 +166,6 @@ CKPT_KEEP_EVERY=${CKPT_KEEP_EVERY:-100}
 # rather than memorization. Set VAL_SETS_DIR="" to turn validation off entirely.
 EVAL_STEPS=${EVAL_STEPS:-100}
 VAL_SETS_DIR=${VAL_SETS_DIR:-$REPO/cold_data/grpo_sets}
-# Eval batch size tracks num_generations so each process handles exactly one prompt's
-# generation group per step. Any other value can split a group across processes, and
-# GRPO reshapes gathered rewards into whole groups.
-EVAL_BATCH=${EVAL_BATCH:-}
 # The benchmark-eval dispatcher (watch_bench_evals.sh) starts with the run and
 # submits a $BENCH_GPUS-GPU job whenever a kept checkpoint is waiting to be scored.
 # It holds no GPU itself. --no-auto-bench turns it off.
@@ -240,7 +241,6 @@ while [[ $# -gt 0 ]]; do
         --natural-only)           NATURAL_ONLY=true;            shift ;;
         --no-natural-only)        NATURAL_ONLY=false;           shift ;;
         --eval-steps)             EVAL_STEPS="$2";              shift 2 ;;
-        --eval-batch)             EVAL_BATCH="$2";              shift 2 ;;
         --no-eval)                VAL_SETS_DIR="";              shift ;;
         --val-sets-dir)           VAL_SETS_DIR="$2";            shift 2 ;;
         --auto-bench)             AUTO_BENCH=true;              shift ;;
@@ -344,7 +344,7 @@ echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_b
 echo "Overlap reward:   layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
 echo "Metric:           $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " mass_floor_tau=$MASS_FLOOR_TAU" || echo " (no mass floor)")"
 echo "Overlap rows:     $([ "$NATURAL_ONLY" = true ] && echo 'natural images only (non-natural: format+accuracy+judge)' || echo 'all rows')"
-echo "Validation:       $([ -n "$VAL_SETS_DIR" ] && echo "every $EVAL_STEPS steps on $VAL_SETS_DIR/{val_natural,val_nonnatural}" || echo 'off')"
+echo "Validation:       $([ -n "$VAL_SETS_DIR" ] && echo "accuracy only, step 0 then every $EVAL_STEPS steps, from $VAL_SETS_DIR" || echo 'off')"
 echo "Checkpoints:      save every $SAVE_STEPS, keep every $CKPT_KEEP_EVERY"
 echo "Benchmarks:       $([ "$AUTO_BENCH" = true ] && echo "dispatcher auto-started (${BENCH_GPUS}-GPU jobs)" || echo 'off (see --auto-bench)')"
 echo "Batch:            per_device=$PER_DEVICE_BATCH num_generations=$NUM_GENERATIONS grad_accum=$GRAD_ACCUM  (gen_batch=$(( PER_DEVICE_BATCH * TRAIN_N * GRAD_ACCUM )))"
@@ -422,7 +422,6 @@ if ! $DIRECT; then
                 --vllm-enforce-eager $VLLM_ENFORCE_EAGER \
                 --eval-steps $EVAL_STEPS \
                 --bench-gpus $BENCH_GPUS \
-                ${EVAL_BATCH:+--eval-batch $EVAL_BATCH} \
                 ${VAL_SETS_DIR:+--val-sets-dir $VAL_SETS_DIR} \
                 $([ -z "$VAL_SETS_DIR" ] && echo --no-eval) \
                 $([ "$AUTO_BENCH" = true ] && echo --auto-bench) \
@@ -621,11 +620,10 @@ if [[ -n "$VAL_SETS_DIR" ]]; then
             exit 1
         }
     done
-    # --eval_on_start scores both validation sets before the first optimizer step,
-    # giving the curves a step-0 baseline. Without it the earliest point is step 100
-    # and there is nothing to say whether training moved anything.
-    EVAL_FLAGS="--eval_strategy steps --eval_steps $EVAL_STEPS --eval_on_start True \
-        --per_device_eval_batch_size ${EVAL_BATCH:-$NUM_GENERATIONS} --val_sets_dir $VAL_SETS_DIR"
+    # Accuracy-only validation, driven by a callback rather than the Trainer's
+    # evaluation loop, so it costs one batched vLLM call instead of re-running the
+    # whole reward pipeline. A step-0 baseline is always taken.
+    EVAL_FLAGS="--val_sets_dir $VAL_SETS_DIR --val_eval_steps $EVAL_STEPS"
 fi
 
 # ---------- benchmark-eval dispatcher ----------

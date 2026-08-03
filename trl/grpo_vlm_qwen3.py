@@ -65,6 +65,7 @@ accelerate launch \
 import glob
 import json
 import os
+import time
 
 import torch
 from datasets import load_dataset, load_from_disk
@@ -84,6 +85,110 @@ from trl import (
     get_quantization_config,
 )
 from trl.rewards import think_format_reward, think_saliency_reward, openai_reward
+
+
+class ValidationAccuracyCallback(TrainerCallback):
+    """Score the held-out sets on answer accuracy alone, as cheaply as possible.
+
+    This deliberately does NOT go through the Trainer's evaluation loop. GRPO's eval
+    path reproduces the whole training pipeline -- num_generations completions per
+    prompt, Grounding-DINO, the saliency re-forward, the LLM judge, and a log-prob
+    forward through the policy -- which cost 21.6 minutes per set (measured), or
+    about 90% of training throughput at a 100-step cadence. None of that is needed
+    to answer "is the model getting the answers right".
+
+    So: one greedy completion per prompt, in a single batched vLLM call, scored by
+    the same accuracy_reward the training rewards use. That is ~250 completions in
+    one request rather than 2,016 in 42 requests of six.
+
+    Greedy rather than sampled, and one completion rather than eight, because the
+    point is to compare checkpoints: with temperature 0 a change in the curve is a
+    change in the model, not in the sampling draw.
+
+    Two consequences worth knowing. The policy never runs a forward pass here, so
+    validation cannot disturb DeepSpeed's ZeRO-3 module trace -- the failure that
+    killed the previous run. And generation happens on the main process only, where
+    the vLLM client lives; the other ranks simply wait at the next collective, which
+    is safe because nothing here is collective.
+    """
+
+    def __init__(self, val_sets, every, accuracy_fn, max_new_tokens):
+        self.val_sets = val_sets
+        self.every = every
+        self.accuracy_fn = accuracy_fn
+        self.max_new_tokens = max_new_tokens
+        self.trainer = None
+        self._warned = False
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        # A step-0 baseline: without it the first point is at `every` steps and there
+        # is nothing to say whether training moved anything.
+        #
+        # Only at a genuine step 0. On resume the adapter is loaded from a checkpoint
+        # but the vLLM server still holds the base weights until the trainer's first
+        # sync, so evaluating here would score the base model and file it under the
+        # resumed step -- a wrong point, which is worse than a missing one. The run
+        # being resumed already recorded its own step-0.
+        if state.global_step == 0:
+            self._evaluate(state)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.every > 0 and state.global_step % self.every == 0:
+            self._evaluate(state)
+
+    def _evaluate(self, state):
+        trainer = self.trainer
+        if trainer is None or not trainer.accelerator.is_main_process:
+            return
+        client = getattr(trainer, "vllm_client", None)
+        if client is None:
+            if not self._warned:
+                self._warned = True
+                print("[val] no vLLM client (needs --use_vllm --vllm_mode server); "
+                      "skipping validation")
+            return
+
+        from trl.data_utils import maybe_apply_chat_template
+
+        metrics = {}
+        for name, dataset in self.val_sets.items():
+            started = time.time()
+            rows = list(dataset)
+            prompts = [maybe_apply_chat_template(r, trainer.processing_class)["prompt"] for r in rows]
+            images = [r["image"] for r in rows]
+
+            completion_ids = client.generate(
+                prompts=prompts,
+                images=images,
+                n=1,
+                temperature=0.0,
+                top_p=1.0,
+                top_k=-1,
+                min_p=0.0,
+                repetition_penalty=1.0,
+                max_tokens=self.max_new_tokens,
+            )
+            texts = trainer.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+            completions = [[{"role": "assistant", "content": t}] for t in texts]
+            scores = self.accuracy_fn(completions=completions, solution=[r["solution"] for r in rows])
+
+            # accuracy_reward returns None when the answer could not be parsed at all;
+            # counting those as wrong would conflate "got it wrong" with "could not be
+            # graded", so they are reported separately instead.
+            graded = [s for s in scores if s is not None]
+            metrics[f"val/{name}/accuracy"] = sum(graded) / len(graded) if graded else float("nan")
+            metrics[f"val/{name}/ungraded"] = (len(scores) - len(graded)) / max(1, len(scores))
+            metrics[f"val/{name}/seconds"] = time.time() - started
+            print(f"[val] step {state.global_step} {name}: "
+                  f"accuracy {metrics[f'val/{name}/accuracy']:.4f} over {len(graded)} rows "
+                  f"in {metrics[f'val/{name}/seconds']:.0f}s")
+
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is not None:
+            wandb.run.log({**metrics, "val/step": state.global_step})
 
 
 class BenchmarkResultsCallback(TrainerCallback):
@@ -247,40 +352,34 @@ if __name__ == "__main__":
     #
     # The `dataset.train_test_split` above is left exactly as it was, so `train` is
     # byte-identical to what previous runs trained on.
-    # GRPO reshapes gathered rewards into whole groups of `num_generations`, and the
-    # eval sampler hands each process exactly one prompt per step (eval batch size ==
-    # num_generations). A prompt count that is not a multiple of the process count
-    # therefore ends the epoch on a partial batch, where some ranks get no prompt at
-    # all. Trim the tail instead: at most world_size-1 rows, reported rather than
-    # silently dropped, and deterministic for a given GPU count.
+    #
+    # These are NOT handed to the Trainer as eval_dataset. Its evaluation loop runs
+    # the full GRPO pipeline per prompt -- num_generations completions, DINO, the
+    # saliency re-forward, the judge, a log-prob forward -- which measured 21.6
+    # minutes per set, about 90% of training throughput at a 100-step cadence.
+    # ValidationAccuracyCallback scores them instead: one greedy completion per
+    # prompt in a single batched vLLM call, accuracy only. No trimming to a multiple
+    # of the process count is needed either, since it does not shard across ranks.
     def load_val_set(path):
         ds = load_from_disk(path)
         if not hasattr(ds, "train_test_split"):  # a DatasetDict written by save_to_disk
             ds = ds[next(iter(ds.keys()))]
-        world_size = max(1, training_args.world_size)
-        usable = len(ds) - len(ds) % world_size
-        if usable != len(ds):
-            print(f"[val] {os.path.basename(path)}: using {usable} of {len(ds)} rows "
-                  f"(a whole multiple of the {world_size} training processes)")
-            ds = ds.select(range(usable))
         return ds.map(make_conversation).map(prepare_image)
 
+    val_sets = {}
+    if script_args.val_sets_dir:
+        for name in ("val_natural", "val_nonnatural"):
+            path = os.path.join(script_args.val_sets_dir, name)
+            if os.path.isdir(path):
+                val_sets[name] = load_val_set(path)
+                print(f"[val] {name}: {len(val_sets[name])} rows from {path}")
+        if not val_sets:
+            raise SystemExit(
+                f"--val_sets_dir {script_args.val_sets_dir} holds neither val_natural/ "
+                f"nor val_nonnatural/; run build_grpo_sets.py --build-val first."
+            )
+    # The Trainer's own evaluation stays off; validation is the callback's job.
     eval_dataset = None
-    if training_args.eval_strategy != "no":
-        if script_args.val_sets_dir:
-            eval_dataset = {}
-            for name in ("val_natural", "val_nonnatural"):
-                path = os.path.join(script_args.val_sets_dir, name)
-                if os.path.isdir(path):
-                    eval_dataset[name] = load_val_set(path)
-                    print(f"[val] {name}: {len(eval_dataset[name])} rows from {path}")
-            if not eval_dataset:
-                raise SystemExit(
-                    f"--val_sets_dir {script_args.val_sets_dir} holds neither val_natural/ "
-                    f"nor val_nonnatural/; run build_grpo_sets.py --build-val first."
-                )
-        else:
-            eval_dataset = dataset["test"]
 
     ################
     # Reward Function for Training
@@ -383,6 +482,19 @@ if __name__ == "__main__":
     # in this directory as they finish; the callback forwards them to WandB.
     # Harmless when nothing ever writes there.
     trainer.add_callback(BenchmarkResultsCallback(os.path.join(training_args.output_dir, "bench_eval")))
+
+    if val_sets:
+        validation = ValidationAccuracyCallback(
+            val_sets=val_sets,
+            every=script_args.val_eval_steps,
+            accuracy_fn=accuracy_reward,
+            max_new_tokens=training_args.max_completion_length,
+        )
+        # The callback needs the trainer's vLLM client and processor, which only
+        # exist once the trainer is built -- hence the back-reference rather than a
+        # constructor argument.
+        validation.trainer = trainer
+        trainer.add_callback(validation)
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 

@@ -71,10 +71,18 @@ class ScriptArguments:
         metadata={
             "help": "Directory holding the held-out validation sets written by "
             "`build_grpo_sets.py --build-val` (val_natural/ and val_nonnatural/). Whichever "
-            "of the two exist are evaluated separately, so natural and non-natural imagery "
-            "get their own curves. Their images are disjoint from set_a and set_b, so this "
-            "does not touch the training corpus. Requires --eval_strategy steps; ignored "
-            "otherwise."
+            "of the two exist are scored separately, so natural and non-natural imagery get "
+            "their own curves. Their images are disjoint from set_a and set_b, so this does "
+            "not touch the training corpus. Scored on answer accuracy only, by one greedy "
+            "completion per prompt through vLLM -- not by the Trainer's evaluation loop, "
+            "which would re-run the whole reward pipeline."
+        },
+    )
+    val_eval_steps: int = field(
+        default=100,
+        metadata={
+            "help": "How often (in optimizer steps) to score the validation sets. A step-0 "
+            "baseline is always taken. 0 disables periodic scoring, leaving only step 0."
         },
     )
     dataset_streaming: bool = field(
