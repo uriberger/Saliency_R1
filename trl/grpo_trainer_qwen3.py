@@ -815,6 +815,7 @@ class GRPOTrainer(Trainer):
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        self._zero3_lookup_warned = False
         self._total_train_tokens = 0
         self.log_completions = args.log_completions
         self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
@@ -2632,6 +2633,58 @@ class GRPOTrainer(Trainer):
             loss = loss.mean().detach()
         return loss, None, None
 
+    def _zero3_param_coordinator(self):
+        """DeepSpeed ZeRO-3's parameter coordinator, or None if that is not what we run under."""
+        for engine in (getattr(self, "deepspeed", None), getattr(self, "model_wrapped", None)):
+            offload = getattr(getattr(engine, "optimizer", None), "parameter_offload", None)
+            if offload is None:
+                continue
+            try:
+                return offload.get_param_coordinator()
+            except Exception:  # a DeepSpeed version whose accessor differs
+                continue
+
+        # Nothing found. Harmless when ZeRO-3 is not in use -- and a silent
+        # no-op that lets the run die at the first eval when it is, so say so.
+        if getattr(self, "is_deepspeed_enabled", False) and not self._zero3_lookup_warned:
+            self._zero3_lookup_warned = True
+            warnings.warn(
+                "DeepSpeed is enabled but its ZeRO-3 parameter coordinator could not be "
+                "located, so the module trace cannot be invalidated around evaluation. "
+                "If this run is ZeRO-3, expect the first eval to fail with 'tracing error "
+                "at step 0'; disable evaluation (--no-eval) or fix the lookup in "
+                "_zero3_param_coordinator."
+            )
+        return None
+
+    def _invalidate_zero3_trace(self, why):
+        """Make ZeRO-3 re-record its module trace instead of replaying a stale one.
+
+        ZeRO-3 records the exact order of module executions during one fwd+bwd and
+        then prefetches parameters against it. Evaluation runs a *different* order --
+        no backward, and `_generate_and_score_completions` fires its own saliency
+        re-forwards -- so once training's trace is COMPLETE, the first eval forward
+        dies in fetch_sub_module with "tracing error at step 0: expected ...
+        layers.34.self_attn.q_proj ... but got ... embed_tokens". DeepSpeed's own
+        trace_prologue only auto-invalidates on a *module* mismatch, and here the
+        modules line up while the parameter queue does not, so it never fires.
+
+        Invalidating on both sides of eval costs one re-record each way and leaves
+        training replaying a trace that describes training.
+
+        This must run on every rank: reset_step() calls assert_ints_same_as_other_ranks
+        on the recorded order, so a coordinator invalidated on some ranks and not
+        others trades this crash for a cross-rank disagreement and an NCCL timeout.
+        `evaluate` is called on all ranks, which is why this lives here.
+        """
+        coordinator = self._zero3_param_coordinator()
+        if coordinator is None or coordinator.is_invalid_trace():
+            return
+        try:
+            coordinator._invalidate_trace()
+        except Exception as exc:
+            warnings.warn(f"could not invalidate the ZeRO-3 trace {why}: {exc}")
+
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"):
         """Remember which eval dataset is being scored, so `log` can name its metrics.
 
@@ -2643,12 +2696,14 @@ class GRPOTrainer(Trainer):
         would silently collapse into one curve.
         """
         previous, self._eval_metric_prefix = getattr(self, "_eval_metric_prefix", "eval"), metric_key_prefix
+        self._invalidate_zero3_trace("before evaluating")
         try:
             return super().evaluate(
                 eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix
             )
         finally:
             self._eval_metric_prefix = previous
+            self._invalidate_zero3_trace("after evaluating")
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         mode = "train" if self.model.training else "eval"

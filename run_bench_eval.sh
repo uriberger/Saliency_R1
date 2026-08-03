@@ -85,8 +85,16 @@ NATURAL_TASKS=${NATURAL_TASKS//mmerealworld_mini,/}
 NATURAL_TASKS=${NATURAL_TASKS//,mmerealworld_mini/}
 
 # ---------- what still needs evaluating ----------
+# Step 0 is the model the run started from, recorded by the launcher. It is already
+# a full model, so it is scored directly -- no adapter to merge, and nothing to
+# delete afterwards.
+BASE_MODEL_FILE="$BENCH_DIR/base_model.txt"
+
 pending_steps() {
     local d step
+    if [[ -f "$BASE_MODEL_FILE" && ! -f "$BENCH_DIR/step-0.json" ]]; then
+        echo 0
+    fi
     for d in "$RUN_DIR"/checkpoint-*; do
         [[ -d "$d" ]] || continue
         step=${d##*checkpoint-}
@@ -174,20 +182,35 @@ while true; do
         break
     fi
 
-    CKPT="$RUN_DIR/checkpoint-$STEP"
-    MERGED="$MERGE_ROOT/${RUN_NAME}_cp${STEP}_merged"
     echo ""
     echo "--------------------------------------------------------------------------"
-    echo "[step $STEP] merging $CKPT -> $MERGED   (${LEFT}min left)"
-    echo "--------------------------------------------------------------------------"
-    rm -rf "$MERGED"
-    if ! bash "$REPO/merge_lora_grpo_qwen3.sh" "$CKPT" "$MERGED"; then
-        echo "[step $STEP] merge FAILED -- skipping this checkpoint" >&2
+    if (( STEP == 0 )); then
+        # The baseline: already a standalone model, so there is nothing to merge and,
+        # crucially, nothing to delete afterwards -- it is the model training started
+        # from, not a temporary copy.
+        MERGED=$(< "$BASE_MODEL_FILE")
+        MERGED_IS_TEMPORARY=false
+        echo "[step 0] baseline: $MERGED   (${LEFT}min left)"
+        if [[ ! -d "$MERGED" ]]; then
+            echo "[step 0] baseline model not found at $MERGED -- skipping" >&2
+            break
+        fi
+    else
+        CKPT="$RUN_DIR/checkpoint-$STEP"
+        MERGED="$MERGE_ROOT/${RUN_NAME}_cp${STEP}_merged"
+        MERGED_IS_TEMPORARY=true
+        echo "[step $STEP] merging $CKPT -> $MERGED   (${LEFT}min left)"
+        echo "--------------------------------------------------------------------------"
         rm -rf "$MERGED"
-        # Leave no step file: a later job retries it rather than recording a gap
-        # as if it had been measured.
-        break
+        if ! bash "$REPO/merge_lora_grpo_qwen3.sh" "$CKPT" "$MERGED"; then
+            echo "[step $STEP] merge FAILED -- skipping this checkpoint" >&2
+            rm -rf "$MERGED"
+            # Leave no step file: a later job retries it rather than recording a gap
+            # as if it had been measured.
+            break
+        fi
     fi
+    echo "--------------------------------------------------------------------------"
 
     set +u; conda activate lmms_eval; set -u
     NAT_RESULTS=$(run_suite "$MERGED" "$NATURAL_TASKS" natural)
@@ -202,7 +225,7 @@ while true; do
         echo "[step $STEP] every suite failed -- not recording a result" >&2
     fi
 
-    rm -rf "$MERGED"
+    $MERGED_IS_TEMPORARY && rm -rf "$MERGED"
 done
 
 echo ""

@@ -621,7 +621,10 @@ if [[ -n "$VAL_SETS_DIR" ]]; then
             exit 1
         }
     done
-    EVAL_FLAGS="--eval_strategy steps --eval_steps $EVAL_STEPS \
+    # --eval_on_start scores both validation sets before the first optimizer step,
+    # giving the curves a step-0 baseline. Without it the earliest point is step 100
+    # and there is nothing to say whether training moved anything.
+    EVAL_FLAGS="--eval_strategy steps --eval_steps $EVAL_STEPS --eval_on_start True \
         --per_device_eval_batch_size ${EVAL_BATCH:-$NUM_GENERATIONS} --val_sets_dir $VAL_SETS_DIR"
 fi
 
@@ -636,6 +639,11 @@ fi
 # confirm it is alive and print the manual command if it is not.
 BENCH_WATCHER_PID=""
 if [[ "$AUTO_BENCH" == true ]]; then
+    # Record what this run starts from, so the benchmark job can score it as step 0.
+    # Without a baseline the earliest benchmark point is step 100, and a curve with
+    # no origin cannot say whether training helped or hurt.
+    mkdir -p "$OUTPUT_DIR/bench_eval"
+    echo "$MODEL" > "$OUTPUT_DIR/bench_eval/base_model.txt"
     echo "[bench] starting the benchmark dispatcher for $OUTPUT_DIR"
     bash "$REPO/watch_bench_evals.sh" --run-dir "$OUTPUT_DIR" --num-gpus "$BENCH_GPUS" \
         --every "$CKPT_KEEP_EVERY" > "$LOG_DIR/bench_watcher.log" 2>&1 &

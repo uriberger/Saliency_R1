@@ -138,6 +138,13 @@ MEM_PER_GPU_GB=${MEM_PER_GPU_GB:-240}
 
 pending_steps() {
     local d step
+    # Step 0 is the model the run started from, recorded by the launcher as
+    # bench_eval/base_model.txt. It has to appear here too: this is what decides
+    # whether a job is submitted at all, so a baseline the job would happily score
+    # would otherwise never get one.
+    if [[ -f "$BENCH_DIR/base_model.txt" && ! -f "$BENCH_DIR/step-0.json" ]]; then
+        echo 0
+    fi
     for d in "$RUN_DIR"/checkpoint-*; do
         [[ -d "$d" ]] || continue
         step=${d##*checkpoint-}
