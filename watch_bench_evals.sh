@@ -60,7 +60,14 @@ done
 RUN_DIR=$(cd "$RUN_DIR" && pwd)
 
 RUN_NAME=$(basename "$RUN_DIR")
-JOB_NAME="bencheval-${RUN_NAME}"
+# submit_job rewrites the name it is given -- it appends a _<date>-<time> stamp and
+# replaces dots with underscores (a run named ...wov0.11... comes back as
+# ...wov0_11..._20260802-144252). An exact `squeue -n` match would therefore never
+# fire, and this loop would submit a fresh job every poll, forever. So the check
+# looks for a token that no such rewriting can touch: letters and digits only,
+# derived from the run directory, hence unique per run.
+JOB_TOKEN="bencheval$(printf '%s' "$RUN_DIR" | md5sum | cut -c1-8)"
+JOB_NAME="${JOB_TOKEN}_${RUN_NAME}"
 BENCH_DIR="$RUN_DIR/bench_eval"
 LOG_ROOT="$REPO/outputs/logs"
 mkdir -p "$BENCH_DIR" "$LOG_ROOT"
@@ -95,7 +102,18 @@ pending_steps() {
 }
 
 job_in_flight() {
-    [[ -n "$(squeue -u "$USER" -h -n "$JOB_NAME" -o '%i' 2>/dev/null)" ]]
+    squeue -u "$USER" -h -o '%j' 2>/dev/null | grep -qF "$JOB_TOKEN"
+}
+
+# Second line of defence. If squeue is ever unreachable, or a job is rejected in a
+# way that leaves nothing in the queue, the check above stops protecting anything --
+# and the cost of getting this wrong is a queue full of duplicate 4-GPU jobs. A
+# cooldown bounds that to one job per COOLDOWN seconds no matter what.
+COOLDOWN=${COOLDOWN:-600}
+last_submit=0
+cooling_down() {
+    local now; now=$(date +%s)
+    (( now - last_submit < COOLDOWN ))
 }
 
 submit_eval_job() {
@@ -130,11 +148,14 @@ while true; do
         status="nothing pending"
     elif job_in_flight; then
         status="pending [$steps] -- a job is already queued/running, not submitting another"
+    elif cooling_down; then
+        status="pending [$steps] -- submitted less than ${COOLDOWN}s ago, waiting"
     elif $DRY_RUN; then
         status="pending [$steps] -- would submit $JOB_NAME ($NUM_GPUS GPUs, $PARTITION, ${DURATION}h)"
     else
         echo "[$(date '+%F %T')] pending [$steps] -- submitting $JOB_NAME"
         if submit_eval_job; then
+            last_submit=$(date +%s)
             status="submitted"
         else
             status="SUBMIT FAILED -- will retry next poll"

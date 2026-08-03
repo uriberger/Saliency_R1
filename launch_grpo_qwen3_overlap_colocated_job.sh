@@ -85,10 +85,36 @@
 # the overlap term on those rows (their `natural` column is False); they keep format +
 # accuracy + judge. Adds _natonly to the run name. Off by default.
 #
+# WATCHING A RUN INSTEAD OF ONLY AUTOPSYING IT
+#
+# Two independent monitors, both landing in the same WandB run:
+#
+#   validation   Every --eval-steps (100) steps the trainer scores val_natural and
+#                val_nonnatural -- 256 held-out rows each, whose images appear in
+#                neither set_a nor set_b -- and logs them as separate curves
+#                (eval_val_natural_*, eval_val_nonnatural_*). Build them once with
+#                `python build_grpo_sets.py --build-val`. Costs ~11% of training
+#                throughput; --no-eval turns it off.
+#
+#   benchmarks   The 16 test benchmarks, cut to 100 random documents each and split
+#                into a natural and a non-natural suite, run on every kept
+#                checkpoint by a separate 4-GPU job. That job is submitted by
+#                watch_bench_evals.sh, which holds no GPUs itself and submits only
+#                when a checkpoint is waiting and nothing is already in flight:
+#
+#                  bash watch_bench_evals.sh --run-dir <output-dir>
+#
+#                --auto-bench starts it automatically, if this node can submit
+#                jobs; it says so plainly when it cannot, rather than appearing to
+#                have started. Results reach WandB under bench/* within one logging
+#                interval; anything finishing after training exits is appended with
+#                `python bench_eval.py --backfill --run-dir DIR --wandb-run-id ID`.
+#
 # Environment overrides:
 #   PARTITION=batch_singlenode   DURATION=4 (hours)
 #   NATURAL_ONLY=true            (same as --natural-only; --no-natural-only to force off)
-#   SAVE_STEPS=10   CKPT_KEEP_EVERY=500
+#   SAVE_STEPS=10   CKPT_KEEP_EVERY=100
+#   EVAL_STEPS=100   VAL_SETS_DIR=<dir>   EVAL_BATCH=<n>   AUTO_BENCH=true  BENCH_GPUS=4
 #   DINO_PORT=8100   VLLM_PORT=8000   VLLM_MAX_MODEL_LEN=4096
 #   VLLM_GPU_MEM     (default 0.90, or 0.85 with --share-sidecar-gpu)
 #   SHARE_SIDECAR_GPU=true   (same as --share-sidecar-gpu; --no-share-sidecar-gpu to force off)
@@ -132,9 +158,10 @@ CKPT_KEEP_EVERY=${CKPT_KEEP_EVERY:-100}
 # rather than memorization. Set VAL_SETS_DIR="" to turn validation off entirely.
 EVAL_STEPS=${EVAL_STEPS:-100}
 VAL_SETS_DIR=${VAL_SETS_DIR:-$REPO/cold_data/grpo_sets}
-# per_device_eval_batch_size * training procs must be a multiple of num_generations,
-# or GRPO cannot form complete generation groups on the eval set.
-EVAL_BATCH=${EVAL_BATCH:-8}
+# Eval batch size tracks num_generations so each process handles exactly one prompt's
+# generation group per step. Any other value can split a group across processes, and
+# GRPO reshapes gathered rewards into whole groups.
+EVAL_BATCH=${EVAL_BATCH:-}
 # --auto-bench: also start the benchmark-eval dispatcher (watch_bench_evals.sh),
 # which submits a 4-GPU job whenever a checkpoint is waiting for one. Off by
 # default -- it submits jobs, so it should be an explicit choice.
@@ -590,7 +617,7 @@ if [[ -n "$VAL_SETS_DIR" ]]; then
         }
     done
     EVAL_FLAGS="--eval_strategy steps --eval_steps $EVAL_STEPS \
-        --per_device_eval_batch_size $EVAL_BATCH --val_sets_dir $VAL_SETS_DIR"
+        --per_device_eval_batch_size ${EVAL_BATCH:-$NUM_GENERATIONS} --val_sets_dir $VAL_SETS_DIR"
 fi
 
 # ---------- benchmark-eval dispatcher ----------

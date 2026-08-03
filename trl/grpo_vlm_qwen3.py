@@ -247,10 +247,22 @@ if __name__ == "__main__":
     #
     # The `dataset.train_test_split` above is left exactly as it was, so `train` is
     # byte-identical to what previous runs trained on.
+    # GRPO reshapes gathered rewards into whole groups of `num_generations`, and the
+    # eval sampler hands each process exactly one prompt per step (eval batch size ==
+    # num_generations). A prompt count that is not a multiple of the process count
+    # therefore ends the epoch on a partial batch, where some ranks get no prompt at
+    # all. Trim the tail instead: at most world_size-1 rows, reported rather than
+    # silently dropped, and deterministic for a given GPU count.
     def load_val_set(path):
         ds = load_from_disk(path)
         if not hasattr(ds, "train_test_split"):  # a DatasetDict written by save_to_disk
             ds = ds[next(iter(ds.keys()))]
+        world_size = max(1, training_args.world_size)
+        usable = len(ds) - len(ds) % world_size
+        if usable != len(ds):
+            print(f"[val] {os.path.basename(path)}: using {usable} of {len(ds)} rows "
+                  f"(a whole multiple of the {world_size} training processes)")
+            ds = ds.select(range(usable))
         return ds.map(make_conversation).map(prepare_image)
 
     eval_dataset = None
