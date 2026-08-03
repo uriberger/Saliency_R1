@@ -209,6 +209,7 @@ def write_html(merged: dict, out_path: Path, validator: Path | None = None) -> P
     <label>Heat by <select id="fMetric">
       <option value="score">score (reward metric)</option>
       <option value="mean_in_raw">mean_in</option>
+      <option value="mean_in_v2_raw">mean_in_v2</option>
       <option value="auroc_raw">auroc</option>
     </select></label>
     <label>Map scale <select id="fHeat">
@@ -301,6 +302,7 @@ function modelStats(name) {{
     scoredPer: mean(cs.map(c => c.n_observe_steps_scored)),
     stepScore: mean(st.map(s => s.score)),
     meanIn: has('mean_in_raw') ? mean(st.map(s => s.mean_in_raw).filter(v => v != null)) : NaN,
+    meanInV2: has('mean_in_v2_raw') ? mean(st.map(s => s.mean_in_v2_raw).filter(v => v != null)) : NaN,
     auroc: has('auroc_raw') ? mean(st.map(s => s.auroc_raw).filter(v => v != null)) : NaN,
     area: mean(st.map(s => s.box_area_frac).filter(v => v != null)),
     dup: mean(cs.map(dupFrac)),
@@ -356,6 +358,7 @@ const ROWS = [
   ['duplicate step fraction', 'dup', 3, true],
   ['mean score per step', 'stepScore', 4, true],
   ['mean_in per step', 'meanIn', 4, true],
+  ['mean_in_v2 per step', 'meanInV2', 4, true],
   ['auroc per step', 'auroc', 4, true],
   ['box area fraction', 'area', 3, true],
   ['overlap reward', 'overlap', 4, true],
@@ -383,7 +386,8 @@ function renderSummary() {{
 // ---------- chart: repeat premium (diverging bar around 0% change) ----------
 function renderRepeat() {{
   const host = $('#repeat');
-  const keys = [['score', 'reward metric'], ['mean_in_raw', 'mean_in'], ['auroc_raw', 'auroc']];
+  const keys = [['score', 'reward metric'], ['mean_in_raw', 'mean_in'],
+                ['mean_in_v2_raw', 'mean_in_v2'], ['auroc_raw', 'auroc']];
   const rows = [];
   for (const [k, label] of keys) {{
     const p = repeatPairs(S.model, k);
@@ -453,6 +457,7 @@ function renderDist() {{
   const st = DATA.models[S.model].samples.flatMap(s => s.completions).flatMap(scored);
   const series = [['score', 'reward metric', css('--s1')]];
   if (st.some(s => s.auroc_raw != null)) series.push(['auroc_raw', 'auroc', css('--s2')]);
+  if (st.some(s => s.mean_in_v2_raw != null)) series.push(['mean_in_v2_raw', 'mean_in_v2', css('--good')]);
   const panels = [], tabRows = [];
   for (const [key, label, colour] of series) {{
     const v = st.map(s => s[key]).filter(x => x != null);
@@ -508,7 +513,8 @@ function heatScale() {{
   const st = DATA.models[S.model].samples.flatMap(s => s.completions).flatMap(scored)
     .map(s => s[S.metric]).filter(v => v != null).sort((a, b) => a - b);
   if (!st.length) return [0, 1];
-  const lo = S.metric === 'auroc_raw' ? 0.5 : 0;
+  // start the ramp at the metric's chance level, so "no preference for the box" is white
+  const lo = S.metric === 'auroc_raw' ? 0.5 : S.metric === 'mean_in_v2_raw' ? 1 : 0;
   return [lo, st[Math.floor(0.95 * (st.length - 1))] || 1];
 }}
 function seqColour(v, lo, hi) {{
@@ -647,6 +653,7 @@ function mapCell(st, src, label) {{
   bindTip(cell, `<b>step ${{st.step_index}}</b><table>
     <tr><td>score</td><td>${{st.grounded ? fmt(st.score, 4) : 'skipped'}}</td></tr>
     ${{st.mean_in_raw != null ? `<tr><td>mean_in</td><td>${{fmt(st.mean_in_raw, 4)}}</td></tr>` : ''}}
+    ${{st.mean_in_v2_raw != null ? `<tr><td>mean_in_v2</td><td>${{fmt(st.mean_in_v2_raw, 4)}}</td></tr>` : ''}}
     ${{st.auroc_raw != null ? `<tr><td>auroc</td><td>${{fmt(st.auroc_raw, 4)}}</td></tr>` : ''}}
     <tr><td>image mass</td><td>${{fmt(st.image_mass, 5)}}</td></tr>
     <tr><td>map peak</td><td>${{fmt(st.map_max, 5)}}</td></tr>
@@ -707,6 +714,7 @@ function renderCompletion(c, sample, lo, hi) {{
       bindTip(n, `<b>observe step ${{s.step_index}}</b><table>
         <tr><td>score (reward)</td><td>${{fmt(s.score, 4)}}</td></tr>
         ${{s.mean_in_raw != null ? `<tr><td>mean_in</td><td>${{fmt(s.mean_in_raw, 4)}}</td></tr>` : ''}}
+        ${{s.mean_in_v2_raw != null ? `<tr><td>mean_in_v2</td><td>${{fmt(s.mean_in_v2_raw, 4)}}</td></tr>` : ''}}
         ${{s.auroc_raw != null ? `<tr><td>auroc</td><td>${{fmt(s.auroc_raw, 4)}}</td></tr>` : ''}}
         <tr><td>tokens</td><td>${{s.n_tokens}}</td></tr>
         <tr><td>boxes raw/kept</td><td>${{s.n_boxes_raw}}/${{s.n_boxes_kept}}</td></tr>
@@ -730,7 +738,8 @@ function renderCompletion(c, sample, lo, hi) {{
   const stepTbl = el('table', {{}},
     el('thead', {{}}, el('tr', {{}}, el('th', {{}}, '#'), el('th', {{}}, 'step text'), el('th', {{}}, 'tok'),
       el('th', {{}}, 'boxes'), el('th', {{}}, 'area'), el('th', {{}}, 'mass'),
-      el('th', {{}}, 'mean_in'), el('th', {{}}, 'auroc'), el('th', {{}}, 'score'))),
+      el('th', {{}}, 'mean_in'), el('th', {{}}, 'mean_in_v2'), el('th', {{}}, 'auroc'),
+      el('th', {{}}, 'score'))),
     el('tbody', {{}}, ...steps(c).map(s => el('tr', {{}},
       el('td', {{ class: 'num' }}, s.step_index), el('td', {{}}, s.text),
       el('td', {{ class: 'num' }}, s.n_tokens),
@@ -738,6 +747,7 @@ function renderCompletion(c, sample, lo, hi) {{
       el('td', {{ class: 'num' }}, fmt(s.box_area_frac, 3)),
       el('td', {{ class: 'num' }}, fmt(s.image_mass, 5)),
       el('td', {{ class: 'num' }}, fmt(s.mean_in_raw, 4)),
+      el('td', {{ class: 'num' }}, fmt(s.mean_in_v2_raw, 4)),
       el('td', {{ class: 'num' }}, fmt(s.auroc_raw, 4)),
       el('td', {{ class: 'num' }}, s.grounded ? fmt(s.score, 4) : 'skipped')))));
 

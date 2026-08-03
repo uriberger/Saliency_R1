@@ -437,18 +437,19 @@ def score_steps(all_step_maps, images_per_completion, store_maps=True):
             rec["mask_q"] = _b64_u8(mask.astype(np.uint8)) if mask is not None else None
         if mask is None:
             rec.update(grounded=False, box_area_frac=None, score=None,
-                       mean_in_raw=None, auroc_raw=None,
+                       mean_in_raw=None, mean_in_v2_raw=None, auroc_raw=None,
                        note="DINO could not ground this step (or union degenerate) -> SKIPPED, not scored 0")
         else:
             # `score` is the configured metric (with the mass gate) and is what the
-            # reward uses. Both metrics are also recorded ungated on every step, so the
-            # two can be compared on identical maps and masks -- a paired comparison of
+            # reward uses. Every metric is also recorded ungated on every step, so they
+            # can be compared on identical maps and masks -- a paired comparison of
             # metrics rather than one across runs with different completions.
             rec.update(
                 grounded=True,
                 box_area_frac=float(mask.sum()) / float(mask.size),
                 score=OREW._step_score(smap, mask),
                 mean_in_raw=OREW._mean_in(smap, mask),
+                mean_in_v2_raw=OREW._mean_in_v2(smap, mask),
                 auroc_raw=OREW._auroc(smap, mask),
                 note="",
             )
@@ -620,7 +621,7 @@ def main():
     p.add_argument("--overlap-layer", type=int, default=22)
     p.add_argument("--overlap-heads", default="28,31")
     p.add_argument("--token-reduction", default="mean", choices=["mean", "max", "min"])
-    p.add_argument("--overlap-metric", default="mean_in", choices=["mean_in", "auroc"])
+    p.add_argument("--overlap-metric", default="mean_in", choices=["mean_in", "mean_in_v2", "auroc"])
     p.add_argument("--box-threshold", type=float, default=0.10)
     p.add_argument("--max-box-area", type=float, default=0.5)
     p.add_argument("--mass-floor-tau", type=float, default=None)

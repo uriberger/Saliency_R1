@@ -155,6 +155,43 @@ assert r_auroc[0] != r_mean[0], (r_auroc, r_mean)
 print(f"[T5c] --overlap_metric switches the reward: auroc={r_auroc[0]:.4f} mean_in={r_mean[0]:.4f}")
 
 # ---------------------------------------------------------------------------
+# Test 5d-f: the mean_in_v2 metric (--overlap_metric mean_in_v2), mean-in / mean-all
+# ---------------------------------------------------------------------------
+orw.configure(metric="mean_in", mass_floor_tau=None)
+
+# 5d. definition + endpoints. m: inside {(1,1),(1,2)} = 2 and 1, outside 4 at (3,3).
+#     mean over the whole 4x4 map = 7/16; mean inside = 1.5 -> 1.5 / (7/16)
+v2 = orw._mean_in_v2(m, mask)
+assert abs(v2 - 1.5 / (7.0 / 16.0)) < 1e-6, v2
+# a flat map has no preference for the box -> exactly chance (1.0), whatever the mask
+assert abs(orw._mean_in_v2(np.ones((4, 4), np.float32), mask) - 1.0) < 1e-9
+# all the mass inside the box -> the ceiling, n_patches / n_in
+only_in = np.zeros((4, 4), np.float32); only_in[mask] = 3.0
+assert abs(orw._mean_in_v2(only_in, mask) - 16.0 / 2) < 1e-6, orw._mean_in_v2(only_in, mask)
+# an all-zero map has no defined ratio -> None (the step is skipped, not scored 0)
+assert orw._mean_in_v2(np.zeros((4, 4), np.float32), mask) is None
+print(f"[T5d] mean_in_v2 OK: {v2:.4f}; flat -> 1.0 (chance), all-in -> {16.0 / 2:.1f} (ceiling)")
+
+# 5e. rescale-invariant like auroc, and flattening moves it TOWARD chance rather than
+#     up -- the opposite direction to mean_in, which is the point of the metric.
+b2 = orw._mean_in_v2(m5b, mk5b)
+assert abs(orw._mean_in_v2(7.3 * m5b, mk5b) - b2) < 1e-9          # rescale cancels
+flat2 = orw._mean_in_v2(m5b + 0.5 * m5b.mean(), mk5b)             # uniform floor
+assert abs(flat2 - 1.0) < abs(b2 - 1.0), (b2, flat2)
+print(f"[T5e] mean_in_v2 rescale-invariant; uniform floor moves it {b2:.4f} -> {flat2:.4f} "
+      f"toward chance (mean_in moved {mi_base:.3f} -> {mi_flat:.3f} away from 0)")
+
+# 5f. the flag switches think_overlap_reward. comp0: step a = 3.0 / (4/16) = 12,
+#     step b = 0 (cell (1,1) is empty) -> mean 6.0
+orw.configure(metric="mean_in_v2")
+r_v2 = orw.think_overlap_reward(
+    completions=[None], saliency_map=[sal[0]], valid_list=[True], image=[_Img()],
+)
+assert abs(r_v2[0] - 6.0) < 1e-6, r_v2
+orw.configure(metric="mean_in")
+print(f"[T5f] --overlap_metric mean_in_v2 switches the reward: {r_v2[0]:.4f} (mean_in {r_mean[0]:.4f})")
+
+# ---------------------------------------------------------------------------
 # Test 6: the image-mass floor (--mass_floor_tau), and that it is OFF by default
 # ---------------------------------------------------------------------------
 orw.configure(metric="auroc", mass_floor_tau=None)

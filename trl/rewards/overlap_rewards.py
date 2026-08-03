@@ -25,7 +25,7 @@ Each map is raw observe-token -> image-patch attention at LAYER 22, mean of the
 configured heads (default (22,28)+(22,31)), ReLU, token-reduced over the step's tokens.
 This reward grounds each step's text with Grounding-DINO (per step, in the loop),
 builds the union mask of boxes >= box_threshold with area <= max_box_area, and scores
-each step with one of two metrics (--overlap_metric), then averages over the
+each step with one of three metrics (--overlap_metric), then averages over the
 completion's grounded observe steps (steps DINO can't ground are SKIPPED, not scored
 0). The result is gated by format validity (multiplicative, like their valid_list).
 Zero grounded observe steps -> None (masked, neutral in the GRPO advantage — NaN is
@@ -43,6 +43,21 @@ nan-summed out).
       wov0.4 runs did exactly that: their MMStar gain disappears once chance-corrected.
       See wiki/lmms-eval-overlap-comparison.md in the vlm_reasoning repo.
 
+  mean_in_v2  (--overlap_metric mean_in_v2)
+      mean over the box divided by the mean over the WHOLE map, i.e. the same numerator
+      as mean_in but normalized by the map's average instead of its peak. Chance = 1.0
+      (a map with no preference for the box scores 1.0); the ceiling is
+      n_patches / n_in_box, so the scale depends on how large the box union is.
+
+      It closes mean_in's flattening hole from the other side than auroc does: both the
+      numerator and the denominator are means, so any rescale m -> c*m cancels exactly,
+      and a uniform flattening moves the score TOWARD 1.0 rather than up. Unlike auroc
+      it still sees magnitudes, so a map that concentrates more mass in the box (not
+      just ranks it higher) is rewarded for it. Unlike mean_in it is NOT bounded by 1,
+      so its spread differs — retune --reward_weights rather than reusing the mean_in
+      w_overlap. Not covered by the offline attack/utility screen that produced the
+      mean_in and auroc numbers below; treat it as untested.
+
   auroc  (--overlap_metric auroc)
       P(a random in-box patch outranks a random out-box patch), average ranks for ties.
       Chance = 0.5. Depends only on the ORDER of the patches, so it is exactly
@@ -51,14 +66,16 @@ nan-summed out).
       predicts correctness more stably than mean_in (mean |r| 0.238 vs 0.181 over four
       powered datasets, sd 0.028 vs 0.089, and mean_in flips sign on Visual-CoT/DINO).
 
-Optional mass floor (--mass_floor_tau, applies to either metric; off by default):
+Optional mass floor (--mass_floor_tau, applies to any metric; off by default):
 
       score *= min(1, image_mass / tau)      image_mass = step_map.sum()
 
   Because attention rows are a softmax over ALL keys and only the image columns are
   kept, image_mass is the fraction of the row spent on the image. AUROC is rank-based
   and therefore blind to a model that withdraws attention from the image toward text
-  tokens while keeping a good ranking; this floor closes that. It is not a pure guard:
+  tokens while keeping a good ranking; mean_in_v2 is a ratio of two means and is blind
+  to it for the same reason (any rescale cancels). This floor closes that for both. It
+  is not a pure guard:
   image_mass is itself predictive of correctness (r +0.22..+0.29), so the floor also
   RAISES the correlation (0.227 -> 0.238) rather than costing anything. Recommended
   tau = 0.0022, the 10th percentile of the reference model's image_mass (stable at
@@ -130,7 +147,8 @@ def _no_deepspeed_zero3_init():
 _CFG = {
     "box_threshold": 0.10,
     "max_box_area": 0.5,
-    "metric": "mean_in",     # "mean_in" (incumbent, default) | "auroc" (hack-resistant)
+    # "mean_in" (incumbent, default) | "mean_in_v2" (/mean instead of /max) | "auroc"
+    "metric": "mean_in",
     "mass_floor_tau": None,  # None/0 disables the image-mass floor; recommended 0.0022
     "dino_api_base": None,   # if set, hit a served batched DINO endpoint; else local
     "dino_device": None,     # local device override; default cuda if available
@@ -288,6 +306,23 @@ def _mean_in(step_map, mask):
     return float(inside.mean()) if inside.size > 0 else None
 
 
+def _mean_in_v2(step_map, mask):
+    """mean of the saliency inside the mask, divided by its mean over the whole map.
+
+    Chance = 1.0; unbounded above (ceiling n_patches / n_in). Both terms are means of
+    the SAME map, so the normalisation constant cancels -- no /max, no separate peak
+    to inflate, and the value is invariant to m -> c*m (see the module docstring).
+    """
+    v = np.asarray(step_map, dtype=np.float64)
+    inside = v[np.asarray(mask, dtype=bool)]
+    if inside.size == 0:
+        return None
+    denom = float(v.mean())
+    if denom <= 0:
+        return None  # all-zero map: the ratio is undefined -> skip this step
+    return float(inside.mean()) / denom
+
+
 def _auroc(step_map, mask):
     """P(random in-box patch outranks a random out-box patch); 0.5 == chance.
 
@@ -328,8 +363,11 @@ def _mass_gate(step_map):
 
 def _step_score(step_map, mask):
     """Per-step reward: the configured metric, times the optional mass floor."""
-    if _CFG.get("metric") == "auroc":
+    metric = _CFG.get("metric")
+    if metric == "auroc":
         v = _auroc(step_map, mask)
+    elif metric == "mean_in_v2":
+        v = _mean_in_v2(step_map, mask)
     else:
         v = _mean_in(step_map, mask)
     if v is None:

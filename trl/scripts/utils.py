@@ -127,11 +127,15 @@ class ScriptArguments:
             "'mean_in' (default, the incumbent) = mean of the MAX-normalized map inside the "
             "box; it divides by the map's own peak, so a map that merely FLATTENS scores "
             "higher (measured: 32x more movement under flattening than under real "
-            "grounding). 'auroc' = P(in-box patch outranks out-box patch), which depends "
+            "grounding). 'mean_in_v2' = the same mean over the box divided by the mean over "
+            "the whole map instead of by its peak: chance is 1.0, it is unbounded above "
+            "(so retune w_overlap rather than reusing the mean_in weight), rescale-invariant, "
+            "and unlike auroc it still sees magnitudes — untested offline. 'auroc' = "
+            "P(in-box patch outranks out-box patch), which depends "
             "only on patch order and is therefore exactly invariant to that flattening, and "
             "predicts correctness more stably (mean |r| 0.238 vs 0.181, sd 0.028 vs 0.089). "
             "Sweep dimension — appears in the model/wandb name.",
-            "choices": ["mean_in", "auroc"],
+            "choices": ["mean_in", "mean_in_v2", "auroc"],
         },
     )
     mass_floor_tau: Optional[float] = field(

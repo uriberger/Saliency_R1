@@ -48,6 +48,15 @@
 #                                mean_in's wov0.4. Reusing 0.2/0.4 here would apply
 #                                ~3.6x the intended pressure.
 #
+# --overlap-metric mean_in_v2 is the third option: the same mean over the box, divided
+# by the mean over the WHOLE map instead of by its peak. Chance is 1.0 and it is
+# unbounded above, so it carries NO coupled defaults -- it keeps whatever --w-overlap
+# and --mass-floor-tau you pass, and the mean_in weights do not transfer (its per-step
+# spread is larger). Set --w-overlap deliberately, and consider --mass-floor-tau 0.0022
+# for the same reason auroc needs it: a ratio of two means is blind to the model
+# withdrawing attention from the image. Untested offline -- unlike mean_in and auroc it
+# has no attack/utility screen behind it.
+#
 # MIXED CORPORA -- restrict the overlap reward to photographs:
 #
 #   bash launch_grpo_qwen3_overlap_colocated_job.sh --dataset_name cold_data/grpo_sets/set_b --natural-only
@@ -109,7 +118,8 @@ OVERLAP_HEADS="28,31"
 OVERLAP_LAYER=22
 BOX_THRESHOLD=0.10
 MAX_BOX_AREA=0.5
-OVERLAP_METRIC=mean_in   # mean_in (incumbent default) | auroc (hack-resistant; see above)
+OVERLAP_METRIC=mean_in   # mean_in (incumbent default) | mean_in_v2 (/mean not /max; see
+                         # below) | auroc (hack-resistant; see above)
 MASS_FLOOR_TAU=""        # unset -> off for mean_in, 0.0022 for auroc (see below).
                          # Pass 0 to force it off explicitly.
 # --natural-only: score the overlap reward only on rows with natural=True, leaving
