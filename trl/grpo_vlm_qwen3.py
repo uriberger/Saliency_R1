@@ -105,12 +105,32 @@ class ValidationAccuracyCallback(TrainerCallback):
     point is to compare checkpoints: with temperature 0 a change in the curve is a
     change in the model, not in the sampling draw.
 
-    Two consequences worth knowing. The policy never runs a forward pass here, so
-    validation cannot disturb DeepSpeed's ZeRO-3 module trace -- the failure that
-    killed the previous run. And generation happens on the main process only, where
-    the vLLM client lives; the other ranks simply wait at the next collective, which
-    is safe because nothing here is collective.
+    The policy never runs a forward pass here, so validation cannot disturb
+    DeepSpeed's ZeRO-3 module trace.
+
+    Two things this got wrong the first time, both of which killed a run:
+
+    Only the main process holds the vLLM client, but every rank must still walk the
+    same sequence of collectives. Generating on rank 0 and returning early elsewhere
+    let the other five ranks run on into the next step's DeepSpeed parameter gather,
+    where they waited 30 minutes for a rank that was busy generating, and the job
+    died on an ALLGATHER timeout. So every rank enters, and they synchronise on
+    broadcast_object_list -- the same main-generates-then-broadcast shape
+    _generate_and_score_completions uses.
+
+    And the request is chunked. Asking for all 256 prompts at once wedged the server
+    at "Adding requests: 0/256"; the training path never sends more than 48
+    sequences per call (6 prompts x num_generations), so CHUNK_SEQUENCES stays at
+    what that path is known to sustain.
     """
+
+    # Sequences per vLLM request. The training path sends 6 prompts x 8 generations
+    # = 48 and is known to work; 256 in one request is not. Note this asks the server
+    # for the same number of sequences as training but 8x the images (one per
+    # sequence, rather than one shared by eight), so if it ever stalls again, drop
+    # VAL_CHUNK_SEQUENCES to 6 to match training's image count exactly -- an
+    # environment variable so that costs a restart, not a code change.
+    CHUNK_SEQUENCES = int(os.environ.get("VAL_CHUNK_SEQUENCES", 48))
 
     def __init__(self, val_sets, every, accuracy_fn, max_new_tokens):
         self.val_sets = val_sets
@@ -138,16 +158,20 @@ class ValidationAccuracyCallback(TrainerCallback):
 
     def _evaluate(self, state):
         trainer = self.trainer
-        if trainer is None or not trainer.accelerator.is_main_process:
+        if trainer is None:
             return
+        # Deliberately NOT `if not is_main_process: return` -- see the class docstring.
+        # Every rank walks the same chunks and meets the main process at each
+        # broadcast, so none of them can wander into the next collective alone.
+        accelerator = trainer.accelerator
+        is_main = accelerator.is_main_process
         client = getattr(trainer, "vllm_client", None)
-        if client is None:
-            if not self._warned:
-                self._warned = True
-                print("[val] no vLLM client (needs --use_vllm --vllm_mode server); "
-                      "skipping validation")
-            return
+        if client is None and is_main and not self._warned:
+            self._warned = True
+            print("[val] no vLLM client (needs --use_vllm --vllm_mode server); "
+                  "skipping validation")
 
+        from accelerate.utils import broadcast_object_list
         from trl.data_utils import maybe_apply_chat_template
 
         metrics = {}
@@ -157,17 +181,33 @@ class ValidationAccuracyCallback(TrainerCallback):
             prompts = [maybe_apply_chat_template(r, trainer.processing_class)["prompt"] for r in rows]
             images = [r["image"] for r in rows]
 
-            completion_ids = client.generate(
-                prompts=prompts,
-                images=images,
-                n=1,
-                temperature=0.0,
-                top_p=1.0,
-                top_k=-1,
-                min_p=0.0,
-                repetition_penalty=1.0,
-                max_tokens=self.max_new_tokens,
-            )
+            completion_ids, aborted = [], False
+            for begin in range(0, len(rows), self.CHUNK_SEQUENCES):
+                end = min(begin + self.CHUNK_SEQUENCES, len(rows))
+                if is_main and client is not None:
+                    chunk = client.generate(
+                        prompts=prompts[begin:end],
+                        images=images[begin:end],
+                        n=1,
+                        temperature=0.0,
+                        top_p=1.0,
+                        top_k=-1,
+                        min_p=0.0,
+                        repetition_penalty=1.0,
+                        max_tokens=self.max_new_tokens,
+                    )
+                else:
+                    chunk = None
+                # Collective: every rank blocks here until the main process has its
+                # chunk, which is what keeps them in lockstep.
+                chunk = broadcast_object_list([chunk], from_process=0)[0]
+                if chunk is None:  # no client anywhere -- give up, on every rank alike
+                    aborted = True
+                    break
+                completion_ids.extend(chunk)
+            if aborted:
+                return
+
             texts = trainer.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
             completions = [[{"role": "assistant", "content": t}] for t in texts]
             scores = self.accuracy_fn(completions=completions, solution=[r["solution"] for r in rows])
