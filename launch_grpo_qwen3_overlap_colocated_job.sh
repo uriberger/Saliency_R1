@@ -98,16 +98,17 @@
 #
 #   benchmarks   The 16 test benchmarks, cut to 100 random documents each and split
 #                into a natural and a non-natural suite, run on every kept
-#                checkpoint by a separate 4-GPU job. That job is submitted by
-#                watch_bench_evals.sh, which holds no GPUs itself and submits only
-#                when a checkpoint is waiting and nothing is already in flight:
+#                checkpoint by a separate 4-GPU job. watch_bench_evals.sh starts
+#                with the run, holds no GPUs itself, and submits a job only when a
+#                checkpoint is waiting and none is already in flight. It submits
+#                with sbatch here on the compute node, because the submit_job
+#                wrapper resolves the cluster from $HOSTNAME and has no pool1-*
+#                entry. --no-auto-bench turns it off; to run it by hand later:
 #
 #                  bash watch_bench_evals.sh --run-dir <output-dir>
 #
-#                --auto-bench starts it automatically, if this node can submit
-#                jobs; it says so plainly when it cannot, rather than appearing to
-#                have started. Results reach WandB under bench/* within one logging
-#                interval; anything finishing after training exits is appended with
+#                Results reach WandB under bench/* within one logging interval;
+#                anything finishing after training exits is appended with
 #                `python bench_eval.py --backfill --run-dir DIR --wandb-run-id ID`.
 #
 # Environment overrides:
@@ -162,10 +163,10 @@ VAL_SETS_DIR=${VAL_SETS_DIR:-$REPO/cold_data/grpo_sets}
 # generation group per step. Any other value can split a group across processes, and
 # GRPO reshapes gathered rewards into whole groups.
 EVAL_BATCH=${EVAL_BATCH:-}
-# --auto-bench: also start the benchmark-eval dispatcher (watch_bench_evals.sh),
-# which submits a 4-GPU job whenever a checkpoint is waiting for one. Off by
-# default -- it submits jobs, so it should be an explicit choice.
-AUTO_BENCH=${AUTO_BENCH:-false}
+# The benchmark-eval dispatcher (watch_bench_evals.sh) starts with the run and
+# submits a $BENCH_GPUS-GPU job whenever a kept checkpoint is waiting to be scored.
+# It holds no GPU itself. --no-auto-bench turns it off.
+AUTO_BENCH=${AUTO_BENCH:-true}
 BENCH_GPUS=${BENCH_GPUS:-4}
 EXTRA_ARGS=""
 DIRECT=false
@@ -624,22 +625,31 @@ fi
 
 # ---------- benchmark-eval dispatcher ----------
 # Submits a $BENCH_GPUS-GPU job whenever a kept checkpoint is waiting to be scored on
-# the mini test suites. It holds no GPU itself, but it does need a host that can
-# submit jobs -- which is not always the node training runs on. Probe rather than
-# assume, and say plainly what to do when the probe fails: a dispatcher that
-# silently never started would look exactly like one that found no work.
+# the mini test suites. It holds no GPU itself and runs alongside training, here on
+# the compute node -- watch_bench_evals.sh picks its own submission backend, falling
+# back from submit_job (which cannot resolve a pool1-* hostname) to sbatch (which
+# can). Deciding that there rather than here keeps one copy of the rule.
+#
+# A dispatcher that died on startup looks exactly like one that found no work, so
+# confirm it is alive and print the manual command if it is not.
 BENCH_WATCHER_PID=""
 if [[ "$AUTO_BENCH" == true ]]; then
-    if command -v submit_job >/dev/null 2>&1 || \
-       [ -x "/lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface/latest/submit_job" ]; then
-        echo "[bench] starting the benchmark dispatcher for $OUTPUT_DIR"
-        bash "$REPO/watch_bench_evals.sh" --run-dir "$OUTPUT_DIR" --num-gpus "$BENCH_GPUS" \
-            --every "$CKPT_KEEP_EVERY" > "$LOG_DIR/bench_watcher.log" 2>&1 &
-        BENCH_WATCHER_PID=$!
+    echo "[bench] starting the benchmark dispatcher for $OUTPUT_DIR"
+    bash "$REPO/watch_bench_evals.sh" --run-dir "$OUTPUT_DIR" --num-gpus "$BENCH_GPUS" \
+        --every "$CKPT_KEEP_EVERY" > "$LOG_DIR/bench_watcher.log" 2>&1 &
+    BENCH_WATCHER_PID=$!
+    sleep 5
+    if kill -0 "$BENCH_WATCHER_PID" 2>/dev/null; then
+        sed -n '/^Submitting:/p' "$LOG_DIR/bench_watcher.log" | sed 's/^/[bench] /'
+        echo "[bench] dispatcher running (pid $BENCH_WATCHER_PID), log: $LOG_DIR/bench_watcher.log"
     else
+        BENCH_WATCHER_PID=""
         echo "==========================================================================" >&2
-        echo "[bench] This node cannot submit jobs, so the dispatcher was NOT started." >&2
-        echo "        Run this on the login node instead (it needs no GPUs):" >&2
+        echo "[bench] The dispatcher exited immediately. It said:" >&2
+        sed 's/^/        /' "$LOG_DIR/bench_watcher.log" >&2
+        echo "" >&2
+        echo "        Training continues. To collect benchmarks, run this on the login" >&2
+        echo "        node (it needs no GPUs):" >&2
         echo "" >&2
         echo "          bash $REPO/watch_bench_evals.sh --run-dir $OUTPUT_DIR \\" >&2
         echo "               --num-gpus $BENCH_GPUS --every $CKPT_KEEP_EVERY" >&2

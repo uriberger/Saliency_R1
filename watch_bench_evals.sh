@@ -57,7 +57,12 @@ done
 
 [[ -n "$RUN_DIR" ]] || { echo "error: --run-dir is required" >&2; exit 2; }
 [[ -d "$RUN_DIR" ]] || { echo "error: no such run dir: $RUN_DIR" >&2; exit 2; }
-RUN_DIR=$(cd "$RUN_DIR" && pwd)
+# `pwd -P`, not `pwd`: /home/uberger/scratch/research/saliency_r1 and
+# /lustre/fs1/.../saliency_r1 are the same directory through a symlink, and the
+# in-flight job token is derived from this string. Two dispatchers started with
+# different spellings of one run would hash differently, fail to see each other's
+# job, and both submit.
+RUN_DIR=$(cd "$RUN_DIR" && pwd -P)
 
 RUN_NAME=$(basename "$RUN_DIR")
 # submit_job rewrites the name it is given -- it appends a _<date>-<time> stamp and
@@ -72,21 +77,64 @@ BENCH_DIR="$RUN_DIR/bench_eval"
 LOG_ROOT="$REPO/outputs/logs"
 mkdir -p "$BENCH_DIR" "$LOG_ROOT"
 
-# ADLR cluster-interface tools (submit_job) on PATH.
-if ! command -v submit_job >/dev/null 2>&1; then
+# ---------- how to submit ----------
+# Two backends, because submit_job does not work everywhere:
+#
+#   submit_job  the ADLR wrapper. It sources detect_system.sh, which maps
+#               $HOSTNAME to a cluster through a case list -- and that list has no
+#               pool1-* entry, so it resolves on the login node and fails on every
+#               compute node. The binary lives on /lustre and is readable from
+#               both, so its PRESENCE proves nothing; the probe below asks
+#               detect_system.sh whether it can actually place this host. Note it
+#               reports the failure on stdout and still exits 0, so the output has
+#               to be inspected rather than the status.
+#
+#   sbatch      stock Slurm. Works from anywhere that reaches slurmctld, compute
+#               nodes included, which is what lets --auto-bench start this from
+#               inside a training job.
+CI_DIR=""
+if command -v submit_job >/dev/null 2>&1; then
+    CI_DIR=$(dirname "$(command -v submit_job)")
+else
     for CI_ROOT in \
         /lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface \
         /lustre/fsw/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface; do
         for CAND in "$CI_ROOT/latest" $(ls -1dt "$CI_ROOT"/*/ 2>/dev/null); do
-            if [ -x "${CAND%/}/submit_job" ]; then export PATH="${CAND%/}:$PATH"; break 2; fi
+            if [ -x "${CAND%/}/submit_job" ]; then
+                CI_DIR="${CAND%/}"; export PATH="$CI_DIR:$PATH"; break 2
+            fi
         done
     done
 fi
-command -v submit_job >/dev/null 2>&1 || {
-    echo "ERROR: submit_job not found. This host cannot submit jobs -- run this script" >&2
-    echo "       somewhere that can (the login/vscode node)." >&2
-    exit 1
+
+submit_job_usable() {
+    [ -n "$CI_DIR" ] && [ -f "$CI_DIR/detect_system.sh" ] || return 1
+    # Capture and match, rather than piping into grep -q. Under `set -o pipefail`
+    # the pipeline reports the rightmost non-zero status, and `grep -q` exits on
+    # its first match -- which SIGPIPEs detect_system.sh, making the pipeline 141
+    # instead of grep's 0. The negation would then read a *detected failure* as
+    # success, i.e. choose submit_job on exactly the hosts where it cannot work.
+    local out
+    out=$(bash "$CI_DIR/detect_system.sh" 2>&1) || true
+    [[ "$out" != *"Unable to determine target cluster"* ]]
 }
+
+if submit_job_usable; then
+    BACKEND=submit_job
+elif command -v sbatch >/dev/null 2>&1; then
+    BACKEND=sbatch
+else
+    echo "ERROR: neither submit_job nor sbatch can submit from $(hostname)." >&2
+    echo "       Run this script on a host that reaches slurmctld." >&2
+    exit 1
+fi
+
+# Only used by the sbatch backend; submit_job sizes the allocation itself. The
+# defaults match what this cluster actually hands out (an 8-GPU interactive job
+# gets 224 CPUs and 1970 GB, i.e. 28 CPUs and ~246 GB per GPU); asking for more
+# per GPU than a node has makes the job unschedulable rather than merely large.
+CPUS_PER_GPU=${CPUS_PER_GPU:-28}
+MEM_PER_GPU_GB=${MEM_PER_GPU_GB:-240}
 
 pending_steps() {
     local d step
@@ -116,27 +164,67 @@ cooling_down() {
     (( now - last_submit < COOLDOWN ))
 }
 
+# The judge key travels in this process's environment, not inside the job script.
+# sbatch propagates the submitting environment (--export=ALL is Slurm's default),
+# and quoting a secret into a `bash -c '...'` string is how you get a value that
+# silently truncates at the first space or quote.
+#
+# The previous form also did not parse at all:
+# `${NVIDIA_API_KEY:+... ${OPENAI_API_KEY:-...} ...}` is not valid nesting -- the
+# inner `}` closed the outer expansion and left a bare `;}` in the emitted command,
+# a syntax error that killed the job before it ran anything.
+#
+# mathvista_testmini_cot is scored by an LLM judge, so a missing key does not fail
+# loudly, it just scores that benchmark wrong. Say so at startup instead.
+BENCH_JUDGE_KEY=${OPENAI_API_KEY:-${NVIDIA_API_KEY:-}}
+[[ -n "$BENCH_JUDGE_KEY" ]] && export OPENAI_API_KEY="$BENCH_JUDGE_KEY"
+
+INNER_CMD="bash $SCRIPT_DIR/run_bench_eval.sh \
+        --run-dir $RUN_DIR --num-gpus $NUM_GPUS --every $EVERY --sample-n $SAMPLE_N"
+
 submit_eval_job() {
-    submit_job \
-        --account "$ACCOUNT" \
-        --partition "$PARTITION" \
-        --name "$JOB_NAME" \
-        --gpu "$NUM_GPUS" \
-        --duration "$DURATION" \
-        --outfile "$LOG_ROOT/${JOB_NAME}.%j.out" \
-        --logroot "$LOG_ROOT" \
-        -c "bash -c '
-            ${HF_TOKEN:+export HF_TOKEN=$HF_TOKEN;}
-            ${OPENAI_API_KEY:+export OPENAI_API_KEY=$OPENAI_API_KEY;}
-            ${NVIDIA_API_KEY:+export OPENAI_API_KEY=\${OPENAI_API_KEY:-$NVIDIA_API_KEY};}
-            bash $SCRIPT_DIR/run_bench_eval.sh \
-                --run-dir $RUN_DIR --num-gpus $NUM_GPUS --every $EVERY --sample-n $SAMPLE_N
-        '"
+    if [[ "$BACKEND" == "submit_job" ]]; then
+        submit_job \
+            --account "$ACCOUNT" \
+            --partition "$PARTITION" \
+            --name "$JOB_NAME" \
+            --gpu "$NUM_GPUS" \
+            --duration "$DURATION" \
+            --outfile "$LOG_ROOT/${JOB_NAME}.%j.out" \
+            --logroot "$LOG_ROOT" \
+            -c "bash -c '$INNER_CMD'"
+        return $?
+    fi
+
+    # No requeue trap here, unlike the eval-suite launcher: this job drains what is
+    # pending and exits, so a wall-clock kill loses at most the checkpoint in
+    # progress -- whose step file was never written, so the next submission simply
+    # picks it up again.
+    local script="$LOG_ROOT/${JOB_TOKEN}.sbatch"
+    cat > "$script" <<SBATCH_EOF
+#!/bin/bash
+#SBATCH --account=$ACCOUNT
+#SBATCH --partition=$PARTITION
+#SBATCH --job-name=$JOB_NAME
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:$NUM_GPUS
+#SBATCH --cpus-per-task=$((CPUS_PER_GPU * NUM_GPUS))
+#SBATCH --mem=$((MEM_PER_GPU_GB * NUM_GPUS))G
+#SBATCH --time=${DURATION}:00:00
+#SBATCH --export=ALL
+#SBATCH --output=$LOG_ROOT/${JOB_TOKEN}.%j.out
+
+bash -c '$INNER_CMD'
+SBATCH_EOF
+    sbatch "$script"
 }
 
 echo "=========================================================================="
 echo "Watching:   $RUN_DIR"
 echo "Job name:   $JOB_NAME   ($NUM_GPUS GPUs, ${DURATION}h, $PARTITION)"
+echo "Submitting: $BACKEND   (from $(hostname))"
+echo "Judge key:  $([[ -n "$BENCH_JUDGE_KEY" ]] && echo '(set)' || echo '(MISSING - mathvista_testmini_cot will be scored without its LLM judge)')"
 echo "Cadence:    every $EVERY steps, $SAMPLE_N samples/benchmark"
 echo "Results:    $BENCH_DIR/step-<N>.json"
 echo "Poll:       every ${INTERVAL}s   $($ONCE && echo '(--once: one pass)' || echo '(Ctrl-C to stop)')"
