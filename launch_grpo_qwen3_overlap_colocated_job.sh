@@ -237,6 +237,7 @@ while [[ $# -gt 0 ]]; do
         --natural-only)           NATURAL_ONLY=true;            shift ;;
         --no-natural-only)        NATURAL_ONLY=false;           shift ;;
         --eval-steps)             EVAL_STEPS="$2";              shift 2 ;;
+        --eval-batch)             EVAL_BATCH="$2";              shift 2 ;;
         --no-eval)                VAL_SETS_DIR="";              shift ;;
         --val-sets-dir)           VAL_SETS_DIR="$2";            shift 2 ;;
         --auto-bench)             AUTO_BENCH=true;              shift ;;
@@ -418,6 +419,7 @@ if ! $DIRECT; then
                 --vllm-enforce-eager $VLLM_ENFORCE_EAGER \
                 --eval-steps $EVAL_STEPS \
                 --bench-gpus $BENCH_GPUS \
+                ${EVAL_BATCH:+--eval-batch $EVAL_BATCH} \
                 ${VAL_SETS_DIR:+--val-sets-dir $VAL_SETS_DIR} \
                 $([ -z "$VAL_SETS_DIR" ] && echo --no-eval) \
                 $([ "$AUTO_BENCH" = true ] && echo --auto-bench) \
