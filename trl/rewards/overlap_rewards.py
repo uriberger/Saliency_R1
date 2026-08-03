@@ -72,6 +72,19 @@ the reward's predictive value and a hard gate costs 50-70%, to close a step-drop
 hole that is already ~5x smaller under auroc (0.20) than under mean_in (1.07). Monitor
 the observe-step count as a training diagnostic instead.
 
+Natural-images-only gating (--overlap_natural_only, OFF by default):
+
+      With a mixed corpus (cold_data/grpo_sets/set_b = 80% natural + 20% charts /
+      documents / diagrams), Grounding-DINO is being asked to localise phrases on
+      imagery it was never trained for, so on the non-natural rows the box union --
+      and therefore the whole overlap score -- is noise. Turning this on returns
+      None for every row whose `natural` column is False: those rows keep exactly
+      the other three rewards (format, accuracy, judge) and contribute nothing to
+      the overlap term. It is a masking, not a zeroing: a zero would be identical
+      for the advantage (a per-group constant cancels in reward - group_mean) but
+      would drag the logged rewards/think_overlap_reward/mean down with rows the
+      reward was never evaluated on.
+
 w_overlap is applied by the trainer via --reward_weights, not here.
 """
 
@@ -122,6 +135,7 @@ _CFG = {
     "dino_api_base": None,   # if set, hit a served batched DINO endpoint; else local
     "dino_device": None,     # local device override; default cuda if available
     "dino_batch_size": 32,
+    "natural_only": False,   # True -> mask (None) the reward on rows with natural=False
 }
 
 # Lazily-loaded local Grounding-DINO singleton (one per training process).
@@ -323,20 +337,38 @@ def _step_score(step_map, mask):
     return v * _mass_gate(step_map)
 
 
-def think_overlap_reward(completions=None, saliency_map=None, valid_list=None, image=None, **kwargs):
+def think_overlap_reward(
+    completions=None, saliency_map=None, valid_list=None, image=None, natural=None, **kwargs
+):
     """Per-completion overlap reward. See module docstring.
 
     Returns a list (len == n completions) of floats, or None where there is no grounded
-    observe step (masked -> neutral in GRPO). w_overlap is applied by --reward_weights.
+    observe step, or where --overlap_natural_only masks a non-natural row (masked ->
+    neutral in GRPO). w_overlap is applied by --reward_weights.
     """
     n = len(saliency_map)
     if valid_list is None:
         valid_list = [True] * n
 
-    # Flatten every (completion, observe-step) into one batched DINO call.
+    # --overlap_natural_only: score only the photographic rows. `natural` arrives as a
+    # per-row dataset column (the trainer forwards every column as a reward kwarg).
+    if _CFG.get("natural_only"):
+        if natural is None:
+            raise KeyError(
+                "--overlap_natural_only requires a boolean 'natural' column in the dataset, "
+                "but none reached the reward function. Use a corpus built by "
+                "build_grpo_sets.py (cold_data/grpo_sets/*), or drop the flag."
+            )
+        scored = [bool(x) for x in natural]
+    else:
+        scored = [True] * n
+
+    # Flatten every (completion, observe-step) into one batched DINO call. Masked rows
+    # never reach DINO -- the trainer normally hands them no maps anyway, but a row
+    # masked here must not cost a grounding call even if it does.
     flat_images, flat_texts, flat_owner = [], [], []
     for c, steps in enumerate(saliency_map):
-        if not steps:
+        if not steps or not scored[c]:
             continue
         img = image[c]
         for si, st in enumerate(steps):
@@ -360,6 +392,9 @@ def think_overlap_reward(completions=None, saliency_map=None, valid_list=None, i
 
     rewards = []
     for c in range(n):
+        if not scored[c]:
+            rewards.append(None)  # non-natural under --overlap_natural_only -> mask
+            continue
         vals = per_completion[c]
         if not vals:
             rewards.append(None)  # zero grounded observe steps -> mask (neutral)

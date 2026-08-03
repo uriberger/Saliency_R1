@@ -37,8 +37,18 @@
 #                                items, 9-8 on benchmark wins). Reusing 0.4 here would
 #                                apply ~3.6x the intended pressure.
 #
+# MIXED CORPORA -- restrict the overlap reward to photographs:
+#
+#   bash launch_grpo_qwen3_overlap_job.sh --dataset_name cold_data/grpo_sets/set_b --natural-only
+#
+# Grounding-DINO is a photograph detector, so on charts/documents/diagrams its boxes --
+# and hence the whole overlap score -- are noise. --natural-only masks the overlap term on
+# rows whose `natural` column is False; they keep format + accuracy + judge. Adds _natonly
+# to the run name. Off by default.
+#
 # Environment overrides:
 #   PARTITION=batch_singlenode   DURATION=4 (hours)
+#   NATURAL_ONLY=true            (same as --natural-only; --no-natural-only to force off)
 #   SAVE_STEPS=10   CKPT_KEEP_EVERY=500
 #   NVIDIA_API_KEY / OPENAI_API_KEY / OPENAI_BASE_URL / JUDGE_MODEL
 #   WANDB_API_KEY   (omit -> offline)   HF_TOKEN
@@ -78,6 +88,10 @@ MAX_BOX_AREA=0.5
 OVERLAP_METRIC=mean_in   # mean_in (incumbent default) | auroc (hack-resistant; see docs/)
 MASS_FLOOR_TAU=""        # unset -> off for mean_in, 0.0022 for auroc (see below).
                          # Pass 0 to force it off explicitly.
+# --natural-only: score the overlap reward only on rows with natural=True, leaving
+# charts/documents/diagrams to format + accuracy + judge. Only meaningful on a mixed
+# corpus with a `natural` column (cold_data/grpo_sets/set_b); OFF by default.
+NATURAL_ONLY=${NATURAL_ONLY:-false}
 DINO_API_BASE=""
 
 # ---------- parse args ----------
@@ -102,6 +116,8 @@ while [[ $# -gt 0 ]]; do
         --max-box-area)           MAX_BOX_AREA="$2";            shift 2 ;;
         --overlap-metric)         OVERLAP_METRIC="$2";          shift 2 ;;
         --mass-floor-tau)         MASS_FLOOR_TAU="$2";          shift 2 ;;
+        --natural-only)           NATURAL_ONLY=true;            shift ;;
+        --no-natural-only)        NATURAL_ONLY=false;           shift ;;
         --dino-api-base)          DINO_API_BASE="$2";           shift 2 ;;
         # The training command runs from $REPO/trl_repo, so a relative dataset path
         # given on the command line would be resolved against the wrong directory.
@@ -134,6 +150,9 @@ SUFFIX="__wov${W_OVERLAP}_${N_HEADS}head_tr${TOKEN_REDUCTION}"
 # (and the checkpoints already on disk) stay exactly as they are.
 [[ "$OVERLAP_METRIC" != "mean_in" ]] && SUFFIX="${SUFFIX}_${OVERLAP_METRIC}"
 [[ -n "$MASS_FLOOR_TAU" ]] && SUFFIX="${SUFFIX}_mf${MASS_FLOOR_TAU}"
+# The reward differs from a plain run, so the checkpoints and the wandb run must not
+# share a name with one.
+[[ "$NATURAL_ONLY" == true ]] && SUFFIX="${SUFFIX}_natonly"
 MODEL_SLUG=$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g')
 RUN_NAME="grpo-${MODEL_SLUG}-overlap${SUFFIX}"
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$REPO/checkpoint/${RUN_NAME}"
@@ -146,6 +165,7 @@ echo "Model:          $MODEL"
 echo "GPUs:           $NUM_GPUS (all training, no colocated sidecars)"
 echo "Overlap reward: layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
 echo "Metric:         $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " mass_floor_tau=$MASS_FLOOR_TAU" || echo " (no mass floor)")"
+echo "Overlap rows:   $([ "$NATURAL_ONLY" = true ] && echo 'natural images only (non-natural: format+accuracy+judge)' || echo 'all rows')"
 echo "DINO:           box_threshold=$BOX_THRESHOLD max_box_area=$MAX_BOX_AREA  $([[ -n "$DINO_API_BASE" ]] && echo "served=$DINO_API_BASE" || echo 'local-on-device')"
 echo "Run name:       $RUN_NAME"
 echo "Output dir:     $OUTPUT_DIR"
@@ -303,6 +323,11 @@ DINO_FLAG=""
 MASS_FLOOR_FLAG=""
 [[ -n "$MASS_FLOOR_TAU" ]] && MASS_FLOOR_FLAG="--mass_floor_tau $MASS_FLOOR_TAU"
 
+# Omitted when off, so the dataclass default (False) applies and the command line of an
+# existing run is reproduced byte for byte.
+NATURAL_ONLY_FLAG=""
+[[ "$NATURAL_ONLY" == true ]] && NATURAL_ONLY_FLAG="--overlap_natural_only True"
+
 accelerate launch \
     --config_file examples/accelerate_configs/deepspeed_zero3.yaml \
     --num_processes "$NUM_GPUS" \
@@ -324,6 +349,7 @@ accelerate launch \
     --max_box_area "$MAX_BOX_AREA" \
     --overlap_metric "$OVERLAP_METRIC" \
     $MASS_FLOOR_FLAG \
+    $NATURAL_ONLY_FLAG \
     $DINO_FLAG \
     --reward_weights $REWARD_WEIGHTS \
     --use_peft \

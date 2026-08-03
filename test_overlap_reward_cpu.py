@@ -1,11 +1,20 @@
 """CPU sanity tests for the attention-overlap reward port. No 8B model / no GPU."""
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
+
+# Which copy of the sources to test. Default: trl_repo/, the tree that actually runs
+# (what patch_trl_qwen3.sh installs there). OVERLAP_TEST_TREE=local tests this checkout's
+# tracked sources instead -- the only option from a git worktree, where copying into the
+# shared trl_repo/ would hit every other session and every running job.
+_LOCAL = os.environ.get("OVERLAP_TEST_TREE") == "local"
+REWARDS_SRC = "trl/rewards/overlap_rewards.py" if _LOCAL else "trl_repo/trl/rewards/overlap_rewards.py"
+STEPS_SRC = "trl/overlap_steps.py" if _LOCAL else "trl_repo/trl/trainer/overlap_steps.py"
 
 
 def _load(name, relpath):
@@ -15,8 +24,9 @@ def _load(name, relpath):
     spec.loader.exec_module(mod)
     return mod
 
-orw = _load("overlap_rewards", "trl_repo/trl/rewards/overlap_rewards.py")
-ost = _load("overlap_steps", "trl_repo/trl/trainer/overlap_steps.py")
+orw = _load("overlap_rewards", REWARDS_SRC)
+ost = _load("overlap_steps", STEPS_SRC)
+print(f"[tree] testing {'this checkout' if _LOCAL else 'trl_repo/ (the running copy)'}")
 
 # ---------------------------------------------------------------------------
 # Test 1: mean_in metric matches offline _score_saliency_flat (max-norm then mean-in)
@@ -163,10 +173,50 @@ print("[T6] mass floor OK: off by default, min(1, mass/tau) once set, penalises 
 # ---------------------------------------------------------------------------
 # Test 7: DEFAULTS ARE UNCHANGED -- a fresh import must reproduce the incumbent
 # ---------------------------------------------------------------------------
-orw_fresh = _load("overlap_rewards_fresh", "trl_repo/trl/rewards/overlap_rewards.py")
+orw_fresh = _load("overlap_rewards_fresh", REWARDS_SRC)
 assert orw_fresh._CFG["metric"] == "mean_in", orw_fresh._CFG
 assert orw_fresh._CFG["mass_floor_tau"] is None, orw_fresh._CFG
+assert orw_fresh._CFG["natural_only"] is False, orw_fresh._CFG
 assert orw_fresh._step_score(m5b, mk5b) == orw_fresh._mean_in(m5b, mk5b)
-print("[T7] defaults unchanged: metric=mean_in, no mass floor, _step_score == _mean_in")
+print("[T7] defaults unchanged: metric=mean_in, no mass floor, natural_only off, _step_score == _mean_in")
+
+# ---------------------------------------------------------------------------
+# Test 8: natural-images-only gating (--overlap_natural_only)
+# ---------------------------------------------------------------------------
+orw.configure(metric="mean_in", mass_floor_tau=None)
+_two = dict(completions=[None, None], saliency_map=[sal[0], sal[0]],
+            valid_list=[True, True], image=[_Img(), _Img()])
+
+# 8a. off (the default): the `natural` column is ignored, both rows are scored
+r_off = orw.think_overlap_reward(natural=[True, False], **_two)
+assert abs(r_off[0] - 0.5) < 1e-6 and abs(r_off[1] - 0.5) < 1e-6, r_off
+print(f"[T8a] switch off -> natural column ignored, both rows scored: {r_off}")
+
+# 8b. on: the non-natural row is MASKED (None, not 0.0), the natural row is untouched,
+#     and the masked row must not cost a Grounding-DINO call
+_grounded = []
+def _counting_dino(images, texts):
+    _grounded.extend(texts)
+    return _fake_dino(images, texts)
+orw._dino_boxes = _counting_dino
+orw.configure(natural_only=True)
+r_on = orw.think_overlap_reward(natural=[True, False], **_two)
+assert abs(r_on[0] - 0.5) < 1e-6, r_on
+assert r_on[1] is None, r_on          # masked (NaN -> neutral), NOT scored 0.0
+assert len(_grounded) == 2, _grounded  # only completion 0's two observe steps
+print(f"[T8b] switch on -> non-natural row masked and never grounded: {r_on}, dino calls={len(_grounded)}")
+
+# 8c. no `natural` column while the switch is on must fail loudly. Silently masking
+#     every row would turn the run into --reward_variant none without saying so.
+try:
+    orw.think_overlap_reward(natural=None, **_two)
+except KeyError as e:
+    assert "natural" in str(e)
+    print("[T8c] missing natural column raises instead of silently masking everything")
+else:
+    raise AssertionError("expected KeyError when natural_only=True and natural is None")
+
+orw.configure(natural_only=False)
+orw._dino_boxes = _fake_dino
 
 print("\nAll CPU logic tests passed.")

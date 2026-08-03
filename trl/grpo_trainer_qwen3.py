@@ -516,10 +516,30 @@ class GRPOTrainer(Trainer):
         overlap_layer: int = 22,
         overlap_heads=(28, 31),
         token_reduction: str = "mean",
+        overlap_natural_only: bool = False,
     ):
         self.reforward_saliency = reforward_saliency
         # --- attention-overlap reward config (reward_variant="ours") ---
         self.reward_variant = reward_variant
+        # Score the overlap reward on natural (photographic) rows only; non-natural rows
+        # fall back to format + accuracy + judge. See think_overlap_reward's docstring.
+        self.overlap_natural_only = bool(overlap_natural_only) and reward_variant == "ours"
+        if overlap_natural_only and not self.overlap_natural_only:
+            warnings.warn(
+                f"overlap_natural_only=True is ignored with reward_variant='{reward_variant}': "
+                "there is no overlap reward to mask."
+            )
+        if self.overlap_natural_only:
+            # IterableDataset may expose no column_names at all; only validate when we
+            # actually get a plain column list (a Dataset), and let the reward raise later
+            # otherwise.
+            _cols = getattr(train_dataset, "column_names", None)
+            if isinstance(_cols, (list, tuple)) and "natural" not in _cols:
+                raise KeyError(
+                    "overlap_natural_only=True requires a boolean 'natural' column in the "
+                    f"train dataset, but its columns are {sorted(_cols)}. Use a corpus built "
+                    "by build_grpo_sets.py (cold_data/grpo_sets/*), or drop the flag."
+                )
         self.overlap_layer = int(overlap_layer)
         if isinstance(overlap_heads, str):
             overlap_heads = [int(h) for h in overlap_heads.split(",") if h.strip() != ""]
@@ -1469,6 +1489,23 @@ class GRPOTrainer(Trainer):
                     _ds_int._hf_deepspeed_config_weak_ref = _saved_ref
         return self._overlap_clf
 
+    @staticmethod
+    def _row_is_natural(inputs, case_id):
+        """`natural` column of one input row (--overlap_natural_only).
+
+        Raises rather than defaulting: a missing column would otherwise silently mask
+        the overlap reward on every row and quietly turn the run into --reward_variant
+        none with extra steps.
+        """
+        row = inputs[case_id]
+        if not isinstance(row, dict) or "natural" not in row:
+            raise KeyError(
+                "overlap_natural_only=True requires a boolean 'natural' column in the "
+                "dataset, but the batch row has none. Use a corpus built by "
+                "build_grpo_sets.py (cold_data/grpo_sets/*), or drop the flag."
+            )
+        return bool(row["natural"])
+
     @profiling_decorator
     def _compute_overlap_step_maps(
         self, inputs, images, prompt_inputs, prompt_completion_ids, attention_mask,
@@ -1571,6 +1608,14 @@ class GRPOTrainer(Trainer):
                 ts, te = think_start[case_id], think_end[case_id]
                 # Skip malformed / empty think spans (reward -> masked/neutral).
                 if not invalid[case_id] or te <= ts:
+                    continue
+                # --overlap_natural_only: this row's overlap reward is masked anyway, so
+                # its capture forward + T5 segmentation + DINO grounding would be pure
+                # waste. Skip the per-case work ONLY -- never the enclosing
+                # unwrap_model_for_generation, whose ZeRO-3 parameter gather is a
+                # collective that every rank must enter the same number of times, and
+                # ranks do not see the same natural/non-natural mix in their batch.
+                if self.overlap_natural_only and not self._row_is_natural(inputs, case_id):
                     continue
 
                 _case_inputs = {
@@ -2344,6 +2389,15 @@ class GRPOTrainer(Trainer):
             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
             std_rewards = nanstd(rewards_per_func[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
+        if self.overlap_natural_only:
+            # Share of rollouts the overlap reward was actually scored on. The
+            # rewards/think_overlap_reward/mean above is a nanmean, so it already
+            # averages over these rows only -- this says how many they were.
+            _nat = torch.tensor(
+                [float(self._row_is_natural(inputs, i)) for i in range(len(inputs))],
+                dtype=torch.float32, device=device,
+            )
+            self._metrics[mode]["overlap/natural_frac"].append(gather(_nat).mean().item())
         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
         # Overall (weighted-sum) reward mean/std across ALL rollouts, in the same

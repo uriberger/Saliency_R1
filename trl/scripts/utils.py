@@ -163,6 +163,18 @@ class ScriptArguments:
             "If unset, DINO runs locally on each training process's device."
         },
     )
+    overlap_natural_only: bool = field(
+        default=False,
+        metadata={
+            "help": "reward_variant='ours': apply the overlap reward ONLY to rows whose "
+            "'natural' column is True; non-natural rows (charts, documents, diagrams) are "
+            "scored by format + accuracy + judge alone. Grounding-DINO is trained on "
+            "photographs, so its boxes -- and hence the overlap score -- are noise on "
+            "non-natural imagery. Requires a boolean 'natural' column (build_grpo_sets.py "
+            "emits one). Off by default, so mixed-corpus runs stay reproducible. Sweep "
+            "dimension — appears in the model/wandb name as natonly."
+        },
+    )
 
 
 def init_zero_verbose():

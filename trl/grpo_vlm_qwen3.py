@@ -249,6 +249,7 @@ if __name__ == "__main__":
             metric=script_args.overlap_metric,
             mass_floor_tau=script_args.mass_floor_tau,
             dino_api_base=script_args.dino_api_base,
+            natural_only=script_args.overlap_natural_only,
         )
         reward_funcs = [think_format_reward, think_overlap_reward, accuracy_reward, openai_reward]
     elif script_args.reward_variant == "none":
@@ -272,6 +273,7 @@ if __name__ == "__main__":
         overlap_layer=script_args.overlap_layer,
         overlap_heads=script_args.overlap_heads,
         token_reduction=script_args.token_reduction,
+        overlap_natural_only=script_args.overlap_natural_only,
     )
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
