@@ -22,30 +22,31 @@ Fields:
              number that is simply wrong. It is still logged -- comparable from
              checkpoint to checkpoint, just not to a published MME score.
 
-An LLM judge sits on the scoring path of `dailyclue` and `omnispatial_test`
-(dailyclue tries exact/numeric/date shortcuts first and judges the rest;
-omnispatial calls server.evaluate for every item). Neither fails loudly without
-OPENAI_API_KEY / NVIDIA_API_KEY -- the call errors, the item is scored wrong, and
-the benchmark simply reads low. Give the dispatcher a key, or expect those two
-curves to sit below the model's real score. mathvision_testmini looks like a third
-but is not: it uses mathvision_process_results, and the judged variant is a
-separate function belonging to the mathvision_reason_* tasks.
+Every benchmark here scores itself: none calls an LLM judge, so the eval job needs
+no API key and cannot be skewed by one being absent or rate-limited. Three of the
+test benchmarks were left out for that reason, because all three fail *quietly* --
+the judge call errors, the item is scored wrong, and the benchmark simply reads
+low, which on a training curve is indistinguishable from a model that got worse:
+
+    mathvista_testmini_cot   llm_as_judge_eval IS its primary metric
+    dailyclue                exact/numeric/date shortcuts first, judges the rest
+    omnispatial_test         calls server.evaluate on every item
+
+All three stay in the full test suite, where a key is always supplied, so the
+headline numbers are unaffected -- only the per-checkpoint monitor is narrower.
+mathvision_testmini looks like a fourth case but is not: it uses
+mathvision_process_results, while the judged function belongs to the
+mathvision_reason_* tasks.
 """
 
 BENCHMARKS = {
     # --- natural imagery ---
-    "dailyclue": dict(
-        suite="natural", yaml="dailyclue/dailyclue.yaml",
-        metric="dailyclue_overall,none", scale=100.0, in_mean=True),
     "mme": dict(
         suite="natural", yaml="mme/mme.yaml",
         metric="mme_perception_score,none", scale=1.0, in_mean=False),
     "mmerealworld": dict(
         suite="natural", yaml="mme_realworld/mme_realworld.yaml",
         metric="mme_realworld_score,none", scale=1.0, in_mean=True),
-    "omnispatial_test": dict(
-        suite="natural", yaml="omnispatial/omnispatial.yaml",
-        metric="omnispatial,none", scale=1.0, in_mean=True),
     "pope": dict(
         suite="natural", yaml="pope/pope.yaml",
         metric="pope_f1_score,none", scale=1.0, in_mean=True),

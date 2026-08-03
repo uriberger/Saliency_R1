@@ -96,8 +96,9 @@
 #                `python build_grpo_sets.py --build-val`. Costs ~11% of training
 #                throughput; --no-eval turns it off.
 #
-#   benchmarks   15 of the test benchmarks (all but mathvista_testmini_cot, which
-#                cannot be scored without a judge API key), cut to 100 docs and split
+#   benchmarks   13 of the test benchmarks -- all but the three that need an LLM
+#                judge to score (see eval_mini/benchmarks.py) -- cut to 100 docs
+#                and split
 #                into a natural and a non-natural suite, run on every kept
 #                checkpoint by a separate 4-GPU job. watch_bench_evals.sh starts
 #                with the run, holds no GPUs itself, and submits a job only when a
