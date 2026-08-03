@@ -123,7 +123,23 @@ GRAD_ACCUM=8
 PER_DEVICE_BATCH=1
 LEARNING_RATE=1e-5
 SAVE_STEPS=${SAVE_STEPS:-10}
-CKPT_KEEP_EVERY=${CKPT_KEEP_EVERY:-500}
+# Checkpoints are cheap -- 116 MB of LoRA adapter plus ZeRO state, not a full model
+# -- and every kept one is a point on the benchmark curve, so keep one per 100
+# steps rather than per 500. A 3,000-step run costs ~3.5 GB.
+CKPT_KEEP_EVERY=${CKPT_KEEP_EVERY:-100}
+# Held-out validation: score val_natural and val_nonnatural every EVAL_STEPS steps.
+# Their images are disjoint from set_a and set_b, so this measures generalization
+# rather than memorization. Set VAL_SETS_DIR="" to turn validation off entirely.
+EVAL_STEPS=${EVAL_STEPS:-100}
+VAL_SETS_DIR=${VAL_SETS_DIR:-$REPO/cold_data/grpo_sets}
+# per_device_eval_batch_size * training procs must be a multiple of num_generations,
+# or GRPO cannot form complete generation groups on the eval set.
+EVAL_BATCH=${EVAL_BATCH:-8}
+# --auto-bench: also start the benchmark-eval dispatcher (watch_bench_evals.sh),
+# which submits a 4-GPU job whenever a checkpoint is waiting for one. Off by
+# default -- it submits jobs, so it should be an explicit choice.
+AUTO_BENCH=${AUTO_BENCH:-false}
+BENCH_GPUS=${BENCH_GPUS:-4}
 EXTRA_ARGS=""
 DIRECT=false
 
@@ -193,6 +209,12 @@ while [[ $# -gt 0 ]]; do
         --mass-floor-tau)         MASS_FLOOR_TAU="$2";          shift 2 ;;
         --natural-only)           NATURAL_ONLY=true;            shift ;;
         --no-natural-only)        NATURAL_ONLY=false;           shift ;;
+        --eval-steps)             EVAL_STEPS="$2";              shift 2 ;;
+        --no-eval)                VAL_SETS_DIR="";              shift ;;
+        --val-sets-dir)           VAL_SETS_DIR="$2";            shift 2 ;;
+        --auto-bench)             AUTO_BENCH=true;              shift ;;
+        --no-auto-bench)          AUTO_BENCH=false;             shift ;;
+        --bench-gpus)             BENCH_GPUS="$2";              shift 2 ;;
         --dino-port)              DINO_PORT="$2";               shift 2 ;;
         --vllm-port)              VLLM_PORT="$2";               shift 2 ;;
         --vllm-gpu-mem)           VLLM_GPU_MEM="$2";            shift 2 ;;
@@ -291,6 +313,9 @@ echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_b
 echo "Overlap reward:   layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
 echo "Metric:           $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " mass_floor_tau=$MASS_FLOOR_TAU" || echo " (no mass floor)")"
 echo "Overlap rows:     $([ "$NATURAL_ONLY" = true ] && echo 'natural images only (non-natural: format+accuracy+judge)' || echo 'all rows')"
+echo "Validation:       $([ -n "$VAL_SETS_DIR" ] && echo "every $EVAL_STEPS steps on $VAL_SETS_DIR/{val_natural,val_nonnatural}" || echo 'off')"
+echo "Checkpoints:      save every $SAVE_STEPS, keep every $CKPT_KEEP_EVERY"
+echo "Benchmarks:       $([ "$AUTO_BENCH" = true ] && echo "dispatcher auto-started (${BENCH_GPUS}-GPU jobs)" || echo 'off (see --auto-bench)')"
 echo "Batch:            per_device=$PER_DEVICE_BATCH num_generations=$NUM_GENERATIONS grad_accum=$GRAD_ACCUM  (gen_batch=$(( PER_DEVICE_BATCH * TRAIN_N * GRAD_ACCUM )))"
 echo "T5 step clf:      $OVERLAP_STEPS_DEVICE  ckpt=$OVERLAP_STEPS_CKPT"
 echo "Run name:         $RUN_NAME"
@@ -364,6 +389,11 @@ if ! $DIRECT; then
                 --vllm-gpu-mem $VLLM_GPU_MEM \
                 --vllm-max-model-len $VLLM_MAX_MODEL_LEN \
                 --vllm-enforce-eager $VLLM_ENFORCE_EAGER \
+                --eval-steps $EVAL_STEPS \
+                --bench-gpus $BENCH_GPUS \
+                ${VAL_SETS_DIR:+--val-sets-dir $VAL_SETS_DIR} \
+                $([ -z "$VAL_SETS_DIR" ] && echo --no-eval) \
+                $([ "$AUTO_BENCH" = true ] && echo --auto-bench) \
                 $([ "$SHARE_SIDECAR_GPU" = true ] && echo --share-sidecar-gpu) \
                 $EXTRA_ARGS
         '"
@@ -439,7 +469,7 @@ VLLM_PID=""
 CLEANUP_PID=""
 cleanup() {
     echo "[cleanup] shutting down sidecars ..."
-    for pid in "$VLLM_PID" "$DINO_PID" "$CLEANUP_PID"; do
+    for pid in "$VLLM_PID" "$DINO_PID" "$CLEANUP_PID" "${BENCH_WATCHER_PID:-}"; do
         [ -n "$pid" ] || continue
         pkill -TERM -P "$pid" 2>/dev/null || true
         kill -TERM "$pid" 2>/dev/null || true
@@ -547,6 +577,47 @@ MASS_FLOOR_FLAG=""
 NATURAL_ONLY_FLAG=""
 [[ "$NATURAL_ONLY" == true ]] && NATURAL_ONLY_FLAG="--overlap_natural_only True"
 
+# Held-out validation. Omitted entirely when off, so eval_strategy stays "no" and the
+# command line of an existing run is unchanged.
+EVAL_FLAGS=""
+if [[ -n "$VAL_SETS_DIR" ]]; then
+    for _split in val_natural val_nonnatural; do
+        [[ -d "$VAL_SETS_DIR/$_split" ]] || {
+            echo "ERROR: $VAL_SETS_DIR/$_split not found. Build the validation sets first:" >&2
+            echo "         python build_grpo_sets.py --build-val --out-dir $VAL_SETS_DIR" >&2
+            echo "       or pass --no-eval to train without validation." >&2
+            exit 1
+        }
+    done
+    EVAL_FLAGS="--eval_strategy steps --eval_steps $EVAL_STEPS \
+        --per_device_eval_batch_size $EVAL_BATCH --val_sets_dir $VAL_SETS_DIR"
+fi
+
+# ---------- benchmark-eval dispatcher ----------
+# Submits a $BENCH_GPUS-GPU job whenever a kept checkpoint is waiting to be scored on
+# the mini test suites. It holds no GPU itself, but it does need a host that can
+# submit jobs -- which is not always the node training runs on. Probe rather than
+# assume, and say plainly what to do when the probe fails: a dispatcher that
+# silently never started would look exactly like one that found no work.
+BENCH_WATCHER_PID=""
+if [[ "$AUTO_BENCH" == true ]]; then
+    if command -v submit_job >/dev/null 2>&1 || \
+       [ -x "/lustre/fs1/portfolios/adlr/projects/adlr_other_infra/release/cluster-interface/latest/submit_job" ]; then
+        echo "[bench] starting the benchmark dispatcher for $OUTPUT_DIR"
+        bash "$REPO/watch_bench_evals.sh" --run-dir "$OUTPUT_DIR" --num-gpus "$BENCH_GPUS" \
+            --every "$CKPT_KEEP_EVERY" > "$LOG_DIR/bench_watcher.log" 2>&1 &
+        BENCH_WATCHER_PID=$!
+    else
+        echo "==========================================================================" >&2
+        echo "[bench] This node cannot submit jobs, so the dispatcher was NOT started." >&2
+        echo "        Run this on the login node instead (it needs no GPUs):" >&2
+        echo "" >&2
+        echo "          bash $REPO/watch_bench_evals.sh --run-dir $OUTPUT_DIR \\" >&2
+        echo "               --num-gpus $BENCH_GPUS --every $CKPT_KEEP_EVERY" >&2
+        echo "==========================================================================" >&2
+    fi
+fi
+
 # ---------- 4. GRPO training on GPUs 2..N-1 ----------
 echo "[start] training on cuda:[$TRAIN_GPUS] ($TRAIN_N procs)"
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
@@ -571,6 +642,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --overlap_metric "$OVERLAP_METRIC" \
     $MASS_FLOOR_FLAG \
     $NATURAL_ONLY_FLAG \
+    $EVAL_FLAGS \
     --dino_api_base "http://127.0.0.1:$DINO_PORT" \
     --reward_weights $REWARD_WEIGHTS \
     --use_vllm \

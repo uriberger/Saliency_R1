@@ -301,8 +301,9 @@ def load_aokvqa(split="train"):
 
     `split` exists for the validation build: the train split is all but exhausted
     by set_a (17,000 of 17,056 rows), so the validation draw takes A-OKVQA's own
-    `validation` split instead. That split is disjoint by construction, and
-    build_val_sets verifies it by image-byte hash rather than trusting the label.
+    `validation` split instead. The split label is not taken as evidence of
+    disjointness -- do_build_val hashes the image content like it does for every
+    other source.
     """
     from datasets import load_dataset
 
@@ -701,28 +702,17 @@ def allocate(recipe, total):
     return counts
 
 
-def aokvqa_image_hashes(ds, indices):
-    """{row index: SHA-256 of its stored image bytes} for rows of an A-OKVQA split.
+def draw_val(pools, counts, excluded_images, rng_seed, oversample=1):
+    """Shuffle each source's admissible candidates and return them in draw order.
 
-    A-OKVQA ships its images inline with no id, filename or COCO reference, so a
-    train/validation split label is the only evidence they differ -- and a label is
-    not evidence. Hashing the bytes is. Reads bytes without decoding, so the cost is
-    I/O rather than 18K JPEG decodes.
-    """
-    from datasets import Image as HFImage
-
-    idx = sorted(indices)
-    raw = ds.select(idx).cast_column("image", HFImage(decode=False))
-    return {i: hashlib.sha256(img["bytes"]).hexdigest() for i, img in zip(idx, raw["image"])}
-
-
-def draw_val(pools, counts, excluded_images, rng_seed):
-    """Draw the validation rows: image-disjoint from training, and from each other.
-
-    Every candidate whose image is touched by set_a or set_b is removed before the
-    shuffle -- not filtered out afterwards -- so the draw is uniform over what is
-    actually admissible. One row per image, because two questions on one picture
+    Candidates whose image reference is touched by set_a or set_b are removed before
+    the shuffle -- not filtered afterwards -- so the draw is uniform over what is
+    admissible. One row per image reference, because two questions on one picture
     are not two independent validation samples.
+
+    A reference is not an identity, though: the source corpora store byte-identical
+    pictures under different names, so `oversample` candidates are drawn per slot and
+    the surplus is spent by pick_clean, which rejects on image CONTENT.
     """
     drawn, shortfalls = {}, []
     for source, n in counts.items():
@@ -739,12 +729,73 @@ def draw_val(pools, counts, excluded_images, rng_seed):
                 continue
             seen.add(k)
             picked.append(r)
-            if len(picked) == n:
+            if len(picked) == n * oversample:
                 break
         if len(picked) < n:
             shortfalls.append((source, len(picked), n))
         drawn[source] = picked
     return drawn, shortfalls
+
+
+def pick_clean(candidates, counts, resolver, split_name, exclude_hashes):
+    """Materialize candidates in draw order, keeping the first N per source that are
+    genuinely new pictures.
+
+    A row is rejected when the SHA-256 of its encoded image already belongs to a
+    training set or to a validation row already kept. Hashing the *materialized*
+    bytes is what makes this exact: every set resizes and re-encodes through the same
+    path, so the same source picture yields the same bytes no matter which corpus,
+    file name or question it arrived under.
+    """
+    rows, kept_hashes, report = [], set(), {}
+    for source, n in counts.items():
+        if n <= 0:
+            continue
+        kept = dup_train = dup_val = unreadable = 0
+        for record in candidates.get(source, []):
+            if kept == n:
+                break
+            out, failed = materialize([record], resolver, split_name)
+            if failed or not out:
+                unreadable += 1
+                continue
+            digest = hashlib.sha256(out[0]["image"]["bytes"]).hexdigest()
+            if digest in exclude_hashes:
+                dup_train += 1
+                continue
+            if digest in kept_hashes:
+                dup_val += 1
+                continue
+            kept_hashes.add(digest)
+            rows.append(out[0])
+            kept += 1
+        report[source] = dict(kept=kept, want=n, dup_train=dup_train, dup_val=dup_val,
+                              unreadable=unreadable, pool=len(candidates.get(source, [])))
+    return rows, kept_hashes, report
+
+
+def training_image_hashes(out_dir, names=("set_a", "set_b"), cache=True):
+    """Every image in the training sets, by content hash. Cached: it is ~9 GB of reads."""
+    cache_path = Path(out_dir) / ".train_image_hashes.json"
+    if cache and cache_path.exists():
+        try:
+            hashes = set(json.loads(cache_path.read_text()))
+            print(f"  reusing {len(hashes)} training image hashes from {cache_path.name}")
+            return hashes
+        except Exception:
+            pass
+
+    hashes = set()
+    for name in names:
+        path = Path(out_dir) / name
+        if not path.exists():
+            raise SystemExit(f"missing training set {path}; the validation draw needs it "
+                             f"to know which images are already spent")
+        print(f"  hashing {name} ...")
+        hashes.update(stored_image_hashes(path))
+    if cache:
+        cache_path.write_text(json.dumps(sorted(hashes)))
+    return hashes
 
 
 def materialize(records, resolver, split_name):
@@ -843,6 +894,16 @@ def save_records(name, records, resolver, out_dir, split_name):
     shutil.rmtree(shard_root)
     print(f"  saved -> {dest}")
     return stats
+
+
+def save_rows(name, rows, out_dir):
+    """Write already-materialized rows as a dataset. For sets small enough to hold."""
+    from datasets import Dataset
+
+    summarize(name, rows)
+    dest = out_dir / name
+    Dataset.from_list(rows, features=output_features()).save_to_disk(str(dest))
+    print(f"  saved -> {dest}")
 
 
 def summarize(name, rows):
@@ -1011,14 +1072,23 @@ def do_build_val(args):
     """Build val_natural and val_nonnatural, image-disjoint from set_a and set_b.
 
     The hard constraint is that no image may appear in both a training set and a
-    validation set, even under a different question. This is enforced by exclusion
-    before the draw, not by filtering after it, and then re-checked against the
-    saved artifacts by --verify-val.
+    validation set, even under a different question. Two filters enforce it, because
+    one is not enough:
+
+      by reference   drop every candidate whose image path set_a or set_b used. Cheap,
+                     applied before the shuffle, and removes ~99% of the overlap.
+      by content     drop every candidate whose encoded image bytes match a training
+                     image. Necessary because the source corpora store byte-identical
+                     pictures under different names: set_a and set_b hold 55,161
+                     distinct image references but only 54,401 distinct images, and a
+                     reference-only filter let six such duplicates through.
+
+    Candidates are over-drawn so the content filter has surplus to spend, and
+    --verify-val re-checks the result against the saved artifacts independently.
 
     Each set mirrors its training recipe's source proportions. A-OKVQA is the one
     source that cannot be served from leftovers -- set_a took 17,000 of its 17,056
-    rows -- so its share comes from A-OKVQA's own validation split, with byte-hash
-    de-duplication against the rows set_a actually drew.
+    rows -- so its share comes from A-OKVQA's own validation split.
     """
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1045,19 +1115,16 @@ def do_build_val(args):
     }
     print(f"  set_a + set_b hold {len(used)} distinct images -- all excluded")
 
-    # --- A-OKVQA: draw from its own validation split, verified by image bytes ---
-    print("Hashing A-OKVQA images to prove the split is disjoint ...", flush=True)
-    aok_val, aokvqa_val_ds = load_aokvqa(split="validation")
-    train_sha = set(
-        aokvqa_image_hashes(aokvqa_train_ds, [r["_ref"][1] for r in set_a_draw["aokvqa"]]).values()
-    )
-    val_sha = aokvqa_image_hashes(aokvqa_val_ds, [r["_ref"][1] for r in aok_val])
-    kept = [r for r in aok_val if val_sha[r["_ref"][1]] not in train_sha]
-    print(f"  A-OKVQA validation: {len(kept)} of {len(aok_val)} rows have an image set_a "
-          f"never saw ({len(aok_val) - len(kept)} dropped as byte-identical)")
+    print("Hashing the training sets' images ...", flush=True)
+    train_hashes = training_image_hashes(out_dir)
+    print(f"  {len(train_hashes)} distinct training images "
+          f"({len(used) - len(train_hashes)} of the {len(used)} references are duplicates "
+          f"of another training image)")
 
+    # A-OKVQA's train split is spent, so its share comes from the validation split.
+    aok_val, aokvqa_val_ds = load_aokvqa(split="validation")
     val_pools = dict(pools)
-    val_pools["aokvqa"] = kept
+    val_pools["aokvqa"] = aok_val
 
     # --- draw, natural first so the second set can also exclude its images ---
     nat_counts = allocate(RECIPE_NATURAL, n)
@@ -1065,17 +1132,18 @@ def do_build_val(args):
     print(f"\nval_natural    ({n}): " + "  ".join(f"{s}={c}" for s, c in nat_counts.items()))
     print(f"val_nonnatural ({n}): " + "  ".join(f"{s}={c}" for s, c in non_counts.items()))
 
-    val_nat, short_nat = draw_val(val_pools, nat_counts, used, VAL_SEED)
-    nat_keys = {image_key(r) for recs in val_nat.values() for r in recs}
-    val_non, short_non = draw_val(val_pools, non_counts, used | nat_keys, VAL_SEED + 1)
+    nat_cand, short_nat = draw_val(val_pools, nat_counts, used, VAL_SEED, args.val_oversample)
+    nat_keys = {image_key(r) for recs in nat_cand.values() for r in recs}
+    non_cand, short_non = draw_val(val_pools, non_counts, used | nat_keys, VAL_SEED + 1,
+                                   args.val_oversample)
 
     for src, have, want in short_nat + short_non:
-        print(f"  [warn] {src}: only {have} image-disjoint candidates for a target of {want}")
+        print(f"  [warn] {src}: only {have} reference-disjoint candidates for a target of {want}")
 
-    # --- resolve images and save ---
+    # --- resolve images ---
     viscot_cache = Path(args.viscot_cache or (out_dir / "_viscot_images"))
     treevgr_cache = Path(args.treevgr_cache or (out_dir / "_treevgr_images"))
-    all_records = [r for g in (val_nat, val_non) for recs in g.values() for r in recs]
+    all_records = [r for g in (nat_cand, non_cand) for recs in g.values() for r in recs]
     stage_source_images(all_records, viscot_cache, treevgr_cache, treevgr_root,
                         args.skip_viscot_extract)
 
@@ -1087,9 +1155,31 @@ def do_build_val(args):
         aokvqa_val_ds=aokvqa_val_ds,
     )
 
-    for name, drawn in (("val_natural", val_nat), ("val_nonnatural", val_non)):
-        records = [r for recs in drawn.values() for r in recs]
-        save_records(name, records, resolver, out_dir, "validation")
+    # --- pick by content, natural first so non-natural can exclude its images too ---
+    excluded = set(train_hashes)
+    for name, candidates, counts in (
+        ("val_natural", nat_cand, nat_counts),
+        ("val_nonnatural", non_cand, non_counts),
+    ):
+        print(f"\nSelecting {name} ...", flush=True)
+        rows, hashes, report = pick_clean(candidates, counts, resolver, "validation", excluded)
+        excluded |= hashes
+
+        short = False
+        for source, r in report.items():
+            note = ""
+            if r["dup_train"] or r["dup_val"] or r["unreadable"]:
+                note = (f"   rejected: {r['dup_train']} already in training, "
+                        f"{r['dup_val']} repeat, {r['unreadable']} unreadable")
+            print(f"    {source:18s} {r['kept']:4d}/{r['want']:<4d} of {r['pool']} candidates{note}")
+            if r["kept"] < r["want"]:
+                short = True
+        if short:
+            raise SystemExit(
+                f"{name}: could not fill every source with distinct, unused images. "
+                f"Re-run with a larger --val-oversample (currently {args.val_oversample})."
+            )
+        save_rows(name, rows, out_dir)
 
     print(f"\nNow verify the hard constraint against what was actually written:")
     print(f"  python build_grpo_sets.py --verify-val --out-dir {out_dir}")
@@ -1172,6 +1262,9 @@ def main():
                    help="construct val_natural + val_nonnatural from data set_a/set_b never touched")
     p.add_argument("--val-size", type=int, default=256,
                    help="rows per validation set (default 256)")
+    p.add_argument("--val-oversample", type=int, default=4,
+                   help="candidates drawn per validation slot, so the content filter has "
+                        "surplus to reject duplicates from (default 4)")
     p.add_argument("--verify-val", action="store_true",
                    help="hash every stored image and prove train/validation share none")
     p.add_argument("--out-dir", default="cold_data/grpo_sets")

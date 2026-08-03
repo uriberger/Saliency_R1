@@ -62,6 +62,8 @@ accelerate launch \
 
 """
 
+import glob
+import json
 import os
 
 import torch
@@ -69,6 +71,7 @@ from datasets import load_dataset, load_from_disk
 from latex2sympy2_extended import NormalizationConfig
 from PIL import Image
 from math_verify import LatexExtractionConfig, parse, verify
+from transformers import TrainerCallback
 
 from trl import (
     GRPOConfig,
@@ -81,6 +84,61 @@ from trl import (
     get_quantization_config,
 )
 from trl.rewards import think_format_reward, think_saliency_reward, openai_reward
+
+
+class BenchmarkResultsCallback(TrainerCallback):
+    """Log mini-benchmark scores produced by the out-of-process eval job.
+
+    run_bench_eval.sh evaluates checkpoints on a separate allocation and drops one
+    flat JSON of scalars per checkpoint into <output_dir>/bench_eval/. This picks
+    them up at each logging step and writes them into the live WandB run, so the
+    benchmark curves sit alongside the reward curves in one place.
+
+    They are logged against `bench/step`, their own x-axis, rather than the current
+    training step: a result arrives whenever its job finishes, which is well after
+    the checkpoint it describes, and WandB's global step cannot go backwards.
+    Anything still unfinished when training exits is appended afterwards by
+    `bench_eval.py --backfill`.
+    """
+
+    def __init__(self, bench_dir):
+        self.bench_dir = bench_dir
+        self.logged = set()
+        self._axis_declared = False
+
+    def _wandb_run(self):
+        try:
+            import wandb
+        except ImportError:
+            return None
+        return wandb.run
+
+    def on_log(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        run = self._wandb_run()
+        if run is None:
+            return
+
+        for path in sorted(glob.glob(os.path.join(self.bench_dir, "step-*.json"))):
+            if path in self.logged:
+                continue
+            try:
+                with open(path) as fh:
+                    payload = json.load(fh)
+                metrics, step = payload["metrics"], payload["step"]
+            except Exception as exc:  # a partial or malformed file must not kill training
+                print(f"[bench] skipping {path}: {type(exc).__name__}: {exc}")
+                self.logged.add(path)
+                continue
+
+            if not self._axis_declared:
+                run.define_metric("bench/step")
+                run.define_metric("bench/*", step_metric="bench/step")
+                self._axis_declared = True
+            run.log({**metrics, "bench/step": step})
+            self.logged.add(path)
+            print(f"[bench] logged checkpoint {step} ({len(metrics)} scalars) to WandB")
 
 
 if __name__ == "__main__":
@@ -308,6 +366,11 @@ if __name__ == "__main__":
         token_reduction=script_args.token_reduction,
         overlap_natural_only=script_args.overlap_natural_only,
     )
+
+    # Benchmark scores are produced by a separate job (run_bench_eval.sh) and land
+    # in this directory as they finish; the callback forwards them to WandB.
+    # Harmless when nothing ever writes there.
+    trainer.add_callback(BenchmarkResultsCallback(os.path.join(training_args.output_dir, "bench_eval")))
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
