@@ -21,6 +21,15 @@ Fields:
              on the 0-2000 scale at all and normalising it would contribute a
              number that is simply wrong. It is still logged -- comparable from
              checkpoint to checkpoint, just not to a published MME score.
+
+An LLM judge sits on the scoring path of `dailyclue` and `omnispatial_test`
+(dailyclue tries exact/numeric/date shortcuts first and judges the rest;
+omnispatial calls server.evaluate for every item). Neither fails loudly without
+OPENAI_API_KEY / NVIDIA_API_KEY -- the call errors, the item is scored wrong, and
+the benchmark simply reads low. Give the dispatcher a key, or expect those two
+curves to sit below the model's real score. mathvision_testmini looks like a third
+but is not: it uses mathvision_process_results, and the judged variant is a
+separate function belonging to the mathvision_reason_* tasks.
 """
 
 BENCHMARKS = {
@@ -60,9 +69,10 @@ BENCHMARKS = {
     "mathvision_testmini": dict(
         suite="nonnatural", yaml="mathvision/mathvision_testmini.yaml",
         metric="mathvision_standard_eval,none", scale=100.0, in_mean=True),
-    "mathvista_testmini_cot": dict(
-        suite="nonnatural", yaml="mathvista/mathvista_testmini_cot.yaml",
-        metric="llm_as_judge_eval,none", scale=100.0, in_mean=True),
+    # mathvista_testmini_cot is deliberately absent. Its primary metric IS
+    # llm_as_judge_eval, so it cannot be scored at all without a judge API key, and
+    # a per-checkpoint monitor should not depend on an external service. It stays in
+    # the full test suite, where the key is always supplied.
     "mmmu_pro_standard": dict(
         suite="nonnatural", yaml="mmmu_pro/mmmu_pro_standard.yaml",
         metric="mmmu_acc,none", scale=1.0, in_mean=True),
