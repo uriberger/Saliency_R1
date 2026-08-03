@@ -66,6 +66,17 @@ class ScriptArguments:
     )
     dataset_train_split: str = field(default="train", metadata={"help": "Dataset split to use for training."})
     dataset_test_split: str = field(default="test", metadata={"help": "Dataset split to use for evaluation."})
+    val_sets_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Directory holding the held-out validation sets written by "
+            "`build_grpo_sets.py --build-val` (val_natural/ and val_nonnatural/). Whichever "
+            "of the two exist are evaluated separately, so natural and non-natural imagery "
+            "get their own curves. Their images are disjoint from set_a and set_b, so this "
+            "does not touch the training corpus. Requires --eval_strategy steps; ignored "
+            "otherwise."
+        },
+    )
     dataset_streaming: bool = field(
         default=False,
         metadata={"help": "Whether to stream the dataset. If True, the dataset will be loaded in streaming mode."},

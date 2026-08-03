@@ -22,13 +22,26 @@ plus one extra column:
 empty for sources that ship no boxes (A-OKVQA, ViRL39K). Rows with an empty bbox are
 usable with --reward_variant ours|none only.
 
+Two validation sets are built by a separate pass, one per imagery type:
+
+    val_natural      256 rows, set_a's source proportions
+    val_nonnatural   256 rows, set_b's non-natural block's proportions
+
+Both are drawn from candidates whose IMAGE is untouched by set_a and set_b, so the
+training sets do not change and no picture is ever seen in training and scored in
+validation. A-OKVQA is the one source with nothing left over (set_a took 17,000 of
+its 17,056 rows), so its share comes from A-OKVQA's own validation split.
+
 Usage:
     python build_grpo_sets.py --probe                 # inspect archive layouts first
     python build_grpo_sets.py --download              # fetch missing sources
     python build_grpo_sets.py --build --out-dir DIR   # construct and save both sets
+    python build_grpo_sets.py --build-val --out-dir DIR    # the two validation sets
+    python build_grpo_sets.py --verify-val --out-dir DIR   # prove no image is shared
 """
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -89,6 +102,10 @@ SOURCE_DIR_ALIASES = {"visual7w": "v7w"}
 CHUNK_ROWS = 4000
 
 SEED = 42
+# The validation draw must not reproduce the training draw's ordering, so it uses
+# its own seed. Disjointness is enforced by exclusion, not by the seed -- see
+# do_build_val -- but a shared seed would still bias which leftovers get picked.
+VAL_SEED = 4242
 MAX_IMAGE_SIDE = 512  # matches prepare_image() in trl/grpo_vlm_qwen3.py
 
 VISCOT_REPO = "deepcs233/Visual-CoT"
@@ -279,12 +296,23 @@ def rank_visual7w(records):
     return reasoning, other
 
 
-def load_aokvqa():
-    """A-OKVQA as multiple choice: the letter is the verifiable target."""
+def load_aokvqa(split="train"):
+    """A-OKVQA as multiple choice: the letter is the verifiable target.
+
+    `split` exists for the validation build: the train split is all but exhausted
+    by set_a (17,000 of 17,056 rows), so the validation draw takes A-OKVQA's own
+    `validation` split instead. That split is disjoint by construction, and
+    build_val_sets verifies it by image-byte hash rather than trusting the label.
+    """
     from datasets import load_dataset
 
-    ds = load_dataset(AOKVQA_REPO, split="train")
+    ds = load_dataset(AOKVQA_REPO, split=split)
     letters = "ABCD"
+    # A-OKVQA rows carry no image identity, only a row index, so an index means
+    # nothing without knowing which split it indexes. Namespacing the ref keeps
+    # train row 5 and validation row 5 from looking like the same picture to the
+    # disjointness check -- they are unrelated images.
+    ref_kind = "inline" if split == "train" else "inline_val"
     out = []
     # Iterate without the image column: indexing a row decodes every column, and
     # decoding 17K images just to read the question text is pure waste. The
@@ -303,7 +331,7 @@ def load_aokvqa():
                 "solution": letters[idx],
                 "bbox": "",  # A-OKVQA ships no boxes
                 "natural": True,
-                "_ref": ("inline", i),
+                "_ref": (ref_kind, i),
             }
         )
     return out, ds
@@ -567,16 +595,20 @@ def extract_from_tar_stream(part_paths, wanted, out_dir):
 class ImageResolver:
     """Resolves each record's `_ref` to a PIL image."""
 
-    def __init__(self, viscot_dir=None, treevgr_dir=None, virl_zip=None, aokvqa_ds=None):
+    def __init__(self, viscot_dir=None, treevgr_dir=None, virl_zip=None, aokvqa_ds=None,
+                 aokvqa_val_ds=None):
         self.viscot_dir = viscot_dir
         self.treevgr_dir = treevgr_dir
         self.virl_zip = zipfile.ZipFile(virl_zip) if virl_zip else None
         self.aokvqa_ds = aokvqa_ds
+        self.aokvqa_val_ds = aokvqa_val_ds
 
     def get(self, ref):
         kind, key = ref
         if kind == "inline":
             return self.aokvqa_ds[key]["image"]
+        if kind == "inline_val":
+            return self.aokvqa_val_ds[key]["image"]
         if kind == "virl":
             with self.virl_zip.open(key) as fh:
                 return Image.open(io.BytesIO(fh.read()))
@@ -631,6 +663,90 @@ def draw(pools, recipe, rng_seed):
     return drawn, shortfalls
 
 
+def image_key(record):
+    """Canonical identity of a record's image, for cross-set disjointness checks.
+
+    Visual-CoT and TreeVGR reference images by path but resolve them by basename
+    (that is what ImageResolver does), so two records naming the same basename are
+    the same picture and must key alike. A-OKVQA rows carry no image identity at
+    all -- only an index into their own split -- so their keys are namespaced per
+    split and are never comparable across splits; do_build_val handles those by
+    hashing the bytes instead.
+    """
+    kind, key = record["_ref"]
+    if kind in ("viscot", "treevgr"):
+        return (kind, os.path.basename(key))
+    return (kind, key)
+
+
+def allocate(recipe, total):
+    """Split `total` across the sources of `recipe`, in proportion, exactly.
+
+    Largest-remainder: floor every share, then hand the leftover units to the
+    largest fractional parts. Ties break on the larger source and then on name, so
+    the allocation is a pure function of the recipe and does not depend on dict
+    ordering.
+
+    Remainders are compared as exact integers rather than as floats. In floating
+    point 256*3500/10000 leaves 0.5999... while 256*1000/10000 leaves 0.6000...,
+    which is enough to hand a unit to the wrong source -- the shares are equal in
+    exact arithmetic and the documented tie-break is what should decide.
+    """
+    grand = sum(recipe.values())
+    counts = {s: total * n // grand for s, n in recipe.items()}
+    rem = {s: total * n % grand for s, n in recipe.items()}
+    order = sorted(recipe, key=lambda s: (-rem[s], -recipe[s], s))
+    for s in order[: total - sum(counts.values())]:
+        counts[s] += 1
+    return counts
+
+
+def aokvqa_image_hashes(ds, indices):
+    """{row index: SHA-256 of its stored image bytes} for rows of an A-OKVQA split.
+
+    A-OKVQA ships its images inline with no id, filename or COCO reference, so a
+    train/validation split label is the only evidence they differ -- and a label is
+    not evidence. Hashing the bytes is. Reads bytes without decoding, so the cost is
+    I/O rather than 18K JPEG decodes.
+    """
+    from datasets import Image as HFImage
+
+    idx = sorted(indices)
+    raw = ds.select(idx).cast_column("image", HFImage(decode=False))
+    return {i: hashlib.sha256(img["bytes"]).hexdigest() for i, img in zip(idx, raw["image"])}
+
+
+def draw_val(pools, counts, excluded_images, rng_seed):
+    """Draw the validation rows: image-disjoint from training, and from each other.
+
+    Every candidate whose image is touched by set_a or set_b is removed before the
+    shuffle -- not filtered out afterwards -- so the draw is uniform over what is
+    actually admissible. One row per image, because two questions on one picture
+    are not two independent validation samples.
+    """
+    drawn, shortfalls = {}, []
+    for source, n in counts.items():
+        if n <= 0:
+            continue
+        eligible = [r for r in pools[source] if image_key(r) not in excluded_images]
+        rng = random.Random(rng_seed + zlib.crc32(source.encode()) % 10_000)
+        rng.shuffle(eligible)
+
+        picked, seen = [], set()
+        for r in eligible:
+            k = image_key(r)
+            if k in seen:
+                continue
+            seen.add(k)
+            picked.append(r)
+            if len(picked) == n:
+                break
+        if len(picked) < n:
+            shortfalls.append((source, len(picked), n))
+        drawn[source] = picked
+    return drawn, shortfalls
+
+
 def materialize(records, resolver, split_name):
     """Decode, resize and finalize rows into the output schema.
 
@@ -671,6 +787,62 @@ def materialize(records, resolver, split_name):
             }
         )
     return rows, failed
+
+
+def output_features():
+    from datasets import Features, Image as HFImage, Value
+
+    return Features(
+        {
+            "dataset": Value("string"),
+            "split": Value("string"),
+            "question_id": Value("int64"),
+            "problem": Value("string"),
+            "bbox": Value("string"),
+            "solution": Value("string"),
+            "image": HFImage(),
+            "natural": Value("bool"),
+        }
+    )
+
+
+def save_records(name, records, resolver, out_dir, split_name):
+    """Decode, chunk, and write one set to `out_dir/name`. Returns the row stats."""
+    from datasets import Dataset, concatenate_datasets, load_from_disk
+
+    features = output_features()
+    print(f"\nMaterializing {name} ({len(records)} records) ...")
+
+    # Convert in chunks and spill each to disk. Holding all 50K rows and then
+    # handing them to Dataset.from_list peaks near 8 GB of RSS, which is what
+    # got the first run OOM-killed; this keeps the peak at roughly
+    # CHUNK_ROWS * 160 KB.
+    shard_root = out_dir / f"_{name}_shards"
+    shard_root.mkdir(parents=True, exist_ok=True)
+    shard_paths, stats, failed_total = [], [], 0
+    for start in range(0, len(records), CHUNK_ROWS):
+        chunk = records[start : start + CHUNK_ROWS]
+        rows, failed = materialize(chunk, resolver, split_name)
+        failed_total += failed
+        stats.extend({k: r[k] for k in ("dataset", "natural", "bbox")} for r in rows)
+        shard_dir = shard_root / f"{start // CHUNK_ROWS:04d}"
+        Dataset.from_list(rows, features=features).save_to_disk(str(shard_dir))
+        shard_paths.append(shard_dir)
+        del rows
+        print(f"    {min(start + CHUNK_ROWS, len(records)):6d}/{len(records)} rows", flush=True)
+
+    if failed_total:
+        print(f"  dropped {failed_total} rows with unreadable images")
+    summarize(name, stats)
+
+    # Shards are memory-mapped, so concatenating and writing stays cheap.
+    merged = concatenate_datasets([load_from_disk(str(p)) for p in shard_paths])
+    dest = out_dir / name
+    merged.save_to_disk(str(dest))
+    del merged
+    shutil.rmtree(shard_root)
+    print(f"  saved -> {dest}")
+    return stats
 
 
 def summarize(name, rows):
@@ -742,13 +914,43 @@ def do_build(args):
         [r for v in set_a_draw.values() for r in v]
         + [r for v in set_b_nonnat.values() for r in v]
     )
+    stage_source_images(all_records, viscot_cache, treevgr_cache, treevgr_root,
+                        args.skip_viscot_extract)
 
+    resolver = ImageResolver(
+        viscot_dir=viscot_cache,
+        treevgr_dir=treevgr_cache,
+        virl_zip=virl_root / "images.zip",
+        aokvqa_ds=aokvqa_ds,
+    )
+
+    # --- materialize and save ---
+    for name, groups in (
+        ("set_a", [set_a_draw]),
+        ("set_b", [set_b_natural, set_b_nonnat]),
+    ):
+        records = [r for g in groups for v in g.values() for r in v]
+        save_records(name, records, resolver, out_dir, "train")
+
+    print("\nTrain with:")
+    print(f"  --dataset_name {out_dir}/set_a --reward_variant ours")
+    print(f"  --dataset_name {out_dir}/set_b --reward_variant ours")
+
+
+def stage_source_images(all_records, viscot_cache, treevgr_cache, treevgr_root,
+                        skip_viscot_extract=False):
+    """Extract every Visual-CoT / TreeVGR image these records need into the caches.
+
+    Both archives are sequential streams, so this is one pass each; already-cached
+    images are skipped, which is what makes a second build (or the validation build)
+    cheap when it reuses images -- and honest about the ones it still has to find.
+    """
     viscot_wanted = {
         os.path.basename(r["_ref"][1]): os.path.basename(r["_ref"][1])
         for r in all_records
         if r["_ref"][0] == "viscot"
     }
-    if viscot_wanted and not args.skip_viscot_extract:
+    if viscot_wanted and not skip_viscot_extract:
         shards = sorted((hf_snapshot(VISCOT_REPO, ["cot_images_tar_split/*"])
                          / "cot_images_tar_split").glob("cot_images_*"))
         if not shards:
@@ -801,71 +1003,161 @@ def do_build(args):
         if missing:
             print(f"  [warn] {len(missing)} TreeVGR images not found; rows dropped")
 
+
+# ---------------------------------------------------------------------------
+# Validation sets
+# ---------------------------------------------------------------------------
+def do_build_val(args):
+    """Build val_natural and val_nonnatural, image-disjoint from set_a and set_b.
+
+    The hard constraint is that no image may appear in both a training set and a
+    validation set, even under a different question. This is enforced by exclusion
+    before the draw, not by filtering after it, and then re-checked against the
+    saved artifacts by --verify-val.
+
+    Each set mirrors its training recipe's source proportions. A-OKVQA is the one
+    source that cannot be served from leftovers -- set_a took 17,000 of its 17,056
+    rows -- so its share comes from A-OKVQA's own validation split, with byte-hash
+    de-duplication against the rows set_a actually drew.
+    """
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    n = args.val_size
+
+    meta_dir = hf_snapshot(VISCOT_REPO, ["metadata/*.jsonl"]) / "metadata"
+    virl_root = hf_snapshot(VIRL_REPO, [VIRL_PARQUET, "images.zip"])
+    treevgr_root = hf_snapshot(TREEVGR_REPO, [TREEVGR_PARQUET, "images.tar.gz"])
+
+    print("Loading candidate pools ...")
+    pools, aokvqa_train_ds = gather_candidates(
+        meta_dir, treevgr_root / TREEVGR_PARQUET, virl_root / VIRL_PARQUET
+    )
+
+    # Reproduce the training draws exactly -- same pools, same seeds -- so that what
+    # gets excluded is what set_a and set_b actually hold, not an approximation.
+    set_a_draw, _ = draw(pools, RECIPE_NATURAL, SEED)
+    set_b_nonnat, _ = draw(pools, RECIPE_NONNATURAL, SEED + 1)
+    used = {
+        image_key(r)
+        for group in (set_a_draw, set_b_nonnat)
+        for recs in group.values()
+        for r in recs
+    }
+    print(f"  set_a + set_b hold {len(used)} distinct images -- all excluded")
+
+    # --- A-OKVQA: draw from its own validation split, verified by image bytes ---
+    print("Hashing A-OKVQA images to prove the split is disjoint ...", flush=True)
+    aok_val, aokvqa_val_ds = load_aokvqa(split="validation")
+    train_sha = set(
+        aokvqa_image_hashes(aokvqa_train_ds, [r["_ref"][1] for r in set_a_draw["aokvqa"]]).values()
+    )
+    val_sha = aokvqa_image_hashes(aokvqa_val_ds, [r["_ref"][1] for r in aok_val])
+    kept = [r for r in aok_val if val_sha[r["_ref"][1]] not in train_sha]
+    print(f"  A-OKVQA validation: {len(kept)} of {len(aok_val)} rows have an image set_a "
+          f"never saw ({len(aok_val) - len(kept)} dropped as byte-identical)")
+
+    val_pools = dict(pools)
+    val_pools["aokvqa"] = kept
+
+    # --- draw, natural first so the second set can also exclude its images ---
+    nat_counts = allocate(RECIPE_NATURAL, n)
+    non_counts = allocate(RECIPE_NONNATURAL, n)
+    print(f"\nval_natural    ({n}): " + "  ".join(f"{s}={c}" for s, c in nat_counts.items()))
+    print(f"val_nonnatural ({n}): " + "  ".join(f"{s}={c}" for s, c in non_counts.items()))
+
+    val_nat, short_nat = draw_val(val_pools, nat_counts, used, VAL_SEED)
+    nat_keys = {image_key(r) for recs in val_nat.values() for r in recs}
+    val_non, short_non = draw_val(val_pools, non_counts, used | nat_keys, VAL_SEED + 1)
+
+    for src, have, want in short_nat + short_non:
+        print(f"  [warn] {src}: only {have} image-disjoint candidates for a target of {want}")
+
+    # --- resolve images and save ---
+    viscot_cache = Path(args.viscot_cache or (out_dir / "_viscot_images"))
+    treevgr_cache = Path(args.treevgr_cache or (out_dir / "_treevgr_images"))
+    all_records = [r for g in (val_nat, val_non) for recs in g.values() for r in recs]
+    stage_source_images(all_records, viscot_cache, treevgr_cache, treevgr_root,
+                        args.skip_viscot_extract)
+
     resolver = ImageResolver(
         viscot_dir=viscot_cache,
         treevgr_dir=treevgr_cache,
         virl_zip=virl_root / "images.zip",
-        aokvqa_ds=aokvqa_ds,
+        aokvqa_ds=aokvqa_train_ds,
+        aokvqa_val_ds=aokvqa_val_ds,
     )
 
-    # --- materialize and save ---
-    from datasets import Dataset, Features, Image as HFImage, Value
+    for name, drawn in (("val_natural", val_nat), ("val_nonnatural", val_non)):
+        records = [r for recs in drawn.values() for r in recs]
+        save_records(name, records, resolver, out_dir, "validation")
 
-    features = Features(
-        {
-            "dataset": Value("string"),
-            "split": Value("string"),
-            "question_id": Value("int64"),
-            "problem": Value("string"),
-            "bbox": Value("string"),
-            "solution": Value("string"),
-            "image": HFImage(),
-            "natural": Value("bool"),
-        }
-    )
+    print(f"\nNow verify the hard constraint against what was actually written:")
+    print(f"  python build_grpo_sets.py --verify-val --out-dir {out_dir}")
 
-    from datasets import concatenate_datasets, load_from_disk
 
-    for name, groups in (
-        ("set_a", [set_a_draw]),
-        ("set_b", [set_b_natural, set_b_nonnat]),
-    ):
-        records = [r for g in groups for v in g.values() for r in v]
-        print(f"\nMaterializing {name} ({len(records)} records) ...")
+def stored_image_hashes(path):
+    """SHA-256 of every stored image in a saved dataset, without decoding."""
+    from datasets import Image as HFImage, load_from_disk
 
-        # Convert in chunks and spill each to disk. Holding all 50K rows and then
-        # handing them to Dataset.from_list peaks near 8 GB of RSS, which is what
-        # got the first run OOM-killed; this keeps the peak at roughly
-        # CHUNK_ROWS * 160 KB.
-        shard_root = out_dir / f"_{name}_shards"
-        shard_root.mkdir(parents=True, exist_ok=True)
-        shard_paths, stats, failed_total = [], [], 0
-        for start in range(0, len(records), CHUNK_ROWS):
-            chunk = records[start : start + CHUNK_ROWS]
-            rows, failed = materialize(chunk, resolver, "train")
-            failed_total += failed
-            stats.extend({k: r[k] for k in ("dataset", "natural", "bbox")} for r in rows)
-            shard_dir = shard_root / f"{start // CHUNK_ROWS:04d}"
-            Dataset.from_list(rows, features=features).save_to_disk(str(shard_dir))
-            shard_paths.append(shard_dir)
-            del rows
-            print(f"    {min(start + CHUNK_ROWS, len(records)):6d}/{len(records)} rows", flush=True)
+    ds = load_from_disk(str(path)).cast_column("image", HFImage(decode=False))
+    hashes = []
+    for i in range(0, len(ds), 1000):
+        batch = ds[i : i + 1000]["image"]
+        hashes.extend(hashlib.sha256(img["bytes"]).hexdigest() for img in batch)
+        print(f"    {min(i + 1000, len(ds)):6d}/{len(ds)}", end="\r", flush=True)
+    print(f"    {len(ds):6d}/{len(ds)} hashed")
+    return hashes
 
-        if failed_total:
-            print(f"  dropped {failed_total} rows with unreadable images")
-        summarize(name, stats)
 
-        # Shards are memory-mapped, so concatenating and writing stays cheap.
-        merged = concatenate_datasets([load_from_disk(str(p)) for p in shard_paths])
-        dest = out_dir / name
-        merged.save_to_disk(str(dest))
-        del merged
-        shutil.rmtree(shard_root)
-        print(f"  saved -> {dest}")
+def do_verify_val(args):
+    """Prove no image is shared between the training sets and the validation sets.
 
-    print("\nTrain with:")
-    print(f"  --dataset_name {out_dir}/set_a --reward_variant ours")
-    print(f"  --dataset_name {out_dir}/set_b --reward_variant ours")
+    Checks the saved artifacts rather than the recipe: every set's images go through
+    the same resize and JPEG re-encode, so an image reused across sets is byte-
+    identical and its hash collides. This catches a leak no matter which step in the
+    draw would have caused it.
+    """
+    out_dir = Path(args.out_dir)
+    train_names = ["set_a", "set_b"]
+    val_names = ["val_natural", "val_nonnatural"]
+
+    missing = [n for n in train_names + val_names if not (out_dir / n).exists()]
+    if missing:
+        raise SystemExit(f"missing set(s) under {out_dir}: {', '.join(missing)}")
+
+    train_hashes = set()
+    for name in train_names:
+        print(f"Hashing {name} ...")
+        train_hashes.update(stored_image_hashes(out_dir / name))
+    print(f"  training sets: {len(train_hashes)} distinct images\n")
+
+    ok = True
+    seen_val = {}
+    for name in val_names:
+        print(f"Hashing {name} ...")
+        hashes = stored_image_hashes(out_dir / name)
+        leaked = train_hashes.intersection(hashes)
+        dupes = len(hashes) - len(set(hashes))
+        cross = set(hashes).intersection(seen_val)
+        seen_val.update({h: name for h in hashes})
+
+        print(f"  {name}: {len(hashes)} rows, {len(set(hashes))} distinct images")
+        if leaked:
+            print(f"  FAIL: {len(leaked)} image(s) also appear in set_a/set_b")
+            ok = False
+        if dupes:
+            print(f"  FAIL: {dupes} row(s) repeat an image within the set")
+            ok = False
+        if cross:
+            print(f"  FAIL: {len(cross)} image(s) shared with the other validation set")
+            ok = False
+        if not (leaked or dupes or cross):
+            print("  OK: disjoint from training, no repeats")
+        print()
+
+    if not ok:
+        raise SystemExit("verification FAILED -- do not train on these sets")
+    print("All checks passed: train and validation share no image.")
 
 
 def main():
@@ -876,6 +1168,12 @@ def main():
     p.add_argument("--with-viscot-images", action="store_true",
                    help="also fetch the 139 GB Visual-CoT image shards")
     p.add_argument("--build", action="store_true", help="construct and save both sets")
+    p.add_argument("--build-val", action="store_true",
+                   help="construct val_natural + val_nonnatural from data set_a/set_b never touched")
+    p.add_argument("--val-size", type=int, default=256,
+                   help="rows per validation set (default 256)")
+    p.add_argument("--verify-val", action="store_true",
+                   help="hash every stored image and prove train/validation share none")
     p.add_argument("--out-dir", default="cold_data/grpo_sets")
     p.add_argument("--viscot-cache", default=None)
     p.add_argument("--treevgr-cache", default=None)
@@ -904,7 +1202,11 @@ def main():
         do_download(args)
     if args.build:
         do_build(args)
-    if not (args.download or args.build):
+    if args.build_val:
+        do_build_val(args)
+    if args.verify_val:
+        do_verify_val(args)
+    if not (args.download or args.build or args.build_val or args.verify_val):
         p.print_help()
 
 

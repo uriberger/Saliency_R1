@@ -177,7 +177,40 @@ if __name__ == "__main__":
     dataset = dataset.map(prepare_image)
 
     train_dataset = dataset["train"]
-    eval_dataset = dataset["test"] if training_args.eval_strategy != "no" else None
+
+    ################
+    # Validation sets
+    ################
+    # The held-out sets are separate corpora, not a slice of the training one: their
+    # images never appear in set_a or set_b (build_grpo_sets.py --build-val enforces
+    # and --verify-val proves it). They are passed as a dict so natural and
+    # non-natural imagery are evaluated and logged separately -- the whole point of
+    # having two of them is to see the curves diverge.
+    #
+    # The `dataset.train_test_split` above is left exactly as it was, so `train` is
+    # byte-identical to what previous runs trained on.
+    def load_val_set(path):
+        ds = load_from_disk(path)
+        if not hasattr(ds, "train_test_split"):  # a DatasetDict written by save_to_disk
+            ds = ds[next(iter(ds.keys()))]
+        return ds.map(make_conversation).map(prepare_image)
+
+    eval_dataset = None
+    if training_args.eval_strategy != "no":
+        if script_args.val_sets_dir:
+            eval_dataset = {}
+            for name in ("val_natural", "val_nonnatural"):
+                path = os.path.join(script_args.val_sets_dir, name)
+                if os.path.isdir(path):
+                    eval_dataset[name] = load_val_set(path)
+                    print(f"[val] {name}: {len(eval_dataset[name])} rows from {path}")
+            if not eval_dataset:
+                raise SystemExit(
+                    f"--val_sets_dir {script_args.val_sets_dir} holds neither val_natural/ "
+                    f"nor val_nonnatural/; run build_grpo_sets.py --build-val first."
+                )
+        else:
+            eval_dataset = dataset["test"]
 
     ################
     # Reward Function for Training

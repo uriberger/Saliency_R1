@@ -2632,14 +2632,34 @@ class GRPOTrainer(Trainer):
             loss = loss.mean().detach()
         return loss, None, None
 
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"):
+        """Remember which eval dataset is being scored, so `log` can name its metrics.
+
+        With a dict of eval datasets, `Trainer.evaluate` recurses once per dataset with
+        `metric_key_prefix="eval_<name>"`, and each pass calls `log`. The reward metrics
+        that GRPO accumulates in `self._metrics["eval"]` carry no dataset name of their
+        own, so without this every dataset would write the same `eval_rewards/...` keys
+        at the same step and only the last one would survive -- two validation sets
+        would silently collapse into one curve.
+        """
+        previous, self._eval_metric_prefix = getattr(self, "_eval_metric_prefix", "eval"), metric_key_prefix
+        try:
+            return super().evaluate(
+                eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix
+            )
+        finally:
+            self._eval_metric_prefix = previous
+
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         mode = "train" if self.model.training else "eval"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
-        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
+        # start with "eval_" (or "eval_<dataset>_" when several eval sets are used). Match that prefix so the
+        # accumulated reward metrics land beside the losses of the dataset they were computed on.
         if mode == "eval":
-            metrics = {f"eval_{key}": val for key, val in metrics.items()}
+            prefix = getattr(self, "_eval_metric_prefix", "eval")
+            metrics = {f"{prefix}_{key}": val for key, val in metrics.items()}
 
         logs = {**logs, **metrics}
         super().log(logs, start_time)
