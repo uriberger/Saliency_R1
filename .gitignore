@@ -20,6 +20,7 @@ trl_repo
 cold_data/LLaVA-CoT-100k
 cold_data/Mulberry-SFT
 cold_data/Saliency-R1-cold
+cold_data/grpo_sets
 cold_data/_verify_out*/
 checkpoint
 outputs
