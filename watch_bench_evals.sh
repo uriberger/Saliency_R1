@@ -164,18 +164,17 @@ cooling_down() {
     (( now - last_submit < COOLDOWN ))
 }
 
-# The judge key travels in this process's environment, not inside the job script.
+# No judge key is needed: every benchmark in the mini suites scores itself, which
+# is why the three judged ones were left out (see eval_mini/benchmarks.py). A key
+# is still forwarded if the environment happens to carry one, so that re-adding a
+# judged benchmark does not also require remembering to plumb it through.
+#
+# It travels in this process's environment rather than inside the job script --
 # sbatch propagates the submitting environment (--export=ALL is Slurm's default),
 # and quoting a secret into a `bash -c '...'` string is how you get a value that
-# silently truncates at the first space or quote.
-#
-# The previous form also did not parse at all:
-# `${NVIDIA_API_KEY:+... ${OPENAI_API_KEY:-...} ...}` is not valid nesting -- the
-# inner `}` closed the outer expansion and left a bare `;}` in the emitted command,
-# a syntax error that killed the job before it ran anything.
-#
-# mathvista_testmini_cot is scored by an LLM judge, so a missing key does not fail
-# loudly, it just scores that benchmark wrong. Say so at startup instead.
+# silently truncates at the first space or quote. The previous form did not even
+# parse: `${NVIDIA_API_KEY:+... ${OPENAI_API_KEY:-...} ...}` is not valid nesting,
+# and the stray `}` left a bare `;}` that killed the job before it ran anything.
 BENCH_JUDGE_KEY=${OPENAI_API_KEY:-${NVIDIA_API_KEY:-}}
 [[ -n "$BENCH_JUDGE_KEY" ]] && export OPENAI_API_KEY="$BENCH_JUDGE_KEY"
 
@@ -224,7 +223,7 @@ echo "==========================================================================
 echo "Watching:   $RUN_DIR"
 echo "Job name:   $JOB_NAME   ($NUM_GPUS GPUs, ${DURATION}h, $PARTITION)"
 echo "Submitting: $BACKEND   (from $(hostname))"
-echo "Judge key:  $([[ -n "$BENCH_JUDGE_KEY" ]] && echo '(set)' || echo '(MISSING - mathvista_testmini_cot will be scored without its LLM judge)')"
+echo "Benchmarks: $(python "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" --print-tasks natural | tr ',' ' ' | wc -w) natural + $(python "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" --print-tasks nonnatural | tr ',' ' ' | wc -w) non-natural, all self-scoring (no API key needed)"
 echo "Cadence:    every $EVERY steps, $SAMPLE_N samples/benchmark"
 echo "Results:    $BENCH_DIR/step-<N>.json"
 echo "Poll:       every ${INTERVAL}s   $($ONCE && echo '(--once: one pass)' || echo '(Ctrl-C to stop)')"
