@@ -87,6 +87,36 @@ from trl import (
 from trl.rewards import think_format_reward, think_saliency_reward, openai_reward
 
 
+def _with_image_placeholder(messages):
+    """Rewrite a text-only conversation into multimodal content, as the trainer does.
+
+    The chat template only emits <|vision_start|><|image_pad|><|vision_end|> when the
+    user message content is a list containing an {"type": "image"} entry. Our
+    conversations are built as plain strings, so without this the prompt carries no
+    placeholder -- and handing vLLM an image with nowhere to bind it does not raise,
+    it wedges the worker inside multimodal processing, forever. Measured: identical
+    request with images deadlocked past 1800s, without images returned in 7.1s.
+
+    It is silent because vllm_serve calls llm.generate with no try/except, so a
+    failure there skips connection.send() and the server blocks in recv() with no
+    timeout. That deadlock propagated to the training job through the rank-0 client
+    and killed two runs.
+
+    Mirrors GRPOTrainerQwen3._generate_and_score_completions; new dicts rather than
+    in-place edits, since these rows are handed back to the dataset.
+    """
+    converted = []
+    for message in messages:
+        content, role = message.get("content"), message.get("role")
+        if isinstance(content, str):
+            if role == "user":
+                message = {**message, "content": [{"type": "image"}, {"type": "text", "text": content}]}
+            else:
+                message = {**message, "content": [{"type": "text", "text": content}]}
+        converted.append(message)
+    return converted
+
+
 class ValidationAccuracyCallback(TrainerCallback):
     """Score the held-out sets on answer accuracy alone, as cheaply as possible.
 
@@ -178,7 +208,12 @@ class ValidationAccuracyCallback(TrainerCallback):
         for name, dataset in self.val_sets.items():
             started = time.time()
             rows = list(dataset)
-            prompts = [maybe_apply_chat_template(r, trainer.processing_class)["prompt"] for r in rows]
+            prompts = [
+                maybe_apply_chat_template(
+                    {"prompt": _with_image_placeholder(r["prompt"])}, trainer.processing_class
+                )["prompt"]
+                for r in rows
+            ]
             images = [r["image"] for r in rows]
 
             completion_ids, aborted = [], False
