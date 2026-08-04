@@ -178,7 +178,22 @@ class ScriptArguments:
     )
     max_box_area: float = field(
         default=0.5,
-        metadata={"help": "reward_variant='ours': drop DINO boxes whose area fraction exceeds this cap."},
+        metadata={
+            "help": "reward_variant='ours': drop INDIVIDUAL DINO boxes whose area fraction exceeds this "
+            "cap. Set to 0 to disable the per-box cap entirely (keep every box above --box_threshold). "
+            "This bounds no. of pixels per box, not the union — see --max_union_area."
+        },
+    )
+    max_union_area: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "reward_variant='ours': skip (do not score) any observe step whose rasterised box "
+            "UNION covers more than this fraction of the image, e.g. 0.4. The step is masked exactly "
+            "like an ungroundable one — SKIPPED, not scored 0 — so it drops out of the per-completion "
+            "mean. None/0 (default) disables the cap, leaving only the existing 100%-coverage "
+            "degenerate guard. Needed because --max_box_area is per-box: N disjoint boxes each under "
+            "the cap can still cover the whole image. Sweep dimension — appears in the model/wandb name."
+        },
     )
     dino_api_base: Optional[str] = field(
         default=None,

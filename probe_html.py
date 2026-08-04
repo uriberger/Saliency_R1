@@ -659,7 +659,9 @@ function mapCell(st, src, label) {{
     <tr><td>map peak</td><td>${{fmt(st.map_max, 5)}}</td></tr>
     <tr><td>flatness mean/max</td><td>${{fmt(st.map_mean / st.map_max, 4)}}</td></tr>
     <tr><td>boxes raw/kept</td><td>${{st.n_boxes_raw}}/${{st.n_boxes_kept}}</td></tr>
-    <tr><td>box area frac</td><td>${{fmt(st.box_area_frac, 3)}}</td></tr></table>`);
+    <tr><td>box area frac</td><td>${{fmt(st.box_area_frac ?? st.union_frac_uncapped, 3)}}${{
+      st.dropped_by_union_cap ? ` &gt; max_union_area ${{CFG.max_union_area}}` : ''}}</td></tr>
+    ${{st.note ? `<tr><td>skipped</td><td>${{st.note}}</td></tr>` : ''}}</table>`);
   return cell;
 }}
 function mapLegend() {{
@@ -674,7 +676,10 @@ function mapLegend() {{
     el('span', {{}}, el('i', {{ class: 'bx', style: `border:1px solid ${{css('--s2')}};opacity:.55` }}),
       'DINO box kept'),
     el('span', {{}}, el('i', {{ class: 'bx', style: `border:1px solid ${{css('--muted')}};opacity:.35` }}),
-      `dropped by max_box_area=${{CFG.max_box_area}}`),
+      CFG.max_box_area ? `dropped by max_box_area=${{CFG.max_box_area}}` : 'per-box cap off, every box kept'),
+    CFG.max_union_area
+      ? el('span', {{}}, `steps whose union exceeds max_union_area=${{CFG.max_union_area}} are drawn but scored 'skipped'`)
+      : null,
     el('span', {{}}, 'base image desaturated so the overlay reads'));
 }}
 function repeatGroups(c) {{
@@ -832,7 +837,8 @@ function renderAll() {{ computeAbsRef(); renderSummary(); renderRepeat(); render
 $('#runsub').textContent =
   `${{CFG.n_samples ?? '?'}} prompts × ${{CFG.num_generations ?? '?'}} completions · temperature ${{CFG.temperature}} · ` +
   `layer ${{CFG.overlap_layer}} heads [${{CFG.overlap_heads}}] token_reduction=${{CFG.token_reduction}} · ` +
-  `metric ${{CFG.overlap_metric}} · box_threshold ${{CFG.box_threshold}} max_box_area ${{CFG.max_box_area}} · ` +
+  `metric ${{CFG.overlap_metric}} · box_threshold ${{CFG.box_threshold}} ` +
+  `max_box_area ${{CFG.max_box_area || 'off'}} max_union_area ${{CFG.max_union_area || 'off'}} · ` +
   `weights [${{CFG.reward_weights}}] · generation only, no training`;
 $('#fModel').replaceChildren(...MODELS.map(m => el('option', {{ value: m }}, m)));
 $('#fModel').value = S.model;

@@ -409,9 +409,18 @@ def score_steps(all_step_maps, images_per_completion, store_maps=True):
         st = all_step_maps[c][si]
         smap = st["map"]
         gh, gw = smap.shape
-        max_area = OREW._CFG["max_box_area"]
-        kept = [b for b in (boxes or []) if max_area is None or OREW._box_area(b) <= max_area]
+        max_area = OREW._CFG.get("max_box_area")
+        box_cap_on = max_area is not None and float(max_area) > 0
+        kept = [b for b in (boxes or []) if not box_cap_on or OREW._box_area(b) <= max_area]
         mask = OREW._union_mask(boxes or [], gh, gw)
+        # _union_mask returns None for three different reasons and the viewer should not
+        # conflate them: nothing grounded, a degenerate/full union, or the union cap.
+        # Re-rasterise the kept boxes without the cap to tell the last one apart.
+        uncapped = OREW._union_mask(boxes or [], gh, gw, apply_union_cap=False)
+        union_frac_uncapped = (
+            float(uncapped.sum()) / float(uncapped.size) if uncapped is not None else None
+        )
+        dropped_by_union_cap = mask is None and uncapped is not None
         rec = {
             "step_index": si,
             "text": st["text"],
@@ -421,6 +430,10 @@ def score_steps(all_step_maps, images_per_completion, store_maps=True):
             "n_boxes_raw": len(boxes or []),
             "n_boxes_kept": len(kept),
             "max_box_area": max(( OREW._box_area(b) for b in (boxes or [])), default=None),
+            # Union coverage BEFORE --max-union-area, so a capped step still reports the
+            # coverage that got it dropped (box_area_frac below is None in that case).
+            "union_frac_uncapped": union_frac_uncapped,
+            "dropped_by_union_cap": dropped_by_union_cap,
             "image_mass": float(smap.sum()),
             "map_max": float(smap.max()),
             "map_mean": float(smap.mean()),
@@ -434,11 +447,17 @@ def score_steps(all_step_maps, images_per_completion, store_maps=True):
             rec["map_q"] = quantize_map(smap)
             rec["boxes_raw"] = [[round(float(v), 5) for v in b] for b in (boxes or [])]
             rec["boxes_kept"] = [[round(float(v), 5) for v in b] for b in kept]
-            rec["mask_q"] = _b64_u8(mask.astype(np.uint8)) if mask is not None else None
+            # Draw the capped-away union too, otherwise a dropped step renders with no
+            # overlay at all and looks identical to an ungrounded one.
+            shown = mask if mask is not None else uncapped
+            rec["mask_q"] = _b64_u8(shown.astype(np.uint8)) if shown is not None else None
         if mask is None:
             rec.update(grounded=False, box_area_frac=None, score=None,
                        mean_in_raw=None, mean_in_v2_raw=None, auroc_raw=None,
-                       note="DINO could not ground this step (or union degenerate) -> SKIPPED, not scored 0")
+                       note=(f"union covers {union_frac_uncapped:.2f} of the image > "
+                             f"--max-union-area {OREW._CFG['max_union_area']} -> SKIPPED, not scored 0"
+                             if dropped_by_union_cap else
+                             "DINO could not ground this step (or union degenerate) -> SKIPPED, not scored 0"))
         else:
             # `score` is the configured metric (with the mass gate) and is what the
             # reward uses. Every metric is also recorded ungated on every step, so they
@@ -623,7 +642,11 @@ def main():
     p.add_argument("--token-reduction", default="mean", choices=["mean", "max", "min"])
     p.add_argument("--overlap-metric", default="mean_in", choices=["mean_in", "mean_in_v2", "auroc"])
     p.add_argument("--box-threshold", type=float, default=0.10)
-    p.add_argument("--max-box-area", type=float, default=0.5)
+    p.add_argument("--max-box-area", type=float, default=0.5,
+                   help="per-BOX area cap; 0 disables it (keep every box above --box-threshold)")
+    p.add_argument("--max-union-area", type=float, default=None,
+                   help="per-STEP cap on the rasterised box union as a fraction of the image; "
+                        "steps above it are skipped, not scored 0. None/0 (default) = off")
     p.add_argument("--mass-floor-tau", type=float, default=None)
     p.add_argument("--reward-weights", default="1.0 0.4 1.0 1.0")
     p.add_argument("--dino-device", default=None)
@@ -658,6 +681,7 @@ def main():
     OREW.configure(
         box_threshold=args.box_threshold,
         max_box_area=args.max_box_area,
+        max_union_area=args.max_union_area,
         metric=args.overlap_metric,
         mass_floor_tau=args.mass_floor_tau,
         dino_api_base=args.dino_api_base,
@@ -752,7 +776,9 @@ def render(out_dir: Path, markdown: bool = False):
          f"- dataset: `{cfg['dataset']}`  n_samples={cfg['n_samples']} seed={cfg['seed']}",
          f"- generations/sample: {cfg['num_generations']}  temperature={cfg['temperature']}  max_new_tokens={cfg['max_new_tokens']}",
          f"- overlap: layer={cfg['overlap_layer']} heads=[{cfg['overlap_heads']}] token_reduction={cfg['token_reduction']} metric={cfg['overlap_metric']}",
-         f"- DINO: box_threshold={cfg['box_threshold']} max_box_area={cfg['max_box_area']}  mass_floor_tau={cfg['mass_floor_tau']}",
+         f"- DINO: box_threshold={cfg['box_threshold']} "
+         f"max_box_area={cfg['max_box_area'] or 'off'} "
+         f"max_union_area={cfg.get('max_union_area') or 'off'}  mass_floor_tau={cfg['mass_floor_tau']}",
          f"- reward_weights (format, overlap, accuracy, judge): `{cfg['reward_weights']}`",
          "",
          "`score` per observe step is the value the reward averages over. Steps DINO cannot",

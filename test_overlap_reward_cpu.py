@@ -214,8 +214,11 @@ orw_fresh = _load("overlap_rewards_fresh", REWARDS_SRC)
 assert orw_fresh._CFG["metric"] == "mean_in", orw_fresh._CFG
 assert orw_fresh._CFG["mass_floor_tau"] is None, orw_fresh._CFG
 assert orw_fresh._CFG["natural_only"] is False, orw_fresh._CFG
+assert orw_fresh._CFG["max_box_area"] == 0.5, orw_fresh._CFG
+assert orw_fresh._CFG["max_union_area"] is None, orw_fresh._CFG
 assert orw_fresh._step_score(m5b, mk5b) == orw_fresh._mean_in(m5b, mk5b)
-print("[T7] defaults unchanged: metric=mean_in, no mass floor, natural_only off, _step_score == _mean_in")
+print("[T7] defaults unchanged: metric=mean_in, no mass floor, natural_only off, "
+      "max_box_area=0.5, no union cap, _step_score == _mean_in")
 
 # ---------------------------------------------------------------------------
 # Test 8: natural-images-only gating (--overlap_natural_only)
@@ -254,6 +257,80 @@ else:
     raise AssertionError("expected KeyError when natural_only=True and natural is None")
 
 orw.configure(natural_only=False)
+orw._dino_boxes = _fake_dino
+
+# ---------------------------------------------------------------------------
+# Test 9: --max_union_area, the per-STEP union coverage cap
+# ---------------------------------------------------------------------------
+orw.configure(metric="mean_in", mass_floor_tau=None, max_box_area=0.5)
+
+# The hole it closes: 4 disjoint boxes, each a 0.25-area quadrant, every one of them
+# UNDER max_box_area=0.5, whose union is the entire image. The old code kept it (the
+# degenerate guard only fires at exactly 100% grid coverage -- which this does hit, so
+# use 3 quadrants for a union that is large but legal at 75%).
+_quads = [[0.0, 0.0, 0.5, 0.5], [0.5, 0.0, 1.0, 0.5], [0.0, 0.5, 0.5, 1.0]]
+assert all(orw._box_area(b) <= 0.5 for b in _quads)          # every box passes the per-box cap
+orw._CFG["max_union_area"] = None                            # 9a. cap off (the default)
+um9 = orw._union_mask(_quads, 8, 8)
+assert um9 is not None and um9.sum() == 48, um9.sum()        # 3/4 of an 8x8 grid
+print(f"[T9a] cap off: union of 3 sub-cap boxes covers {um9.sum()}/64 and is SCORED")
+
+orw.configure(max_union_area=0.5)                            # 9b. cap on, union 0.75 > 0.5
+assert orw._union_mask(_quads, 8, 8) is None
+# ... and apply_union_cap=False still returns it, which is how the probe tells "capped"
+# apart from "DINO grounded nothing".
+assert orw._union_mask(_quads, 8, 8, apply_union_cap=False).sum() == 48
+print("[T9b] cap on: same union rejected -> None (skipped); apply_union_cap=False still shows it")
+
+orw.configure(max_union_area=0.8)                            # 9c. cap above the union
+assert orw._union_mask(_quads, 8, 8).sum() == 48
+print("[T9c] cap above the union: kept")
+
+# 9d. end-to-end -- a capped step is SKIPPED, not scored 0. Completion 0's step `a`
+#     grounds to one small box and survives; give step `b` a full-frame-ish union and
+#     it must drop OUT OF THE MEAN rather than pull it toward zero.
+def _wide_dino(images, texts):
+    return [_quads if t == "a stop sign" else [[0.25, 0.25, 0.5, 0.5]] for t in texts]
+
+orw._dino_boxes = _wide_dino
+_one = dict(completions=[None], saliency_map=[sal[0]], valid_list=[True], image=[_Img()])
+orw._CFG["max_union_area"] = None
+r_uncapped = orw.think_overlap_reward(**_one)
+orw.configure(max_union_area=0.5)
+r_capped = orw.think_overlap_reward(**_one)
+# uncapped: mean of both steps. capped: step b gone, so the mean is step a alone (1.0),
+# which is strictly ABOVE the uncapped mean -- proof it was dropped, not zeroed.
+assert abs(r_capped[0] - 1.0) < 1e-6, r_capped
+assert r_capped[0] > r_uncapped[0], (r_capped, r_uncapped)
+print(f"[T9d] end-to-end: capped step skipped not zeroed ({r_uncapped[0]:.3f} -> {r_capped[0]:.3f})")
+
+# 9e. every step capped -> the completion is MASKED (None), same as no grounded step.
+#     0.05 is below one cell of the 4x4 map (1/16 = 0.0625), so even step `a`'s single-
+#     cell union is rejected -- rasterisation puts a hard floor on the achievable union.
+orw.configure(max_union_area=0.05)
+assert orw.think_overlap_reward(**_one)[0] is None
+print("[T9e] all steps capped -> completion masked (None), not 0.0")
+
+# ---------------------------------------------------------------------------
+# Test 10: --max_box_area 0 disables the per-box cap
+# ---------------------------------------------------------------------------
+orw._CFG["max_union_area"] = None
+_mixed = [[0.25, 0.25, 0.75, 0.75], [0.0, 0.0, 1.0, 0.9]]   # areas 0.25 and 0.90
+
+orw.configure(max_box_area=0.5)                              # 10a. cap on: big box dropped
+assert orw._union_mask(_mixed, 8, 8).sum() == 16             # only the 0.5x0.5 box
+orw.configure(max_box_area=0)                                # 10b. 0 disables the cap
+um10 = orw._union_mask(_mixed, 8, 8)
+assert um10.sum() == 8 * 8 - 8, um10.sum()                   # the 0.9-tall box now counts
+print(f"[T10] max_box_area=0 disables the per-box cap: n_in 16 -> {int(um10.sum())}")
+
+# 10c. with the cap off, a single full-frame box still hits the degenerate guard, so
+#      disabling the cap can never make the whole image the "scored region".
+assert orw._union_mask([[0.0, 0.0, 1.0, 1.0]], 8, 8) is None
+print("[T10c] cap off: a full-frame box still rejected by the 100%-coverage guard")
+
+orw.configure(max_box_area=0.5)
+orw._CFG["max_union_area"] = None
 orw._dino_boxes = _fake_dino
 
 print("\nAll CPU logic tests passed.")

@@ -534,6 +534,7 @@ if __name__ == "__main__":
         configure_overlap(
             box_threshold=script_args.box_threshold,
             max_box_area=script_args.max_box_area,
+            max_union_area=script_args.max_union_area,
             metric=script_args.overlap_metric,
             mass_floor_tau=script_args.mass_floor_tau,
             dino_api_base=script_args.dino_api_base,

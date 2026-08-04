@@ -111,7 +111,14 @@ TOKEN_REDUCTION=mean
 OVERLAP_HEADS="28,31"
 OVERLAP_LAYER=22
 BOX_THRESHOLD=0.10
-MAX_BOX_AREA=0.5
+MAX_BOX_AREA=0.5         # per-BOX area cap. Pass 0 to disable it and keep every box
+                         # above --box-threshold.
+MAX_UNION_AREA=""        # unset -> off. Per-STEP cap on the union of the kept boxes:
+                         # a step whose union covers more than this fraction of the
+                         # image is skipped (not scored 0), like an ungroundable one.
+                         # --max-box-area does not bound the union -- N disjoint boxes
+                         # each under the per-box cap can cover the whole image, and
+                         # the measured median union is already 56% of it.
 OVERLAP_METRIC=mean_in   # mean_in (incumbent default) | mean_in_v2 (/mean not /max; see
                          # above) | auroc (hack-resistant; see docs/)
 MASS_FLOOR_TAU=""        # unset -> off for mean_in, 0.0022 for auroc (see below).
@@ -142,6 +149,7 @@ while [[ $# -gt 0 ]]; do
         --overlap-layer)          OVERLAP_LAYER="$2";           shift 2 ;;
         --box-threshold)          BOX_THRESHOLD="$2";           shift 2 ;;
         --max-box-area)           MAX_BOX_AREA="$2";            shift 2 ;;
+        --max-union-area)         MAX_UNION_AREA="$2";          shift 2 ;;
         --overlap-metric)         OVERLAP_METRIC="$2";          shift 2 ;;
         --mass-floor-tau)         MASS_FLOOR_TAU="$2";          shift 2 ;;
         --natural-only)           NATURAL_ONLY=true;            shift ;;
@@ -185,6 +193,8 @@ SUFFIX="__wov${W_OVERLAP}_${N_HEADS}head_tr${TOKEN_REDUCTION}"
 # (and the checkpoints already on disk) stay exactly as they are.
 [[ "$OVERLAP_METRIC" != "mean_in" ]] && SUFFIX="${SUFFIX}_${OVERLAP_METRIC}"
 [[ -n "$MASS_FLOOR_TAU" ]] && SUFFIX="${SUFFIX}_mf${MASS_FLOOR_TAU}"
+[[ -n "$MAX_UNION_AREA" ]] && SUFFIX="${SUFFIX}_mu${MAX_UNION_AREA}"
+[[ "$MAX_BOX_AREA" == "0" ]] && SUFFIX="${SUFFIX}_nobox"
 # The reward differs from a plain run, so the checkpoints and the wandb run must not
 # share a name with one.
 [[ "$NATURAL_ONLY" == true ]] && SUFFIX="${SUFFIX}_natonly"
@@ -201,7 +211,7 @@ echo "GPUs:           $NUM_GPUS (all training, no colocated sidecars)"
 echo "Overlap reward: layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
 echo "Metric:         $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " mass_floor_tau=$MASS_FLOOR_TAU" || echo " (no mass floor)")"
 echo "Overlap rows:   $([ "$NATURAL_ONLY" = true ] && echo 'natural images only (non-natural: format+accuracy+judge)' || echo 'all rows')"
-echo "DINO:           box_threshold=$BOX_THRESHOLD max_box_area=$MAX_BOX_AREA  $([[ -n "$DINO_API_BASE" ]] && echo "served=$DINO_API_BASE" || echo 'local-on-device')"
+echo "DINO:           box_threshold=$BOX_THRESHOLD max_box_area=$([[ "$MAX_BOX_AREA" == "0" ]] && echo 'off (no per-box cap)' || echo "$MAX_BOX_AREA") max_union_area=$([[ -n "$MAX_UNION_AREA" ]] && echo "$MAX_UNION_AREA" || echo 'off')  $([[ -n "$DINO_API_BASE" ]] && echo "served=$DINO_API_BASE" || echo 'local-on-device')"
 echo "Run name:       $RUN_NAME"
 echo "Output dir:     $OUTPUT_DIR"
 echo "Mode:           $($DIRECT && echo 'direct (no SLURM)' || echo "SLURM ($PARTITION, ${DURATION}h)")"
@@ -358,6 +368,12 @@ DINO_FLAG=""
 MASS_FLOOR_FLAG=""
 [[ -n "$MASS_FLOOR_TAU" ]] && MASS_FLOOR_FLAG="--mass_floor_tau $MASS_FLOOR_TAU"
 
+# Same shape: omitted when unset, so the dataclass default (None = no union cap) applies
+# and an existing run's command line is reproduced byte for byte. _union_mask treats a
+# non-positive value as "off", so --max-union-area 0 disables it explicitly.
+MAX_UNION_FLAG=""
+[[ -n "$MAX_UNION_AREA" ]] && MAX_UNION_FLAG="--max_union_area $MAX_UNION_AREA"
+
 # Omitted when off, so the dataclass default (False) applies and the command line of an
 # existing run is reproduced byte for byte.
 NATURAL_ONLY_FLAG=""
@@ -382,6 +398,7 @@ accelerate launch \
     --token_reduction "$TOKEN_REDUCTION" \
     --box_threshold "$BOX_THRESHOLD" \
     --max_box_area "$MAX_BOX_AREA" \
+    $MAX_UNION_FLAG \
     --overlap_metric "$OVERLAP_METRIC" \
     $MASS_FLOOR_FLAG \
     $NATURAL_ONLY_FLAG \

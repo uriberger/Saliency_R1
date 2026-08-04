@@ -16,8 +16,11 @@ Wire contract (must match overlap_rewards._dino_boxes_served):
     GET /health -> {"status": "ok", "model": ..., "device": ...}
 
 Box selection + relative-coord conversion are byte-for-byte the same as the local path
-(_dino_boxes_local) so served and local runs are interchangeable. Area filtering is done
-client-side (max_box_area), so it is intentionally NOT applied here.
+(_dino_boxes_local) so served and local runs are interchangeable. Both area filters are
+done client-side and are intentionally NOT applied here: max_box_area (per box) and
+max_union_area (per step, on the rasterised union, which needs the patch grid the server
+has never seen). The server returns every box above box_threshold; _union_mask decides
+what survives. So changing either cap does not require restarting this server.
 
 Run:
     bash serve_grounding_dino.sh                 # port 8100, GPU 0 of this node

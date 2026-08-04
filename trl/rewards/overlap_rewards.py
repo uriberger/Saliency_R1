@@ -24,7 +24,9 @@ maps + the step text:
 Each map is raw observe-token -> image-patch attention at LAYER 22, mean of the
 configured heads (default (22,28)+(22,31)), ReLU, token-reduced over the step's tokens.
 This reward grounds each step's text with Grounding-DINO (per step, in the loop),
-builds the union mask of boxes >= box_threshold with area <= max_box_area, and scores
+builds the union mask of boxes >= box_threshold with area <= max_box_area (and, with
+--max_union_area, drops steps whose union covers too much of the image -- see the
+coverage section below), and scores
 each step with one of three metrics (--overlap_metric), then averages over the
 completion's grounded observe steps (steps DINO can't ground are SKIPPED, not scored
 0). The result is gated by format validity (multiplicative, like their valid_list).
@@ -111,6 +113,39 @@ Optional mass floor (--mass_floor_tau, applies to any metric; off by default):
   p25 it stops being a floor and "raise image attention uniformly" becomes its own
   exploitable direction.
 
+Box-coverage caps (two independent filters, both in _union_mask):
+
+  --box_threshold (default 0.10)
+      DINO confidence floor. Applied server-side too when --dino_api_base is set.
+
+  --max_box_area (default 0.5, set to 0 to DISABLE)
+      Drops any INDIVIDUAL box whose area exceeds this fraction of the image, before
+      rasterisation. Note this is a per-box filter and says nothing about the union:
+      ten disjoint boxes at 0.1 each pass it and cover the whole image between them.
+
+  --max_union_area (default None = OFF)
+      Skips the whole step when the RASTERISED union covers more than this fraction
+      of the patch grid. Returns None from _union_mask, so the step takes the same
+      path as an ungroundable one: SKIPPED, not scored 0, exactly like the existing
+      degenerate-union guard (which only fires at 100% coverage).
+
+      Why it is worth having: the per-box cap leaves the union unbounded, and the
+      measured median union already covers 56% of the image (overlap_metric_spread.py,
+      1074 grounded steps of the cold-start policy on set_a). A near-full union makes
+      the score meaningless -- everything is "inside the box" -- and under mean_in it
+      also pays: the score correlates +0.17 with the union area fraction, so drifting
+      toward broadly-groundable text is a slow reward-hacking gradient in the same
+      family as the confirmed duplicate-step hack.
+
+      Why it is OFF by default: the exposure is metric-dependent and mostly already
+      handled. mean_in_v2 correlates +0.38 with the area fraction but is self-limiting
+      (full coverage gives exactly 1.0, i.e. chance, so the pull dies rather than
+      diverging), and auroc correlates -0.11 -- growing the union actively hurts. Only
+      mean_in, the default metric, is genuinely exposed. Turning the cap on also
+      changes WHICH steps are scored, so it shifts the reward's scale (fewer, tighter
+      steps survive the mean) -- re-check w_overlap against a probe run before using
+      it in a sweep, don't assume the incumbent weight transfers.
+
 There is deliberately NO step-count term. The observe-step count carries essentially
 no correctness signal (r -0.004..-0.022), so an anti-brevity multiplier costs 24% of
 the reward's predictive value and a hard gate costs 50-70%, to close a step-dropping
@@ -182,7 +217,8 @@ def _no_deepspeed_zero3_init():
 # max_box_area default to the flagship offline filter (honest |r|~0.22 combo).
 _CFG = {
     "box_threshold": 0.10,
-    "max_box_area": 0.5,
+    "max_box_area": 0.5,     # per-box area cap; None or <= 0 disables it
+    "max_union_area": None,  # per-step union coverage cap; None or <= 0 disables it
     # "mean_in" (incumbent, default) | "mean_in_v2" (/mean instead of /max) | "auroc"
     "metric": "mean_in",
     "mass_floor_tau": None,  # None/0 disables the image-mass floor; recommended 0.0022
@@ -312,13 +348,37 @@ def _box_area(b):
     return max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
 
-def _union_mask(boxes, grid_h, grid_w):
+def _union_mask(boxes, grid_h, grid_w, apply_union_cap=True):
     """Boolean (grid_h, grid_w) union of area-filtered boxes; None if degenerate.
 
     Rasterisation matches analysis/aggregation_correlation.py exactly.
+
+    Two independent filters, both disabled by None or a non-positive value:
+
+      max_box_area    per-box, applied to the raw relative-coordinate box BEFORE
+                      rasterisation. Drops individual boxes; the surviving ones
+                      still form a union.
+      max_union_area  per-step, applied to the RASTERISED union. Rejects the whole
+                      step (-> None -> skipped, not scored 0) when the union covers
+                      more than this fraction of the patch grid. The per-box cap
+                      does not bound the union: N disjoint boxes each under the cap
+                      can cover the image between them (measured median union
+                      coverage on set_a is 56%), and under `mean_in` a growing union
+                      raises the score (r +0.17 with the area fraction). This is the
+                      only filter that closes that.
+
+    The union is measured on the patch grid, not on the box geometry, because the
+    grid mask is what the metric actually scores -- and rasterisation inflates it:
+    every surviving box claims at least one patch row and column, so many small
+    boxes cover more grid than their summed area suggests.
+
+    apply_union_cap=False skips only the max_union_area check, so a caller can see the
+    mask the cap rejected (overlap_probe uses this to distinguish "the cap dropped this
+    step" from "DINO grounded nothing"). The reward path always leaves it True.
     """
-    max_area = _CFG["max_box_area"]
-    boxes = [b for b in boxes if max_area is None or _box_area(b) <= max_area]
+    max_area = _CFG.get("max_box_area")
+    if max_area is not None and float(max_area) > 0:
+        boxes = [b for b in boxes if _box_area(b) <= max_area]
     if not boxes:
         return None
     mask = np.zeros((grid_h, grid_w), dtype=bool)
@@ -331,6 +391,10 @@ def _union_mask(boxes, grid_h, grid_w):
     n_in = int(mask.sum())
     if n_in == 0 or n_in == grid_h * grid_w:
         return None
+    max_union = _CFG.get("max_union_area")
+    if apply_union_cap and max_union is not None and float(max_union) > 0:
+        if n_in > float(max_union) * grid_h * grid_w:
+            return None
     return mask
 
 
