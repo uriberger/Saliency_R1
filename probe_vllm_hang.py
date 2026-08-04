@@ -50,15 +50,28 @@ import requests
 #
 # For reference, the training server logged the identical lazy-processor warning
 # and finished the same request in 3 seconds, then ran at 104 it/s.
+# `placeholder` selects how the prompt is built:
+#   True  -- the trainer's way, user content rewritten to [{"type": "image"}, ...]
+#            so the chat template emits <|vision_start|><|image_pad|><|vision_end|>
+#   False -- the callback's original way, plain string content and therefore no
+#            placeholder, which is the bug that wedged the worker
+#
+# The cases below the divider are the ones that established the diagnosis; they
+# keep placeholder=False so they still reproduce it.
 CASES = {
-    "text_only":              dict(n_prompts=6,  n=8, temperature=1.0, images=False),
-    "control_slow":           dict(n_prompts=6,  n=8, temperature=1.0),
-    "control_training_shape": dict(n_prompts=6,  n=8, temperature=1.0),
-    "n1_temp1":               dict(n_prompts=6,  n=1, temperature=1.0),
-    "n8_temp0":               dict(n_prompts=6,  n=8, temperature=0.0),
-    "n1_temp0":               dict(n_prompts=6,  n=1, temperature=0.0),
-    "many_prompts_n8_temp1":  dict(n_prompts=48, n=8, temperature=1.0),
-    "validation_shape":       dict(n_prompts=48, n=1, temperature=0.0),
+    # --- verification of the fix ---
+    "fixed_prompt":           dict(n_prompts=6,  n=8, temperature=1.0, placeholder=True),
+    "fixed_validation_shape": dict(n_prompts=48, n=1, temperature=0.0, placeholder=True),
+
+    # --- diagnosis (broken prompt, kept reproducible) ---
+    "text_only":              dict(n_prompts=6,  n=8, temperature=1.0, images=False, placeholder=False),
+    "control_slow":           dict(n_prompts=6,  n=8, temperature=1.0, placeholder=False),
+    "control_training_shape": dict(n_prompts=6,  n=8, temperature=1.0, placeholder=False),
+    "n1_temp1":               dict(n_prompts=6,  n=1, temperature=1.0, placeholder=False),
+    "n8_temp0":               dict(n_prompts=6,  n=8, temperature=0.0, placeholder=False),
+    "n1_temp0":               dict(n_prompts=6,  n=1, temperature=0.0, placeholder=False),
+    "many_prompts_n8_temp1":  dict(n_prompts=48, n=8, temperature=1.0, placeholder=False),
+    "validation_shape":       dict(n_prompts=48, n=1, temperature=0.0, placeholder=False),
 }
 
 
@@ -68,8 +81,8 @@ def encode_image(img):
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def build_inputs(n_prompts, val_dir, model):
-    """Prompts and images exactly as ValidationAccuracyCallback builds them."""
+def build_inputs(n_prompts, val_dir, model, placeholder=True):
+    """Prompts and images as the callback builds them, with or without the fix."""
     from datasets import load_from_disk
     from transformers import AutoProcessor
     from trl.data_utils import maybe_apply_chat_template
@@ -85,9 +98,20 @@ def build_inputs(n_prompts, val_dir, model):
     )
     prompts, images = [], []
     for row in rows:
-        example = {"prompt": [{"role": "system", "content": SYSTEM},
-                              {"role": "user", "content": row["problem"]}]}
-        prompts.append(maybe_apply_chat_template(example, processor)["prompt"])
+        messages = [{"role": "system", "content": SYSTEM},
+                    {"role": "user", "content": row["problem"]}]
+        if placeholder:
+            # The trainer's conversion: without it the template emits no
+            # <|image_pad|>, and an image with nowhere to bind wedges the worker.
+            messages = [
+                {**m, "content": ([{"type": "image"}, {"type": "text", "text": m["content"]}]
+                                  if m["role"] == "user" else
+                                  [{"type": "text", "text": m["content"]}])}
+                if isinstance(m.get("content"), str) else m
+                for m in messages
+            ]
+        text = maybe_apply_chat_template({"prompt": messages}, processor)["prompt"]
+        prompts.append(text)
         images.append(encode_image(row["image"]))
     return prompts, images
 
@@ -115,9 +139,11 @@ def main():
         raise SystemExit("--model is required")
 
     spec = CASES[args.case]
-    prompts, images = build_inputs(spec["n_prompts"], args.val_dir, args.model)
+    prompts, images = build_inputs(spec["n_prompts"], args.val_dir, args.model,
+                                   placeholder=spec.get("placeholder", True))
     if spec.get("images", True) is False:
         images = None
+    print(f"[probe] prompt has {prompts[0].count('<|image_pad|>')} image placeholder(s)", flush=True)
     payload = {
         "prompts": prompts,
         "images": images,
