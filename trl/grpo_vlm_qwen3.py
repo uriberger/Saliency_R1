@@ -169,6 +169,7 @@ class ValidationAccuracyCallback(TrainerCallback):
         self.max_new_tokens = max_new_tokens
         self.trainer = None
         self._warned = False
+        self._axis_declared = False
 
     def on_train_begin(self, args, state, control, **kwargs):
         # A step-0 baseline: without it the first point is at `every` steps and there
@@ -262,8 +263,18 @@ class ValidationAccuracyCallback(TrainerCallback):
             import wandb
         except ImportError:
             return
-        if wandb.run is not None:
-            wandb.run.log({**metrics, "val/step": state.global_step})
+        if wandb.run is None:
+            return
+        # Plot against the training step, not WandB's internal counter. The Trainer
+        # sets `define_metric("*", step_metric="train/global_step")`, so without a
+        # step metric of its own the validation curve would be drawn on a different
+        # x-axis from every other curve in the run and could not be read next to
+        # them. Declared once, on the first log.
+        if not self._axis_declared:
+            wandb.run.define_metric("val/step")
+            wandb.run.define_metric("val/*", step_metric="val/step")
+            self._axis_declared = True
+        wandb.run.log({**metrics, "val/step": state.global_step})
 
 
 class BenchmarkResultsCallback(TrainerCallback):
