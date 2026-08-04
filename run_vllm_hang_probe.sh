@@ -44,10 +44,41 @@ CASES=$(python "$SCRIPT_DIR/probe_vllm_hang.py" --list | awk '{print $1}')
 [[ -n "$ONLY" ]] && CASES="$ONLY"
 
 SERVER_PID=""
+
+# A wedged worker does not die on SIGTERM -- it is blocked inside the hung
+# generate, and its own log says so ("Process-1 is still alive after 10 seconds").
+# It keeps the port bound, so the next case's server fails with EADDRINUSE, the
+# health check then finds nothing, and that case reports a hang it never ran. The
+# first run of this probe lost two cases exactly that way. So: SIGKILL, kill
+# whatever still holds the port, and verify the port is free before continuing.
+port_holder() {
+    # Fall back through the tools that might be present on a compute node.
+    if command -v fuser >/dev/null 2>&1; then fuser "$1/tcp" 2>/dev/null | tr -d ' '
+    elif command -v ss  >/dev/null 2>&1; then ss -ltnp "sport = :$1" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | head -1
+    fi
+}
+
+port_is_free() {
+    python - "$1" <<'PY'
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1]))); print("free")
+except OSError:
+    print("busy")
+finally:
+    s.close()
+PY
+}
+
 cleanup() {
-    [[ -n "$SERVER_PID" ]] && { pkill -TERM -P "$SERVER_PID" 2>/dev/null; kill -TERM "$SERVER_PID" 2>/dev/null; }
-    pkill -TERM -u "$USER" -f "VLLM::EngineCore" 2>/dev/null
-    sleep 2; pkill -KILL -u "$USER" -f "VLLM::EngineCore" 2>/dev/null
+    [[ -n "$SERVER_PID" ]] && { pkill -KILL -P "$SERVER_PID" 2>/dev/null; kill -KILL "$SERVER_PID" 2>/dev/null; }
+    pkill -KILL -u "$USER" -f "trl.scripts.vllm_serve" 2>/dev/null
+    pkill -KILL -u "$USER" -f "VLLM::EngineCore" 2>/dev/null
+    local holder
+    holder=$(port_holder "$PORT")
+    [[ -n "$holder" ]] && kill -KILL $holder 2>/dev/null
+    sleep 3
 }
 trap cleanup EXIT INT TERM
 
@@ -60,6 +91,14 @@ echo "==========================================================================
 for case_name in $CASES; do
     echo ""
     echo "--- $case_name : starting a fresh server on port $PORT ---"
+    # Refuse to run against a port someone else holds: the result would describe
+    # the previous case's wedged server, not this case.
+    cleanup
+    if [[ "$(port_is_free "$PORT")" != "free" ]]; then
+        echo "  ABORT: port $PORT is still held (pid $(port_holder "$PORT")) -- a previous" >&2
+        echo "         server is wedged. Kill it, or rerun with --port <other>." >&2
+        exit 1
+    fi
     cd "$REPO/trl_repo"
     python -m trl.scripts.vllm_serve --model "$MODEL" --host 127.0.0.1 --port "$PORT" \
         --gpu_memory_utilization 0.90 --dtype bfloat16 --max_model_len 4096 \
@@ -72,8 +111,14 @@ for case_name in $CASES; do
             echo "  server died before becoming healthy; see $LOGDIR/$case_name.server.log" >&2
             break
         fi
+        # A server that cannot bind logs EADDRINUSE and shuts uvicorn down while the
+        # parent lingers, so kill -0 keeps succeeding and the old 20-minute wait sat
+        # there for nothing. Watch the log for the give-up conditions instead.
+        if grep -q "address already in use" "$LOGDIR/$case_name.server.log" 2>/dev/null; then
+            echo "  server could not bind port $PORT -- aborting this case" >&2; break
+        fi
         sleep 5; waited=$((waited + 5))
-        if (( waited > 1200 )); then echo "  server not healthy after 20 min" >&2; break; fi
+        if (( waited > 900 )); then echo "  server not healthy after 15 min" >&2; break; fi
     done
 
     if curl -sf "http://127.0.0.1:$PORT/health/" >/dev/null 2>&1; then
