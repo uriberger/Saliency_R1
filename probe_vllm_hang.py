@@ -38,8 +38,21 @@ import time
 
 import requests
 
-# (n_prompts, n, temperature) -- the control first, then one variable at a time.
+# The control -- the exact shape training uses -- HUNG, which exonerates n,
+# temperature and prompt count: none of them differ in that case. So the first
+# question is no longer "which parameter", it is "is this a deadlock or just very
+# slow, and is it the image path at all".
+#
+#   text_only      no images. If this passes, the hang is multimodal.
+#   control_slow   the control again with a 30-minute timeout. If it completes,
+#                  nothing is deadlocked and we are looking at pathological
+#                  slowness in image preprocessing on this node.
+#
+# For reference, the training server logged the identical lazy-processor warning
+# and finished the same request in 3 seconds, then ran at 104 it/s.
 CASES = {
+    "text_only":              dict(n_prompts=6,  n=8, temperature=1.0, images=False),
+    "control_slow":           dict(n_prompts=6,  n=8, temperature=1.0),
     "control_training_shape": dict(n_prompts=6,  n=8, temperature=1.0),
     "n1_temp1":               dict(n_prompts=6,  n=1, temperature=1.0),
     "n8_temp0":               dict(n_prompts=6,  n=8, temperature=0.0),
@@ -103,6 +116,8 @@ def main():
 
     spec = CASES[args.case]
     prompts, images = build_inputs(spec["n_prompts"], args.val_dir, args.model)
+    if spec.get("images", True) is False:
+        images = None
     payload = {
         "prompts": prompts,
         "images": images,
@@ -117,7 +132,9 @@ def main():
     }
 
     print(f"[probe] {args.case}: {spec}  ({len(prompts)} prompts, "
-          f"{spec['n_prompts'] * spec['n']} sequences)", flush=True)
+          f"{spec['n_prompts'] * spec['n']} sequences, "
+          f"{'no images' if images is None else str(len(images)) + ' images'}, "
+          f"timeout {args.timeout}s)", flush=True)
     started = time.time()
     try:
         response = requests.post(f"{args.url}/generate/", json=payload, timeout=args.timeout)
