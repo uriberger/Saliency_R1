@@ -75,6 +75,21 @@
 # (r +0.38 vs mean_in's +0.17), though that pull dies at 1.0 rather than diverging, and
 # it has no offline attack/utility screen behind it.
 #
+# LORA TARGETS -- k_proj is now on by default:
+#
+#   bash launch_grpo_qwen3_overlap_colocated_job.sh --lora-targets q_proj,v_proj   # old default
+#
+# This reward pays for WHERE attention lands, and with k_proj frozen the image-token key
+# directions are frozen with it: an attention logit here is cos(q, k_j) (Qwen3-VL RMS-
+# normalises q and k per head, so a LoRA can only rotate them, never rescale), and two
+# patches whose keys point the same way cannot be pulled apart by any query update.
+# Adapting k_proj is what opens that route. Cheap under GQA -- 32 query heads over 8 KV
+# heads makes k_proj 4096x1024 against q_proj's 4096x4096, so +38% adapter params over
+# q+v -- and blunt in one way worth knowing: reward heads 28 and 31 share KV group 7, so
+# a key update moves heads 28-31 together. The old q_proj,v_proj default is the LoRA
+# paper's, chosen for downstream language quality at a fixed budget, not for attention
+# placement. Changing this invalidates --resume from an existing adapter checkpoint.
+#
 # MIXED CORPORA -- restrict the overlap reward to photographs:
 #
 #   bash launch_grpo_qwen3_overlap_colocated_job.sh --dataset_name cold_data/grpo_sets/set_b --natural-only
@@ -156,6 +171,20 @@ NUM_GENERATIONS=8
 GRAD_ACCUM=8
 PER_DEVICE_BATCH=1
 LEARNING_RATE=1e-5
+# LoRA targets, comma-separated. k_proj is in the default because this run rewards
+# WHERE attention lands: Qwen3-VL RMS-normalises q and k per head (q_norm/k_norm in
+# modeling_qwen3_vl.py), so a LoRA can only ROTATE key/query directions, never scale
+# them, and with k_proj frozen the image-token key directions are fixed -- two patches
+# whose keys point the same way cannot be separated by any query update, which is
+# exactly the move the overlap reward is asking for. It is cheap under GQA (32 query
+# heads over 8 KV heads, so k_proj is 4096x1024 against q_proj's 4096x4096: +38%
+# adapter params over q+v). It is also blunt: the reward heads 28 and 31 share KV
+# group 7, so a key update moves heads 28-31 together.
+# The upstream q_proj,v_proj default comes from the LoRA paper's ablation, which tuned
+# downstream language quality at a fixed budget, not attention placement.
+# NOTE: changing this invalidates --resume from an existing adapter checkpoint (the
+# adapter shapes no longer match). It needs a fresh run.
+LORA_TARGETS=${LORA_TARGETS:-q_proj,k_proj,v_proj}
 SAVE_STEPS=${SAVE_STEPS:-10}
 # Checkpoints are cheap -- 116 MB of LoRA adapter plus ZeRO state, not a full model
 # -- and every kept one is a point on the benchmark curve, so keep one per 100
@@ -239,6 +268,7 @@ while [[ $# -gt 0 ]]; do
         --learning-rate)          LEARNING_RATE="$2";           shift 2 ;;
         --w-overlap)              W_OVERLAP="$2"; W_OVERLAP_SET=1; shift 2 ;;
         --token-reduction)        TOKEN_REDUCTION="$2";         shift 2 ;;
+        --lora-targets)           LORA_TARGETS="$2";            shift 2 ;;
         --overlap-heads)          OVERLAP_HEADS="$2";           shift 2 ;;
         --overlap-layer)          OVERLAP_LAYER="$2";           shift 2 ;;
         --box-threshold)          BOX_THRESHOLD="$2";           shift 2 ;;
@@ -339,6 +369,11 @@ SUFFIX="__wov${W_OVERLAP}_${N_HEADS}head_tr${TOKEN_REDUCTION}"
 # The reward differs from a plain run, so the checkpoints and the wandb run must not
 # share a name with one.
 [[ "$NATURAL_ONLY" == true ]] && SUFFIX="${SUFFIX}_natonly"
+# A different adapter is a different experiment, so it must not share a name (or a
+# checkpoint dir) with a q+v run. q_proj,v_proj is the historical set and stays unmarked,
+# which keeps every existing run name and every checkpoint already on disk untouched.
+LORA_SLUG=$(echo "$LORA_TARGETS" | sed 's/_proj//g; s/,//g')
+[[ "$LORA_TARGETS" != "q_proj,v_proj" ]] && SUFFIX="${SUFFIX}_lora${LORA_SLUG}"
 MODEL_SLUG=$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g')
 RUN_NAME="grpo-${MODEL_SLUG}-overlap${SUFFIX}"
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$REPO/checkpoint/${RUN_NAME}"
@@ -358,6 +393,7 @@ echo "Validation:       $([ -n "$VAL_SETS_DIR" ] && echo "accuracy only, step 0 
 echo "Checkpoints:      save every $SAVE_STEPS, keep every $CKPT_KEEP_EVERY"
 echo "Benchmarks:       $([ "$AUTO_BENCH" = true ] && echo "dispatcher auto-started (${BENCH_GPUS}-GPU jobs)" || echo 'off (see --auto-bench)')"
 echo "Batch:            per_device=$PER_DEVICE_BATCH num_generations=$NUM_GENERATIONS grad_accum=$GRAD_ACCUM  (gen_batch=$(( PER_DEVICE_BATCH * TRAIN_N * GRAD_ACCUM )))"
+echo "LoRA targets:     ${LORA_TARGETS//,/ }"
 echo "T5 step clf:      $OVERLAP_STEPS_DEVICE  ckpt=$OVERLAP_STEPS_CKPT"
 echo "Run name:         $RUN_NAME"
 echo "Output dir:       $OUTPUT_DIR"
@@ -419,6 +455,7 @@ if ! $DIRECT; then
                 --learning-rate $LEARNING_RATE \
                 --w-overlap $W_OVERLAP \
                 --token-reduction $TOKEN_REDUCTION \
+                --lora-targets $LORA_TARGETS \
                 --overlap-heads $OVERLAP_HEADS \
                 --overlap-layer $OVERLAP_LAYER \
                 --box-threshold $BOX_THRESHOLD \
@@ -715,7 +752,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --vllm_server_host 127.0.0.1 \
     --vllm_server_port "$VLLM_PORT" \
     --use_peft \
-    --lora_target_modules q_proj v_proj \
+    --lora_target_modules ${LORA_TARGETS//,/ } \
     --log_completions \
     --per_device_train_batch_size "$PER_DEVICE_BATCH" \
     --gradient_accumulation_steps "$GRAD_ACCUM" \
