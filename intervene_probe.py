@@ -452,6 +452,12 @@ class Intervener:
         self.mask = None
         self._reentry = False
         self.n_rows = 0
+        # When set, every forward records how far the rebuilt rows are from the
+        # module's OWN eager output for those rows. At alpha=0 the two must agree to
+        # bf16 rounding; that is the only check that isolates the rebuild, because it
+        # is taken before anything propagates through layers L+1.. and the LM head.
+        self.audit = False
+        self.audit_stats = None
         self.handle = attn_mod.register_forward_hook(self._hook, with_kwargs=True)
 
     def close(self):
@@ -502,6 +508,16 @@ class Intervener:
         ctx = torch.matmul(a[:, :, rows, :], v)                     # [1, H_all, R, hd]
         ctx = ctx.transpose(1, 2).reshape(1, rows.numel(), -1)
         new_rows = module.o_proj(ctx)
+        if self.audit:
+            ref = _out[:, rows, :].float()
+            err = (new_rows.float() - ref).abs()
+            self.audit_stats = {
+                "max_abs_err": float(err.max()),
+                "mean_abs_err": float(err.mean()),
+                "max_abs_ref": float(ref.abs().max()),
+                "rel": float(err.max() / ref.abs().max().clamp_min(1e-12)),
+                "n_rows": int(rows.numel()),
+            }
         out0 = (output[0] if isinstance(output, tuple) else output).clone()
         out0[:, rows, :] = new_rows.to(out0.dtype)
         return (out0,) + tuple(output[1:]) if isinstance(output, tuple) else out0
@@ -561,7 +577,8 @@ def score_case(model, processor, iv, case, image, device, heads, alpha, kind, se
             "n_gold": len(gold),
             "top1_id": int(logits[first - 1].argmax()),
             "first_correct": int(int(logits[first - 1].argmax()) == gold[0]),
-            "n_rows": iv.n_rows}
+            "n_rows": iv.n_rows,
+            "audit": iv.audit_stats}
 
 
 @torch.no_grad()
@@ -750,11 +767,21 @@ def run_shard(args, device):
 # stage: selftest
 # ---------------------------------------------------------------------------
 def selftest(args, device):
-    """alpha=0 must reproduce the un-hooked forward; alpha=1 must not.
+    """Gate: the rebuilt attention rows must equal the module's own eager output.
 
-    Rebuilding a module's output from its attention weights means getting v_proj,
-    the GQA expansion and o_proj exactly right. A mistake there corrupts every
-    number the probe produces and raises nothing, so this gate runs before the grid.
+    Rebuilding a module's output from its attention weights means getting v_proj, the
+    GQA expansion and o_proj exactly right. A mistake corrupts every number the probe
+    produces and raises nothing, so this runs before the grid.
+
+    The check is taken INSIDE the hook, comparing the rebuilt rows against the
+    module's own eager output for the same rows. An earlier version compared
+    end-to-end `log P(gold)` against an un-hooked forward instead, and failed at
+    0.06-0.43 nats -- because the hook rebuilds its rows in EAGER attention while the
+    un-hooked forward runs on sdpa, and in bf16 that difference propagates through
+    layers L+1.. and the LM head. That gap says nothing about the rebuild, and it
+    cancels in the real measurement (the baseline is hooked at alpha=0 over the same
+    rows, so every variant carries the identical offset). It is reported below as
+    context, never as a gate.
     """
     out = Path(args.out_dir)
     cases, cfg = load_cases(out)
@@ -773,32 +800,53 @@ def selftest(args, device):
     iv = Intervener(PROBE.find_attn_module(model, layer),
                     next(model.parameters()).dtype)
     ok, n = True, 0
+    print(f"[selftest] layer {layer}, attn_impl={args.attn_impl}, "
+          f"tol rel<{args.selftest_tol:g}")
     try:
-        for case in cases:
-            row = rows[case["row_index"]]          # cases were filtered to resolvable rows
+        iv.audit = True
+        for case in cases[:args.selftest_cases]:
+            row = rows[case["row_index"]]
             a0 = score_case(model, processor, iv, case, row["image"], device,
                             heads, 0.0, "box", 0)
-            ref = score_case_nohook(model, processor, case, row["image"], device)
-            if a0 is None:
+            if a0 is None or a0["audit"] is None:
                 continue
-            d = abs(a0["logp_gold"] - ref["logp_gold"])
-            same = a0["top1_id"] == ref["top1_id"]
-            print(f"[selftest] row {case['row_index']}: rows={a0['n_rows']:>4} "
-                  f"|d logp| = {d:.3e}  top1 {'==' if same else '!='}")
-            if d > args.selftest_tol or not same:
+            au = a0["audit"]
+            ref = score_case_nohook(model, processor, case, row["image"], device)
+            ctx = abs(a0["logp_gold"] - ref["logp_gold"])
+            print(f"[selftest] row {case['row_index']:>6}: rows={au['n_rows']:>4}  "
+                  f"REBUILD rel_err={au['rel']:.2e} "
+                  f"(max {au['max_abs_err']:.2e} of {au['max_abs_ref']:.2e})   "
+                  f"[context: end-to-end |d logp| vs un-hooked = {ctx:.2e}, "
+                  f"top1 {'==' if a0['top1_id'] == ref['top1_id'] else '!='}]")
+            if au["rel"] > args.selftest_tol:
                 ok = False
             n += 1
-            if n >= 3:
-                break
+        # The plan must actually reach the model: alpha=1 has to move the answer, and
+        # it has to move it relative to the alpha=0 rebuild -- the same comparison the
+        # experiment makes -- not relative to the un-hooked forward.
+        iv.audit = False
         for case in cases[:1]:
             row = rows[case["row_index"]]
+            b = score_case(model, processor, iv, case, row["image"], device,
+                           heads, 0.0, "box", 0)
             a1 = score_case(model, processor, iv, case, row["image"], device,
                             heads, 1.0, "box", 0)
-            ref = score_case_nohook(model, processor, case, row["image"], device)
-            d = a1["logp_gold"] - ref["logp_gold"]
-            print(f"[selftest] alpha=1, whole layer {layer}: d logp = {d:+.4f} "
-                  f"(must be nonzero, or the plan is not being applied)")
+            d = a1["logp_gold"] - b["logp_gold"]
+            print(f"[selftest] alpha=1 vs alpha=0, whole layer {layer}: "
+                  f"d logp = {d:+.4f} (must be nonzero)")
             if abs(d) < 1e-6:
+                ok = False
+        # alpha=0 twice must be bit-identical: the pipeline has to be deterministic,
+        # or a paired delta measures the sampler as much as the intervention.
+        for case in cases[:1]:
+            row = rows[case["row_index"]]
+            r1 = score_case(model, processor, iv, case, row["image"], device,
+                            heads, 0.0, "box", 0)
+            r2 = score_case(model, processor, iv, case, row["image"], device,
+                            heads, 0.0, "box", 0)
+            d = abs(r1["logp_gold"] - r2["logp_gold"])
+            print(f"[selftest] determinism: repeat of alpha=0 differs by {d:.2e}")
+            if d > 1e-9:
                 ok = False
     finally:
         iv.close()
@@ -923,7 +971,10 @@ def main():
                    help="report a separate delta over cases whose mean union is below "
                         "this -- forcing attention into a union that already covers "
                         "most of the image is barely an intervention")
-    p.add_argument("--selftest-tol", type=float, default=5e-2)
+    p.add_argument("--selftest-tol", type=float, default=1e-2,
+                   help="max RELATIVE error of the rebuilt attention rows against the "
+                        "module's own eager output; bf16 carries ~3 decimal digits")
+    p.add_argument("--selftest-cases", type=int, default=3)
     p.add_argument("--log-every", type=int, default=25)
     p.add_argument("--monitor-interval", type=float, default=30.0)
     p.add_argument("--once", action="store_true",
