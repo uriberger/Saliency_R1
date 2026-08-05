@@ -588,6 +588,41 @@ def score_case_nohook(model, processor, case, image, device):
             "top1_id": int(logits[first - 1].argmax())}
 
 
+def load_cases(out: Path, shard: int = 0, num_shards: int = 1, max_cases: int = 0):
+    """Cases from every shard file, plus the sampling config that produced them.
+
+    `run` and `selftest` need the IMAGES, which the case files do not store -- they
+    re-derive them with load_samples() and look each case up by row_index. That draw
+    depends on (dataset, split, n_samples, seed), so taking those from the CLI lets a
+    mismatched --n-samples silently find nothing: every case is skipped, `run` writes
+    an empty results file while reporting 100% complete, and `selftest` runs zero
+    checks and still prints PASS. Read them from the cases file instead, which is the
+    only source that cannot disagree with the cases themselves.
+    """
+    files = sorted((out / "cases").glob("shard*.json"))
+    if not files:
+        raise SystemExit(f"no cases in {out / 'cases'} -- run --stage prepare first")
+    cases, cfg = [], None
+    for f in files:
+        d = json.loads(f.read_text())
+        cases.extend(d["cases"])
+        c = {k: d["config"][k] for k in ("dataset", "split", "n_samples", "seed")}
+        if cfg is not None and c != cfg:
+            raise SystemExit(f"{f.name} was prepared with {c}, earlier shards with "
+                             f"{cfg} -- the case files disagree, re-run prepare")
+        cfg = c
+    cases.sort(key=lambda c: c["row_index"])
+    if max_cases:
+        cases = cases[:max_cases]
+    return cases[shard::num_shards], cfg
+
+
+def load_case_images(cfg, tag):
+    return {r["row_index"]: r for r in PROBE.load_samples(
+        cfg["dataset"], cfg["n_samples"], cfg["seed"], cache_tag=tag,
+        split=cfg["split"])}
+
+
 def parse_layers(spec, n_layers):
     out = []
     for part in str(spec).split(","):
@@ -627,17 +662,7 @@ def build_variants(args, n_heads):
 
 def run_shard(args, device):
     out = Path(args.out_dir)
-    case_files = sorted((out / "cases").glob("shard*.json"))
-    if not case_files:
-        raise SystemExit(f"no cases in {out / 'cases'} -- run --stage prepare first")
-    cases = []
-    for f in case_files:
-        cases.extend(json.loads(f.read_text())["cases"])
-    cases.sort(key=lambda c: c["row_index"])
-    if args.max_cases:
-        cases = cases[: args.max_cases]
-    cases = cases[args.shard::args.num_shards]
-
+    cases, cfg = load_cases(out, args.shard, args.num_shards, args.max_cases)
     processor, model = PROBE.load_model(args.base_model, args.adapter or None, device,
                                         args.attn_impl)
     tc = text_config(model)
@@ -660,9 +685,13 @@ def run_shard(args, device):
                     continue         # a torn final line from a killed run: ignore it
                 done.add((d["row_index"], d["layer"], d["hname"], d["variant"]))
 
-    rows = {r["row_index"]: r for r in PROBE.load_samples(
-        args.dataset, args.n_samples, args.seed, cache_tag=f"_ivr{args.shard}",
-        split=args.split)}
+    rows = load_case_images(cfg, f"_ivr{args.shard}")
+    missing = [c["row_index"] for c in cases if c["row_index"] not in rows]
+    if missing:
+        raise SystemExit(
+            f"{len(missing)}/{len(cases)} cases have no image (e.g. row {missing[0]}). "
+            f"The cases were prepared with {cfg}; that draw no longer reproduces. "
+            "Re-run --stage prepare rather than scoring a subset silently.")
 
     # +1 per (case, layer) for the alpha=0 baseline that pairs against every variant
     total = len(cases) * len(layers) * (1 + len(variants))
@@ -674,11 +703,7 @@ def run_shard(args, device):
     fh = res_path.open("a")
     try:
         for ci, case in enumerate(cases):
-            row = rows.get(case["row_index"])
-            if row is None:
-                prog.tick(len(layers) * (1 + len(variants)))
-                continue
-            image = row["image"]
+            image = rows[case["row_index"]]["image"]
             seed = 1000003 * case["row_index"] + args.seed
             meta = {"row_index": case["row_index"],
                     "n_steps": len(case["steps"]),
@@ -732,12 +757,14 @@ def selftest(args, device):
     number the probe produces and raises nothing, so this gate runs before the grid.
     """
     out = Path(args.out_dir)
-    files = sorted((out / "cases").glob("shard*.json"))
-    if not files:
-        raise SystemExit("run --stage prepare first")
-    cases = json.loads(files[0].read_text())["cases"]
-    rows = {r["row_index"]: r for r in PROBE.load_samples(
-        args.dataset, args.n_samples, args.seed, cache_tag="_ivs", split=args.split)}
+    cases, cfg = load_cases(out)
+    rows = load_case_images(cfg, "_ivs")
+    cases = [c for c in cases if c["row_index"] in rows]
+    if not cases:
+        raise SystemExit(
+            f"no case image could be resolved. The cases were prepared with {cfg}; "
+            "that draw no longer reproduces, so the selftest would check nothing and "
+            "still pass. Re-run --stage prepare.")
     processor, model = PROBE.load_model(args.base_model, args.adapter or None, device,
                                         args.attn_impl)
     tc = text_config(model)
@@ -748,9 +775,7 @@ def selftest(args, device):
     ok, n = True, 0
     try:
         for case in cases:
-            row = rows.get(case["row_index"])
-            if row is None:
-                continue
+            row = rows[case["row_index"]]          # cases were filtered to resolvable rows
             a0 = score_case(model, processor, iv, case, row["image"], device,
                             heads, 0.0, "box", 0)
             ref = score_case_nohook(model, processor, case, row["image"], device)
@@ -766,9 +791,7 @@ def selftest(args, device):
             if n >= 3:
                 break
         for case in cases[:1]:
-            row = rows.get(case["row_index"])
-            if row is None:
-                continue
+            row = rows[case["row_index"]]
             a1 = score_case(model, processor, iv, case, row["image"], device,
                             heads, 1.0, "box", 0)
             ref = score_case_nohook(model, processor, case, row["image"], device)
@@ -779,7 +802,11 @@ def selftest(args, device):
                 ok = False
     finally:
         iv.close()
-    print("[selftest] PASS" if ok else "[selftest] FAIL")
+    if n == 0:
+        print("[selftest] FAIL -- zero checks ran; a gate that checks nothing is not "
+              "a pass")
+        return 1
+    print(f"[selftest] PASS ({n} cases)" if ok else "[selftest] FAIL")
     return 0 if ok else 1
 
 
