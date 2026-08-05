@@ -128,7 +128,7 @@ done
 mon_pid=""
 if [[ $NO_MONITOR -eq 0 ]]; then
     sleep 5
-    python intervene_probe.py --stage monitor --out-dir "$OUT_DIR" &
+    python intervene_probe.py --stage monitor --monitor-stage "$STAGE" --out-dir "$OUT_DIR" &
     mon_pid=$!
 fi
 
@@ -150,7 +150,7 @@ done
 [[ -n "$mon_pid" ]] && kill "$mon_pid" 2>/dev/null || true
 # The polling monitor is killed the instant the shards exit, so it never shows the
 # final state. Print it once, explicitly.
-python intervene_probe.py --stage monitor --once --out-dir "$OUT_DIR" || true
+python intervene_probe.py --stage monitor --once --monitor-stage "$STAGE" --out-dir "$OUT_DIR" || true
 
 if [[ $fail -ne 0 ]]; then
     echo "WARNING: at least one shard failed. Re-run the same command to resume; " >&2

@@ -203,7 +203,7 @@ class Progress:
         print(self.line(), flush=True)
 
 
-def monitor(out_dir: Path, interval: float, once: bool = False):
+def monitor(out_dir: Path, interval: float, once: bool = False, stage: str = ""):
     """Aggregate every shard heartbeat into one progress line + ETA.
 
     `once` prints a single line and returns; the launcher uses it after `wait` so the
@@ -215,7 +215,10 @@ def monitor(out_dir: Path, interval: float, once: bool = False):
         print(f"[monitor] watching {beats} (ctrl-C to stop)", flush=True)
     while True:
         entries = []
-        for f in sorted(beats.glob("*.json")) if beats.is_dir() else []:
+        # Heartbeats are named <stage><shard>.json. Without the filter the monitor
+        # sums a finished `prepare` into a running `run` and reports 100% at once.
+        pattern = f"{stage}*.json" if stage else "*.json"
+        for f in sorted(beats.glob(pattern)) if beats.is_dir() else []:
             try:
                 entries.append(json.loads(f.read_text()))
             except Exception:
@@ -642,9 +645,17 @@ def load_cases(out: Path, shard: int = 0, num_shards: int = 1, max_cases: int = 
                              f"{cfg} -- the case files disagree, re-run prepare")
         cfg = c
     cases.sort(key=lambda c: c["row_index"])
+    # Fingerprint the WHOLE corpus, before --max-cases and before sharding. Hashing
+    # the shard's working slice instead made a calibration run (--max-cases 40) and
+    # the full run disagree on identical cases, and the guard rejected the resume it
+    # was written to protect.
+    fp = hashlib.sha256(json.dumps(
+        [[c["row_index"], c["chain_ids"], c["gold_ids"], c.get("score_from", 0),
+          [[st["tok_a"], st["tok_b"], st["mask_q"]] for st in c["steps"]]]
+         for c in cases], sort_keys=True).encode()).hexdigest()[:16]
     if max_cases:
         cases = cases[:max_cases]
-    return cases[shard::num_shards], cfg
+    return cases[shard::num_shards], cfg, fp
 
 
 def load_case_images(cfg, tag):
@@ -716,7 +727,7 @@ def build_variants(args, n_heads):
 
 def run_shard(args, device):
     out = Path(args.out_dir)
-    cases, cfg = load_cases(out, args.shard, args.num_shards, args.max_cases)
+    cases, cfg, fp = load_cases(out, args.shard, args.num_shards, args.max_cases)
     processor, model = PROBE.load_model(args.base_model, args.adapter or None, device,
                                         args.attn_impl)
     tc = text_config(model)
@@ -733,10 +744,6 @@ def run_shard(args, device):
     # across a re-prepare with the same seed -- so results computed against an OLDER
     # corpus would be silently reused if the cases were rebuilt. Fingerprint the
     # cases and refuse rather than mixing two corpora in one report.
-    fp = hashlib.sha256(json.dumps(
-        [[c["row_index"], c["chain_ids"], c["gold_ids"], c.get("score_from", 0),
-          [[st["tok_a"], st["tok_b"], st["mask_q"]] for st in c["steps"]]]
-         for c in cases], sort_keys=True).encode()).hexdigest()[:16]
     fp_path = out / "results" / f"fingerprint{args.shard:02d}.txt"
     if fp_path.exists() and fp_path.read_text().strip() != fp:
         raise SystemExit(
@@ -837,7 +844,7 @@ def selftest(args, device):
     context, never as a gate.
     """
     out = Path(args.out_dir)
-    cases, cfg = load_cases(out)
+    cases, cfg, _fp = load_cases(out)
     rows = load_case_images(cfg, "_ivs")
     cases = [c for c in cases if c["row_index"] in rows]
     if not cases:
@@ -1030,6 +1037,9 @@ def main():
     p.add_argument("--selftest-cases", type=int, default=3)
     p.add_argument("--log-every", type=int, default=25)
     p.add_argument("--monitor-interval", type=float, default=30.0)
+    p.add_argument("--monitor-stage", default="",
+                   help="--stage monitor: only aggregate heartbeats of this stage "
+                        "(prepare|run); otherwise a finished stage is summed in")
     p.add_argument("--once", action="store_true",
                    help="--stage monitor: print one aggregate line and exit")
     p.add_argument("--overwrite", action="store_true")
@@ -1037,7 +1047,8 @@ def main():
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     if args.stage == "monitor":
-        return monitor(Path(args.out_dir), args.monitor_interval, once=args.once)
+        return monitor(Path(args.out_dir), args.monitor_interval, once=args.once,
+                       stage=args.monitor_stage)
     if args.stage == "report":
         return report(args)
     if args.stage == "prepare":
