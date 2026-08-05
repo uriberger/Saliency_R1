@@ -288,10 +288,10 @@ def _dino_boxes_local(images, texts):
     proc, model, device = _load_dino_local()
     prompts = [(t.strip() + (".") if not t.strip().endswith(".") else t.strip()) for t in texts]
     out_boxes = [None] * len(images)
-    bs = int(_CFG["dino_batch_size"])
-    for start in range(0, len(images), bs):
-        imgs = images[start:start + bs]
-        txts = prompts[start:start + bs]
+
+    def _run_chunk(start, n):
+        imgs = images[start:start + n]
+        txts = prompts[start:start + n]
         inputs = proc(
             images=imgs, text=txts, return_tensors="pt",
             padding=True, truncation=True, max_length=256,
@@ -312,6 +312,30 @@ def _dino_boxes_local(images, texts):
                 x1, y1, x2, y2 = box
                 boxes.append([x1 / w, y1 / h, x2 / w, y2 / h])
             out_boxes[start + j] = boxes
+
+    # Deformable attention materialises one contiguous
+    # (batch, queries, heads, levels, points) tensor, so peak memory scales with the
+    # batch AND with the images' native resolution: a batch that fits on one caller
+    # can OOM on the next. Callers that co-reside with a big model on the same GPU
+    # (the probe: 8B VLM + attention re-forward) cannot pick a batch size that is
+    # both safe and fast, so halve on OOM instead of dying. A single item that still
+    # OOMs is a real failure and is re-raised.
+    bs = int(_CFG["dino_batch_size"])
+    start = 0
+    while start < len(images):
+        n = min(bs, len(images) - start)
+        while True:
+            try:
+                _run_chunk(start, n)
+                break
+            except torch.cuda.OutOfMemoryError:
+                if n == 1:
+                    raise
+                torch.cuda.empty_cache()
+                n = max(1, n // 2)
+                print(f"[dino] CUDA OOM; retrying batch at offset {start} with size {n}",
+                      flush=True)
+        start += n
     return out_boxes
 
 

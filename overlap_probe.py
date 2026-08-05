@@ -553,6 +553,10 @@ def run_model(spec, rows, args, device):
             all_maps.append(step_maps_from_attention(per_tok, steps, gh, gw, args.token_reduction))
             del per_tok
 
+        # The attention re-forward leaves tens of GB cached but fragmented; DINO then
+        # wants one large contiguous block on the same GPU. Return the cache before
+        # handing over, or the first sample of a shard can OOM outright.
+        torch.cuda.empty_cache()
         detail = score_steps(all_maps, [row["image"]] * len(comp_ids), store_maps=args.store_maps)
         overlap = []
         for c in range(len(comp_ids)):
@@ -651,6 +655,10 @@ def main():
     p.add_argument("--reward-weights", default="1.0 0.4 1.0 1.0")
     p.add_argument("--dino-device", default=None)
     p.add_argument("--dino-api-base", default=None)
+    # Lower than the trainer's 32: here DINO shares the GPU with the 8B VLM and the
+    # attention re-forward. _dino_boxes_local halves this on OOM, so it is a starting
+    # point, not a ceiling.
+    p.add_argument("--dino-batch-size", type=int, default=8)
     p.add_argument("--steps-device", default=None)
     p.add_argument("--steps-ckpt", default=os.environ.get("OVERLAP_STEPS_CKPT", str(repo_path("checkpoint/steps_classifier/best"))))
     # BooleanOptionalAction gives both --judge and --no-judge, so this matches the
@@ -686,6 +694,7 @@ def main():
         mass_floor_tau=args.mass_floor_tau,
         dino_api_base=args.dino_api_base,
         dino_device=args.dino_device or args.device,
+        dino_batch_size=args.dino_batch_size,
     )
     if args.steps_device is None:
         args.steps_device = args.device
