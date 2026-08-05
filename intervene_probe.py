@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import importlib.util
 import json
 import math
@@ -346,17 +347,40 @@ def build_case(args, tok, processor, model, clf, row, device):
     if not steps:
         return "no_observe_steps"
 
-    # Everything from `</think>` on is replaced by the gold answer, so the readout is
+    # Everything after `</think>` is replaced by the gold answer, so the readout is
     # log P(gold | prompt, chain) over a chain identical across every variant.
+    #
+    # Two things this has to get exactly right, both of which were wrong before:
+    #
+    #  1. Where the chain ENDS. char_to_token(cut) resolves the character AFTER
+    #     `</think>`, i.e. the first token of the model's OWN answer, so taking
+    #     cut and adding one left that token in the chain and the gold answer was
+    #     appended to a model that had already answered. Ask for the LAST character
+    #     of `</think>` instead.
+    #  2. The SEPARATOR. The model writes "</think> answer" with a space; tokenising
+    #     "\n" + gold both scored a token the model would never emit and put the real
+    #     answer tokens off-distribution behind it. Take the separator from the
+    #     model's own continuation, and score only the tokens that cover `gold` --
+    #     located by offset mapping, because a tokeniser may merge the separator into
+    #     the first answer token (" B" is one token, not two).
     cut = text.find("</think>")
     cut = cut + len("</think>") if cut >= 0 else len(text)
-    chain_len = enc.char_to_token(0, min(cut, len(text) - 1))
-    chain_len = (chain_len + 1) if chain_len is not None else len(comp_ids)
+    end_tok = enc.char_to_token(0, cut - 1)          # token holding `>` of `</think>`
+    chain_len = (end_tok + 1) if end_tok is not None else len(comp_ids)
     chain_len = min(max(chain_len, te + 1), len(comp_ids))
     chain_ids = comp_ids[:chain_len]
     gold = str(row["gt_answer"]).strip()
-    gold_ids = tok("\n" + gold, add_special_tokens=False)["input_ids"]
+    if not gold:
+        return "empty_gold"
+    sep = re.match(r"\s*", text[cut:]).group(0)
+    enc_a = tok(sep + gold, add_special_tokens=False, return_offsets_mapping=True)
+    gold_ids = enc_a["input_ids"]
+    offsets = enc_a["offset_mapping"]
     if not gold_ids:
+        return "empty_gold"
+    # first token whose span reaches past the separator into `gold` itself
+    score_from = next((i for i, (a, b) in enumerate(offsets) if b > len(sep)), None)
+    if score_from is None:
         return "empty_gold"
 
     gh = int(inputs["image_grid_thw"][0, 1].item()) // 2
@@ -375,8 +399,9 @@ def build_case(args, tok, processor, model, clf, row, device):
     if not kept:
         return "no_grounded_steps"
     return {"row_index": row["row_index"], "dataset": row.get("dataset"),
-            "question": row["question"], "gold": gold,
+            "question": row["question"], "gold": gold, "sep": sep,
             "chain_text": text[:cut], "chain_ids": chain_ids, "gold_ids": gold_ids,
+            "score_from": int(score_from),
             "grid": [gh, gw], "steps": kept}
 
 
@@ -569,16 +594,8 @@ def score_case(model, processor, iv, case, image, device, heads, alpha, kind, se
         iv.spec = None
         iv.mask = None
 
-    logits = out.logits[0].float()
-    first = prompt_len + len(chain)
-    lp = torch.log_softmax(logits[first - 1: first - 1 + len(gold)], dim=-1)
-    gold_t = torch.tensor(gold, device=device)
-    return {"logp_gold": float(lp.gather(1, gold_t[:, None]).sum()),
-            "n_gold": len(gold),
-            "top1_id": int(logits[first - 1].argmax()),
-            "first_correct": int(int(logits[first - 1].argmax()) == gold[0]),
-            "n_rows": iv.n_rows,
-            "audit": iv.audit_stats}
+    return answer_readout(out.logits[0].float(), prompt_len + len(chain), case,
+                          extra={"n_rows": iv.n_rows, "audit": iv.audit_stats})
 
 
 @torch.no_grad()
@@ -597,12 +614,8 @@ def score_case_nohook(model, processor, case, image, device):
     if inputs.get("mm_token_type_ids") is not None:
         pad = torch.zeros(1, ids.shape[1] - prompt_len, dtype=torch.long, device=device)
         fwd["mm_token_type_ids"] = torch.cat([inputs["mm_token_type_ids"], pad], dim=1)
-    logits = model(**fwd).logits[0].float()
-    first = prompt_len + len(chain)
-    lp = torch.log_softmax(logits[first - 1: first - 1 + len(gold)], dim=-1)
-    gold_t = torch.tensor(gold, device=device)
-    return {"logp_gold": float(lp.gather(1, gold_t[:, None]).sum()),
-            "top1_id": int(logits[first - 1].argmax())}
+    return answer_readout(model(**fwd).logits[0].float(),
+                          prompt_len + len(chain), case)
 
 
 def load_cases(out: Path, shard: int = 0, num_shards: int = 1, max_cases: int = 0):
@@ -638,6 +651,30 @@ def load_case_images(cfg, tag):
     return {r["row_index"]: r for r in PROBE.load_samples(
         cfg["dataset"], cfg["n_samples"], cfg["seed"], cache_tag=tag,
         split=cfg["split"])}
+
+
+def answer_readout(logits, answer_pos, case, extra=None):
+    """log P(gold) and the top-1 at the first token that is actually part of `gold`.
+
+    `score_from` skips the separator the model itself emitted between `</think>` and
+    the answer: scoring it would mostly measure how confidently the model predicts a
+    space, and comparing top-1 against it made `first_correct` identically 0 for
+    every case in the first Stage-0 slice.
+    """
+    ids = case["gold_ids"]
+    k = int(case.get("score_from", 0))
+    scored = ids[k:]
+    start = answer_pos + k                      # position of the first scored token
+    lp = torch.log_softmax(logits[start - 1: start - 1 + len(scored)], dim=-1)
+    tgt = torch.tensor(scored, device=logits.device)
+    top1 = int(logits[start - 1].argmax())
+    out = {"logp_gold": float(lp.gather(1, tgt[:, None]).sum()),
+           "n_gold": len(scored),
+           "top1_id": top1,
+           "first_correct": int(top1 == scored[0])}
+    if extra:
+        out.update(extra)
+    return out
 
 
 def parse_layers(spec, n_layers):
@@ -692,6 +729,22 @@ def run_shard(args, device):
 
     res_path = out / "results" / f"shard{args.shard:02d}.jsonl"
     res_path.parent.mkdir(parents=True, exist_ok=True)
+    # Resume is keyed on (row_index, layer, head, variant), and row_index is stable
+    # across a re-prepare with the same seed -- so results computed against an OLDER
+    # corpus would be silently reused if the cases were rebuilt. Fingerprint the
+    # cases and refuse rather than mixing two corpora in one report.
+    fp = hashlib.sha256(json.dumps(
+        [[c["row_index"], c["chain_ids"], c["gold_ids"], c.get("score_from", 0),
+          [[st["tok_a"], st["tok_b"], st["mask_q"]] for st in c["steps"]]]
+         for c in cases], sort_keys=True).encode()).hexdigest()[:16]
+    fp_path = out / "results" / f"fingerprint{args.shard:02d}.txt"
+    if fp_path.exists() and fp_path.read_text().strip() != fp:
+        raise SystemExit(
+            f"results/shard{args.shard:02d}.jsonl was computed against a different "
+            f"corpus (fingerprint {fp_path.read_text().strip()} != {fp}). The cases "
+            "have been re-prepared since. Delete results/ or use a fresh --out-dir; "
+            "resuming would mix two corpora in one report.")
+    fp_path.write_text(fp)
     done = set()
     if res_path.exists():
         with res_path.open() as fh:

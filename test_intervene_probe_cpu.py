@@ -111,6 +111,43 @@ try:
 except SystemExit:
     check("unknown condition rejected", True)
 
+print("\n5b. answer readout scores gold, not the separator")
+
+V = 100
+torch.manual_seed(0)
+# ids = [sep, gold0, gold1]. Non-degenerate logits, so logp is a real number and a
+# mistake in the offset shows up as a wrong value rather than a wrong-but-tiny one.
+logits = torch.randn(10, V)
+logits[3, 7] += 4.0        # position predicting the separator
+logits[4, 42] += 4.0       # position predicting gold0
+logits[5, 43] += 4.0       # position predicting gold1
+case = {"gold_ids": [7, 42, 43], "score_from": 1}
+r = IV.answer_readout(logits, answer_pos=4, case=case)
+lp = torch.log_softmax(logits[4:6], dim=-1)
+want = float(lp[0, 42] + lp[1, 43])
+check("scores len(gold) tokens, not the separator", r["n_gold"] == 2, f"(got {r['n_gold']})")
+check("top1 taken at the first GOLD token", r["top1_id"] == 42)
+check("first_correct compares against gold", r["first_correct"] == 1)
+check("logp sums exactly the gold tokens", abs(r["logp_gold"] - want) < 1e-5,
+      f"({r['logp_gold']:.4f} vs {want:.4f})")
+
+# score_from=0 is the pre-fix behaviour: the comparison lands one position earlier,
+# on the separator, which is what made first_correct identically 0 on real data.
+r0 = IV.answer_readout(logits, answer_pos=4, case={"gold_ids": [7, 42, 43]})
+lp0 = torch.log_softmax(logits[3:6], dim=-1)
+want0 = float(lp0[0, 7] + lp0[1, 42] + lp0[2, 43])
+check("score_from=0 scores every token including the separator",
+      r0["n_gold"] == 3 and abs(r0["logp_gold"] - want0) < 1e-5)
+check("score_from=0 takes top1 at the SEPARATOR position", r0["top1_id"] == 7)
+check("score_from shifts the comparison onto the answer",
+      r0["top1_id"] != r["top1_id"])
+
+# a separator merged into the first answer token (" B" is one token) -> score_from 0
+# gold_ids here start at position 5, so logits[4] (which favours 42) predicts them
+r1 = IV.answer_readout(logits, answer_pos=5, case={"gold_ids": [42, 43], "score_from": 0})
+check("merged separator: nothing skipped, top1 still on the answer",
+      r1["n_gold"] == 2 and r1["top1_id"] == 42)
+
 print("\n6. progress heartbeat + ETA")
 with tempfile.TemporaryDirectory() as d:
     p = IV.Progress(Path(d) / "progress" / "run00.json", 100, "t", log_every=1000,
