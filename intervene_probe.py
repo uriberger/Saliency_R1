@@ -141,12 +141,14 @@ class Progress:
     include the model load and are not representative of the steady state.
     """
 
+    HEARTBEAT_SECS = 15.0
+
     def __init__(self, path: Path, total: int, label: str, log_every: int = 25,
                  already_done: int = 0):
         self.path, self.total, self.label = path, int(total), label
         self.log_every = max(1, int(log_every))
         self.done, self.resumed, self.rate = 0, int(already_done), None
-        self.t0 = self.tlast = time.time()
+        self.t0 = self.tlast = self.twrite = time.time()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._write()
         print(f"[{label}] starting: {self.resumed} already done of {self.total}", flush=True)
@@ -161,7 +163,14 @@ class Progress:
         self.tlast = now
         self.rate = dt if self.rate is None else 0.9 * self.rate + 0.1 * dt
         self.done += n
-        if self.done % self.log_every == 0 or self.completed >= self.total:
+        # Count-based cadence alone makes a slow stage look dead: `prepare` runs at
+        # ~7 s/sample, so log_every=25 is a heartbeat every three minutes and the
+        # monitor reported 0/8 for an entire smoke run that was working fine. Write
+        # on elapsed time as well, so the monitor's picture is never more than
+        # HEARTBEAT_SECS stale whatever the per-unit cost of the stage.
+        if (self.done % self.log_every == 0 or self.completed >= self.total
+                or now - self.twrite >= self.HEARTBEAT_SECS):
+            self.twrite = now
             self._write()
             print(self.line(), flush=True)
 
@@ -193,10 +202,16 @@ class Progress:
         print(self.line(), flush=True)
 
 
-def monitor(out_dir: Path, interval: float):
-    """Aggregate every shard heartbeat into one progress line + ETA."""
+def monitor(out_dir: Path, interval: float, once: bool = False):
+    """Aggregate every shard heartbeat into one progress line + ETA.
+
+    `once` prints a single line and returns; the launcher uses it after `wait` so the
+    final state is shown, which the polling loop otherwise misses (it gets killed the
+    moment the shards exit).
+    """
     beats = out_dir / "progress"
-    print(f"[monitor] watching {beats} (ctrl-C to stop)", flush=True)
+    if not once:
+        print(f"[monitor] watching {beats} (ctrl-C to stop)", flush=True)
     while True:
         entries = []
         for f in sorted(beats.glob("*.json")) if beats.is_dir() else []:
@@ -206,6 +221,8 @@ def monitor(out_dir: Path, interval: float):
                 continue                       # mid-write or torn: skip this round
         if not entries:
             print("[monitor] no heartbeats yet", flush=True)
+            if once:
+                return
             time.sleep(interval)
             continue
         now = time.time()
@@ -219,6 +236,8 @@ def monitor(out_dir: Path, interval: float):
               f"{sum(rates):.1f} it/s total  "
               f"{len(alive)}/{len(entries)} shards alive  "
               f"ETA {fmt_dt(max(etas) if etas else None)}", flush=True)
+        if once:
+            return
         if comp >= tot:
             print("[monitor] all shards complete", flush=True)
             return
@@ -880,12 +899,14 @@ def main():
     p.add_argument("--selftest-tol", type=float, default=5e-2)
     p.add_argument("--log-every", type=int, default=25)
     p.add_argument("--monitor-interval", type=float, default=30.0)
+    p.add_argument("--once", action="store_true",
+                   help="--stage monitor: print one aggregate line and exit")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     if args.stage == "monitor":
-        return monitor(Path(args.out_dir), args.monitor_interval)
+        return monitor(Path(args.out_dir), args.monitor_interval, once=args.once)
     if args.stage == "report":
         return report(args)
     if args.stage == "prepare":

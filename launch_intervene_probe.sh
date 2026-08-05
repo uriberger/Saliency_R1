@@ -135,7 +135,12 @@ fi
 fail=0
 for i in "${!pids[@]}"; do
     if wait "${pids[$i]}"; then
+        # The shard's own summary -- `prepare`'s kept/dropped histogram above all --
+        # goes to its log, not the console. Surface the tail so a run's result does
+        # not require going and finding the file.
         echo "[done] shard ${shards[$i]} ok"
+        grep -v "Loading weights" "$OUT_DIR/logs/${STAGE}_shard${shards[$i]}.log" \
+            | tail -3 | sed 's/^/        /'
     else
         echo "[FAIL] shard ${shards[$i]} -- see $OUT_DIR/logs/${STAGE}_shard${shards[$i]}.log" >&2
         tail -20 "$OUT_DIR/logs/${STAGE}_shard${shards[$i]}.log" >&2 || true
@@ -143,6 +148,9 @@ for i in "${!pids[@]}"; do
     fi
 done
 [[ -n "$mon_pid" ]] && kill "$mon_pid" 2>/dev/null || true
+# The polling monitor is killed the instant the shards exit, so it never shows the
+# final state. Print it once, explicitly.
+python intervene_probe.py --stage monitor --once --out-dir "$OUT_DIR" || true
 
 if [[ $fail -ne 0 ]]; then
     echo "WARNING: at least one shard failed. Re-run the same command to resume; " >&2
