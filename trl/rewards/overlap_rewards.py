@@ -96,6 +96,16 @@ nan-summed out).
       predicts correctness more stably than mean_in (mean |r| 0.238 vs 0.181 over four
       powered datasets, sd 0.028 vs 0.089, and mean_in flips sign on Visual-CoT/DINO).
 
+      NOT immune to the union-growth hack, despite all of the above. The offline screen
+      covers RESHAPING the map for a FIXED box; it says nothing about the policy changing
+      the TEXT so that DINO returns a bigger box. The wov0.11 / auroc / 50k set_a run did
+      exactly that: the overlap reward jumped around step 2200 and every observe step had
+      become a description of the BACKGROUND, which grounds to huge boxes. Rank-invariance
+      does not help when the ranking is taken over a different, much larger in-box set.
+      So do not read auroc's r -0.11 with the box-area fraction (cited below) as evidence
+      that it needs no union cap -- that number is from static offline collections and it
+      did not predict this. See --max_union_area.
+
 Optional mass floor (--mass_floor_tau, applies to any metric; off by default):
 
       score *= min(1, image_mass / tau)      image_mass = step_map.sum()
@@ -132,19 +142,29 @@ Box-coverage caps (two independent filters, both in _union_mask):
       Why it is worth having: the per-box cap leaves the union unbounded, and the
       measured median union already covers 56% of the image (overlap_metric_spread.py,
       1074 grounded steps of the cold-start policy on set_a). A near-full union makes
-      the score meaningless -- everything is "inside the box" -- and under mean_in it
-      also pays: the score correlates +0.17 with the union area fraction, so drifting
-      toward broadly-groundable text is a slow reward-hacking gradient in the same
-      family as the confirmed duplicate-step hack.
+      the score meaningless -- everything is "inside the box".
 
-      Why it is OFF by default: the exposure is metric-dependent and mostly already
-      handled. mean_in_v2 correlates +0.38 with the area fraction but is self-limiting
-      (full coverage gives exactly 1.0, i.e. chance, so the pull dies rather than
-      diverging), and auroc correlates -0.11 -- growing the union actively hurts. Only
-      mean_in, the default metric, is genuinely exposed. Turning the cap on also
-      changes WHICH steps are scored, so it shifts the reward's scale (fewer, tighter
-      steps survive the mean) -- re-check w_overlap against a probe run before using
-      it in a sweep, don't assume the incumbent weight transfers.
+      CONFIRMED ONLINE, under AUROC. The wov0.11 / auroc / 50k set_a run jumped in
+      overlap reward around step 2200, and its observe steps had all turned into
+      descriptions of the BACKGROUND -- background phrases ground to huge boxes, and a
+      huge scored region is easier to rank well against. This is the metric-INDEPENDENT
+      hole: the offline area-fraction correlations (mean_in +0.17, mean_in_v2 +0.38,
+      auroc -0.11) are about reshaping the map for a fixed box and did not predict it.
+      auroc's negative number in particular is not protection.
+
+      Why it is still OFF by default (2026-08-04): the right value is not yet known.
+      The cold-start policy's median union is ALREADY 0.562, so any cap tight enough to
+      look principled masks a large share of completions before training does anything
+      -- and a step the cap drops leaves the mean entirely, so an aggressive cap turns
+      the reward off for whole completions rather than merely trimming it. Size it from
+      the measured distribution first: union_size_report.py over an overlap_probe run
+      (which must itself be run with --max_union_area 0, or it cannot see the tail it
+      is being used to measure).
+
+      Turning it on also changes WHICH steps are scored, so it shifts the reward's
+      scale -- re-check w_overlap against a probe run rather than assuming the
+      incumbent weight transfers, and note the launchers add _mu<x> to the run name so
+      a capped run never shares a checkpoint dir or wandb name with an uncapped one.
 
 There is deliberately NO step-count term. The observe-step count carries essentially
 no correctness signal (r -0.004..-0.022), so an anti-brevity multiplier costs 24% of
