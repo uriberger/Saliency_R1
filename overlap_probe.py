@@ -155,7 +155,18 @@ def prepare_image(image):
     return image
 
 
-def load_samples(dataset_path: str, n: int, seed: int, cache_tag: str = ""):
+def load_samples(dataset_path: str, n: int, seed: int, cache_tag: str = "", split: str = "train"):
+    """Sample n rows from `dataset_path`.
+
+    `split` selects which side of the trainer's holdout to draw from:
+      train   -- the rows the model trained on (the trainer's 100-row holdout removed)
+      holdout -- those 100 held-out rows, still from the *training* corpus
+      all     -- the whole dataset, no carve-out. This is the one to use with the
+                 dedicated validation sets (cold_data/grpo_sets/val_natural,
+                 val_nonnatural): they are image-disjoint from set_a/set_b, so there
+                 is no holdout to carve and taking 'train' would silently discard
+                 100 of their 256 rows.
+    """
     from datasets import load_dataset, load_from_disk
 
     if os.path.isfile(os.path.join(dataset_path, "state.json")):
@@ -170,17 +181,32 @@ def load_samples(dataset_path: str, n: int, seed: int, cache_tag: str = ""):
             "If you are running from a worktree, cold_data/ is untracked and is not "
             "symlinked in -- pass --dataset with an absolute path to the central tree."
         )
-    # The trainer holds out 100 rows with seed 42 before training; sample from the
-    # same train side so the probe sees prompts the model actually trained on.
+    # The trainer holds out 100 rows with seed 42 before training; reproduce that same
+    # split here so 'train' means exactly the prompts the model trained on.
     # Per-shard indices cache files: 8 concurrent shards writing the dataset's shared
     # cache-*.arrow would race on the same filenames.
-    tmp = Path(os.environ.get("TMPDIR", "/tmp")) / f"probe_split{cache_tag}"
-    tmp.mkdir(parents=True, exist_ok=True)
-    ds = ds.train_test_split(
-        test_size=100, seed=42,
-        train_indices_cache_file_name=str(tmp / "train.arrow"),
-        test_indices_cache_file_name=str(tmp / "test.arrow"),
-    )["train"]
+    if split != "all":
+        # A val set carved by --split train would silently drop 100 of its rows and the
+        # report would still be labelled "val". Refuse rather than mislabel.
+        if Path(dataset_path).name.startswith("val"):
+            raise SystemExit(
+                f"{dataset_path} looks like a validation set but --split is '{split}', "
+                "which carves out the trainer's 100-row holdout. Pass --split all."
+            )
+        if len(ds) <= 100:
+            raise SystemExit(
+                f"--split {split} needs the trainer's 100-row holdout, but {dataset_path} "
+                f"has only {len(ds)} rows. Validation sets have no holdout to carve: "
+                "pass --split all."
+            )
+        tmp = Path(os.environ.get("TMPDIR", "/tmp")) / f"probe_split{cache_tag}"
+        tmp.mkdir(parents=True, exist_ok=True)
+        parts = ds.train_test_split(
+            test_size=100, seed=42,
+            train_indices_cache_file_name=str(tmp / "train.arrow"),
+            test_indices_cache_file_name=str(tmp / "test.arrow"),
+        )
+        ds = parts["train"] if split == "train" else parts["test"]
     rng = np.random.default_rng(seed)
     idx = sorted(rng.choice(len(ds), size=min(n, len(ds)), replace=False).tolist())
     rows = []
@@ -633,6 +659,12 @@ def run_model(spec, rows, args, device):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", default=str(repo_path("cold_data/grpo_sets/set_a")))
+    # Which side of the trainer's holdout to probe. Default stays "train" so existing
+    # reports remain reproducible; --split all is what the val_* sets want.
+    p.add_argument("--split", default="train", choices=["train", "holdout", "all"],
+                   help="train: prompts the model trained on (default). holdout: the "
+                        "trainer's 100 held-out rows. all: the whole dataset, for the "
+                        "dedicated validation sets (val_natural / val_nonnatural).")
     p.add_argument("--n-samples", type=int, default=30)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--base-model", default=str(repo_path("checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged")))
@@ -699,7 +731,8 @@ def main():
     if args.steps_device is None:
         args.steps_device = args.device
 
-    rows = load_samples(args.dataset, args.n_samples, args.seed, cache_tag=f"_s{args.shard}")
+    rows = load_samples(args.dataset, args.n_samples, args.seed,
+                        cache_tag=f"_s{args.shard}", split=args.split)
     mine = [r for i, r in enumerate(rows) if i % args.num_shards == args.shard]
     # Each shard exports only its own images: concurrent shards writing the same PNG
     # can interleave and leave a truncated file.
@@ -782,7 +815,8 @@ def render(out_dir: Path, markdown: bool = False):
     L = ["# Attention-overlap reward probe", "",
          "Generation only -- no training, no optimizer step. Same prompts for every model.",
          "",
-         f"- dataset: `{cfg['dataset']}`  n_samples={cfg['n_samples']} seed={cfg['seed']}",
+         f"- dataset: `{cfg['dataset']}` split={cfg.get('split', 'train')}  "
+         f"n_samples={cfg['n_samples']} seed={cfg['seed']}",
          f"- generations/sample: {cfg['num_generations']}  temperature={cfg['temperature']}  max_new_tokens={cfg['max_new_tokens']}",
          f"- overlap: layer={cfg['overlap_layer']} heads=[{cfg['overlap_heads']}] token_reduction={cfg['token_reduction']} metric={cfg['overlap_metric']}",
          f"- DINO: box_threshold={cfg['box_threshold']} "

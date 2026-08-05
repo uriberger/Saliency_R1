@@ -835,6 +835,9 @@ function renderAll() {{ computeAbsRef(); renderSummary(); renderRepeat(); render
 
 // ---------- wire up ----------
 $('#runsub').textContent =
+  // The dataset+split belongs in the header: a report on held-out prompts and one on
+  // prompts the model trained on look identical otherwise, and are read very differently.
+  `${{(CFG.dataset || '?').split('/').pop()}} [${{CFG.split || 'train'}}] · ` +
   `${{CFG.n_samples ?? '?'}} prompts × ${{CFG.num_generations ?? '?'}} completions · temperature ${{CFG.temperature}} · ` +
   `layer ${{CFG.overlap_layer}} heads [${{CFG.overlap_heads}}] token_reduction=${{CFG.token_reduction}} · ` +
   `metric ${{CFG.overlap_metric}} · box_threshold ${{CFG.box_threshold}} ` +
