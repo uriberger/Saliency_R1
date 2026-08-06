@@ -66,8 +66,26 @@ forcing all 32 heads at once is a different manipulation from forcing one.
 - **STORAGE**: the `nvr_israel_rlop` project quota is at **79.96T / 80T**. Free space
   oscillates 7–90 GB while other users' jobs cycle. A full filesystem silently
   truncated a file to 0 bytes here (`ast.parse("")` succeeds — verify writes landed
-  non-empty). ~289 GB sits in 17 `_merged` full-model copies, 16 of which are
-  reconstructible from adapters via `merge_lora_grpo_qwen3.sh`.
+  non-empty).
+
+  A full `du` walk (2026-08-06, 1h40m) says this is **not fixable from this tree**:
+
+  ```
+  59T   users/jonathanp/     <- 74% of the whole allocation
+  16T   sweep_checkpoints/   <- 20%
+   2.3T datasets/
+   2.0T users/uberger/       <- 2.5%
+  800G  experiments/   272G code/   270G users/gdalal/   218G dockers/
+  145G  users/esharony/   80G users/igreenberg/
+  ```
+
+  Those top two are **94%** of 80 TB; everything else including all five other users
+  is under 5 TB. Deleting every `_merged` model in this repo (289 GB, 16 of 17
+  reconstructible via `merge_lora_grpo_qwen3.sh`) recovers 0.36%. The ask belongs with
+  `jonathanp` and whoever owns `sweep_checkpoints/` — likely unpruned intermediate
+  checkpoints, since pruning 7 runs here removed 120 of them. Caveats for that
+  conversation: `du` reports apparent size and Lustre striping can shift it ~10%, and
+  nothing here says that 59 TB is abandoned rather than active.
 
 ## Environment facts that cost time to rediscover
 
