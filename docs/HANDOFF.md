@@ -88,7 +88,9 @@ forcing all 32 heads at once is a different manipulation from forcing one.
 | file | what |
 |---|---|
 | `intervene_probe.py` | causal intervention; `prepare` / `selftest` / `run` / `report` / `monitor`. `--stage selftest` gates every run and must pass. |
-| `head_correlation_probe.py` | all-1152-head correlation scan; `scan` / `report` |
+| `head_correlation_probe.py` | all-1152-head correlation scan of the DIRECT map; `scan` / `report` |
+| `flow_correlation_probe.py` | the same correlation test on INDIRECT maps — layer-wise attention rollout (heads merged by mean, or by `‖Σ_h A^h W_O^h v^h‖`) and the input-gradient map. Readout is the last layer, so no layer is selected. `scan` / `report` |
+| `test_flow_correlation_cpu.py` | CPU checks for the rollout algebra, the wnorm Gram expansion, the increment and the report |
 | `overlap_probe.py` | the original offline reward probe (generation + per-step breakdown) |
 | `test_intervene_probe_cpu.py` | CPU checks for the intervention algebra, resume, report |
 | `docs/attention-intervention-plan.md` | the P0–P5 plan, with its Stage 0→1 gate marked invalid |
