@@ -66,7 +66,13 @@ echo "==========================================================================
 overall=0
 for MAP in "${MAP_LIST[@]}"; do
     MOUT="$OUT_DIR/$MAP"
-    mkdir -p "$MOUT/logs"
+    mkdir -p "$MOUT/logs" "$MOUT/progress"
+    # Drop the previous attempt's heartbeats. A shard writes its first one only after
+    # the model is loaded, ~a minute in, so on a resume the monitor spends that minute
+    # reading files from the run that died -- sees them stale, declares "no shard has
+    # reported in 10 min", and exits, while the shards it was watching are fine.
+    # Resume state lives in scan/shardNN.npz, so nothing is lost by clearing these.
+    rm -f "$MOUT"/progress/*.json
     echo
     echo "##### $MAP -> $MOUT"
 
