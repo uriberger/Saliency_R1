@@ -146,19 +146,23 @@ intervention is still required, and result 2 is what selects the layers for it.
 
 ## Next
 
-Per-head intervention on **L18-L24** -- the layers result 2 flags, plus L22 as the
-incumbent control, excluding L0/L1 for the near-embedding concern above:
+Per-head intervention on **L0, L1 and L18-L24** -- the layers result 2 flags, plus L22
+as the incumbent control. L0/L1 are included despite the near-embedding concern above
+precisely because they carry the largest correlations: if that signal is an image-
+statistics artefact rather than grounding, the intervention is what shows it.
 
 ```bash
 bash launch_intervene_probe.sh --stage run --gpus 8 \
     --out-dir outputs/intervene_probe/coldstart_setA_v2 \
-    --layers 18,19,20,21,22,23,24 --head-mode each \
+    --layers 0,1,18,19,20,21,22,23,24 --head-mode each \
     --conditions box,roll --alphas 1.0
 ```
 
-1,157 x 7 x 64 new forwards (the alpha=0 baselines for these layers already exist from
-result 1) ~= **518k**, about 3h50m on 8 GPUs at the measured 37.2 it/s.
+1,157 x 9 x 64 new forwards (the alpha=0 baselines for these layers already exist from
+result 1) ~= **666k**, about 5h on 8 GPUs at the measured 37.2 it/s -- past the 4-hour
+interactive limit, so either split it over two nodes (`--num-nodes 2 --node-index 0|1`,
+~2h30m) or expect one resume.
 
 **Before reading its output, `--stage report` needs the odd/even split-half.** 7 layers
-x 32 heads = 224 tests is the same selection problem result 2 just demonstrated, and
+x 32 heads = 288 tests is the same selection problem result 2 just demonstrated, and
 the report does not yet do it.
