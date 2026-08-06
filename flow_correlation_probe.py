@@ -209,7 +209,9 @@ class RolloutFlow:
                 w = edge_weights_wnorm(module, hs, a, self.chunk)
             w = w / w.sum(-1, keepdim=True).clamp_min(1e-12)
             self.sal = rollout_update(self.sal, w, self.alpha)
-            self.snaps.append(self.sal[self.rows].clone().cpu())
+            # Stays on the device: .cpu() here would force 36 syncs per case for a
+            # couple of MB. One transfer after the forward instead.
+            self.snaps.append(self.sal[self.rows].clone())
             del a, w, attn, _o
             return None
         return hook
@@ -316,6 +318,12 @@ def grad_maps(model, leaves, logits, ids, prompt_len, spans):
     """
     logp = torch.log_softmax(logits[0].float(), dim=-1)
     targets = [leaves.embeds] + list(leaves.deep)
+    # The leaves are the tensors being differentiated, so they carry requires_grad.
+    # gradient-times-input multiplies by them, and without detaching here that product
+    # is a graph node -- which both keeps the forward graph alive past the last
+    # backward and makes the final .numpy() raise.
+    e = leaves.embeds.detach().float()
+    deep = [t.detach().float() for t in leaves.deep]
     out = []
     for si, (a, b) in enumerate(spans):
         # logits_to_keep trimmed the leading positions: absolute position p-1 predicts
@@ -325,19 +333,18 @@ def grad_maps(model, leaves, logits, ids, prompt_len, spans):
         gs = torch.autograd.grad(f, targets, retain_graph=(si < len(spans) - 1),
                                  allow_unused=True)
         ge = gs[0].float()
-        e = leaves.embeds.float()
         gnorm = ge.norm(dim=-1)
         gxi = (e * ge).sum(-1)
         sq = gnorm ** 2
         dot = gxi.clone()
-        for lf, gd in zip(leaves.deep, gs[1:]):
+        for lf, gd in zip(deep, gs[1:]):
             if gd is None:
                 continue
             gd = gd.float()
             sq = sq + gd.norm(dim=-1) ** 2
-            dot = dot + (lf.float() * gd).sum(-1)
+            dot = dot + (lf * gd).sum(-1)
         out.append(torch.stack([gnorm, sq.clamp_min(0).sqrt(), gxi.abs(), dot.abs()]))
-    return torch.stack(out, dim=1).unsqueeze(1).float().cpu().numpy()   # [4,1,S,M]
+    return torch.stack(out, dim=1).unsqueeze(1).detach().float().cpu().numpy()  # [4,1,S,M]
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +425,7 @@ def scan_case(model, processor, engine, case, image, device, args):
     try:
         with torch.no_grad():
             model(**build_forward(inputs, ids, prompt_len), use_cache=False)
-        snaps = torch.stack(engine.snaps)                    # [n_layers, n_need, M]
+        snaps = torch.stack(engine.snaps).cpu()              # [n_layers, n_need, M]
     finally:
         engine.disarm()
 
@@ -566,6 +573,14 @@ def report(args):
             cagg[name] = np.where(cnt > 0, s / cnt, np.nan)
 
     sel_c, sel_s = (uniq % 2 == 1), (row % 2 == 1)
+    # col_corr refuses to report an r from fewer than 8 pairs, so on a small run the
+    # select/held-out columns come back all-NaN. That is the guard doing its job, not
+    # a failure -- say so, because a wall of `nan` reads like one.
+    small = min(sel_c.sum(), (~sel_c).sum())
+    if small < 8:
+        print(f"NOTE: the smaller odd/even half has {small} completions; col_corr needs "
+              f"8, so r(select)/r(HELD OUT) will be NaN at completion level. Expected "
+              f"on a --max-cases smoke run, not on the full scan.")
     primary = names[-2] if which.startswith("rollout") else names[0]
     saved = {}
     for name, sarr, carr in (("mean_in_v2", v2, cagg["mean_in_v2"]),

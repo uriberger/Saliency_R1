@@ -170,6 +170,37 @@ def test_increment_definition():
           torch.allclose(mean[-1], snaps[-1, [pos[12], pos[13], pos[14]]].mean(0)))
 
 
+def test_grad_maps_returns_numpy():
+    """The leaves being differentiated require grad, and gradient-times-input
+    multiplies by them. Without detaching, that product is a graph node and the final
+    .numpy() raises -- which it did, on the first GPU run, after the whole model had
+    loaded. A toy graph reproduces it in a millisecond."""
+    print("\n[grad] gradient-times-input leaves the graph behind")
+    gen = torch.Generator().manual_seed(4)
+    m, d, vocab, s, prompt_len = 5, 8, 20, 7, 3
+
+    class Leaves:
+        pass
+
+    leaves = Leaves()
+    leaves.embeds = torch.randn(m, d, generator=gen).requires_grad_(True)
+    leaves.deep = [torch.randn(m, d, generator=gen).requires_grad_(True) for _ in range(2)]
+    w = torch.randn(d, vocab, generator=gen)
+    logits = ((leaves.embeds.sum(0) + sum(t.sum(0) for t in leaves.deep)) @ w
+              ).expand(s, vocab)[None]
+    ids = torch.randint(0, vocab, (1, s + prompt_len), generator=gen)
+    spans = [(prompt_len, prompt_len + 2), (prompt_len + 2, prompt_len + 5)]
+
+    maps = FC.grad_maps(None, leaves, logits, ids, prompt_len, spans)
+    check("returns [4, 1, n_steps, M]", maps.shape == (4, 1, len(spans), m), str(maps.shape))
+    check("is finite", bool(np.isfinite(maps).all()))
+    check("gnorm and gnorm_ds are non-negative", float(maps[:2].min()) >= 0.0)
+    check("deepstack columns differ from the input-only ones",
+          float(np.abs(maps[1] - maps[0]).max()) > 0)
+    check("every column is defined for every step",
+          bool((np.abs(maps).sum(-1) > 0).all()))
+
+
 def test_report_recovers_planted_effect():
     print("\n[report] recovers a planted correlation, held out")
     rng = np.random.default_rng(0)
@@ -220,6 +251,7 @@ def main():
     test_wnorm_matches_naive()
     test_repeat_v_agrees()
     test_increment_definition()
+    test_grad_maps_returns_numpy()
     test_report_recovers_planted_effect()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
