@@ -814,8 +814,21 @@ def run_shard(args, device):
     total = len(cases) * len(layers) * (1 + len(variants))
     print(f"[run] shard {args.shard}: {len(cases)} cases x {len(layers)} layers x "
           f"({len(variants)} variants + 1 baseline) = {total} forwards", flush=True)
+    # `done` holds every key in this shard's results file, including grids from
+    # earlier runs sharing the out-dir. Counting all of them against THIS grid's total
+    # printed "22040/1740 (1266.7%)" once and, worse, an ETA of 0 with most of the work
+    # outstanding -- twice it made a healthy run unreadable. Intersect with what this
+    # invocation actually plans to do.
+    planned = {(c["row_index"], L, hn, nm)
+               for c in cases for L in layers
+               for hn, nm in ([("-", "base")]
+                              + [(v["hname"], v["name"]) for v in variants])}
+    already = len(done & planned)
+    if len(done) != already:
+        print(f"[run] shard {args.shard}: {len(done) - already} records in the results "
+              f"file belong to other grids and are not counted as progress", flush=True)
     prog = Progress(out / "progress" / f"run{args.shard:02d}.json", total,
-                    f"run{args.shard}", args.log_every, already_done=len(done))
+                    f"run{args.shard}", args.log_every, already_done=already)
 
     fh = res_path.open("a")
     try:
