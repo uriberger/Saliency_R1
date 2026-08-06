@@ -288,8 +288,15 @@ def prepare_shard(args, device):
     if dest.exists() and not args.overwrite:
         print(f"[prepare] {dest} exists -- nothing to do (--overwrite to redo)")
         return
+    exclude = None
+    if args.exclude_cases_dir:
+        prev, _cfg, _fp = load_cases(Path(args.exclude_cases_dir))
+        exclude = {c["row_index"] for c in prev}
+        print(f"[prepare] excluding {len(exclude)} rows already used by "
+              f"{args.exclude_cases_dir}")
     rows = PROBE.load_samples(args.dataset, args.n_samples, args.seed,
-                              cache_tag=f"_iv{args.shard}", split=args.split)
+                              cache_tag=f"_iv{args.shard}", split=args.split,
+                              exclude=exclude)
     rows = rows[args.shard::args.num_shards]
 
     processor, model = PROBE.load_model(args.base_model, args.adapter or None, device,
@@ -658,10 +665,42 @@ def load_cases(out: Path, shard: int = 0, num_shards: int = 1, max_cases: int = 
     return cases[shard::num_shards], cfg, fp
 
 
-def load_case_images(cfg, tag):
-    return {r["row_index"]: r for r in PROBE.load_samples(
-        cfg["dataset"], cfg["n_samples"], cfg["seed"], cache_tag=tag,
-        split=cfg["split"])}
+def load_case_images(cfg, tag, row_indices=None):
+    """Images for the cases, looked up by row_index.
+
+    This used to re-run load_samples() with the config's (n_samples, seed) and hope
+    the draw came out the same, which made every consumer depend on a random draw it
+    had no reason to care about -- and silently found nothing when it did not match.
+    `row_index` is already an index into the (post-carve) dataset, so index it
+    directly. That also makes a disjoint confirmation draw a non-event: any sample
+    resolves, whatever seed or size produced it.
+    """
+    from datasets import load_dataset, load_from_disk
+
+    path = cfg["dataset"]
+    if os.path.isfile(os.path.join(path, "state.json")):
+        ds = load_from_disk(path)
+        if hasattr(ds, "keys"):
+            ds = ds["train"]
+    else:
+        ds = load_dataset(path, split="train")
+    if cfg["split"] != "all":
+        tmp = Path(os.environ.get("TMPDIR", "/tmp")) / f"probe_split_iv{tag}"
+        tmp.mkdir(parents=True, exist_ok=True)
+        parts = ds.train_test_split(
+            test_size=100, seed=42,
+            train_indices_cache_file_name=str(tmp / "train.arrow"),
+            test_indices_cache_file_name=str(tmp / "test.arrow"))
+        ds = parts["train"] if cfg["split"] == "train" else parts["test"]
+    out = {}
+    for i in sorted(set(row_indices)) if row_indices is not None else range(len(ds)):
+        if i < 0 or i >= len(ds):
+            continue
+        r = ds[int(i)]
+        out[int(i)] = {"row_index": int(i), "dataset": r.get("dataset"),
+                       "question": r["problem"], "gt_answer": r.get("solution"),
+                       "image": PROBE.prepare_image(r["image"])}
+    return out
 
 
 def answer_readout(logits, answer_pos, case, extra=None):
@@ -762,7 +801,8 @@ def run_shard(args, device):
                     continue         # a torn final line from a killed run: ignore it
                 done.add((d["row_index"], d["layer"], d["hname"], d["variant"]))
 
-    rows = load_case_images(cfg, f"_ivr{args.shard}")
+    rows = load_case_images(cfg, f"_ivr{args.shard}",
+                            [c["row_index"] for c in cases])
     missing = [c["row_index"] for c in cases if c["row_index"] not in rows]
     if missing:
         raise SystemExit(
@@ -845,7 +885,7 @@ def selftest(args, device):
     """
     out = Path(args.out_dir)
     cases, cfg, _fp = load_cases(out)
-    rows = load_case_images(cfg, "_ivs")
+    rows = load_case_images(cfg, "_ivs", [c["row_index"] for c in cases])
     cases = [c for c in cases if c["row_index"] in rows]
     if not cases:
         raise SystemExit(
@@ -921,7 +961,80 @@ def selftest(args, device):
 # ---------------------------------------------------------------------------
 # stage: report
 # ---------------------------------------------------------------------------
+def gaps_by_head(out: Path):
+    """-> {(layer, hname, alpha_tag): np.array of per-case (box - roll)}.
+
+    Paired by row within a layer/head, which is what makes the eager-vs-sdpa offset
+    and the bf16 matmul rounding cancel: both sides run the identical rebuild over
+    the identical rows and differ only in the attention values.
+    """
+    per = defaultdict(dict)
+    for f in sorted((out / "results").glob("shard*.jsonl")):
+        with f.open() as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if r["variant"] == "base":
+                    continue
+                per[(r["layer"], r["hname"], r["row_index"])][r["variant"]] = r["logp_gold"]
+    g = defaultdict(list)
+    for (layer, hname, _row), v in per.items():
+        for name in v:
+            if not name.startswith("box_"):
+                continue
+            a = name.split("_", 1)[1]
+            roll = "roll_" + a
+            if roll in v:
+                g[(layer, hname, a)].append(v[name] - v[roll])
+    return {k: np.asarray(x) for k, x in g.items()}
+
+
+def confirm_report(args):
+    """Rank heads on --out-dir, report their effect on --confirm-dir.
+
+    With 9 layers x 32 heads the best of 288 cells looks impressive whether or not
+    any head has an effect; the confirmation set is what separates the two. It is
+    single-use -- look at it, adjust, look again, and it is no longer held out.
+    """
+    sel = gaps_by_head(Path(args.out_dir))
+    con = gaps_by_head(Path(args.confirm_dir))
+    if not con:
+        raise SystemExit(f"no results under {args.confirm_dir}/results")
+    rng = np.random.default_rng(0)
+
+    def ci(x):
+        b = np.array([x[rng.integers(0, len(x), len(x))].mean() for _ in range(4000)])
+        return float(np.percentile(b, 2.5)), float(np.percentile(b, 97.5))
+
+    ranked = sorted(sel.items(), key=lambda kv: -abs(kv[1].mean()))
+    print(f"\nHELD-OUT CONFIRMATION   select: {args.out_dir}\n"
+          f"                        confirm: {args.confirm_dir}")
+    print(f"{'layer':>5} {'head':>6} {'a':>5} {'n_sel':>6} {'box-roll(sel)':>14} "
+          f"{'n_con':>6} {'box-roll(CONFIRM)':>18} {'95% CI':>20} {'sign':>5}")
+    kept = 0
+    for (layer, hname, a), x in ranked[: args.top_heads]:
+        y = con.get((layer, hname, a))
+        if y is None or len(y) < 20:
+            print(f"{layer:>5} {hname:>6} {a:>5} {len(x):>6} {x.mean():>+14.4f} "
+                  f"{'-':>6} {'not in confirm dir':>18}")
+            continue
+        lo, hi = ci(y)
+        same = np.sign(x.mean()) == np.sign(y.mean())
+        kept += bool(same and (lo > 0 or hi < 0))
+        print(f"{layer:>5} {hname:>6} {a:>5} {len(x):>6} {x.mean():>+14.4f} "
+              f"{len(y):>6} {y.mean():>+18.4f} [{lo:>+.4f},{hi:>+.4f}] "
+              f"{'yes' if same else 'NO':>5}")
+    print(f"\n{kept}/{min(args.top_heads, len(ranked))} of the top-ranked heads keep "
+          f"their sign AND exclude 0 on the confirmation set.")
+    print("A head that does neither was selection noise; the selection-set number for "
+          "it is not a measurement.")
+
+
 def report(args):
+    if args.confirm_dir:
+        return confirm_report(args)
     out = Path(args.out_dir)
     recs = []
     for f in sorted((out / "results").glob("shard*.jsonl")):
@@ -1042,6 +1155,16 @@ def main():
                         "(prepare|run); otherwise a finished stage is summed in")
     p.add_argument("--once", action="store_true",
                    help="--stage monitor: print one aggregate line and exit")
+    p.add_argument("--exclude-cases-dir", default="",
+                   help="--stage prepare: draw rows DISJOINT from this out-dir's "
+                        "cases, for a confirmation set that shares nothing with the "
+                        "selection set")
+    p.add_argument("--top-heads", type=int, default=20,
+                   help="--stage report with --confirm-dir: how many of the "
+                        "selection-ranked heads to carry to the confirmation set")
+    p.add_argument("--confirm-dir", default="",
+                   help="--stage report: rank heads on --out-dir, then report their "
+                        "box-roll on this second out-dir (held-out confirmation)")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 

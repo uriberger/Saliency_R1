@@ -155,7 +155,8 @@ def prepare_image(image):
     return image
 
 
-def load_samples(dataset_path: str, n: int, seed: int, cache_tag: str = "", split: str = "train"):
+def load_samples(dataset_path: str, n: int, seed: int, cache_tag: str = "",
+                 split: str = "train", exclude=None):
     """Sample n rows from `dataset_path`.
 
     `split` selects which side of the trainer's holdout to draw from:
@@ -166,6 +167,10 @@ def load_samples(dataset_path: str, n: int, seed: int, cache_tag: str = "", spli
                  val_nonnatural): they are image-disjoint from set_a/set_b, so there
                  is no holdout to carve and taking 'train' would silently discard
                  100 of their 256 rows.
+
+    `exclude` is a set of row indices -- in the same (post-carve) space as the
+    returned `row_index` -- to draw AROUND, so a confirmation set can be made
+    disjoint from an earlier draw.
     """
     from datasets import load_dataset, load_from_disk
 
@@ -208,7 +213,15 @@ def load_samples(dataset_path: str, n: int, seed: int, cache_tag: str = "", spli
         )
         ds = parts["train"] if split == "train" else parts["test"]
     rng = np.random.default_rng(seed)
-    idx = sorted(rng.choice(len(ds), size=min(n, len(ds)), replace=False).tolist())
+    # Two independent draws of 2,000 from 50,000 overlap by ~48 rows. Small, but a
+    # confirmation set that shares rows with the selection set is not one.
+    pool = np.arange(len(ds))
+    if exclude:
+        pool = pool[~np.isin(pool, np.asarray(sorted(exclude), dtype=np.int64))]
+        if len(pool) < n:
+            raise SystemExit(f"only {len(pool)} rows remain after excluding "
+                             f"{len(exclude)}; asked for {n}")
+    idx = sorted(rng.choice(pool, size=min(n, len(pool)), replace=False).tolist())
     rows = []
     for i in idx:
         r = ds[int(i)]
