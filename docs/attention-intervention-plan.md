@@ -1,5 +1,13 @@
 # Does making the model look at what it mentions make it more accurate?
 
+> **Status 2026-08-06: results are in [probe-results.md](probe-results.md).**
+> Stage 0 ran and returned a tight *layer-level* null. Its Stage 0 -> Stage 1 gate
+> ("if forcing every head at layer L does nothing, no single head there will") is
+> **invalid** -- heads can carry opposing contributions that cancel, and o_proj mixes
+> them, so a layer-level null does not bound per-head effects. Stages 1-5 as written
+> below are therefore NOT superseded by that null. An all-head correlation scan
+> (`head_correlation_probe.py`) now selects the layers for the per-head Stage 1.
+
 The plan of record for `intervene_probe.py`, written 2026-08-05. Stages P0–P5, with
 the measurement that motivated each and the gate that decides whether to run the next.
 
