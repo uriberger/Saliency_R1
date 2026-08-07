@@ -577,7 +577,7 @@ def selftest(args, device):
               f"attention layers: {len(fi.layers)}   attn_impl {args.attn_impl}")
         fi.audit = True
         print(f"  {'row':>6} {'rebuild rel':>12} {'L':>3} {'drift(a=0)':>11} "
-              f"{'repeat':>8} {'edit(a1-a0)':>12} {'d ushare':>9} {'d umass':>9}")
+              f"{'repeat':>8} {'edit(a1-a0)':>12} {'d ushare':>9} {'u %':>8} {'m %':>8}")
         for case in cases:
             img = case_image(imgs, case["row_index"])
             ref = IV.score_case_nohook(model, proc, case, img, device)
@@ -595,7 +595,8 @@ def selftest(args, device):
             print(f"  {case['row_index']:>6} {rels[-1]:>12.2e} "
                   f"{au.get('layer', -1):>3} {drift[-1]:>11.5f} {det[-1]:>8.1e} "
                   f"{edit[-1]:>12.5f} {dushare[-1]:>+9.4f} "
-                  f"{a1['umass'] - a0['umass']:>+9.4f}")
+                  f"{100.0 * (a1['umass'] - a0['umass']) / max(a0['umass'], 1e-12):>+8.2f}"
+                  f"{100.0 * (a1['mmass'] - a0['mmass']) / max(a0['mmass'], 1e-12):>+8.2f}")
     finally:
         fi.close()
     if not rels:
@@ -651,11 +652,11 @@ def report(args):
           "right-hand pair:\nbox must raise ushare and roll must raise rshare, or the "
           "logp column is not evidence about grounding.\n")
     print(f"   {'cut':>4} {'alpha':>6} {'n':>5} {'box-roll':>10} {'95% CI':>20} "
-          f"{'d ushare(box)':>14} {'d rshare(roll)':>15}")
+          f"{'d ushare(box)':>14} {'d rshare(roll)':>15} {'u %':>8} {'m %':>8}")
     rng = np.random.default_rng(0)
     for c in cuts:
         for al in alphas:
-            d, du, dr = [], [], []
+            d, du, dr, ru, rm = [], [], [], [], []
             for ri in {r["row_index"] for r in rows}:
                 b = key.get((ri, c, "box", al))
                 q = key.get((ri, c, "roll", al))
@@ -663,6 +664,13 @@ def report(args):
                 if not (b and q and z):
                     continue
                 d.append(b["logp_gold"] - q["logp_gold"])
+                # The share is a ratio, so it can move because the numerator rose or
+                # because the denominator fell -- opposite claims. These are the two
+                # relative moves behind it. Absolute masses are ~1e-2 after 36 layers of
+                # dilution, so they are reported as percentages, not raw deltas.
+                if z.get("umass") and z.get("mmass"):
+                    ru.append(100.0 * (b["umass"] - z["umass"]) / abs(z["umass"]))
+                    rm.append(100.0 * (b["mmass"] - z["mmass"]) / abs(z["mmass"]))
                 du.append(b["ushare"] - z["ushare"])
                 dr.append(q["rshare"] - z["rshare"])
             if len(d) < 8:
@@ -673,9 +681,17 @@ def report(args):
             lo, hi = np.percentile(bs, [2.5, 97.5])
             print(f"   {c:>4} {al:>6.2f} {len(d):>5} {arr.mean():>+10.5f} "
                   f"[{lo:>+8.5f},{hi:>+8.5f}] {np.mean(du):>+14.4f} "
-                  f"{np.mean(dr):>+15.4f}")
+                  f"{np.mean(dr):>+15.4f} "
+                  f"{(np.mean(ru) if ru else float('nan')):>+8.2f} "
+                  f"{(np.mean(rm) if rm else float('nan')):>+8.2f}")
     print("\nA cell whose manipulation columns are ~0 is not a null about grounding; it "
           "is a failed intervention.")
+    print("`u %` / `m %` are the box condition's relative change in union-traceable and "
+          "image-traceable mass at the step's own positions. They decompose d ushare: a "
+          "share that rises\nbecause `u %` rose is the model reading MORE from the boxes; "
+          "one that rises because `m %` fell is it reading less from everywhere else. "
+          "Those are different claims and only\nthe first is the one the reward was "
+          "trying to buy.")
 
 
 # ---------------------------------------------------------------------------
