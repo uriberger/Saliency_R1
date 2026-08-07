@@ -67,12 +67,26 @@ value information the max-entropy default is the plain mean over heads
 (--weighting mean); that is a convention, not a fact about the architecture, which is
 why both are run.
 
-Increment. sal is cumulative -- step k's map contains steps 1..k-1's objects -- so a
-better `r` can come from the map absorbing a completion-level signal rather than from
-per-step grounding. The `inc` column subtracts the map at the token immediately before
-the step from the step's own mean map, isolating what the step's span added. Read
-AUROC for it; mean_in_v2 divides by the map's mean, which an increment can drive to
-zero, so it is NaN for a non-random subset of steps and the report drops it.
+Increment. sal is cumulative -- step k's map contains steps 1..k-1's objects, plus
+whatever the question tokens pulled in -- so a better `r` can come from the map
+absorbing a completion-level signal rather than from per-step grounding. The `incL`
+columns subtract `sal` at the token immediately BEFORE the step from the step's own
+mean map, at the same layer L, isolating what the step's own span newly pulled in from
+the image. One `incL` per layer, so the increment has its own layer curve rather than
+being read at the last layer alone: the 2026-08-06 run found `inc` at the last layer
+to be the only column above chance, which makes the shape of that curve the thing to
+know. Read AUROC for them; mean_in_v2 divides by the map's mean, which an increment
+can drive to zero, so it is NaN for a non-random subset of steps and the report drops
+it.
+
+Controls. Every correlation here is also reported as a PARTIAL correlation holding
+three covariates fixed: the step's DINO union area, the completion's step count, and
+the column's own image mass. Union area moves `mean_in_v2` mechanically (its ceiling
+is n_patches/n_in) and tracks clutter, hence difficulty; image mass is the strongest
+correlate of correctness anyone has measured here (+0.22-0.29), and a map's *shape*
+predicting correctness is a different claim from its *magnitude* doing so. A column
+whose raw r survives but whose partial r does not is measuring difficulty, not
+grounding.
 
 DEEPSTACK CAVEAT. Qwen3-VL re-injects visual features at the image positions at several
 decoder layers (`_deepstack_process`). The recursion does not model that addition; it
@@ -430,13 +444,14 @@ def scan_case(model, processor, engine, case, image, device, args):
         engine.disarm()
 
     n_l, _, m = snaps.shape
-    maps = np.zeros((n_l + 1, 1, len(spans), m), dtype=np.float32)
+    maps = np.zeros((2 * n_l, 1, len(spans), m), dtype=np.float32)
     for si, (a, b) in enumerate(spans):
         sel = [pos[p] for p in range(a, b)]
         mean = snaps[:, sel].mean(dim=1)                     # [n_layers, M]
         maps[:n_l, 0, si] = mean.numpy()
-        maps[n_l, 0, si] = (mean[-1] - snaps[-1, pos[a - 1]]).numpy()
-    names = [f"L{l}" for l in engine.layers] + ["inc"]
+        maps[n_l:, 0, si] = (mean - snaps[:, pos[a - 1]]).numpy()
+    names = ([f"L{l}" for l in engine.layers]
+             + [f"inc{l}" for l in engine.layers])
     return maps, names, answer, kept
 
 
@@ -485,7 +500,7 @@ def scan(args, device):
     prog = IV.Progress(out / "progress" / f"scan{args.shard:02d}.json", len(cases),
                        f"scan{args.shard}", args.log_every)
 
-    V2, AU, ROW, STEP, COR, UNI = [], [], [], [], [], []
+    V2, AU, ROW, STEP, COR, UNI, MASS = [], [], [], [], [], [], []
     names = None
     dropped = 0
     try:
@@ -507,6 +522,12 @@ def scan(args, device):
             masks = np.stack([IV.unb64u8(st["mask_q"], (gh, gw)).astype(bool).reshape(-1)
                               for st in steps])
             v2, au = HC.metrics(maps, masks)                 # each [K, 1, S]
+            # The column's own magnitude, as a covariate for the partial correlations.
+            # For a rollout column this is exactly mass(sal), the fraction of the
+            # step's content traceable to the image; for an increment it is the change
+            # in that fraction and may be negative; for the gradient map it is a scale
+            # with no such interpretation, kept only so the control can run.
+            mass = maps.sum(-1)                              # [K, 1, S]
             grade = PROBE.accuracy_reward(
                 [[{"role": "assistant", "content": f"</think> {answer}"}]],
                 [case["gold"]])[0]
@@ -517,6 +538,7 @@ def scan(args, device):
             for si, st in enumerate(steps):
                 V2.append(v2[:, 0, si])
                 AU.append(au[:, 0, si])
+                MASS.append(mass[:, 0, si])
                 ROW.append(case["row_index"])
                 STEP.append(si)
                 COR.append(float(grade))
@@ -532,6 +554,7 @@ def scan(args, device):
         v2=np.stack(V2).astype(np.float32), auroc=np.stack(AU).astype(np.float32),
         row=np.array(ROW), step=np.array(STEP),
         correct=np.array(COR, dtype=np.float32), union=np.array(UNI, dtype=np.float32),
+        mass=np.stack(MASS).astype(np.float32),
         names=np.array(names), map=np.array(args.map), alpha=np.array(args.alpha))
     print(f"[scan] shard {args.shard}: {len(V2)} steps from "
           f"{len(set(ROW))} completions, {dropped} cases dropped -> {dest}")
@@ -540,6 +563,39 @@ def scan(args, device):
 # ---------------------------------------------------------------------------
 # stage: report
 # ---------------------------------------------------------------------------
+def partial_corr(x, y, z):
+    """Pearson r between x and y after linearly removing the columns of z from both.
+
+    -> (r, n). NaN when fewer than 12 rows are finite in all of x, y and z. Constant
+    covariates are dropped rather than left to make the design rank-deficient.
+    """
+    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(z).all(axis=1)
+    nn = int(ok.sum())
+    if nn < 12:
+        return np.nan, nn
+    xs = x[ok].astype(np.float64)
+    ys = y[ok].astype(np.float64)
+    zs = z[ok].astype(np.float64)
+    cols = [np.ones(nn)] + [zs[:, j] for j in range(zs.shape[1]) if zs[:, j].std() > 0]
+    des = np.column_stack(cols)
+    rx = xs - des @ np.linalg.lstsq(des, xs, rcond=None)[0]
+    ry = ys - des @ np.linalg.lstsq(des, ys, rcond=None)[0]
+    if rx.std() <= 0 or ry.std() <= 0:
+        return np.nan, nn
+    return float((rx * ry).mean() / (rx.std() * ry.std())), nn
+
+
+def sample_columns(ix, want=9):
+    """A readable spread of column indices, always including the first and the last."""
+    if len(ix) <= want:
+        return list(ix)
+    stride = max(1, (len(ix) - 1) // (want - 1))
+    out = list(ix[::stride])
+    if ix[-1] not in out:
+        out.append(ix[-1])
+    return out
+
+
 def report(args):
     out = Path(args.out_dir)
     files = sorted((out / "scan").glob("shard*.npz"))
@@ -550,6 +606,10 @@ def report(args):
     au = np.concatenate([x["auroc"] for x in d])
     row = np.concatenate([x["row"] for x in d])
     cor = np.concatenate([x["correct"] for x in d])
+    uni = np.concatenate([x["union"] for x in d])
+    stp = np.concatenate([x["step"] for x in d])
+    has_mass = "mass" in d[0].files                 # absent in pre-2026-08-06 scans
+    mass = np.concatenate([x["mass"] for x in d]) if has_mass else None
     names = [str(s) for s in d[0]["names"]]
     which = str(d[0]["map"])
     n, k = v2.shape
@@ -559,18 +619,33 @@ def report(args):
           f"accuracy {acc:.3f}")
     print(f"chance |r| at n={len(uniq)}: 1.96/sqrt(n-3) = "
           f"{1.96 / np.sqrt(len(uniq) - 3):.4f} (two-sided, single test)")
+    if not has_mass:
+        print("NOTE: this scan predates the `mass` column, so the partial correlations "
+              "control only for union area and step count. Re-run the scan for the "
+              "full control set.")
 
     idx = np.searchsorted(uniq, row)
     ccor = np.zeros(len(uniq))
     np.maximum.at(ccor, idx, cor)              # label is constant within a completion
-    cagg = {}
-    for name, arr in (("mean_in_v2", v2), ("auroc", au)):
-        s = np.zeros((len(uniq), k))
-        cnt = np.zeros((len(uniq), k))
+
+    def by_completion(arr):
+        """Mean over each completion's steps, NaN-aware. [N] or [N,K] -> [C] or [C,K]."""
+        shape = (len(uniq),) if arr.ndim == 1 else (len(uniq), arr.shape[1])
+        s, cnt = np.zeros(shape), np.zeros(shape)
         np.add.at(s, idx, np.nan_to_num(arr, nan=0.0))
         np.add.at(cnt, idx, np.isfinite(arr).astype(float))
         with np.errstate(invalid="ignore", divide="ignore"):
-            cagg[name] = np.where(cnt > 0, s / cnt, np.nan)
+            return np.where(cnt > 0, s / cnt, np.nan)
+
+    cagg = {"mean_in_v2": by_completion(v2), "auroc": by_completion(au)}
+
+    # Covariates for the partial correlations. Step count is a completion property, so
+    # at step level every step of a completion carries its completion's value.
+    cns = np.zeros(len(uniq))
+    np.maximum.at(cns, idx, stp + 1.0)
+    cov_s = [uni.astype(np.float64), cns[idx]]
+    cov_c = [by_completion(uni), cns]
+    cmass = by_completion(mass) if has_mass else None
 
     sel_c, sel_s = (uniq % 2 == 1), (row % 2 == 1)
     # col_corr refuses to report an r from fewer than 8 pairs, so on a small run the
@@ -581,37 +656,89 @@ def report(args):
         print(f"NOTE: the smaller odd/even half has {small} completions; col_corr needs "
               f"8, so r(select)/r(HELD OUT) will be NaN at completion level. Expected "
               f"on a --max-cases smoke run, not on the full scan.")
-    primary = names[-2] if which.startswith("rollout") else names[0]
-    saved = {}
+    base_i = [i for i, nm in enumerate(names) if not nm.startswith("inc")]
+    inc_i = [i for i, nm in enumerate(names) if nm.startswith("inc")]
+    primary = names[base_i[-1]] if which.startswith("rollout") else names[0]
+    order = (list(range(k)) if args.all_columns
+             else sorted(set(sample_columns(base_i) + sample_columns(inc_i))))
+
+    saved, table = {}, []
     for name, sarr, carr in (("mean_in_v2", v2, cagg["mean_in_v2"]),
                              ("auroc", au, cagg["auroc"])):
-        for setup, X, y, sel in (("step", sarr, cor, sel_s),
-                                 ("completion", carr, ccor, sel_c)):
+        for setup, X, y, sel, cov, mcov in (
+                ("step", sarr, cor, sel_s, cov_s, mass),
+                ("completion", carr, ccor, sel_c, cov_c, cmass)):
             r_all = HC.col_corr(X[:, :, None], y)[:, 0]
             r_sel = HC.col_corr(X[sel][:, :, None], y[sel])[:, 0]
             r_out = HC.col_corr(X[~sel][:, :, None], y[~sel])[:, 0]
-            saved[f"{name}_{setup}"] = np.stack([r_all, r_sel, r_out])
+            # Partial out union area, step count, and the column's OWN magnitude: a
+            # map's shape predicting correctness is a different claim from its size
+            # doing so, and union area moves mean_in_v2 mechanically.
+            r_par = np.full(k, np.nan)
+            for i in range(k):
+                z = cov + ([mcov[:, i]] if mcov is not None else [])
+                r_par[i] = partial_corr(X[:, i], y, np.column_stack(z))[0]
+            # The LEVEL, which no amount of correlation substitutes for: a column can
+            # predict correctness while sitting on the wrong side of chance, in which
+            # case "more overlap -> more correct" is really "less anti-overlap -> more
+            # correct". null is 0.5 for auroc (the union ranks no higher than the rest
+            # of the image) and 1.0 for mean_in_v2 (in-mask mean == overall mean).
+            null = 0.5 if name == "auroc" else 1.0
+            with np.errstate(invalid="ignore"):
+                lvl = np.nanmean(X, axis=0)
+                lse = 2 * np.nanstd(X, axis=0) / np.sqrt(np.isfinite(X).sum(axis=0))
+            saved[f"{name}_{setup}"] = np.stack([r_all, r_sel, r_out, r_par, lvl, lse])
             print(f"\n=== {name} / {setup}-level (n={len(y)}) ===")
             print(f"   {'column':>10} {'r(all)':>9} {'r(select)':>10} "
-                  f"{'r(HELD OUT)':>12} {'n':>7}")
-            order = list(range(k)) if args.all_columns else \
-                [i for i, nm in enumerate(names)
-                 if nm == primary or nm == names[-1] or i % max(1, k // 8) == 0]
+                  f"{'r(HELD OUT)':>12} {'r(PARTIAL)':>11} {'level':>8} {'n':>7}")
             for i in order:
-                if name == "mean_in_v2" and names[i] == "inc":
+                if name == "mean_in_v2" and names[i].startswith("inc"):
                     continue          # undefined wherever the increment's mean <= 0
                 star = "  <- PRIMARY" if names[i] == primary else ""
+                side = ("" if not np.isfinite(lvl[i]) or abs(lvl[i] - null) <= lse[i]
+                        else ("+" if lvl[i] > null else "-"))
                 cnt = int(np.isfinite(X[:, i]).sum())
                 print(f"   {names[i]:>10} {r_all[i]:>+9.4f} {r_sel[i]:>+10.4f} "
-                      f"{r_out[i]:>+12.4f} {cnt:>7}{star}")
-            if k > 2:
-                best = int(np.nanargmax(np.abs(np.nan_to_num(r_sel, nan=0.0))))
-                print(f"   best on the SELECT half: {names[best]}  "
-                      f"select {r_sel[best]:+.4f} -> held out {r_out[best]:+.4f}")
-    np.savez_compressed(out / "corr.npz", names=np.array(names), **saved)
-    print(f"\n-> {out}/corr.npz")
-    print("PRIMARY is the last layer's readout (or gnorm for the gradient map); every "
-          "other column is a secondary whose held-out value is the one to believe.")
+                      f"{r_out[i]:>+12.4f} {r_par[i]:>+11.4f} "
+                      f"{lvl[i]:>7.4f}{side:<1} {cnt:>7}{star}")
+            print(f"   level = the column's mean; chance is {null:.1f}. "
+                  f"'+'/'-' marks a level more than 2 SE above/below it.")
+            for i in range(k):
+                if np.isfinite(r_all[i]) and not (name == "mean_in_v2"
+                                                  and names[i].startswith("inc")):
+                    table.append((name, setup, names[i], r_all[i], r_sel[i],
+                                  r_out[i], r_par[i]))
+
+    # What the primary-only summary used to hide: rank EVERY column that clears a
+    # Bonferroni threshold over every test this report ran, whatever its role. The
+    # effective n is the completion count in both set-ups -- steps within a completion
+    # share a label and are not independent.
+    from scipy.stats import norm
+    n_tests = len(table)
+    thr = norm.ppf(1 - 0.025 / max(1, n_tests)) / np.sqrt(len(uniq) - 3)
+    print(f"\n=== ABOVE THRESHOLD ===")
+    print(f"   {n_tests} tests reported; Bonferroni |r| >= {thr:.4f} "
+          f"(alpha 0.05, effective n = {len(uniq)} completions)")
+    hits = sorted([t for t in table if abs(t[3]) >= thr], key=lambda t: -abs(t[3]))
+    if not hits:
+        print("   nothing clears it.")
+    else:
+        print(f"   {'metric':>11} {'setup':>11} {'column':>10} {'r(all)':>9} "
+              f"{'r(select)':>10} {'r(HELD OUT)':>12} {'r(PARTIAL)':>11}")
+        for m_, s_, c_, ra, rs, ro, rp in hits:
+            print(f"   {m_:>11} {s_:>11} {c_:>10} {ra:>+9.4f} {rs:>+10.4f} "
+                  f"{ro:>+12.4f} {rp:>+11.4f}")
+    np.savez_compressed(out / "corr.npz", names=np.array(names), threshold=thr, **saved)
+    print(f"\n-> {out}/corr.npz   (rows of each array: r_all, r_select, r_heldout, "
+          f"r_partial, level, level_2se)")
+    print("PRIMARY is the pre-registered readout: the last layer for a rollout, gnorm "
+          "for the gradient map. ABOVE THRESHOLD ignores that and ranks everything, "
+          "so a secondary column cannot hide behind it. r(PARTIAL) holds union area, "
+          "step count and the column's own mass fixed; a column whose r survives but "
+          "whose partial r does not is measuring difficulty, not grounding. And read "
+          "`level` alongside every r: a column below chance that still correlates "
+          "positively says less anti-grounding goes with being right, which is not the "
+          "same claim as grounding going with being right.")
 
 
 # ---------------------------------------------------------------------------
