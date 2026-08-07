@@ -330,14 +330,19 @@ class FlowIntervener:
                 ctx = ctx.transpose(1, 2).reshape(1, rows.numel(), -1)
                 new_rows = module.o_proj(ctx)
                 if self.audit:
+                    # The WORST layer, not the last one. Keeping only the most recent
+                    # made this report layer 35 alone and call a 36-layer rebuild
+                    # faithful on the strength of one layer.
                     ref = _out[:, rows, :].float()
                     err = (new_rows.float() - ref).abs()
-                    self.audit_stats = {
-                        "max_abs_err": float(err.max()),
-                        "max_abs_ref": float(ref.abs().max()),
-                        "rel": float(err.max() / ref.abs().max().clamp_min(1e-12)),
-                        "n_rows": int(rows.numel()),
-                    }
+                    rel = float(err.max() / ref.abs().max().clamp_min(1e-12))
+                    if self.audit_stats is None or rel > self.audit_stats["rel"]:
+                        self.audit_stats = {
+                            "rel": rel, "layer": int(layer_idx),
+                            "max_abs_err": float(err.max()),
+                            "max_abs_ref": float(ref.abs().max()),
+                            "n_rows": int(rows.numel()),
+                        }
 
             # float32 accumulation: a bf16 mean over 32 heads loses the small weights
             # that the whole indirect path is made of.
@@ -438,12 +443,18 @@ def manipulation_check(X, steps):
     cannot be told apart from never having moved anything.
     """
     m = X[:, 0].clamp_min(1e-12)
-    us, rs = [], []
+    us, rs, um, mm = [], [], [], []
     for i, st in enumerate(steps):
         r = st["rows"]
         us.append(float((X[r, 1 + 2 * i] / m[r]).mean()))
         rs.append(float((X[r, 2 + 2 * i] / m[r]).mean()))
-    return {"ushare": float(np.mean(us)), "rshare": float(np.mean(rs))}
+        um.append(float(X[r, 1 + 2 * i].mean()))
+        mm.append(float(X[r, 0].mean()))
+    # The shares are the normalised claim, but concentrating attention on union-carriers
+    # raises the numerator AND the denominator -- a flat share can hide a real move. The
+    # raw masses separate the two.
+    return {"ushare": float(np.mean(us)), "rshare": float(np.mean(rs)),
+            "umass": float(np.mean(um)), "mmass": float(np.mean(mm))}
 
 
 # ---------------------------------------------------------------------------
@@ -533,45 +544,82 @@ def run_shard(args, device):
 
 
 def selftest(args, device):
-    """Three gates. Any failure means the run below it would be meaningless."""
-    cases, cfg, _fp = IV.load_cases(Path(args.cases_dir), 0, 1, args.max_cases or 4)
+    """Four gates, three of them AGGREGATE.
+
+    The first version gated per case on |logp(alpha=0, hooked) - logp(un-hooked)|, which
+    was wrong twice over.
+
+    It compared a forward whose step rows are rebuilt in eager at all 36 layers against
+    one running sdpa throughout, so it measured 36 layers of accumulated eager-vs-sdpa
+    drift and called it a rebuild bug. The per-layer audit is what isolates the rebuild:
+    it compares the rebuilt rows against that same module's OWN eager output, before
+    anything propagates. That is gate 1 now, and `--attn-impl eager` (the default here,
+    unlike the correlational probe) removes the drift at the source.
+
+    And it gated per case on the edit's effect size. How much purchase the edit has
+    depends on the step's union -- a case whose eligible keys already carry uniform union
+    content has nothing to re-allocate, and that is a fact about the case, not a broken
+    harness. Gates 3 and 4 are therefore aggregate, with the per-case spread printed
+    because it is the first real evidence about how much the indirect path can be moved
+    at all.
+    """
+    cases, cfg, _fp = IV.load_cases(Path(args.cases_dir), 0, 1, args.max_cases or 8)
     imgs = IV.load_case_images(cfg, "_fist")
-    cases = [c for c in cases if c["row_index"] in imgs][:4]
+    cases = [c for c in cases if c["row_index"] in imgs][:8]
     if not cases:
         raise SystemExit("selftest needs at least one case with an image")
     proc, model = load_model(args, device)
     fi = FlowIntervener(model, next(model.parameters()).dtype)
     cut = max(fi.layers)
-    ok = True
+    rels, drift, edit, dushare, det = [], [], [], [], []
     try:
         print(f"deepstack re-seed layers: {sorted(fi.deep)}   "
-              f"attention layers: {len(fi.layers)}")
+              f"attention layers: {len(fi.layers)}   attn_impl {args.attn_impl}")
         fi.audit = True
+        print(f"  {'row':>6} {'rebuild rel':>12} {'L':>3} {'drift(a=0)':>11} "
+              f"{'repeat':>8} {'edit(a1-a0)':>12} {'d ushare':>9} {'d umass':>9}")
         for case in cases:
             img = case_image(imgs, case["row_index"])
             ref = IV.score_case_nohook(model, proc, case, img, device)
             a0 = score_case(model, proc, fi, case, img, device, cut, 0.0, "box", 0)
+            a0b = score_case(model, proc, fi, case, img, device, cut, 0.0, "box", 0)
             a1 = score_case(model, proc, fi, case, img, device, cut, 1.0, "box", 0)
-            if ref is None or a0 is None or a1 is None:
+            if None in (ref, a0, a0b, a1):
                 continue
-            d0 = abs(a0["logp_gold"] - ref["logp_gold"])
-            d1 = abs(a1["logp_gold"] - ref["logp_gold"])
-            rel = (a0.get("audit") or {}).get("rel", float("nan"))
-            g1 = d0 < max(0.02, 0.002 * abs(ref["logp_gold"]))
-            g2 = d1 > 10 * max(d0, 1e-6)
-            g3 = a1["ushare"] > a0["ushare"]
-            ok = ok and g1 and g2 and g3
-            print(f"  row {case['row_index']:>6}  |d(alpha=0)| {d0:.5f} {'ok' if g1 else 'FAIL'}"
-                  f"   |d(alpha=1)| {d1:.5f} {'ok' if g2 else 'FAIL'}"
-                  f"   ushare {a0['ushare']:.4f} -> {a1['ushare']:.4f} "
-                  f"{'ok' if g3 else 'FAIL'}   rebuild rel {rel:.2e}")
+            au = a0.get("audit") or {}
+            rels.append(au.get("rel", float("nan")))
+            drift.append(abs(a0["logp_gold"] - ref["logp_gold"]))
+            det.append(abs(a0["logp_gold"] - a0b["logp_gold"]))
+            edit.append(abs(a1["logp_gold"] - a0["logp_gold"]))
+            dushare.append(a1["ushare"] - a0["ushare"])
+            print(f"  {case['row_index']:>6} {rels[-1]:>12.2e} "
+                  f"{au.get('layer', -1):>3} {drift[-1]:>11.5f} {det[-1]:>8.1e} "
+                  f"{edit[-1]:>12.5f} {dushare[-1]:>+9.4f} "
+                  f"{a1['umass'] - a0['umass']:>+9.4f}")
     finally:
         fi.close()
-    print("\nGATES\n"
-          "  1 alpha=0 reproduces the un-hooked forward (the rebuild is faithful)\n"
-          "  2 alpha=1 moves it by far more (the edit reaches the answer at all)\n"
-          "  3 alpha=1 raises ushare (the manipulation lands on the union)")
-    print("SELFTEST PASS" if ok else "SELFTEST FAIL")
+    if not rels:
+        raise SystemExit("selftest scored no cases")
+
+    g1 = float(np.nanmax(rels)) < 0.05
+    g2 = float(np.max(det)) < 1e-6
+    g3 = float(np.mean(edit)) > 1e-3 and sum(e > 1e-4 for e in edit) >= len(edit) / 2
+    g4 = float(np.mean(dushare)) > 0 and sum(d > 0 for d in dushare) >= len(dushare) / 2
+    print(f"\nGATES over {len(rels)} cases")
+    print(f"  1 {'ok  ' if g1 else 'FAIL'} the per-layer rebuild matches the module's "
+          f"own eager output: worst rel {np.nanmax(rels):.2e} < 5e-2")
+    print(f"  2 {'ok  ' if g2 else 'FAIL'} an alpha=0 repeat is deterministic: "
+          f"worst {np.max(det):.1e} < 1e-6")
+    print(f"  3 {'ok  ' if g3 else 'FAIL'} the edit reaches the answer: mean |d logp| "
+          f"{np.mean(edit):.5f}, {sum(e > 1e-4 for e in edit)}/{len(edit)} cases move")
+    print(f"  4 {'ok  ' if g4 else 'FAIL'} the manipulation lands: mean d ushare "
+          f"{np.mean(dushare):+.4f}, {sum(d > 0 for d in dushare)}/{len(dushare)} up")
+    print(f"\n  FYI eager-vs-un-hooked drift at alpha=0: mean {np.mean(drift):.5f}, "
+          f"max {np.max(drift):.5f}. Common to baseline, box and roll, so it cancels in\n"
+          f"  box - roll -- but it is per-case noise, so it sets the variance floor. "
+          f"Large values here mean the run needs its n.")
+    ok = g1 and g2 and g3 and g4
+    print("\nSELFTEST PASS" if ok else "\nSELFTEST FAIL")
     if not ok:
         raise SystemExit(1)
 
@@ -641,7 +689,12 @@ def main():
     p.add_argument("--base-model", default=str(repo_path(
         "checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged")))
     p.add_argument("--adapter", default="")
-    p.add_argument("--attn-impl", default="sdpa")
+    # eager, unlike the correlational probe. The hook re-runs every layer in eager
+    # anyway, so an sdpa model pays for a pass whose step rows are then discarded AND
+    # leaves the rebuilt rows differing from the ones the rest of the model produced --
+    # 36 layers of that drift reached 0.18 nats per case, which is pure variance in the
+    # paired readout.
+    p.add_argument("--attn-impl", default="eager")
     p.add_argument("--cutoffs", default="8,16,24,35")
     p.add_argument("--alphas", default="0.25,0.5,1.0")
     p.add_argument("--conditions", default="box,roll")
