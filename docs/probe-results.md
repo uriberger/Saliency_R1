@@ -401,23 +401,37 @@ content hash) is the cheap strong claim; the flow probe reads an `intervene_prob
 columns and the direction before running it — the whole point is that nothing gets
 selected twice.
 
-**C. Per-head intervention** on **L0, L1 and L18-L24** -- the layers result 2 flags, plus L22
-as the incumbent control. L0/L1 are included despite the near-embedding concern above
-precisely because they carry the largest correlations: if that signal is an image-
-statistics artefact rather than grounding, the intervention is what shows it.
+**C. ~~Per-head intervention~~ — done 2026-08-07**, and it is result 4 above: 0 of 288
+cells survive.
+
+**D. Intervene on the INDIRECT path.** Every causal result so far (1 and 4) edits the
+direct path — the step's own tokens attending to image tokens — which is precisely the
+path result 3 says carries little of the traffic. Both nulls are therefore consistent
+with never having moved the thing that matters. `flow_intervene_probe.py` edits the
+indirect path instead: at every layer up to a cutoff it holds fixed how much each head
+reads from image-*carrying* keys (image tokens **and** earlier text positions that
+absorbed image content) and re-allocates that mass toward the keys holding the most
+boxed-object content. `roll` is the matched-area, wrong-place control, as before.
 
 ```bash
-bash launch_intervene_probe.sh --stage run --gpus 8 \
-    --out-dir outputs/intervene_probe/coldstart_setA_v2 \
-    --layers 0,1,18,19,20,21,22,23,24 --head-mode each \
-    --conditions box,roll --alphas 1.0
+bash launch_flow_intervene.sh --stage selftest --gpus 1 \
+    --out-dir outputs/flow_intervene/coldstart_setA \
+    --cases-dir outputs/intervene_probe/coldstart_setA_v2
+bash launch_flow_intervene.sh --stage run --gpus 8 \
+    --out-dir outputs/flow_intervene/coldstart_setA \
+    --cases-dir outputs/intervene_probe/coldstart_setA_v2
 ```
 
-1,157 x 9 x 64 new forwards (the alpha=0 baselines for these layers already exist from
-result 1) ~= **666k**, about 5h on 8 GPUs at the measured 37.2 it/s -- past the 4-hour
-interactive limit, so either split it over two nodes (`--num-nodes 2 --node-index 0|1`,
-~2h30m) or expect one resume.
+1,157 cases x 28 units (4 cutoffs x (1 baseline + 2 conditions x 3 alphas)) = **32.4k**
+forwards, ~25–35 min on 8 GPUs. The cutoff sweep turns result 3's layer curve into a
+prediction: if the causal effect tracks the correlation ramp, that corroborates it; if
+it is flat while the correlation ramps, the correlation is epiphenomenal.
 
-**Before reading its output, `--stage report` needs the odd/even split-half.** 7 layers
-x 32 heads = 288 tests is the same selection problem result 2 just demonstrated, and
-the report does not yet do it.
+**Read the manipulation columns before the logp column.** Unlike the direct probe, the
+actuator (attention) and the measurement (traceable mass) are different objects here, so
+a cell whose `d ushare(box)` is ~0 is a failed intervention, not a null about grounding.
+The selftest gates on exactly that and must pass before the run.
+
+This still does not answer the positive control that results 1 and 4 leave open, and it
+is still activation-level: weights are frozen and no gradient is taken. Blinding, and
+plan Stage 4, remain unbuilt.

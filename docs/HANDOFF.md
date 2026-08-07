@@ -135,6 +135,8 @@ at +0.968 — one signal, not two. It is real and it is small.
 | `head_correlation_probe.py` | all-1152-head correlation scan of the DIRECT map; `scan` / `report` |
 | `flow_correlation_probe.py` | the same correlation test on INDIRECT maps — layer-wise attention rollout (heads merged by mean, or by `‖Σ_h A^h W_O^h v^h‖`) and the input-gradient map. Readout is the last layer, so no layer is selected. `scan` / `report` |
 | `test_flow_correlation_cpu.py` | CPU checks for the rollout algebra, the wnorm Gram expansion, the increment and the report |
+| `flow_intervene_probe.py` | causal test of the INDIRECT path: re-allocates each head's mass over image-*carrying* keys toward union-carriers, at every layer up to a cutoff. `selftest` / `run` / `report` / `monitor`. Reports `ushare`/`rshare` on every forward — a null with a flat `ushare` is a failed intervention, not a result |
+| `test_flow_intervene_cpu.py` | CPU checks for the edit algebra against naive references, the carried scalars, the deepstack re-seed and the report pairing |
 | `overlap_probe.py` | the original offline reward probe (generation + per-step breakdown) |
 | `test_intervene_probe_cpu.py` | CPU checks for the intervention algebra, resume, report |
 | `docs/attention-intervention-plan.md` | the P0–P5 plan, with its Stage 0→1 gate marked invalid |
