@@ -281,6 +281,63 @@ variation predicts correctness. Nothing here explains that.
 
 ---
 
+## 4. Per-head intervention (2026-08-07) — the null holds at head granularity
+
+The direct test of result 1's invalid gate. `intervene_probe.py`, 9 layers x 32 heads
+x (box, roll) on 1,157 cases = **842,296 records**, 0 errors, 0 duplicates. Layers
+0, 1, 18, 19, 20, 21, 22, 23, 24: those result 2 ranked highest, plus L22 as the
+incumbent control.
+
+```
+cells (layer, head)                              288      n = 1,157 each
+per-case sd 0.0731   SE 0.00215   Bonferroni |box-roll| threshold = 0.00806
+
+cells over Bonferroni                            0 / 288
+cells at nominal p<0.05 (|z|>1.96)              15         chance predicts ~14
+pooled over all 288 cells                       +0.000022
+strongest cell                                  L18H12, -0.00654, z -2.88
+```
+
+Fifteen nominal hits against fourteen expected is the textbook signature of no effect.
+Per-layer means are all within +-0.0005 and per-layer mean |box-roll| is uniform at
+0.0014-0.0021 — no layer separates.
+
+**L0 and L1 come back empty.** They carried result 2's largest correlations, and the
+concern was that at near-embedding depth "attention to the object's patches" measures
+image statistics rather than grounding. Causally they are the *weakest* layers scanned
+(mean |box-roll| 0.0019, max 0.0044, no cell even nominal), which supports the artefact
+reading — something result 2 alone could not settle.
+
+**L22 shows the cancellation, without a surviving effect.** Its two rewarded heads rank
+4th and 7th of 288 and pull in opposite directions:
+
+| | box - roll | z |
+|---|---|---|
+| L22H28 | **+0.00495** | +2.38 |
+| L22H31 | **-0.00549** | -2.79 |
+
+Neither clears correction, and two of 288 draws landing in the top ten is unremarkable.
+But this is exactly the head cancellation that made result 1's gate invalid: at layer
+level L22 gave +0.0010 because its heads oppose. The mechanism is real and visible; it
+just does not sum to an effect in either head.
+
+### What is now closed, and what is not
+
+Three independent lines agree that overlap at these heads has no causal path to the
+answer: the layer-level null with its alpha sweep (result 1), the correlation ranking
+(result 2), and 0/288 here. With the benchmark collapses (-11.5% and -8.5%), the reward
+has been optimising a quantity that cannot help accuracy.
+
+Still open: **the positive control**. |d logp| does not scale with alpha, so a single
+head's attention may simply be too small a perturbation for this readout to register.
+Blinding -- scale the image block toward zero and renormalise over the text keys --
+remains the test, and needs the ~20-line extension the mass-preserving parameterisation
+cannot express.
+
+Note this is an **activation-level** intervention: attention values are overwritten
+mid-forward, weights are frozen, no gradient is taken. No experiment run so far changes
+weights. That is plan Stage 4 (the supervised attention loss), still unbuilt.
+
 ## Why result 1 does not close the question
 
 The plan's Stage 0 -> Stage 1 gate said: *if forcing every head at layer L does nothing,
@@ -290,7 +347,9 @@ cancel, and `o_proj` mixes them, so a zero net effect at the layer is fully comp
 with real per-head effects. The gate treated a sum as an upper bound on its parts.
 
 Result 1 therefore stands as a **layer-level** result and nothing more. The per-head
-intervention is still required, and result 2 is what selects the layers for it.
+intervention was therefore run anyway — that is result 4, which reaches the same
+conclusion at head granularity, and which found the predicted head cancellation at L22
+along the way.
 
 ## Next
 

@@ -39,7 +39,11 @@ should be a **differentiable loss, not a reward**.
 about?" — is **0.534** against a **0.953** oracle and a 0.494 shuffled null. No run
 improved it.
 
-**4. A layer-level causal intervention returns a tight null**, and **5. the rewarded
+**4. Causal intervention returns a tight null at BOTH granularities** — layer-level
+(36 layers, alpha sweep) and per-head (288 cells, 0 surviving). Note both are
+**activation-level**: attention values are overwritten mid-forward with weights frozen
+and no gradient taken. **No experiment so far changes weights** — that is plan Stage 4.
+Also, and **5. the rewarded
 heads rank ~1100/1152** on correlation with correctness under `auroc`. Both in
 [probe-results.md](probe-results.md) with the statistics and the caveats. **Do not
 read result 4 as bounding per-head effects** — that inference was made and retracted;
@@ -64,13 +68,12 @@ at +0.968 — one signal, not two. It is real and it is small.
 
 ## What is running / pending
 
-- **RUNNING**: per-head intervention, `--layers 0,1,18,19,20,21,22,23,24 --head-mode
-  each --conditions box,roll --alphas 1.0`, out-dir
-  `outputs/intervene_probe/coldstart_setA_v2`. 666,432 new forwards, ~5h at the
-  measured 37.4 it/s on 8 GPUs. **Exceeds the 4h interactive limit — expect one
-  resume**; re-run the identical command with the same `--gpus 8` (resume state is
-  per-shard-file, so changing the shard count would redo work and write duplicates
-  that the main report path would double-count).
+- **DONE (2026-08-07)**: per-head intervention over 9 layers x 32 heads, 842,296
+  records. **0 of 288 cells survive Bonferroni**; 15 nominal hits against ~14 expected
+  by chance. L0/L1 — result 2's strongest correlational layers — are the weakest here.
+  L22's two rewarded heads rank 4th and 7th of 288 in *opposite* directions, which is
+  the head cancellation that made the layer-level gate invalid, visible but not
+  amounting to an effect. Result 4 in [probe-results.md](probe-results.md).
 - **DONE 2026-08-07**: the flow re-scan with per-layer increments and the mass
   covariate, in `outputs/flow_corr/coldstart_setA_v2`. Read it with `--stage report
   --all-columns`; the launcher's own `report.txt` thins 72 columns down to ~18.
