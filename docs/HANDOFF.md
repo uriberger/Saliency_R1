@@ -45,6 +45,17 @@ heads rank ~1100/1152** on correlation with correctness under `auroc`. Both in
 read result 4 as bounding per-head effects** — that inference was made and retracted;
 forcing all 32 heads at once is a different manipulation from forcing one.
 
+**6. The indirect-flow maps do not rescue the premise.** Attention rollout — which
+follows image content through intermediate text positions, the path a direct map at L22
+cannot see — puts *less* weight on the objects a step names than on the rest of the
+image, at every layer, worsening with depth (wnorm auroc 0.490 at L0 → 0.430 at L35;
+the rewarded heads sit at 0.410/0.392). The gradient map is the only one above chance
+(gxi_ds 0.574) and it correlates **negatively** with correctness. Exactly one column
+out of 308 clears a Bonferroni threshold: the rollout-wnorm *increment*, r = +0.117,
+held out +0.143, and it too sits below chance in level — so the finding is "less
+anti-grounding goes with being right", at 0.235 sd of separation. Result 3 in
+[probe-results.md](probe-results.md).
+
 ## What is running / pending
 
 - **RUNNING**: per-head intervention, `--layers 0,1,18,19,20,21,22,23,24 --head-mode
@@ -54,6 +65,10 @@ forcing all 32 heads at once is a different manipulation from forcing one.
   resume**; re-run the identical command with the same `--gpus 8` (resume state is
   per-shard-file, so changing the shard count would redo work and write duplicates
   that the main report path would double-count).
+- **NEXT, cheap and first**: re-scan the flow maps with per-layer increments and the
+  mass covariate — ~10 min on 8 GPUs. Command in
+  [probe-results.md](probe-results.md#next) under "A". The 2026-08-06 run's one
+  surviving column exists at a single layer and has one uncontrolled confound left.
 - **NEXT**: confirmation runs. `val_natural` (256 rows, image-disjoint from set_a by
   content hash — the strong claim, ~1h) and a fresh disjoint 2,000-row set_a draw
   (`--exclude-cases-dir`, the powered claim, ~8.4h). Then
@@ -127,7 +142,10 @@ Companion analysis lives in the sibling `vlm_reasoning` repo under `wiki/` —
    renormalise over text keys), which the current mass-preserving parameterisation
    cannot express.
 2. **Most heads that survive the held-out split correlate NEGATIVELY** — more overlap
-   predicts being *wrong*. Nobody has explained that.
+   predicts being *wrong*. Nobody has explained that. Result 6 sharpens it rather than
+   settling it: the gradient map, the one measure with no rollout approximation and the
+   only one above chance in level, is also negative (−0.098, −0.124 partialled), while
+   the rollout increment is positive. The two survivors disagree in sign.
 3. **Layer 0 is the strongest `auroc` layer**, but sits near raw embeddings, so it may
    be measuring image statistics rather than grounding.
 4. **The supervised route** (plan Stage 4) is unbuilt: teacher-forced chains,

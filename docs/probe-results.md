@@ -260,7 +260,27 @@ intervention is still required, and result 2 is what selects the layers for it.
 
 ## Next
 
-Per-head intervention on **L0, L1 and L18-L24** -- the layers result 2 flags, plus L22
+**A. Re-scan the flow maps with per-layer increments** (~10 min on 8 GPUs, so do it
+first). The one column that survived correction exists at a single layer, and the
+covariate that could still explain it — the column's own image mass — was not recorded.
+Both are in the tool now. A fresh out-dir, because the column set changed:
+
+```bash
+bash launch_flow_correlation.sh --gpus 8 \
+    --out-dir outputs/flow_corr/coldstart_setA_v2 \
+    --cases-dir outputs/intervene_probe/coldstart_setA_v2 \
+    --maps rollout_mean,rollout_wnorm,grad
+python flow_correlation_probe.py --stage report --all-columns \
+    --out-dir outputs/flow_corr/coldstart_setA_v2/rollout_wnorm
+```
+
+Three things it answers. Does `inc` have a layer curve, or is L35 a lone spike? Does it
+survive holding its own mass fixed? And is `rollout_mean`'s null a head-merge effect or
+a depth effect, which per-layer increments separate. Note that `inc` at L35 is now a
+*re-test* on the same data, not a fresh discovery — a confirmation needs the
+image-disjoint `val_natural` draw, same as the intervention.
+
+**B. Per-head intervention** on **L0, L1 and L18-L24** -- the layers result 2 flags, plus L22
 as the incumbent control. L0/L1 are included despite the near-embedding concern above
 precisely because they carry the largest correlations: if that signal is an image-
 statistics artefact rather than grounding, the intervention is what shows it.
