@@ -321,6 +321,45 @@ But this is exactly the head cancellation that made result 1's gate invalid: at 
 level L22 gave +0.0010 because its heads oppose. The mechanism is real and visible; it
 just does not sum to an effect in either head.
 
+### The same 288 cells, ranked by ACCURACY instead of log P
+
+`box - roll` in case-insensitive first-token accuracy (exact-token match is biased low
+by capitalisation -- the model writes " Bus" where gold is "bus"):
+
+| rank | layer | head | d accuracy | z | top-1 changed | d log P |
+|---|---|---|---|---|---|---|
+| 1 | 18 | 9 | **+0.17%** | +1.42 | 4 / 1157 | -0.0011 |
+| 2 | 18 | 31 | **+0.17%** | +1.42 | 5 / 1157 | -0.0007 |
+| 3 | 19 | 8 | **+0.17%** | +1.42 | 4 / 1157 | +0.0009 |
+| 4 | 0 | 2 | +0.09% | +1.00 | 4 / 1157 | -0.0002 |
+| 5 | 0 | 16 | +0.09% | +1.00 | 3 / 1157 | +0.0001 |
+| 6 | 0 | 26 | +0.09% | +1.00 | 3 / 1157 | +0.0001 |
+| 7 | 1 | 3 | +0.09% | +1.00 | 4 / 1157 | +0.0033 |
+| 8 | 1 | 7 | +0.09% | +1.00 | 3 / 1157 | -0.0039 |
+| 9 | 1 | 24 | +0.09% | +1.00 | 3 / 1157 | -0.0012 |
+| 10 | 1 | 26 | +0.09% | +1.00 | 3 / 1157 | -0.0001 |
+
+**+0.17% is two cases of 1,157**, and the whole table spans +-2 flipped answers. Read
+it as noise:
+
+```
+cells at |z| > 1.96           0 / 288    (chance ~14 -- accuracy is too quantised to have power)
+best z                        +1.42      (Bonferroni needs 3.46)
+largest LOSS                  -0.17%     same magnitude as the largest gain, 3 cells
+pooled over 288 cells         -0.00005
+top-1 changed at all          866 / 333,216 pairs = 0.26%
+```
+
+Two independent reasons not to trust the ranking. The losses mirror the gains, which is
+a symmetric noise distribution. And **the accuracy ranking disagrees with the log P
+ranking** -- L18H9 tops this table with d log P *negative*, while L18H12, the strongest
+log P cell at z -2.88, does not appear at all. Two orderings of the same 288 cells that
+disagree is what you get when both are noise.
+
+The 0.26% tie-rate is structural: the model sits at P ~ 0.999 when right and about -8
+nats when wrong, so accuracy is a thresholded readout with very little power here. That
+is why log P is the primary measure -- and log P returns 0/288 as well.
+
 ### What is now closed, and what is not
 
 Three independent lines agree that overlap at these heads has no causal path to the

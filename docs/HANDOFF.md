@@ -73,7 +73,10 @@ at +0.968 — one signal, not two. It is real and it is small.
   by chance. L0/L1 — result 2's strongest correlational layers — are the weakest here.
   L22's two rewarded heads rank 4th and 7th of 288 in *opposite* directions, which is
   the head cancellation that made the layer-level gate invalid, visible but not
-  amounting to an effect. Result 4 in [probe-results.md](probe-results.md).
+  amounting to an effect. Ranked by ACCURACY instead of log P the best cell gains
+  **+0.17% = two cases of 1,157**, 0/288 reach even nominal significance, the losses
+  mirror the gains, and the two rankings disagree with each other. Top-1 changed in
+  0.26% of all pairs. Result 4 in [probe-results.md](probe-results.md).
 - **DONE 2026-08-07**: the flow re-scan with per-layer increments and the mass
   covariate, in `outputs/flow_corr/coldstart_setA_v2`. Read it with `--stage report
   --all-columns`; the launcher's own `report.txt` thins 72 columns down to ~18.
