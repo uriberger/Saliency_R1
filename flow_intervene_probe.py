@@ -357,6 +357,20 @@ class FlowIntervener:
 # ---------------------------------------------------------------------------
 # scoring one case
 # ---------------------------------------------------------------------------
+def case_image(imgs, row_index):
+    """The PIL image for a row, or None.
+
+    `IV.load_case_images` returns a RECORD per row -- {row_index, dataset, question,
+    gt_answer, image} -- not a bare image. Handing the record straight to the processor
+    raises deep inside `fetch_images` with "got type=<class 'dict'>", nowhere near the
+    call site, so the unwrap lives here where a test can reach it.
+    """
+    rec = imgs.get(int(row_index))
+    if rec is None:
+        return None
+    return rec["image"] if isinstance(rec, dict) else rec
+
+
 def case_steps(case, prompt_len, gh, gw, device, seed):
     """Query rows and the box/rolled masks for every usable step of this case."""
     rng = np.random.default_rng(seed)
@@ -495,11 +509,11 @@ def run_shard(args, device):
           f"{len(units)}; {len(todo)} to do")
 
     proc, model = load_model(args, device)
-    fi = FlowIntervener(model, torch.bfloat16)
+    fi = FlowIntervener(model, next(model.parameters()).dtype)
     try:
         with dest.open("a") as fh:
             for case, (cut, kind, al) in todo:
-                img = imgs.get(case["row_index"])
+                img = case_image(imgs, case["row_index"])
                 if img is None:
                     prog.tick()
                     continue
@@ -526,7 +540,7 @@ def selftest(args, device):
     if not cases:
         raise SystemExit("selftest needs at least one case with an image")
     proc, model = load_model(args, device)
-    fi = FlowIntervener(model, torch.bfloat16)
+    fi = FlowIntervener(model, next(model.parameters()).dtype)
     cut = max(fi.layers)
     ok = True
     try:
@@ -534,7 +548,7 @@ def selftest(args, device):
               f"attention layers: {len(fi.layers)}")
         fi.audit = True
         for case in cases:
-            img = imgs[case["row_index"]]
+            img = case_image(imgs, case["row_index"])
             ref = IV.score_case_nohook(model, proc, case, img, device)
             a0 = score_case(model, proc, fi, case, img, device, cut, 0.0, "box", 0)
             a1 = score_case(model, proc, fi, case, img, device, cut, 1.0, "box", 0)

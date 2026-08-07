@@ -269,6 +269,24 @@ def _raises(fn):
     return False
 
 
+def test_case_image_unwraps_the_record():
+    print("\n[images] load_case_images returns records, not bare images")
+
+    class FakePIL:
+        pass
+
+    pil = FakePIL()
+    imgs = {7: {"row_index": 7, "dataset": "d", "question": "q", "gt_answer": "a",
+                "image": pil}}
+    check("the record's image is unwrapped", FI.case_image(imgs, 7) is pil)
+    check("a missing row gives None, not a KeyError", FI.case_image(imgs, 8) is None)
+    check("a numpy/str row index still resolves", FI.case_image(imgs, "7") is pil)
+    check("a bare image is passed through unchanged",
+          FI.case_image({3: pil}, 3) is pil)
+    check("what reaches the processor is never a dict",
+          not isinstance(FI.case_image(imgs, 7), dict))
+
+
 def test_manipulation_check():
     print("\n[check] ushare/rshare read the step's own rows of the right columns")
     X = torch.zeros(6, 5)
@@ -375,6 +393,7 @@ def main():
     test_init_columns_layout()
     test_rolled_mask_matches_area()
     test_grid_has_one_baseline_per_cutoff()
+    test_case_image_unwraps_the_record()
     test_manipulation_check()
     test_report_pairs_and_recovers_a_planted_effect()
     test_report_survives_a_torn_line()
