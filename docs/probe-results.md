@@ -1,12 +1,14 @@
-# Probe results: the layer-level intervention null, and the all-head correlation scan
+# Probe results: the intervention null, the all-head scan, and the indirect-flow maps
 
 Results log for the experiments planned in
-[attention-intervention-plan.md](attention-intervention-plan.md). Two runs so far,
-both on the cold-start model, `cold_data/grpo_sets/set_a`, per-step Grounding-DINO
-boxes, 1,157 prepared cases in `outputs/intervene_probe/coldstart_setA_v2`.
+[attention-intervention-plan.md](attention-intervention-plan.md). Three runs so far,
+all on the cold-start model, `cold_data/grpo_sets/set_a`, per-step Grounding-DINO
+boxes, the same 1,157 prepared cases in `outputs/intervene_probe/coldstart_setA_v2`.
 
-Read these two together. The first is a *layer-level* null; the second shows why that
-null does not license the conclusion the plan drew from it.
+Read 1 and 2 together. The first is a *layer-level* null; the second shows why that
+null does not license the conclusion the plan drew from it. 3 replaces the direct
+attention map with three indirect ones and is the first place a signal survives
+correction.
 
 ---
 
@@ -130,6 +132,118 @@ Layers ranking highest at completion level under both metrics: **0, 1, 18, 19, 2
 - **Layer 0 is suspect.** It is the strongest `auroc` layer and every survivor there is
   negative, but at layer 0 the residual stream is close to raw embeddings, so "attention
   to the object's patches" may be measuring image statistics rather than grounding.
+
+---
+
+## 3. Indirect-flow maps (2026-08-06) — the first surviving signal, and it is small
+
+`flow_correlation_probe.py` over the same 1,157 completions / 3,471 observe steps and
+the same DINO unions, so every number is directly comparable with result 2. Three
+replacement maps, each scored by `mean_in_v2` and `auroc`, at step and completion
+level: `rollout_mean` (layer-wise rollout, heads merged by the mean), `rollout_wnorm`
+(the same, merged by `‖Σ_h A^h W_O^h v^h‖`) and `grad` (`‖∂ log P(step)/∂e_j‖`).
+Output in `outputs/flow_corr/coldstart_setA`. ~45 s per shard — the whole thing is
+under 10 minutes on 8 GPUs, unlike every other probe here.
+
+### The premise fails first, before any correlation
+
+The rollout maps put **less** weight on the objects a step names than on the rest of
+the image, at every layer, and it worsens monotonically with depth:
+
+| auroc level (0.5 = the union ranks no higher than the rest of the image) | L0 | L8 | L16 | L22 | L28 | L35 |
+|---|---|---|---|---|---|---|
+| `rollout_mean` | 0.487 | 0.470 | 0.458 | 0.455 | 0.453 | 0.452 |
+| `rollout_wnorm` | 0.490 | 0.458 | 0.439 | **0.434** | 0.432 | **0.430** |
+
+Every cell is below 0.5 by many standard errors (2 SE ≈ 0.004–0.007). The direct map
+agrees and is worse at the rewarded heads: **L22H28 sits at 0.410, L22H31 at 0.392**,
+against 0.518 averaged over all 1152 heads. So the reward was pointing at two of the
+*least* object-aligned heads in the model.
+
+**The gradient map is the exception, and the only map above chance**: `gnorm` 0.545,
+`gnorm_ds` 0.553, `gxi` 0.556, `gxi_ds` **0.574**. Differentiating the step's own
+log-probability does find it more sensitive to the named object's patches than to the
+background. That is the first positive grounding measurement in this line of work, and
+it is the one method with no rollout approximation, no α and no head-merge convention.
+
+### Exactly one column survives multiplicity correction
+
+308 tests across the three variants (maps × metrics × step/completion × columns).
+Bonferroni at α=0.05 needs |r| ≥ 0.105 at the effective n of 1,157 completions — steps
+of one completion share a label, so completions are the unit in both set-ups.
+
+| variant | metric | setup | column | r(all) | p | r(held out) | r(partial) |
+|---|---|---|---|---|---|---|---|
+| `rollout_wnorm` | auroc | completion | **`inc`** | **+0.117** | 6.3e-05 | **+0.143** | +0.119 |
+| `grad` | auroc | completion | `gxi` | −0.098 | 8.9e-04 | −0.104 | −0.124 |
+| `grad` | auroc | step | `gxi` | −0.087 | 3.1e-03 | −0.078 | −0.100 |
+| `rollout_wnorm` | auroc | step | `inc` | +0.077 | 9.1e-03 | +0.086 | +0.080 |
+
+Only the first clears the threshold. Nothing in `rollout_mean` clears it at all, so the
+value-norm head merge is doing the work — the plain mean over heads sees +0.052 for the
+same column.
+
+`inc` is the **increment**: the step's own mean flow map minus the map at the token
+immediately before it, i.e. what the step's span newly pulled in from the image rather
+than what it inherited. It holds up under everything asked of it:
+
+```
+permutation, 20k shuffles of the completion labels          p = 0.00005
+Spearman instead of Pearson                                 +0.122
+1st-99th percentile trimmed (n=1133)                        +0.112
+200 random half-splits    median +0.118, range [+0.033, +0.200], both halves same sign 100%
+partial: union area / step count / union+steps              +0.117 / +0.119 / +0.119
+partial: + base L35 auroc, + base L0 auroc                  +0.102 / +0.105
+by completion length   1 step +0.119 (n=161) | 2-3 +0.115 (n=639) | 4+ +0.129 (n=357)
+```
+
+**The increment is the carrier, not the cumulative map.** Holding `inc` fixed collapses
+the base map's correlation from +0.065 to **+0.025**; holding the base map fixed leaves
+`inc` at +0.102. The last layer's weak association is inherited from the increment, not
+the other way round.
+
+### What the effect actually is
+
+`inc` averages **0.461** — below chance. Correct completions sit at 0.479, wrong ones
+at 0.445; the gap is 0.034, or **0.235 sd**. So the honest statement is *less
+anti-grounding goes with being right*, inside a regime that is anti-grounded
+throughout. It is not "grounding predicts correctness". The report now prints `level`
+beside every r so this cannot be read off wrong again.
+
+Splitting the increment by position: step 0, which differences against a *prompt*
+token, sits at chance (0.504); steps ≥1, which difference against a previous step, sit
+at 0.439. Both correlate with correctness at about the same strength (+0.073 / +0.064),
+so the effect is not an artefact of step-to-step differencing.
+
+### The two survivors disagree in sign, and nobody has explained that
+
+`inc` says more union weight → more likely right. `gxi` — the assumption-free
+measure, and the only one above chance in level — says more union weight → more likely
+**wrong**, and gets *stronger* when union area and step count are held fixed (−0.124).
+This is the same sign puzzle as result 2's held-out survivors, which were mostly
+negative, and it is unresolved. Candidate readings, none tested: the gradient is large
+where the model is uncertain and leaning on the image, so it tracks difficulty that
+union area does not capture; or the two measure genuinely different things and the
+rollout's below-chance regime makes its sign hard to interpret at all.
+
+### Comparison with the direct map
+
+Result 2's best single head is |r| = 0.155, but selected from 1152 candidates. The
+median head is 0.039 and the 95th percentile 0.094, so the flow increment's 0.117 lands
+around the 99th percentile of the direct-head distribution while needing a 308-fold
+correction rather than a 1152-fold one. The indirect map does beat the direct map — by
+a margin far too small to carry the project's premise.
+
+### Caveats
+
+- **`inc` was computed at the last layer only**, so the one live column has no layer
+  curve. Fixed in the tool (per-layer `incL`); needs a re-scan, which is cheap.
+- **The column's own image mass was not held fixed** in the run above, only union area
+  and step count. `mass` is recorded from this commit on; the report says so when a
+  scan predates it. This is the last uncontrolled candidate confound for `inc`.
+- The DEEPSTACK caveat in the probe's docstring applies to both rollout variants and
+  not to `grad`, which is another reason the two can disagree.
+- `r ≈ 0.12` at 0.235 sd of separation is not a basis for a training signal.
 
 ---
 
