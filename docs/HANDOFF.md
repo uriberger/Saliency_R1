@@ -53,8 +53,14 @@ the rewarded heads sit at 0.410/0.392). The gradient map is the only one above c
 (gxi_ds 0.574) and it correlates **negatively** with correctness. Exactly one column
 out of 308 clears a Bonferroni threshold: the rollout-wnorm *increment*, r = +0.117,
 held out +0.143, and it too sits below chance in level — so the finding is "less
-anti-grounding goes with being right", at 0.235 sd of separation. Result 3 in
+anti-grounding goes with being right", at ~0.25 sd of separation. Result 3 in
 [probe-results.md](probe-results.md).
+
+The 2026-08-07 re-scan (`coldstart_setA_v2`) closed both of that result's open caveats
+and neither rescued it. The increment has a clean **monotonic layer curve** peaking at
+L34/L35, not a lone spike, and it **survives holding its own image mass fixed**
+(+0.124 → +0.117). Two columns now clear the threshold, `inc34` and `inc35`, correlated
+at +0.968 — one signal, not two. It is real and it is small.
 
 ## What is running / pending
 
@@ -65,10 +71,9 @@ anti-grounding goes with being right", at 0.235 sd of separation. Result 3 in
   resume**; re-run the identical command with the same `--gpus 8` (resume state is
   per-shard-file, so changing the shard count would redo work and write duplicates
   that the main report path would double-count).
-- **NEXT, cheap and first**: re-scan the flow maps with per-layer increments and the
-  mass covariate — ~10 min on 8 GPUs. Command in
-  [probe-results.md](probe-results.md#next) under "A". The 2026-08-06 run's one
-  surviving column exists at a single layer and has one uncontrolled confound left.
+- **DONE 2026-08-07**: the flow re-scan with per-layer increments and the mass
+  covariate, in `outputs/flow_corr/coldstart_setA_v2`. Read it with `--stage report
+  --all-columns`; the launcher's own `report.txt` thins 72 columns down to ~18.
 - **NEXT**: confirmation runs. `val_natural` (256 rows, image-disjoint from set_a by
   content hash — the strong claim, ~1h) and a fresh disjoint 2,000-row set_a draw
   (`--exclude-cases-dir`, the powered claim, ~8.4h). Then

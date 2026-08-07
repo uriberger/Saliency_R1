@@ -234,16 +234,50 @@ around the 99th percentile of the direct-head distribution while needing a 308-f
 correction rather than a 1152-fold one. The indirect map does beat the direct map — by
 a margin far too small to carry the project's premise.
 
+### The re-scan: `inc` is a ramp, not a spike, and mass does not explain it
+
+`outputs/flow_corr/coldstart_setA_v2`, same 1,157 completions / 3,471 steps / 0 dropped,
+now with a per-layer `incL` and the `mass` covariate. Both open caveats close.
+
+**The increment has a clean monotonic layer curve**, so L35 was the top of a ramp rather
+than a lone spike:
+
+| `incL`, auroc/completion | 0 | 5 | 10 | 15 | 20 | 25 | 30 | 33 | **34** | 35 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| r(all) | −0.012 | +0.038 | +0.054 | +0.080 | +0.089 | +0.082 | +0.093 | +0.107 | **+0.124** | +0.117 |
+| r(held out) | −0.044 | +0.017 | +0.055 | +0.055 | +0.067 | +0.062 | +0.073 | +0.103 | **+0.138** | +0.143 |
+| level | 0.485 | 0.499 | 0.494 | 0.479 | 0.455 | 0.436 | 0.430 | 0.443 | 0.453 | 0.461 |
+
+Against the higher threshold the extra columns demand (216 tests, |r| ≥ 0.108), **two**
+now clear it: `inc34` (+0.124, held out +0.138) and `inc35` (+0.117, held out +0.143).
+They are the same signal — the two columns correlate at **+0.968** — and `inc33` sits
+just under. All three behave identically under stress: permutation p ≤ 3e-4 over 20k
+shuffles, 200 random half-splits agreeing in sign 100% of the time, and 0.21–0.25 sd of
+separation between correct and wrong.
+
+**Holding the column's own image mass fixed does not remove it**: `inc34` goes +0.124 →
+**+0.117** partialled, `inc35` +0.117 → +0.108. That was the last uncontrolled candidate
+confound, and it is not the explanation.
+
+Two secondary observations. The increment's *level* curve is non-monotonic where its
+*correlation* curve is not — it passes through chance around L5–L10 (`inc7` = 0.512, the
+only rollout column anywhere above chance by 2 SE, which at 1 of 36 columns is exactly
+the false-positive rate to expect) before falling away with depth. And the two curves run
+opposite: the deeper the layer, the more anti-grounded the increment *and* the more its
+variation predicts correctness. Nothing here explains that.
+
+`grad` reproduces exactly (`gxi` −0.098, held out −0.105, partial −0.123) and
+`rollout_mean` still clears nothing, so the value-norm head merge remains load-bearing.
+
 ### Caveats
 
-- **`inc` was computed at the last layer only**, so the one live column has no layer
-  curve. Fixed in the tool (per-layer `incL`); needs a re-scan, which is cheap.
-- **The column's own image mass was not held fixed** in the run above, only union area
-  and step count. `mass` is recorded from this commit on; the report says so when a
-  scan predates it. This is the last uncontrolled candidate confound for `inc`.
 - The DEEPSTACK caveat in the probe's docstring applies to both rollout variants and
   not to `grad`, which is another reason the two can disagree.
-- `r ≈ 0.12` at 0.235 sd of separation is not a basis for a training signal.
+- `r ≈ 0.12` at ~0.25 sd of separation is not a basis for a training signal.
+- Everything above is still **the same 1,157 cases the columns were selected on**.
+  `inc34` in particular is a fresh selection from 36 increment columns. The odd/even
+  split is internal to that set; a real confirmation needs the image-disjoint
+  `val_natural` draw.
 
 ---
 
@@ -260,27 +294,16 @@ intervention is still required, and result 2 is what selects the layers for it.
 
 ## Next
 
-**A. Re-scan the flow maps with per-layer increments** (~10 min on 8 GPUs, so do it
-first). The one column that survived correction exists at a single layer, and the
-covariate that could still explain it — the column's own image mass — was not recorded.
-Both are in the tool now. A fresh out-dir, because the column set changed:
+**A. ~~Re-scan with per-layer increments~~ — done 2026-08-07**, written up above.
 
-```bash
-bash launch_flow_correlation.sh --gpus 8 \
-    --out-dir outputs/flow_corr/coldstart_setA_v2 \
-    --cases-dir outputs/intervene_probe/coldstart_setA_v2 \
-    --maps rollout_mean,rollout_wnorm,grad
-python flow_correlation_probe.py --stage report --all-columns \
-    --out-dir outputs/flow_corr/coldstart_setA_v2/rollout_wnorm
-```
+**B. Confirm `inc34`/`inc35` on held-out images.** Everything so far is selection and
+re-test on one set of 1,157 cases. `val_natural` (256 rows, image-disjoint from set_a by
+content hash) is the cheap strong claim; the flow probe reads an `intervene_probe`
+`prepare` out-dir, so it needs one built for those rows first. Pre-register the two
+columns and the direction before running it — the whole point is that nothing gets
+selected twice.
 
-Three things it answers. Does `inc` have a layer curve, or is L35 a lone spike? Does it
-survive holding its own mass fixed? And is `rollout_mean`'s null a head-merge effect or
-a depth effect, which per-layer increments separate. Note that `inc` at L35 is now a
-*re-test* on the same data, not a fresh discovery — a confirmation needs the
-image-disjoint `val_natural` draw, same as the intervention.
-
-**B. Per-head intervention** on **L0, L1 and L18-L24** -- the layers result 2 flags, plus L22
+**C. Per-head intervention** on **L0, L1 and L18-L24** -- the layers result 2 flags, plus L22
 as the incumbent control. L0/L1 are included despite the near-embedding concern above
 precisely because they carry the largest correlations: if that signal is an image-
 statistics artefact rather than grounding, the intervention is what shows it.
