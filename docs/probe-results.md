@@ -444,6 +444,89 @@ Note this is an **activation-level** intervention: attention values are overwrit
 mid-forward, weights are frozen, no gradient is taken. No experiment run so far changes
 weights. That is plan Stage 4 (the supervised attention loss), still unbuilt.
 
+## 5. Indirect-path intervention (2026-08-07) — the positive control finally works, and the answer still does not care
+
+`flow_intervene_probe.py` on the same 1,157 cases. At every layer up to a cutoff, each
+head's mass over image-*carrying* keys (image tokens **and** earlier text positions that
+absorbed image content) is held fixed and re-allocated toward the keys holding the most
+boxed-object content. 32,396 forwards, 0 dropped, ~40 min on 8 GPUs. Output in
+`outputs/flow_intervene/coldstart_setA`.
+
+### This is the positive control results 1 and 4 lacked
+
+The edit moves the answer, hard: mean **|Δ log P(gold)| = 0.726 nats**, 8/8 selftest
+cases, up to 2.03. Against the direct intervention's 0.0378 at α=0.25 versus 0.0402 at
+α=1.0 — a 4× stronger perturbation buying 6% more, which was read as a noise floor.
+
+So the readout is not blind, and the earlier nulls were not "we never moved anything."
+That question has been open since 2026-08-05 and is now closed.
+
+The manipulation also lands the right way round. Union-traceable mass at the step's own
+positions rises **13–71%**, and it rises *faster than* total image-traceable mass in
+every cell, so `ushare` climbs because the numerator grew — the model reading more from
+the boxes — not because the denominator shrank.
+
+### Pointing it at the boxes rather than anywhere else buys almost nothing
+
+`box − roll` on log P(gold), paired per case, n=1,157. 12 cells, so Bonferroni needs
+|t| ≥ 2.87:
+
+| cut | α=0.25 | α=0.50 | α=1.00 |
+|---|---|---|---|
+| 8 | +0.0033 (t 1.07) | +0.0041 (t 1.24) | +0.0158 (t 2.83) |
+| 16 | +0.0086 (t 2.65) | +0.0093 (t 2.59) | **−0.0488 (t −3.78)** |
+| 24 | +0.0068 (t 2.04) | **+0.0126 (t 3.01)** | −0.0031 (t −0.25) |
+| 35 | +0.0046 (t 1.37) | +0.0050 (t 1.20) | −0.0005 (t −0.05) |
+
+One cell clears correction with the intended sign, at **+0.0126 nats** — under 2% of the
+0.726 the edit moves overall. Normalised by manipulation strength the estimate is flat at
+**~+0.2 millinats per 1% of union mass** across every cutoff and both usable α.
+
+**Behaviourally it is nothing.** Over 13,884 box/roll comparisons, **98.96% produce an
+identical top-1 token** and correctness differs on **0.14%**. No accuracy cell clears
+correction.
+
+### α=1.0 is off-manifold and should not be read
+
+Against the α=0 baseline, at α=1.0:
+
+| cut | box − base | roll − base |
+|---|---|---|
+| 24 | **+0.671** | **+0.674** |
+| 35 | **+0.939** | **+0.939** |
+
+Concentrating *all* eligible mass at every layer improves log P(gold) by ~0.9 nats — and
+box and roll agree to within 0.0003, so it has nothing to do with where the mass points.
+That is an activation the model never sees, exactly the failure the direct probe's
+docstring predicted for α=1. Read α=0.25 and 0.5 only; the −0.0488 outlier at cut 16 sits
+in the same unusable regime.
+
+### The depth prediction fails
+
+Result 3's pre-registered test: the correlation ramps with depth (`inc0` −0.012 →
+`inc34` +0.124), so if it is causal, editing deeper should buy more.
+
+```
+alpha 0.25   cut8 +0.0033   cut16 +0.0086   cut24 +0.0068   cut35 +0.0046
+alpha 0.5    cut8 +0.0041   cut16 +0.0093   cut24 +0.0126   cut35 +0.0050
+```
+
+A hump at 16–24 and no ramp; cut 35, which edits every layer, is near the bottom. **The
+causal effect does not track the correlation curve**, which is what the plan said would
+mark the correlation as epiphenomenal.
+
+### The one caveat, and it cuts toward the null
+
+The control is a *weaker* manipulation than the treatment: `d ushare(box)` runs
++0.013…+0.040 while `d rshare(roll)` runs only +0.004…+0.010, roughly 3–4×. Both
+redistribute identical attention mass, so this says content from the DINO-boxed objects
+propagates into text positions more readily than content from equal-area background —
+interesting in itself, and something no correlational measure here would have shown. But
+it biases `box − roll` **in box's favour**, and box − roll is still ~+0.01 nats with no
+behavioural effect. The bias works against the null and the null holds anyway.
+
+---
+
 ## Why result 1 does not close the question
 
 The plan's Stage 0 -> Stage 1 gate said: *if forcing every head at layer L does nothing,
@@ -471,7 +554,14 @@ selected twice.
 **C. ~~Per-head intervention~~ — done 2026-08-07**, and it is result 4 above: 0 of 288
 cells survive.
 
-**D. Intervene on the INDIRECT path.** Every causal result so far (1 and 4) edits the
+**D. ~~Intervene on the INDIRECT path~~ — done 2026-08-07**, and it is result 5 above:
+the edit is causally powerful, `box − roll` is ~+0.01 nats, and 98.96% of comparisons
+give an identical answer token. What remains on this thread is **necessity, not
+sufficiency**: blinding — scale the image block toward zero and renormalise over the text
+keys — which no probe here can express yet. Result 5 tested whether pointing the flow at
+the boxes *helps*; blinding tests whether the image is being used at all.
+
+Original plan for D, kept for the command: Every causal result so far (1 and 4) edits the
 direct path — the step's own tokens attending to image tokens — which is precisely the
 path result 3 says carries little of the traffic. Both nulls are therefore consistent
 with never having moved the thing that matters. `flow_intervene_probe.py` edits the

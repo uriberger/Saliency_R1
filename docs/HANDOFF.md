@@ -49,6 +49,19 @@ heads rank ~1100/1152** on correlation with correctness under `auroc`. Both in
 read result 4 as bounding per-head effects** — that inference was made and retracted;
 forcing all 32 heads at once is a different manipulation from forcing one.
 
+**7. The indirect path is causally live, and the answer still does not care where it
+points.** `flow_intervene_probe.py` re-allocates each head's mass over image-*carrying*
+keys toward boxed-object content, at every layer up to a cutoff. It moves log P(gold) by
+**0.726 nats** on average — **the positive control this project has lacked since
+2026-08-05**, and 18× the direct intervention's α=1 response. Union-traceable mass at the
+step rises 13–71%, faster than total image mass, so the manipulation lands the right way
+round. And `box − roll` is **+0.0126 nats** in the one cell of 12 that clears Bonferroni
+with the right sign, with **98.96% of 13,884 comparisons giving an identical top-1
+token**. The depth prediction from result 6 fails: the causal effect does not track the
+correlation ramp. Result 5 in [probe-results.md](probe-results.md). **Read α=0.25/0.5
+only** — at α=1.0 box and roll both gain ~0.9 nats and agree to 0.0003, which is
+off-manifold, not grounding.
+
 **6. The indirect-flow maps do not rescue the premise.** Attention rollout — which
 follows image content through intermediate text positions, the path a direct map at L22
 cannot see — puts *less* weight on the objects a step names than on the rest of the
@@ -161,12 +174,12 @@ Companion analysis lives in the sibling `vlm_reasoning` repo under `wiki/` —
 
 ## Open questions worth new ideas
 
-1. **Is the attention causally live at all?** The α sweep showed |Δ logp| is
-   0.0378 at α=0.25 and 0.0402 at α=1.0 — a 4× stronger perturbation buying 6% more
-   disturbance, which is a noise floor, not a response. The design lacks a positive
-   control; the natural one is **blinding** (scale the image block toward zero and
-   renormalise over text keys), which the current mass-preserving parameterisation
-   cannot express.
+1. ~~**Is the attention causally live at all?**~~ **CLOSED by result 7.** The direct α
+   sweep looked like a noise floor (0.0378 at α=0.25, 0.0402 at α=1.0). The indirect-path
+   edit moves log P(gold) by **0.726 nats**, so the readout registers a real causal
+   response and the earlier nulls are not blindness. Blinding is no longer needed as the
+   positive control, though it remains the cleanest test of *necessity* (result 7 tests
+   sufficiency: pointing the flow somewhere specific).
 2. **Most heads that survive the held-out split correlate NEGATIVELY** — more overlap
    predicts being *wrong*. Nobody has explained that. Result 6 sharpens it rather than
    settling it: the gradient map, the one measure with no rollout approximation and the
