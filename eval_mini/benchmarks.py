@@ -17,10 +17,22 @@ Fields:
              taken from what the tasks actually emitted in results/lmms_eval, not
              from the yaml.
     in_mean  whether it contributes to the suite average. MME does not: its score
-             is a SUM over 14 sub-categories, so on a 100-document sample it is not
-             on the 0-2000 scale at all and normalising it would contribute a
-             number that is simply wrong. It is still logged -- comparable from
-             checkpoint to checkpoint, just not to a published MME score.
+             is a SUM over 14 sub-categories, and with stratify_by below the mini
+             sample does cover all 14, so it lands on the published 0-2000 scale --
+             but on 3 or 4 image pairs per category, where one flipped pair moves a
+             category by tens of points. It is logged and watchable as a curve;
+             it is too coarse to average into a suite headline.
+    group_by (optional) a column whose rows must be sampled together. Absent for
+             every benchmark that scores each row on its own, which is all of them
+             but MME: MME scores an image from the yes/no pair sharing its
+             question_id and asserts both are present, so a row-wise sample splits
+             the pairs and the task raises during aggregation.
+    stratify_by
+             (optional) a column the sample is balanced across. Only meaningful
+             with group_by. MME needs it because its score sums per-category
+             averages: a proportional draw of 50 pairs from 14 unequal categories
+             misses the small ones outright, and a missing category is not a
+             smaller contribution but no contribution.
 
 Every benchmark here scores itself: none calls an LLM judge, so the eval job needs
 no API key and cannot be skewed by one being absent or rate-limited. Three of the
@@ -43,7 +55,8 @@ BENCHMARKS = {
     # --- natural imagery ---
     "mme": dict(
         suite="natural", yaml="mme/mme.yaml",
-        metric="mme_perception_score,none", scale=1.0, in_mean=False),
+        metric="mme_perception_score,none", scale=1.0, in_mean=False,
+        group_by="question_id", stratify_by="category"),
     "mmerealworld": dict(
         suite="natural", yaml="mme_realworld/mme_realworld.yaml",
         metric="mme_realworld_score,none", scale=1.0, in_mean=True),
