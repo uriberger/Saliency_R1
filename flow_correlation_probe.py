@@ -112,9 +112,28 @@ Both the merged image embeds AND every deepstack tensor are captured as leaves, 
 `gxi` is gradient-times-input, |<e_j, dF/de_j>|, usually the less noisy of the two.
 
 ---------------------------------------------------------------------------
+The union size
+---------------------------------------------------------------------------
+The DINO union is the reference region every one of these maps is scored against, and
+it is UNCAPPED -- `prepare` applies the per-BOX cap (0.5) only, and N boxes each under
+it can cover the image between them. The median step's union covers 54% of the patch
+grid, the top decile 89%. Every map here reads lower the larger it gets (r(union,
+auroc) = -0.50 for gxi_ds, -0.28 for rollout_wnorm at L22, but only -0.04 for the
+increment), and the rollout's below-chance level is carried by the large-union half:
+at union < 0.19 rollout_wnorm sits at 0.537 rather than 0.434. Chance is exactly 0.5
+for a mask of any size at a random location, so that curve is real map/mask structure
+rather than an artefact of the statistic -- but above ~0.5 coverage the union has
+stopped localising the thing the step names, so the two ends of the curve answer
+different questions. `report` prints the level by union decile before anything else,
+and `--max-union` restricts every number after it. Fix that threshold before looking
+at a confirmation set.
+
+---------------------------------------------------------------------------
     bash launch_flow_correlation.sh --gpus 8 --out-dir DIR --cases-dir <probe out-dir> \
          --maps rollout_mean,rollout_wnorm,grad
     python flow_correlation_probe.py --stage report --out-dir DIR/rollout_mean
+    python flow_correlation_probe.py --stage report --out-dir DIR/rollout_mean \
+         --all-columns --max-union 0.5
 """
 
 from __future__ import annotations
@@ -612,6 +631,25 @@ def report(args):
     mass = np.concatenate([x["mass"] for x in d]) if has_mass else None
     names = [str(s) for s in d[0]["names"]]
     which = str(d[0]["map"])
+    k = v2.shape[1]
+    base_i = [i for i, nm in enumerate(names) if not nm.startswith("inc")]
+    inc_i = [i for i, nm in enumerate(names) if nm.startswith("inc")]
+    primary = names[base_i[-1]] if which.startswith("rollout") else names[0]
+    order = (list(range(k)) if args.all_columns
+             else sorted(set(sample_columns(base_i) + sample_columns(inc_i))))
+
+    # The union curve goes first and on everything, before any cap -- it is what the
+    # cap is chosen from, so restricting it would hide the tail being cut.
+    HC.union_decile_table(uni, {names[i]: au[:, i] for i in order}, null=0.5)
+
+    (v2, au, row, cor, uni, stp, mass), keep = HC.apply_union_cap(
+        args.max_union, uni, (v2, au, row, cor, uni, stp, mass))
+    if not keep.all():
+        print(f"\n--max-union {args.max_union}: {int(keep.sum())}/{len(keep)} steps "
+              f"and {len(np.unique(row))} completions kept. Everything below is that "
+              f"subset -- including the Bonferroni threshold, which rises as the "
+              f"completion count falls. The table above is not.")
+
     n, k = v2.shape
     uniq = np.unique(row)
     acc = cor[np.unique(row, return_index=True)[1]].mean()
@@ -656,12 +694,6 @@ def report(args):
         print(f"NOTE: the smaller odd/even half has {small} completions; col_corr needs "
               f"8, so r(select)/r(HELD OUT) will be NaN at completion level. Expected "
               f"on a --max-cases smoke run, not on the full scan.")
-    base_i = [i for i, nm in enumerate(names) if not nm.startswith("inc")]
-    inc_i = [i for i, nm in enumerate(names) if nm.startswith("inc")]
-    primary = names[base_i[-1]] if which.startswith("rollout") else names[0]
-    order = (list(range(k)) if args.all_columns
-             else sorted(set(sample_columns(base_i) + sample_columns(inc_i))))
-
     saved, table = {}, []
     for name, sarr, carr in (("mean_in_v2", v2, cagg["mean_in_v2"]),
                              ("auroc", au, cagg["auroc"])):
@@ -728,7 +760,8 @@ def report(args):
         for m_, s_, c_, ra, rs, ro, rp in hits:
             print(f"   {m_:>11} {s_:>11} {c_:>10} {ra:>+9.4f} {rs:>+10.4f} "
                   f"{ro:>+12.4f} {rp:>+11.4f}")
-    np.savez_compressed(out / "corr.npz", names=np.array(names), threshold=thr, **saved)
+    np.savez_compressed(out / "corr.npz", names=np.array(names), threshold=thr,
+                        max_union=np.array(args.max_union), **saved)
     print(f"\n-> {out}/corr.npz   (rows of each array: r_all, r_select, r_heldout, "
           f"r_partial, level, level_2se)")
     print("PRIMARY is the pre-registered readout: the last layer for a rollout, gnorm "
@@ -771,6 +804,12 @@ def main():
     p.add_argument("--answer-max-tokens", type=int, default=16)
     p.add_argument("--all-columns", action="store_true",
                    help="report every per-layer readout, not a sample of them")
+    p.add_argument("--max-union", type=float, default=0.0,
+                   help="report stage: drop steps whose DINO union covers more than "
+                        "this fraction of the patch grid (0 = off, the default and "
+                        "what every published number used). Fix it BEFORE looking at "
+                        "a confirmation set -- it is a researcher degree of freedom "
+                        "otherwise.")
     p.add_argument("--log-every", type=int, default=25)
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()

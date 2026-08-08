@@ -36,8 +36,17 @@ Selecting a winner from 1152 candidates is where a ranking becomes an artefact, 
 re-scored on the even. A head that survives that is a candidate; one that does not is
 selection noise.
 
+THE UNION IS UNCAPPED, here and in the `prepare` that built the cases -- only the
+per-BOX cap (0.5) ran, and N boxes each under it can cover the image between them. The
+median step's union covers 54% of the patch grid and the top decile 89%, and every map
+measured so far reads lower the larger it gets (r(union, auroc) = -0.55 for the mean
+over all 1152 heads). `report` therefore prints the level by union decile before
+anything else, and `--max-union` restricts every number after it to a subset. Fix that
+threshold before looking at a confirmation set; chosen afterwards it is a researcher
+degree of freedom, and the confirmation draws are single use.
+
     bash launch_head_correlation.sh --gpus 8 --out-dir DIR --cases-dir <probe out-dir>
-    python head_correlation_probe.py --stage report --out-dir DIR
+    python head_correlation_probe.py --stage report --out-dir DIR [--max-union 0.5]
 """
 
 from __future__ import annotations
@@ -325,6 +334,70 @@ def col_corr(X, y):
     return r
 
 
+def union_decile_table(uni, cols, null=0.5, nbins=10):
+    """Print each column's mean level within deciles of the step's DINO union size.
+
+    `cols` maps a display name to that column's per-step values [N]; `uni` is the
+    per-step union fraction, `null` the metric's chance level.
+
+    None of the probes caps the union, and it is large: on set_a the median step's
+    union covers 54% of the patch grid and the top decile covers 89%. Every map
+    measured so far falls monotonically as it grows, so a single pooled level mixes
+    two different questions. Midrank AUROC has chance exactly 0.5 for a mask of any
+    size at a random location -- averaged over toroidal shifts each pair contributes
+    symmetrically, because the mask's autocorrelation is symmetric -- so the curve is
+    real map/mask structure and not an artefact of the statistic. What it is not is
+    interchangeable across bins: above ~0.5 coverage the union has stopped localising
+    the thing the step names (those steps read "The image shows a group of people
+    outdoors"), and the level there answers a different question from the level on a
+    small union. Read the curve before reading any pooled number, and see --max-union
+    to restrict everything else to a subset of it.
+
+    mean_in_v2 is deliberately not tabulated here: its ceiling is 1/union, so it falls
+    with union size for a mechanical reason this table could not distinguish from the
+    structural one.
+    """
+    uni = np.asarray(uni, dtype=np.float64)
+    edges = np.percentile(uni, np.linspace(0, 100, nbins + 1))
+    keeps = [(uni >= edges[i]) & ((uni <= edges[i + 1]) if i == nbins - 1
+                                  else (uni < edges[i + 1])) for i in range(nbins)]
+    w = 7
+    print(f"\n=== level by union-size decile (chance {null:.1f}) ===")
+    print(f"   {'bin from':>12}" + "".join(f"{edges[i]:>{w}.2f}" for i in range(nbins))
+          + f"{'r(union)':>10}")
+    print(f"   {'mean union':>12}"
+          + "".join(f"{uni[k].mean():>{w}.2f}" for k in keeps))
+    print(f"   {'n steps':>12}" + "".join(f"{int(k.sum()):>{w}d}" for k in keeps))
+    for name, v in cols.items():
+        v = np.asarray(v, dtype=np.float64)
+        ok = np.isfinite(v)
+        r = (np.corrcoef(uni[ok], v[ok])[0, 1] if ok.sum() >= 8 and v[ok].std() > 0
+             else np.nan)
+        with np.errstate(invalid="ignore"):
+            cells = [np.nanmean(v[k]) for k in keeps]
+        print(f"   {name:>12}" + "".join(f"{c:>{w}.3f}" for c in cells)
+              + f"{r:>+10.3f}")
+    print(f"   r(union) is over steps, not bins. A column flat in union size is one "
+          f"whose reading does not depend on how much of the image the step's boxes "
+          f"cover.")
+
+
+def apply_union_cap(max_union, uni, arrays):
+    """Drop steps whose DINO union exceeds `max_union`. -> (kept arrays, mask).
+
+    A no-op at max_union <= 0. The cap is applied here, at report time, rather than in
+    intervene_probe's `prepare`: dropping steps at case-construction time would change
+    the case set under all four probes at once and break comparability with every
+    number already published against these cases.
+    """
+    if not max_union or float(max_union) <= 0:
+        return arrays, np.ones(len(uni), dtype=bool)
+    keep = np.asarray(uni) <= float(max_union)
+    if keep.sum() < 12:
+        raise SystemExit(f"--max-union {max_union} keeps only {int(keep.sum())} steps")
+    return tuple(None if a is None else a[keep] for a in arrays), keep
+
+
 def report(args):
     out = Path(args.out_dir)
     files = sorted((out / "scan").glob("shard*.npz"))
@@ -335,8 +408,31 @@ def report(args):
     au = np.concatenate([x["auroc"] for x in d])
     row = np.concatenate([x["row"] for x in d])
     cor = np.concatenate([x["correct"] for x in d])
+    uni = np.concatenate([x["union"] for x in d])
     layers = d[0]["layers"]
     N, Lc, Hc = v2.shape
+
+    # The union curve is reported on everything, before any cap -- it is the thing the
+    # cap is chosen from, so restricting it first would hide the tail being cut.
+    li22 = int(np.where(layers == 22)[0][0]) if (layers == 22).any() else 0
+    bl, bh = divmod(int(np.nanargmax(np.nanmean(au.reshape(N, -1), axis=0))), Hc)
+    curves = {f"mean {Lc * Hc}": np.nanmean(au.reshape(N, -1), axis=1),
+              f"L{int(layers[bl])}H{bh}": au[:, bl, bh]}
+    for h in (28, 31):                       # the rewarded heads, when the run has them
+        if h < Hc:
+            curves[f"L{int(layers[li22])}H{h}"] = au[:, li22, h]
+    union_decile_table(uni, curves, null=0.5)
+    print(f"   the rows are auroc: the mean over all {Lc * Hc} heads, the single "
+          f"head with the highest pooled level, and the two rewarded heads.")
+
+    (v2, au, row, cor, uni), keep = apply_union_cap(args.max_union, uni,
+                                                    (v2, au, row, cor, uni))
+    if not keep.all():
+        print(f"\n--max-union {args.max_union}: {int(keep.sum())}/{N} steps and "
+              f"{len(np.unique(row))} completions kept. Everything below is that "
+              f"subset; the table above is not.")
+        N = len(row)
+
     uniq = np.unique(row)
     print(f"steps {N}   completions {len(uniq)}   layers {Lc}   heads {Hc}   "
           f"accuracy {cor[np.unique(row, return_index=True)[1]].mean():.3f}")
@@ -387,7 +483,8 @@ def report(args):
                 print(f"   incumbent L22H{h22}: r(all) {r_all[li, h22]:>+.4f}  "
                       f"rank {rank} of {Lc * Hc}")
             np.savez_compressed(out / f"corr_{name}_{setup}.npz",
-                                r_all=r_all, r_sel=r_sel, r_out=r_out, layers=layers)
+                                r_all=r_all, r_sel=r_sel, r_out=r_out, layers=layers,
+                                max_union=np.array(args.max_union))
     print(f"\n-> {out}/corr_*.npz")
 
 
@@ -411,6 +508,13 @@ def main():
     p.add_argument("--answer-max-tokens", type=int, default=16)
     p.add_argument("--top-layers", type=int, default=10)
     p.add_argument("--top-heads", type=int, default=15)
+    p.add_argument("--max-union", type=float, default=0.0,
+                   help="report stage: drop steps whose DINO union covers more than "
+                        "this fraction of the patch grid (0 = off, the default and "
+                        "what every published number used). The union is the metric's "
+                        "reference region and it is uncapped everywhere else, "
+                        "including intervene_probe's `prepare`; see the decile table "
+                        "the report prints before applying this.")
     p.add_argument("--log-every", type=int, default=25)
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()

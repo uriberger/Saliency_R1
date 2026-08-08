@@ -269,6 +269,69 @@ variation predicts correctness. Nothing here explains that.
 `grad` reproduces exactly (`gxi` −0.098, held out −0.105, partial −0.123) and
 `rollout_mean` still clears nothing, so the value-norm head merge remains load-bearing.
 
+### The union was never capped, and the level statement depends on it (2026-08-07)
+
+**No probe here applied a maximum union size.** `intervene_probe.py --stage prepare`
+configures the per-**box** cap (`max_box_area=0.5`) and never `max_union_area`, which
+defaults to `None`; the only steps dropped are unions that are literally empty or
+literally the whole grid. All four methods read that one prepared case set, so all four
+inherit it. The per-box cap does not bound the union — N boxes each under it can cover
+the image between them. (The *training* runs are not uniform on this: `auroc_maxun_03`
+and `auroc_maxun_05` exist.)
+
+The unions are large: percentiles 0.19 / **0.538** / 0.688 / 0.819 at p10 / p50 / p75 /
+p90. Every map falls monotonically as the union grows — `auroc` by union decile, same
+3,471 steps:
+
+| union bin | n | `wnorm` L22 | `wnorm` L35 | `inc35` | `gxi_ds` | L22H28 | L22H31 | mean of 1152 heads |
+|---|---|---|---|---|---|---|---|---|
+| 0.02–0.19 | 331 | **0.541** | **0.525** | 0.485 | **0.689** | 0.392 | 0.361 | **0.601** |
+| 0.32–0.42 | 339 | 0.473 | 0.466 | 0.461 | 0.593 | 0.421 | 0.402 | 0.539 |
+| 0.48–0.54 | 339 | 0.441 | 0.436 | 0.463 | 0.577 | 0.427 | 0.410 | 0.524 |
+| 0.66–0.73 | 343 | 0.381 | 0.379 | 0.447 | 0.538 | 0.391 | 0.379 | 0.487 |
+| 0.82–0.99 | 352 | 0.364 | 0.370 | 0.451 | 0.492 | 0.379 | 0.368 | 0.452 |
+| **ALL** | 3471 | 0.434 | 0.430 | 0.461 | 0.575 | 0.408 | 0.391 | 0.518 |
+
+r(union, auroc) over steps: −0.55 all-head mean, −0.50 `gxi_ds`, −0.28 `wnorm` L22,
+**−0.039 `inc35`**.
+
+This is not an arithmetic artefact. Midrank AUROC has chance exactly 0.5 for a mask of
+any size at a random location: averaged over toroidal shifts every pair contributes
+symmetrically, because the mask's autocorrelation is symmetric. The curve is real
+map/mask structure. What it does mean is that the two ends answer different questions —
+above ~0.5 coverage the union has stopped localising anything (those steps read *"The
+image shows a group of people outdoors, possibly at a wedding"*, against *"There's also
+a small piece of white onion"* below 0.2).
+
+**So the section heading above is over-general.** "The rollout puts less weight on the
+objects a step names, at every layer" holds at the population's median union of 0.54;
+it does not hold on localised steps, where `rollout_wnorm` is at 0.537 ± 0.020 (2 SE
+clustered by completion) at L22 and the average head is at 0.598. The depth ordering
+survives the cap; the below-chance **sign** does not. Note also that the average of all
+1152 direct heads was already above chance uncapped (0.518) — what is anti-grounded is
+the rollout and the two rewarded heads, not the model's attention as such.
+
+What does not move:
+
+- **The rewarded heads are anti-aligned in every union bin** (0.407/0.378 at u < 0.19).
+  Against the all-head mean this *widens* under a cap — 0.60 vs 0.39 rather than 0.52
+  vs 0.40.
+- **`inc34`/`inc35`**: +0.124/+0.117 uncapped → +0.136/+0.150 at `--max-union 0.5`,
+  still clearing the threshold that rises to 0.130 as the sample falls to 807
+  completions. `inc35` is the one column essentially flat in union size, which is a new
+  argument that it is the right column rather than an artefact.
+- **`gxi`'s negative sign**, which sharpens: −0.098 → −0.115 (cap 0.5) → −0.155 (0.25).
+- **The causal null** (result 4): re-aggregated at case-level union caps off/0.6/0.5/
+  0.35 it gives 14/15/16/16 nominal hits against ~14 expected and 0 over Bonferroni.
+  `box − roll` is a same-size same-shape contrast, so union size cancels by
+  construction.
+
+`--max-union` now exists on the `report` stage of `flow_correlation_probe.py` and
+`head_correlation_probe.py` (default 0 = off, what every number above used), and both
+reports open with the decile table on the uncapped data. **Fix a threshold before
+looking at `val_natural`** — chosen afterwards it is a researcher degree of freedom, and
+the confirmation draw is single use.
+
 ### Caveats
 
 - The DEEPSTACK caveat in the probe's docstring applies to both rollout variants and
@@ -278,6 +341,10 @@ variation predicts correctness. Nothing here explains that.
   `inc34` in particular is a fresh selection from 36 increment columns. The odd/even
   split is internal to that set; a real confirmation needs the image-disjoint
   `val_natural` draw.
+- A union cap is also a **selection on step semantics**, not just on mask size: small
+  unions are single localised objects, large ones are scene-level statements. "Grounded
+  on localised steps" is a claim about a different step population, not a corrected
+  measurement of the same one.
 
 ---
 

@@ -13,14 +13,19 @@ numbers while raising nothing:
   * `edge_weights_wnorm`'s Gram expansion equals the naive || sum_h a W_O^h v^h ||
     it replaces -- the expansion is the only nontrivial algebra in the file;
   * the increment is the step's mean map minus the pre-step map, at the final layer;
-  * `report` recovers a planted correlation and holds it on the even-row half.
+  * `report` recovers a planted correlation and holds it on the even-row half;
+  * the union-decile table reads a union-dependent column as falling and a flat one as
+    flat, and `--max-union` reaches the Bonferroni threshold rather than the tables
+    alone -- dropping steps drops completions, and completions are the effective n.
 
     python test_flow_correlation_cpu.py
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import sys
 import tempfile
 from pathlib import Path
@@ -273,6 +278,7 @@ def test_report_recovers_planted_effect():
         class A:
             out_dir = str(out)
             all_columns = True
+            max_union = 0.0
         FC.report(A())
         d = np.load(out / "corr.npz")
         r_all, _r_sel, r_out, r_par, lvl, lse = d["mean_in_v2_completion"]
@@ -295,6 +301,97 @@ def test_report_recovers_planted_effect():
         check("the level standard error is positive", bool(np.all(lse > 0)))
 
 
+def test_union_cap_and_decile_table():
+    print("\n[union] the decile table reads the curve, --max-union restricts the rest")
+    HC = FC.HC
+    rng = np.random.default_rng(3)
+
+    # apply_union_cap: the contract is "drop steps, keep every array aligned".
+    uni = np.where(np.arange(40) % 2 == 0, 0.3, 0.9)     # evens under a 0.5 cap
+    a = np.arange(40)
+    b = np.arange(80).reshape(40, 2)
+    (ca, cb, cn), keep = HC.apply_union_cap(0.5, uni, (a, b, None))
+    check("the cap keeps exactly the steps at or below it",
+          list(np.flatnonzero(keep)) == list(range(0, 40, 2)),
+          f"kept {int(keep.sum())} of 40")
+    check("...and applies to every array, 1-D and 2-D alike",
+          list(ca) == list(range(0, 40, 2)) and cb.shape == (20, 2)
+          and list(cb[:, 0]) == list(range(0, 80, 4)))
+    check("a None array (an absent `mass`) survives the cap", cn is None)
+    (na,), nkeep = HC.apply_union_cap(0.0, uni, (a,))
+    check("cap 0 is a no-op, which is the default and every published number",
+          bool(nkeep.all()) and list(na) == list(a))
+    try:
+        HC.apply_union_cap(0.05, uni, (a,))
+        check("a cap that leaves too little to analyse raises", False)
+    except SystemExit:
+        check("a cap that leaves too little to analyse raises", True)
+
+    # The decile table: a column built to fall with union size must read that way, and
+    # one built independent of it must read flat. This is the whole point of the table.
+    n = 2000
+    u = rng.uniform(0.05, 0.95, n)
+    cols = {"falls": 1.0 - u + rng.normal(0, 0.02, n), "flat": rng.normal(0.5, 0.3, n)}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        HC.union_decile_table(u, cols, null=0.5)
+    def cells(label):
+        ln = next(l for l in buf.getvalue().splitlines() if l.strip().startswith(label))
+        return [float(x) for x in ln.strip()[len(label):].split()]
+
+    falls = cells("falls")
+    check("the decile cells of a union-dependent column decrease monotonically",
+          all(falls[i] > falls[i + 1] for i in range(9)),
+          f"{falls[0]:.2f}->{falls[9]:.2f}")
+    check("r(union) is strongly negative for it", falls[10] < -0.9, f"r={falls[10]:+.3f}")
+    check("r(union) is ~0 for a column independent of union size",
+          abs(cells("flat")[10]) < 0.1, f"r={cells('flat')[10]:+.3f}")
+    check("the deciles are equal-count", len(set(cells("n steps"))) <= 2,
+          f"{cells('n steps')}")
+    check("the bin means increase across the deciles",
+          cells("mean union") == sorted(cells("mean union")))
+
+    # End to end: the cap has to reach the Bonferroni threshold, not just the tables.
+    # Steps are dropped, so the completion count -- the effective n -- falls with it.
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "rollout_mean"
+        (out / "scan").mkdir(parents=True)
+        rows_, cor, v2, au, step, uu, mass = [], [], [], [], [], [], []
+        for c in range(400):
+            y = float(rng.integers(0, 2))
+            for s in range(2):
+                rows_.append(c); cor.append(y); step.append(s)
+                # one completion in four is entirely above the cap, so it disappears
+                uu.append(0.9 if c % 4 == 0 else 0.3)
+                v2.append(rng.normal(size=3)); au.append(rng.normal(size=3))
+                mass.append(rng.normal(size=3))
+        np.savez_compressed(
+            out / "scan" / "shard00.npz",
+            v2=np.array(v2, dtype=np.float32), auroc=np.array(au, dtype=np.float32),
+            row=np.array(rows_), step=np.array(step),
+            correct=np.array(cor, dtype=np.float32), union=np.array(uu, dtype=np.float32),
+            mass=np.array(mass, dtype=np.float32),
+            names=np.array(["L0", "L1", "inc1"]), map=np.array("rollout_mean"),
+            alpha=np.array(0.5))
+
+        def run(cap):
+            class A:
+                out_dir = str(out)
+                all_columns = True
+                max_union = cap
+            with contextlib.redirect_stdout(io.StringIO()):
+                FC.report(A())
+            # read eagerly: np.load is lazy and the next run overwrites this file
+            with np.load(out / "corr.npz") as z:
+                return float(z["max_union"]), float(z["threshold"])
+
+        full, capped = run(0.0), run(0.5)
+        check("the cap is recorded in corr.npz, so a saved report is unambiguous",
+              full[0] == 0.0 and capped[0] == 0.5)
+        check("the cap raises the Bonferroni threshold, the effective n having fallen",
+              capped[1] > full[1], f"{full[1]:.4f} -> {capped[1]:.4f}")
+
+
 def main():
     test_mass_invariant()
     test_residual_fixed_point()
@@ -305,6 +402,7 @@ def main():
     test_sample_columns()
     test_grad_maps_returns_numpy()
     test_report_recovers_planted_effect()
+    test_union_cap_and_decile_table()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         for f in FAIL:

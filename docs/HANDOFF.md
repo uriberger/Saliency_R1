@@ -60,6 +60,19 @@ held out +0.143, and it too sits below chance in level — so the finding is "le
 anti-grounding goes with being right", at ~0.25 sd of separation. Result 3 in
 [probe-results.md](probe-results.md).
 
+**7. No probe capped the DINO union, and the "anti-grounded" level depends on that.**
+`prepare` applies the per-*box* cap only; the median step's union covers **54%** of the
+patch grid and the top decile 89%. Every map reads lower the larger it gets
+(r(union, auroc) = −0.55 for the mean over all 1152 heads). Below 0.19 coverage
+`rollout_wnorm` sits at **0.537**, not 0.434, and the average head at 0.598 — so result
+3's level claim holds at the median union and not on localised steps. The depth ordering
+survives; the sign does not. What survives unchanged: the rewarded heads are below
+chance in every union bin, `inc34`/`inc35` hold (+0.136/+0.150 at a 0.5 cap), `gxi`'s
+negative sign sharpens, and the causal null is untouched (`box − roll` cancels union
+size). `--max-union` is now a `report`-stage flag on both correlation probes, off by
+default, and both reports open with the union-decile table. **Pick a threshold before
+`val_natural` runs.**
+
 The 2026-08-07 re-scan (`coldstart_setA_v2`) closed both of that result's open caveats
 and neither rescued it. The increment has a clean **monotonic layer curve** peaking at
 L34/L35, not a lone spike, and it **survives holding its own image mass fixed**

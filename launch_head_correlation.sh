@@ -87,4 +87,6 @@ python "$REPO/intervene_probe.py" --stage monitor --once --monitor-stage scan \
 
 [[ $fail -eq 0 ]] || echo "WARNING: a shard failed; re-run to resume." >&2
 echo "[next] python head_correlation_probe.py --stage report --out-dir $OUT_DIR"
+echo "       it opens with the level by union-size decile; --max-union 0.5 restricts"
+echo "       everything after that table to the steps whose union stays localised"
 exit "$fail"

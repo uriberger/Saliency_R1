@@ -118,4 +118,6 @@ done
 echo
 echo "[next] reports are in $OUT_DIR/<map>/report.txt; re-render any of them with"
 echo "       python flow_correlation_probe.py --stage report --all-columns --out-dir $OUT_DIR/<map>"
+echo "       each opens with the level by union-size decile, uncapped; add"
+echo "       --max-union 0.5 to restrict every number after that table"
 exit "$overall"
