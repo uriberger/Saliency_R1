@@ -46,6 +46,7 @@ Usage:
 
 import argparse
 import collections
+import gzip
 import json
 import os
 import random
@@ -92,12 +93,22 @@ IMAGE_BUDGET = {
     "vsr": 63,
 }
 
-# saliency-r1-8k's label -> Visual-CoT's metadata stem and archive directory. The 8k
-# calls Visual7W "v7w", which is also what the archive directory is called; only the
-# metadata file uses the long name.
+# saliency-r1-8k's label -> Visual-CoT's metadata file stem. The 8k calls Visual7W
+# "v7w"; only the metadata file uses the long name.
 SOURCE_META = {s: s for s in RECIPE_ROWS}
 SOURCE_META["v7w"] = "visual7w"
-SOURCE_DIR = {s: s for s in RECIPE_ROWS}
+
+# ... and -> the archive directories that may hold its images, best first. Measured
+# from the archive itself (see --index): it has no textcap/ directory at all, because
+# TextCaps is built on OpenImages and its pictures are simply the OpenImages ones. The
+# same is true of TextVQA, whose own directory holds only part of what it references.
+# Where two directories offer the same name they offer the same picture, so a fallback
+# is a rename, not a substitution -- and the manifest records which one was used.
+SOURCE_DIRS = {s: [s] for s in RECIPE_ROWS}
+SOURCE_DIRS["textcap"] = ["textcap", "openimages", "textvqa"]
+SOURCE_DIRS["textvqa"] = ["textvqa", "openimages", "textcap"]
+SOURCE_DIRS["openimages"] = ["openimages", "textvqa", "textcap"]
+SOURCE_DIRS["v7w"] = ["v7w", "visual7w"]
 
 # Scanned documents and infographics: Grounding-DINO detections on those are noise, so
 # the overlap reward is zeroed there. Same rule as build_grpo_sets.py.
@@ -117,8 +128,19 @@ EIGHTK_REPO = "peterant330/saliency-r1-8k"
 # Candidate pool
 # ---------------------------------------------------------------------------
 def archive_key(source, image_field):
-    """The record's identity: its full path inside the Visual-CoT tar."""
-    return f"{ARCHIVE_ROOT}/{SOURCE_DIR[source]}/{image_field}"
+    """A record's canonical image identity, and its path in the image cache.
+
+    Named for the source that references it, which is not always the directory the
+    bytes came from -- see SOURCE_DIRS. Keeping the canonical name stable is what lets
+    a record be resolved without consulting the archive again.
+    """
+    return f"{ARCHIVE_ROOT}/{source}/{image_field}"
+
+
+def archive_candidates(key):
+    """Where in the archive `key` might actually live, best first."""
+    _, source, rel = key.split("/", 2)
+    return [f"{ARCHIVE_ROOT}/{d}/{rel}" for d in SOURCE_DIRS[source]]
 
 
 def load_pool(source, meta_dir):
@@ -349,39 +371,71 @@ def stage_images(wanted, shards, cache_dir):
     The 13 shards concatenate into a single uncompressed tar, so members cannot be
     seeked to individually; the pass is ~139 GB of reads for ~1.5 GB of writes. Files
     already on disk are skipped, which makes a re-run after a failure cheap.
+
+    The pass runs to the end even once every image has been found, because it also
+    writes the archive's full member list to `.archive_index.txt.gz`. That index is
+    what turns "which directory holds TextCaps?" into an offline question -- the
+    alternative is another 139 GB read per guess.
+
+    Each image is cached under its CANONICAL key, whatever directory supplied the
+    bytes, so a record resolves the same way no matter how the archive is laid out.
+    `.manifest.json` records the archive path each one actually came from.
     """
     cache_dir = Path(cache_dir)
-    remaining = {k for k in wanted if not (cache_dir / k).exists()}
-    have = len(wanted) - len(remaining)
-    print(f"  {have} of {len(wanted)} images already cached, {len(remaining)} to extract",
-          flush=True)
-    if not remaining:
-        return set(), collections.Counter()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    index_path = cache_dir / ".archive_index.txt.gz"
+    manifest_path = cache_dir / ".manifest.json"
+    manifest = {}
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except Exception:
+            manifest = {}
+
+    remaining = [k for k in wanted if not (cache_dir / k).exists()]
+    print(f"  {len(wanted) - len(remaining)} of {len(wanted)} images already cached, "
+          f"{len(remaining)} to extract", flush=True)
+    if not remaining and index_path.exists():
+        return set(), collections.Counter(), manifest
+
+    # archive path -> the canonical keys that would accept it, best candidate first
+    accepts = collections.defaultdict(list)
+    for key in remaining:
+        for rank, cand in enumerate(archive_candidates(key)):
+            accepts[cand].append((rank, key))
+    pending = set(remaining)
 
     seen_dirs = collections.Counter()
-    with B.open_chained_tar(shards) as tf:
+    left = len(pending)
+    with gzip.open(index_path, "wt") as index, B.open_chained_tar(shards) as tf:
         for member in tf:
-            if not remaining:
-                break
             if not member.isfile():
                 continue
             name = member.name.lstrip("./")
+            index.write(name + "\n")
             parts = name.split("/")
             if len(parts) > 2:
                 seen_dirs[parts[1]] += 1
-            if name not in remaining:
+            takers = [k for _, k in sorted(accepts.get(name, ())) if k in pending]
+            if not takers:
                 continue
-            fh = tf.extractfile(member)
-            if fh is None:
+            data = tf.extractfile(member)
+            if data is None:
                 continue
-            dest = cache_dir / name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with open(dest, "wb") as out:
-                out.write(fh.read())
-            remaining.discard(name)
-            if len(remaining) % 1000 == 0:
-                print(f"    {len(remaining)} left", end="\r", flush=True)
-    return remaining, seen_dirs
+            payload = data.read()
+            for key in takers:
+                dest = cache_dir / key
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with open(dest, "wb") as out:
+                    out.write(payload)
+                manifest[key] = name
+                pending.discard(key)
+            if left - len(pending) >= 500:
+                left = len(pending)
+                print(f"    {left} left", end="\r", flush=True)
+
+    manifest_path.write_text(json.dumps(manifest))
+    return pending, seen_dirs, manifest
 
 
 # ---------------------------------------------------------------------------
@@ -443,15 +497,23 @@ def do_build(args):
         if len(shards) != 13:
             raise SystemExit(f"expected 13 Visual-CoT shards, found {len(shards)}")
         print(f"\nStreaming {len(shards)} shards for {len(wanted)} images ...", flush=True)
-        missing, seen_dirs = stage_images(wanted, shards, cache_dir)
+        missing, seen_dirs, manifest = stage_images(wanted, shards, cache_dir)
         if seen_dirs:
-            print(f"  archive source directories: "
+            print("  archive source directories: "
                   + ", ".join(f"{d}({n})" for d, n in seen_dirs.most_common()))
+        fallback = collections.Counter(
+            (k.split("/")[1], manifest[k].split("/")[1])
+            for k in wanted if k in manifest and manifest[k] != k
+        )
+        for (src, got), n in fallback.most_common():
+            print(f"  {n} {src} images were served from the archive's {got}/ directory")
         if missing:
             raise SystemExit(
                 f"{len(missing)} images were not in the archive, e.g. "
-                f"{sorted(missing)[:3]}. If a whole source is missing, its archive "
-                f"directory name differs from SOURCE_DIR -- see the list above.")
+                f"{sorted(missing)[:3]}. The directory list above shows what the archive "
+                f"actually holds; {cache_dir / '.archive_index.txt.gz'} has every member "
+                f"path, so the right SOURCE_DIRS entry can be found without re-reading "
+                f"139 GB.")
     else:
         missing = {k for k in wanted if not (cache_dir / k).exists()}
         if missing:
