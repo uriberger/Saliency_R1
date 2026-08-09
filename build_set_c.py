@@ -53,22 +53,12 @@ import json
 import os
 import random
 import shutil
+import subprocess
 import sys
 import zlib
 from pathlib import Path
 
 from PIL import Image
-
-# The login node caps virtual address space at 8 GB and the cap is a HARD limit -- it
-# cannot be raised, only lived within. glibc hands each thread its own 64 MB arena and
-# sizes the pool by core count, so on a 96-core login node the allocator alone reserves
-# more address space than the cap allows, and Arrow's memory-mapping of the output
-# shards then fails with "Cannot allocate memory" on a 1.3 GB file. The variable is read
-# at the first malloc, far earlier than any Python code runs, so the only way to set it
-# is to re-exec.
-if os.environ.get("MALLOC_ARENA_MAX") != "2":
-    os.environ["MALLOC_ARENA_MAX"] = "2"
-    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_grpo_sets as B
@@ -119,9 +109,8 @@ SOURCE_META["v7w"] = "visual7w"
 
 # ... and -> the archive directories that may hold its images, best first. Measured
 # from the archive itself (.archive_index.txt.gz): it has no textcap/ directory at all,
-# because
-# TextCaps is built on OpenImages and its pictures are simply the OpenImages ones. The
-# same is true of TextVQA, whose own directory holds only part of what it references.
+# because TextCaps is built on OpenImages and its pictures are simply the OpenImages
+# ones. The same is true of TextVQA, whose directory holds only part of what it names.
 # Where two directories offer the same name they offer the same picture, so a fallback
 # is a rename, not a substitution -- and the manifest records which one was used.
 SOURCE_DIRS = {s: [s] for s in RECIPE_ROWS}
@@ -375,15 +364,22 @@ def draw_val_c(meta_dir, used_keys, excluded_basenames, oversample=VAL_OVERSAMPL
 def save_chunked(name, records, resolver, out_dir, split_name):
     """Materialize `records` into shards, then merge them into out_dir/name.
 
-    build_grpo_sets.save_records does the same thing, and this would just call it but
-    for one property that matters here: a shard already on disk is not rebuilt. The
-    merge is the step most likely to die on this node's address-space cap, and paying
-    16,160 JPEG decode-resize-encodes again to retry it is not worth it.
+    build_grpo_sets.save_records does this in one process. Here it cannot be: the login
+    node caps virtual address space at 8 GB as a HARD limit, and writing 16,160 JPEGs
+    and memory-mapping the 1.3 GB result do not fit in one address space. Each step is
+    fine alone, so the merge runs as a child process -- a fresh address space that holds
+    nothing but the shards. glibc sizes its arena pool by core count, which on 96 cores
+    is itself most of the cap, so the child also gets MALLOC_ARENA_MAX.
 
-    Reuse is gated on a fingerprint of the exact records the shards were built from, so
-    a changed draw rebuilds rather than silently mixing two selections.
+    Shards already on disk are reused, gated on a fingerprint of the records they were
+    built from: retrying a failed merge should not cost 16,160 re-encodes, but a changed
+    draw must not silently mix two selections either.
+
+    Each shard carries a tally sidecar with its rows' content hashes, so the caller gets
+    the composition summary and the image hashes the validation draw needs without ever
+    reading the merged file back.
     """
-    from datasets import Dataset, concatenate_datasets, load_from_disk
+    from datasets import Dataset
 
     out_dir = Path(out_dir)
     shard_root = out_dir / f"_{name}_shards"
@@ -393,44 +389,80 @@ def save_chunked(name, records, resolver, out_dir, split_name):
     ).hexdigest()
     stamp = shard_root / ".fingerprint"
     if shard_root.exists() and (not stamp.exists() or stamp.read_text() != fingerprint):
-        print(f"  existing shards are from a different draw -- rebuilding")
+        print("  existing shards are from a different draw -- rebuilding")
         shutil.rmtree(shard_root)
     shard_root.mkdir(parents=True, exist_ok=True)
     stamp.write_text(fingerprint)
 
     features = B.output_features()
     print(f"\nMaterializing {name} ({len(records)} records) ...", flush=True)
-    shard_paths, failed_total, reused = [], 0, 0
+    tallies, reused = [], 0
     for start in range(0, len(records), B.CHUNK_ROWS):
         shard_dir = shard_root / f"{start // B.CHUNK_ROWS:04d}"
-        shard_paths.append(shard_dir)
-        if (shard_dir / "state.json").exists():
+        tally_path = shard_dir / ".tally.json"
+        if (shard_dir / "state.json").exists() and tally_path.exists():
+            tallies.append(json.loads(tally_path.read_text()))
             reused += 1
             continue
         rows, failed = B.materialize(records[start : start + B.CHUNK_ROWS],
                                      resolver, split_name)
-        failed_total += failed
         Dataset.from_list(rows, features=features).save_to_disk(str(shard_dir))
+        tally = {
+            "rows": len(rows),
+            "failed": failed,
+            "by_src": dict(collections.Counter(r["dataset"] for r in rows)),
+            "natural": sum(1 for r in rows if r["natural"]),
+            "boxed": sum(1 for r in rows if r["bbox"]),
+            "hashes": [hashlib.sha256(r["image"]["bytes"]).hexdigest() for r in rows],
+        }
+        tally_path.write_text(json.dumps(tally))
+        tallies.append(tally)
         del rows
         print(f"    {min(start + B.CHUNK_ROWS, len(records)):6d}/{len(records)} rows",
               flush=True)
     if reused:
         print(f"  reused {reused} shard(s) from an earlier run")
+
+    total = sum(t["rows"] for t in tallies)
+    failed_total = sum(t["failed"] for t in tallies)
+    by_src = collections.Counter()
+    for t in tallies:
+        by_src.update(t["by_src"])
     if failed_total:
         print(f"  dropped {failed_total} rows with unreadable images")
+    print(f"\n=== {name}: {total} rows ===")
+    for s, n in by_src.most_common():
+        print(f"    {s:18s} {n:6d}")
+    nat = sum(t["natural"] for t in tallies)
+    boxed = sum(t["boxed"] for t in tallies)
+    print(f"    {'-- natural':18s} {nat:6d}  ({100 * nat / max(1, total):.1f}%)")
+    print(f"    {'-- with bbox':18s} {boxed:6d}  ({100 * boxed / max(1, total):.1f}%)")
 
-    parts = [load_from_disk(str(p)) for p in shard_paths]
-    stats = [{k: r[k] for k in ("dataset", "natural", "bbox")}
-             for part in parts for r in part.remove_columns("image")]
-    B.summarize(name, stats)
+    print(f"\nMerging {len(tallies)} shards in a child process ...", flush=True)
+    env = dict(os.environ, MALLOC_ARENA_MAX="2")
+    subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                    "--merge-shards", name, "--out-dir", str(out_dir)],
+                   env=env, check=True)
 
-    merged = concatenate_datasets(parts)
-    dest = out_dir / name
+    hashes = [h for t in tallies for h in t["hashes"]]
+    return by_src, hashes
+
+
+def do_merge_shards(args):
+    """Concatenate out_dir/_NAME_shards into out_dir/NAME. Runs as its own process."""
+    from datasets import concatenate_datasets, load_from_disk
+
+    out_dir = Path(args.out_dir)
+    shard_root = out_dir / f"_{args.merge_shards}_shards"
+    paths = sorted(p for p in shard_root.iterdir() if (p / "state.json").exists())
+    if not paths:
+        raise SystemExit(f"no shards under {shard_root}")
+    merged = concatenate_datasets([load_from_disk(str(p)) for p in paths])
+    dest = out_dir / args.merge_shards
     merged.save_to_disk(str(dest))
-    del merged, parts
+    del merged
     shutil.rmtree(shard_root)
-    print(f"  saved -> {dest}")
-    return stats
+    print(f"  merged {len(paths)} shards -> {dest}")
 
 
 class PathResolver:
@@ -604,12 +636,14 @@ def do_build(args):
     resolver = PathResolver(cache_dir)
     del val_records, wanted
     gc.collect()  # the draw held every source's pool; none of it is needed from here
-    save_chunked("set_c", records, resolver, out_dir, "train")
+    _, set_c_hashes = save_chunked("set_c", records, resolver, out_dir, "train")
 
-    print("\nHashing set_c's images, so the validation sets can exclude them by content ...",
-          flush=True)
-    train_hashes = set(B.stored_image_hashes(out_dir / "set_c"))
-    print(f"  {len(train_hashes)} distinct images")
+    # Hashed as the rows were written, not read back from the merged file: the point is
+    # to exclude set_c's pictures from validation by CONTENT, and re-reading 1.3 GB to
+    # learn what we just encoded would only risk the address-space cap again.
+    train_hashes = set(set_c_hashes)
+    print(f"\nset_c holds {len(train_hashes)} distinct images by content "
+          f"({len(set_c_hashes) - len(train_hashes)} rows share a picture with another row)")
 
     excluded = set(train_hashes)
     for name, (drawn, counts) in val.items():
@@ -642,6 +676,13 @@ def do_verify(args):
     collision. The existing val_natural / val_nonnatural are checked too when present:
     set_c is only a drop-in for the 8k if those stay usable against it.
     """
+    # Memory-mapping 1.3 GB of set_c needs most of the login node's 8 GB address-space
+    # cap to be free of glibc's per-core arena reservations. Read at the first malloc,
+    # so it can only be set by re-exec.
+    if os.environ.get("MALLOC_ARENA_MAX") != "2":
+        os.environ["MALLOC_ARENA_MAX"] = "2"
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
     out_dir = Path(args.out_dir)
     if not (out_dir / "set_c").exists():
         raise SystemExit(f"missing {out_dir / 'set_c'}")
@@ -703,9 +744,13 @@ def main():
                    help="where extracted Visual-CoT images live (default OUT_DIR/_viscot_paths)")
     p.add_argument("--skip-extract", action="store_true",
                    help="assume the image cache is already populated")
+    p.add_argument("--merge-shards", metavar="NAME",
+                   help="internal: merge OUT_DIR/_NAME_shards, run as a child process")
     args = p.parse_args()
 
     B.require_deps()
+    if args.merge_shards:
+        return do_merge_shards(args)
     if args.report:
         return do_report(args)
     if args.build:
