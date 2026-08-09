@@ -46,6 +46,7 @@ Usage:
 
 import argparse
 import collections
+import gc
 import gzip
 import json
 import os
@@ -58,6 +59,12 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_grpo_sets as B
+
+# The login node caps virtual address space at 8 GB (ulimit -v), and the draw leaves a
+# couple of GB of freed-but-unreturned pool behind it. Arrow copies a whole chunk while
+# converting it, so build_grpo_sets' default of 4,000 rows of 512px JPEG is enough to
+# hit the ceiling; 1,000 keeps the conversion's peak allocation near 100 MB.
+B.CHUNK_ROWS = 1000
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +106,8 @@ SOURCE_META = {s: s for s in RECIPE_ROWS}
 SOURCE_META["v7w"] = "visual7w"
 
 # ... and -> the archive directories that may hold its images, best first. Measured
-# from the archive itself (see --index): it has no textcap/ directory at all, because
+# from the archive itself (.archive_index.txt.gz): it has no textcap/ directory at all,
+# because
 # TextCaps is built on OpenImages and its pictures are simply the OpenImages ones. The
 # same is true of TextVQA, whose own directory holds only part of what it references.
 # Where two directories offer the same name they offer the same picture, so a fallback
@@ -521,6 +529,8 @@ def do_build(args):
                              f"{cache_dir}, e.g. {sorted(missing)[:3]}")
 
     resolver = PathResolver(cache_dir)
+    del val_records, wanted
+    gc.collect()  # the draw held every source's pool; none of it is needed from here
     B.save_records("set_c", records, resolver, out_dir, "train")
 
     print("\nHashing set_c's images, so the validation sets can exclude them by content ...",
