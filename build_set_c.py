@@ -48,22 +48,34 @@ import argparse
 import collections
 import gc
 import gzip
+import hashlib
 import json
 import os
 import random
+import shutil
 import sys
 import zlib
 from pathlib import Path
 
 from PIL import Image
 
+# The login node caps virtual address space at 8 GB and the cap is a HARD limit -- it
+# cannot be raised, only lived within. glibc hands each thread its own 64 MB arena and
+# sizes the pool by core count, so on a 96-core login node the allocator alone reserves
+# more address space than the cap allows, and Arrow's memory-mapping of the output
+# shards then fails with "Cannot allocate memory" on a 1.3 GB file. The variable is read
+# at the first malloc, far earlier than any Python code runs, so the only way to set it
+# is to re-exec.
+if os.environ.get("MALLOC_ARENA_MAX") != "2":
+    os.environ["MALLOC_ARENA_MAX"] = "2"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_grpo_sets as B
 
-# The login node caps virtual address space at 8 GB (ulimit -v), and the draw leaves a
-# couple of GB of freed-but-unreturned pool behind it. Arrow copies a whole chunk while
-# converting it, so build_grpo_sets' default of 4,000 rows of 512px JPEG is enough to
-# hit the ceiling; 1,000 keeps the conversion's peak allocation near 100 MB.
+# Arrow copies a whole chunk while converting it, so build_grpo_sets' default of 4,000
+# rows of 512px JPEG is enough to hit the same ceiling from the other direction; 1,000
+# keeps the conversion's peak allocation near 100 MB.
 B.CHUNK_ROWS = 1000
 
 
@@ -360,6 +372,67 @@ def draw_val_c(meta_dir, used_keys, excluded_basenames, oversample=VAL_OVERSAMPL
 # ---------------------------------------------------------------------------
 # Image staging
 # ---------------------------------------------------------------------------
+def save_chunked(name, records, resolver, out_dir, split_name):
+    """Materialize `records` into shards, then merge them into out_dir/name.
+
+    build_grpo_sets.save_records does the same thing, and this would just call it but
+    for one property that matters here: a shard already on disk is not rebuilt. The
+    merge is the step most likely to die on this node's address-space cap, and paying
+    16,160 JPEG decode-resize-encodes again to retry it is not worth it.
+
+    Reuse is gated on a fingerprint of the exact records the shards were built from, so
+    a changed draw rebuilds rather than silently mixing two selections.
+    """
+    from datasets import Dataset, concatenate_datasets, load_from_disk
+
+    out_dir = Path(out_dir)
+    shard_root = out_dir / f"_{name}_shards"
+    fingerprint = hashlib.sha256(
+        "\n".join(f"{r['dataset']}|{r['question_id']}|{r['_ref'][1]}" for r in records)
+        .encode()
+    ).hexdigest()
+    stamp = shard_root / ".fingerprint"
+    if shard_root.exists() and (not stamp.exists() or stamp.read_text() != fingerprint):
+        print(f"  existing shards are from a different draw -- rebuilding")
+        shutil.rmtree(shard_root)
+    shard_root.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(fingerprint)
+
+    features = B.output_features()
+    print(f"\nMaterializing {name} ({len(records)} records) ...", flush=True)
+    shard_paths, failed_total, reused = [], 0, 0
+    for start in range(0, len(records), B.CHUNK_ROWS):
+        shard_dir = shard_root / f"{start // B.CHUNK_ROWS:04d}"
+        shard_paths.append(shard_dir)
+        if (shard_dir / "state.json").exists():
+            reused += 1
+            continue
+        rows, failed = B.materialize(records[start : start + B.CHUNK_ROWS],
+                                     resolver, split_name)
+        failed_total += failed
+        Dataset.from_list(rows, features=features).save_to_disk(str(shard_dir))
+        del rows
+        print(f"    {min(start + B.CHUNK_ROWS, len(records)):6d}/{len(records)} rows",
+              flush=True)
+    if reused:
+        print(f"  reused {reused} shard(s) from an earlier run")
+    if failed_total:
+        print(f"  dropped {failed_total} rows with unreadable images")
+
+    parts = [load_from_disk(str(p)) for p in shard_paths]
+    stats = [{k: r[k] for k in ("dataset", "natural", "bbox")}
+             for part in parts for r in part.remove_columns("image")]
+    B.summarize(name, stats)
+
+    merged = concatenate_datasets(parts)
+    dest = out_dir / name
+    merged.save_to_disk(str(dest))
+    del merged, parts
+    shutil.rmtree(shard_root)
+    print(f"  saved -> {dest}")
+    return stats
+
+
 class PathResolver:
     """Resolves ("viscot_path", "cot_image_data/<source>/<path>") to a PIL image."""
 
@@ -531,7 +604,7 @@ def do_build(args):
     resolver = PathResolver(cache_dir)
     del val_records, wanted
     gc.collect()  # the draw held every source's pool; none of it is needed from here
-    B.save_records("set_c", records, resolver, out_dir, "train")
+    save_chunked("set_c", records, resolver, out_dir, "train")
 
     print("\nHashing set_c's images, so the validation sets can exclude them by content ...",
           flush=True)
