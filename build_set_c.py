@@ -438,10 +438,11 @@ def save_chunked(name, records, resolver, out_dir, split_name):
     print(f"    {'-- natural':18s} {nat:6d}  ({100 * nat / max(1, total):.1f}%)")
     print(f"    {'-- with bbox':18s} {boxed:6d}  ({100 * boxed / max(1, total):.1f}%)")
 
-    print(f"\nMerging {len(tallies)} shards in a child process ...", flush=True)
+    print(f"\nAssembling {len(tallies)} shards in a child process ...", flush=True)
     env = dict(os.environ, MALLOC_ARENA_MAX="2")
     subprocess.run([sys.executable, str(Path(__file__).resolve()),
-                    "--merge-shards", name, "--out-dir", str(out_dir)],
+                    "--merge-shards", name, "--out-dir", str(out_dir),
+                    "--expect-rows", str(total)],
                    env=env, check=True)
 
     hashes = [h for t in tallies for h in t["hashes"]]
@@ -449,20 +450,62 @@ def save_chunked(name, records, resolver, out_dir, split_name):
 
 
 def do_merge_shards(args):
-    """Concatenate out_dir/_NAME_shards into out_dir/NAME. Runs as its own process."""
-    from datasets import concatenate_datasets, load_from_disk
+    """Assemble out_dir/_NAME_shards into one saved dataset at out_dir/NAME.
+
+    Not concatenate_datasets().save_to_disk(). That re-embeds every image on the way
+    out and wants a contiguous ~130 MB buffer per batch on top of the mapped input,
+    which the login node's hard 8 GB address-space cap will not hand out -- it is the
+    write, not the concatenation, that fails.
+
+    It does not need to. A saved dataset on disk is N arrow files plus a state.json
+    naming them, and each shard is already exactly one such file with the same schema.
+    So the shards ARE the output: hard-linked into place under the names the format
+    expects. Nothing is re-encoded, nothing large is allocated, and the result is loaded
+    back and counted before the shards are discarded.
+    """
+    from datasets import load_from_disk
 
     out_dir = Path(args.out_dir)
     shard_root = out_dir / f"_{args.merge_shards}_shards"
-    paths = sorted(p for p in shard_root.iterdir() if (p / "state.json").exists())
+    paths = sorted(p for p in shard_root.iterdir()
+                   if p.is_dir() and (p / "state.json").exists())
     if not paths:
         raise SystemExit(f"no shards under {shard_root}")
-    merged = concatenate_datasets([load_from_disk(str(p)) for p in paths])
+
     dest = out_dir / args.merge_shards
-    merged.save_to_disk(str(dest))
-    del merged
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+
+    n = len(paths)
+    names = []
+    for i, p in enumerate(paths):
+        src = json.loads((p / "state.json").read_text())["_data_files"]
+        if len(src) != 1:
+            raise SystemExit(f"{p} holds {len(src)} data files, expected 1")
+        name = f"data-{i:05d}-of-{n:05d}.arrow"
+        try:
+            os.link(p / src[0]["filename"], dest / name)
+        except OSError:  # different filesystem -- copy rather than fail
+            shutil.copy2(p / src[0]["filename"], dest / name)
+        names.append(name)
+
+    shutil.copy2(paths[0] / "dataset_info.json", dest / "dataset_info.json")
+    (dest / "state.json").write_text(json.dumps({
+        "_data_files": [{"filename": name} for name in names],
+        "_fingerprint": hashlib.sha256("".join(names).encode()).hexdigest()[:16],
+        "_format_columns": None,
+        "_format_kwargs": {},
+        "_format_type": None,
+        "_output_all_columns": False,
+        "_split": None,
+    }, indent=2))
+
+    rows = len(load_from_disk(str(dest)))
+    if args.expect_rows and rows != args.expect_rows:
+        raise SystemExit(f"assembled {rows} rows, expected {args.expect_rows}")
     shutil.rmtree(shard_root)
-    print(f"  merged {len(paths)} shards -> {dest}")
+    print(f"  assembled {n} shards -> {dest} ({rows} rows)")
 
 
 class PathResolver:
@@ -745,7 +788,9 @@ def main():
     p.add_argument("--skip-extract", action="store_true",
                    help="assume the image cache is already populated")
     p.add_argument("--merge-shards", metavar="NAME",
-                   help="internal: merge OUT_DIR/_NAME_shards, run as a child process")
+                   help="internal: assemble OUT_DIR/_NAME_shards, run as a child process")
+    p.add_argument("--expect-rows", type=int, default=0,
+                   help="internal: row count the assembled set must have")
     args = p.parse_args()
 
     B.require_deps()
