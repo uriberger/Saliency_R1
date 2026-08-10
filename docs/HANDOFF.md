@@ -43,24 +43,14 @@ improved it.
 (36 layers, alpha sweep) and per-head (288 cells, 0 surviving). Note both are
 **activation-level**: attention values are overwritten mid-forward with weights frozen
 and no gradient taken. **No experiment so far changes weights** — that is plan Stage 4.
-Also, and **5. the rewarded
-heads rank ~1100/1152** on correlation with correctness under `auroc`. Both in
-[probe-results.md](probe-results.md) with the statistics and the caveats. **Do not
-read result 4 as bounding per-head effects** — that inference was made and retracted;
-forcing all 32 heads at once is a different manipulation from forcing one.
+Results 1 and 4 in [probe-results.md](probe-results.md) with the statistics and the
+caveats. **Do not read the layer-level null as bounding per-head effects** — that
+inference was made and retracted; forcing all 32 heads at once is a different
+manipulation from forcing one.
 
-**7. The indirect path is causally live, and the answer still does not care where it
-points.** `flow_intervene_probe.py` re-allocates each head's mass over image-*carrying*
-keys toward boxed-object content, at every layer up to a cutoff. It moves log P(gold) by
-**0.726 nats** on average — **the positive control this project has lacked since
-2026-08-05**, and 18× the direct intervention's α=1 response. Union-traceable mass at the
-step rises 13–71%, faster than total image mass, so the manipulation lands the right way
-round. And `box − roll` is **+0.0126 nats** in the one cell of 12 that clears Bonferroni
-with the right sign, with **98.96% of 13,884 comparisons giving an identical top-1
-token**. The depth prediction from result 6 fails: the causal effect does not track the
-correlation ramp. Result 5 in [probe-results.md](probe-results.md). **Read α=0.25/0.5
-only** — at α=1.0 box and roll both gain ~0.9 nats and agree to 0.0003, which is
-off-manifold, not grounding.
+**5. The rewarded heads rank ~1100/1152** on correlation with correctness under `auroc`
+— the bottom 4% of every head in the model, in exactly the configuration the reward
+used. Result 2 in [probe-results.md](probe-results.md).
 
 **6. The indirect-flow maps do not rescue the premise.** Attention rollout — which
 follows image content through intermediate text positions, the path a direct map at L22
@@ -71,7 +61,12 @@ the rewarded heads sit at 0.410/0.392). The gradient map is the only one above c
 out of 308 clears a Bonferroni threshold: the rollout-wnorm *increment*, r = +0.117,
 held out +0.143, and it too sits below chance in level — so the finding is "less
 anti-grounding goes with being right", at ~0.25 sd of separation. Result 3 in
-[probe-results.md](probe-results.md).
+[probe-results.md](probe-results.md). The 2026-08-07 re-scan (`coldstart_setA_v2`)
+closed both of that result's open caveats and neither rescued it: the increment has a
+clean **monotonic layer curve** peaking at L34/L35 rather than a lone spike, and it
+**survives holding its own image mass fixed** (+0.124 → +0.117). Two columns clear the
+threshold, `inc34` and `inc35`, correlated at +0.968 — one signal, not two. Real, and
+small.
 
 **7. No probe capped the DINO union, and the "anti-grounded" level depends on that.**
 `prepare` applies the per-*box* cap only; the median step's union covers **54%** of the
@@ -86,11 +81,24 @@ size). `--max-union` is now a `report`-stage flag on both correlation probes, of
 default, and both reports open with the union-decile table. **Pick a threshold before
 `val_natural` runs.**
 
-The 2026-08-07 re-scan (`coldstart_setA_v2`) closed both of that result's open caveats
-and neither rescued it. The increment has a clean **monotonic layer curve** peaking at
-L34/L35, not a lone spike, and it **survives holding its own image mass fixed**
-(+0.124 → +0.117). Two columns now clear the threshold, `inc34` and `inc35`, correlated
-at +0.968 — one signal, not two. It is real and it is small.
+**8. The indirect path is causally live, and the answer still does not care where it
+points.** `flow_intervene_probe.py` re-allocates each head's mass over image-*carrying*
+keys toward boxed-object content, at every layer up to a cutoff. It moves log P(gold) by
+**0.726 nats** on average — **the positive control this project has lacked since
+2026-08-05**, and 18× the direct intervention's α=1 response. Union-traceable mass at the
+step rises 13–71%, faster than total image mass, so the manipulation lands the right way
+round. And `box − roll` is **+0.0126 nats** in the one cell of 12 that clears Bonferroni
+with the right sign, with **98.96% of 13,884 comparisons giving an identical top-1
+token**. The depth prediction from result 6 fails: the causal effect does not track the
+correlation ramp. Stratifying by union area does not rescue it either — below 0.5
+coverage **0 of 3,960 comparisons change the answer**, and the largest `t` values sit in
+the *worst*-contrast stratum. Result 5 in [probe-results.md](probe-results.md). **Read
+α=0.25/0.5 only** — at α=1.0 box and roll both gain ~0.9 nats and agree to 0.0003, which
+is off-manifold, not grounding.
+
+Definitions of every map named above — the rollout, the two head merges, the increment,
+the gradient map and the intervention edit — are in
+[saliency-maps.md](saliency-maps.md), with the notation stated once.
 
 ## What is running / pending
 
@@ -165,6 +173,7 @@ at +0.968 — one signal, not two. It is real and it is small.
 | `test_flow_intervene_cpu.py` | CPU checks for the edit algebra against naive references, the carried scalars, the deepstack re-seed and the report pairing |
 | `overlap_probe.py` | the original offline reward probe (generation + per-step breakdown) |
 | `test_intervene_probe_cpu.py` | CPU checks for the intervention algebra, resume, report |
+| `docs/saliency-maps.md` | **every map defined in one place** — direct, rollout-mean, rollout-wnorm, increment, gradient, and the intervention edit — with the notation, the scoring, the fixed-vs-swept parameters and the deepstack facts stated once. Start here before reading any probe |
 | `docs/attention-intervention-plan.md` | the P0–P5 plan, with its Stage 0→1 gate marked invalid |
 | `docs/probe-results.md` | results 4 and 5 in full |
 

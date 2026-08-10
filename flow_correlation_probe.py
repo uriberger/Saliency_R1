@@ -129,6 +129,9 @@ and `--max-union` restricts every number after it. Fix that threshold before loo
 at a confirmation set.
 
 ---------------------------------------------------------------------------
+All five maps used in this project, side by side and with the notation stated once:
+docs/saliency-maps.md.
+
     bash launch_flow_correlation.sh --gpus 8 --out-dir DIR --cases-dir <probe out-dir> \
          --maps rollout_mean,rollout_wnorm,grad
     python flow_correlation_probe.py --stage report --out-dir DIR/rollout_mean

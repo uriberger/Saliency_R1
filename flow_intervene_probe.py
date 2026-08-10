@@ -80,6 +80,8 @@ STAGES
             manipulation check beside every cell.
   monitor   aggregate every shard's heartbeat into one ETA.
 
+This edit alongside the five maps it was built to test: docs/saliency-maps.md.
+
     bash launch_flow_intervene.sh --stage selftest --gpus 1 --out-dir DIR --cases-dir C
     bash launch_flow_intervene.sh --stage run --gpus 8 --out-dir DIR --cases-dir C
     python flow_intervene_probe.py --stage report --out-dir DIR
