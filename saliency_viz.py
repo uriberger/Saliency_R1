@@ -107,6 +107,11 @@ def _load_module(name: str, relpath: str):
 # of them exactly once instead of a second copy under a different module name.
 FC = _load_module("_sv_flow", "flow_correlation_probe.py")
 PROBE, IV = FC.PROBE, FC.IV
+# The pixel->token regrouping now lives with the training-time gradient map, so the
+# picture drawn here and the map the reward scores cannot drift apart. `--stage selftest`
+# still gates it against the real processor.
+GM = _load_module("_sv_grad_maps", "trl/grad_maps.py")
+pixel_regroup = GM.pixel_regroup
 OSTEPS = PROBE.OSTEPS
 IMAGE_TOKEN_ID = PROBE.IMAGE_TOKEN_ID
 
@@ -218,31 +223,10 @@ def rollout_map(model, inputs, ids, prompt_len, steps, gh, gw, weighting, args, 
 
 # ---------------------------------------------------------------------------
 # map 4: the gradient w.r.t. the pixels
+#
+# `pixel_regroup` moved to trl/grad_maps.py (imported above as GM and re-exported), so
+# the map drawn here and the one the GRPO gradient reward scores are the same function.
 # ---------------------------------------------------------------------------
-def pixel_regroup(grad, grid_thw, ps: int, tps: int):
-    """[n_patch, C*T*ps*ps] pixel gradient -> [gh, gw] per language-model token.
-
-    The processor's flatten order is [gh, gw, merge, merge, C, T, ps, ps] (identically
-    in the slow and fast Qwen2-VL image processors), so a language-model token owns
-    `merge*merge` consecutive rows. The temporal axis holds `tps` copies of the SAME
-    pixels, so the chain rule says the gradient w.r.t. a pixel is the SUM over that
-    axis; summing before the norm rather than after is the difference between the
-    gradient w.r.t. the image and the gradient w.r.t. the processor's buffer.
-    """
-    n, d = grad.shape
-    gh2, gw2 = int(grid_thw[1]), int(grid_thw[2])          # pre-merge patch grid
-    gh, gw = gh2 // 2, gw2 // 2
-    c = d // (tps * ps * ps)
-    if c * tps * ps * ps != d or gh * gw * 4 != n:
-        raise RuntimeError(f"pixel_values {grad.shape} does not match grid {gh2}x{gw2} "
-                           f"with patch={ps} temporal={tps}")
-    g = grad.reshape(n, c, tps, ps * ps).sum(dim=2)        # collapse the duplicate frames
-    per_patch_sq = (g.float() ** 2).sum(dim=(1, 2))        # [n_patch]
-    # a token's pixels are the union of its 2x2 patches, so its gradient norm is the
-    # norm of the concatenation: sqrt of the summed squares.
-    return per_patch_sq.reshape(gh, gw, 4).sum(dim=2).clamp_min(0).sqrt()
-
-
 def grad_map(model, processor, inputs, ids, prompt_len, steps, gh, gw, args, device):
     ip = processor.image_processor
     ps = int(getattr(ip, "patch_size", 16))

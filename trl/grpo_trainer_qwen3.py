@@ -517,13 +517,20 @@ class GRPOTrainer(Trainer):
         overlap_heads=(28, 31),
         token_reduction: str = "mean",
         overlap_natural_only: bool = False,
+        grad_target: str = "clogit",
     ):
         self.reforward_saliency = reforward_saliency
         # --- attention-overlap reward config (reward_variant="ours") ---
         self.reward_variant = reward_variant
+        # "ours" and "grad" differ only in what the per-case re-forward extracts -- raw
+        # attention at one layer, or the pixel gradient of the step's own tokens. Both
+        # segment observe steps, ground them with DINO and score per step, so every
+        # observe-step-shaped decision below applies to both.
+        self._per_step_reward = reward_variant in ("ours", "grad")
+        self.grad_target = grad_target
         # Score the overlap reward on natural (photographic) rows only; non-natural rows
         # fall back to format + accuracy + judge. See think_overlap_reward's docstring.
-        self.overlap_natural_only = bool(overlap_natural_only) and reward_variant == "ours"
+        self.overlap_natural_only = bool(overlap_natural_only) and self._per_step_reward
         if overlap_natural_only and not self.overlap_natural_only:
             warnings.warn(
                 f"overlap_natural_only=True is ignored with reward_variant='{reward_variant}': "
@@ -546,9 +553,10 @@ class GRPOTrainer(Trainer):
         self.overlap_heads = list(overlap_heads)
         self.token_reduction = token_reduction
         self._overlap_clf = None  # lazily loaded FLAN-T5 steps classifier
-        if self.reward_variant == "ours" and not self.reforward_saliency:
-            # The "ours" extraction needs full per-token attention over the whole
-            # prompt+completion, which only the re-forward path provides.
+        if self._per_step_reward and not self.reforward_saliency:
+            # Both per-step extractions need a teacher-forced pass over the whole
+            # prompt+completion -- "ours" for full per-token attention, "grad" because a
+            # gradient has to be taken through one. Only the re-forward path provides it.
             self.reforward_saliency = True
 
         # Args
@@ -1733,6 +1741,162 @@ class GRPOTrainer(Trainer):
 
         return results
 
+    @profiling_decorator
+    def _compute_grad_step_maps(
+        self, inputs, images, prompt_inputs, prompt_completion_ids, attention_mask,
+        prompt_ids, prompt_length, completion_ids, output_text,
+        think_start_idx, think_end_idx, think_start, think_end, invalid, out, device,
+    ):
+        """Per completion -> list of {"map": (gh, gw) float32, "text": str} per observe
+        step, where the map is the PIXEL GRADIENT of that step's own tokens:
+
+            G_j = || d/d(pixels of image token j)  mean_{n in S} centered_logit(t_n) ||
+
+        Same output contract as `_compute_overlap_step_maps`, so the segmentation, the
+        DINO grounding and every probe that reads these maps are unchanged; only the map
+        differs. `trl/grad_maps.py` holds the definition and the reasoning; the reward is
+        `trl.rewards.grad_rewards.think_grad_reward`.
+
+        Cheaper than the attention path in the model: no eager re-run of a layer and no
+        [1, heads, seq, seq] tensor (gradients work under sdpa/FA2), against one extra
+        backward that costs about one forward because no parameter gradients are wanted.
+
+        THE ZeRO-3 HAZARD, which is why the structure below looks over-careful. This runs
+        a BACKWARD through the very module DeepSpeed hangs its hooks on. Three things keep
+        it out of the training state, and all three are load-bearing:
+
+          * `frozen_params` clears `requires_grad` on every weight, so autograd prunes
+            every weight-gradient node -- nothing accumulates into `.grad`, no gradient
+            hook has anything to reduce;
+          * exactly ONE model forward runs per case on EVERY rank, whatever that case
+            contains. ZeRO-3 asserts its recorded module order is byte-identical across
+            ranks, and ranks do not see the same mix of malformed spans or natural rows,
+            so a skipped forward becomes "disagreement between rank0 and rankN" in the
+            next training step and then a 30-minute NCCL timeout. A case with nothing to
+            score gets a one-token dummy span and has its result discarded;
+          * the ZeRO-3 trace is invalidated on both sides, as `evaluate` already does for
+            the same reason: this pass is a module order training never sees.
+
+        `DISABLE_GRAD_FORWARD=1` bisects the whole thing out (the reward then sees no maps
+        and contributes nothing) if a run starts dying in `reset_step`.
+        """
+        from .grad_maps import frozen_params, step_grad_maps
+        from .overlap_steps import segment_observe_steps
+
+        if os.environ.get("DISABLE_GRAD_FORWARD") == "1":
+            return [[] for _ in range(len(images))]
+
+        clf = self._get_overlap_classifier()
+        ip = getattr(self.processing_class, "image_processor", None)
+        ps = int(getattr(ip, "patch_size", 16))
+        tps = int(getattr(ip, "temporal_patch_size", 2))
+
+        thw = prompt_inputs.get("image_grid_thw")  # [batch, 3]
+        if thw is None:
+            raise RuntimeError(
+                "reward_variant='grad' differentiates w.r.t. pixel_values, but this batch "
+                "carries no image_grid_thw. It needs an image corpus."
+            )
+        patch_offsets = [0]
+        for _i in range(thw.shape[0]):
+            patch_offsets.append(patch_offsets[-1] + int(thw[_i].prod().item()))
+
+        results = [[] for _ in range(len(images))]
+        self._invalidate_zero3_trace("before the gradient re-forward")
+
+        import time as _time
+        _prof = os.environ.get("OVERLAP_PROFILE") == "1"
+        _t_fwd = _t_seg = 0.0
+        _n_spans = 0
+
+        with (
+            unwrap_model_for_generation(
+                self.model_wrapped, self.accelerator,
+                gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+            ) as _unwrapped,
+            frozen_params(_unwrapped),
+            FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
+        ):
+            for case_id in range(len(images)):
+                ts, te = think_start[case_id], think_end[case_id]
+                # Unlike the attention path, the spans have to be known BEFORE the
+                # forward: they select the rows that reach lm_head. Segmentation is
+                # rank-local (FLAN-T5, not the policy), so doing it first changes nothing
+                # about the ZeRO-3 trace -- but the forward below must still happen for
+                # every case, which is what `discard` is for.
+                discard = not invalid[case_id] or te <= ts
+                if not discard and self.overlap_natural_only:
+                    discard = not self._row_is_natural(inputs, case_id)
+
+                steps = []
+                if not discard:
+                    question = inputs[case_id].get("problem", "") if isinstance(inputs[case_id], dict) else ""
+                    if _prof:
+                        _tg = _time.perf_counter()
+                    steps = segment_observe_steps(
+                        output_text[case_id], think_start_idx[case_id], think_end_idx[case_id],
+                        out, case_id, ts, te, question, clf,
+                    )
+                    if _prof:
+                        _t_seg += _time.perf_counter() - _tg
+
+                spans, texts = [], []
+                for step_text, tok_a, tok_b in steps:
+                    a, b = prompt_length + tok_a, prompt_length + tok_b
+                    if b <= a or a <= 0 or b > prompt_completion_ids.shape[1]:
+                        continue
+                    spans.append((a, b))
+                    texts.append(step_text)
+                if not spans:
+                    # Nothing to score, but the forward is not optional: a one-token dummy
+                    # keeps this rank's module order identical to every other rank's.
+                    spans = [(prompt_completion_ids.shape[1] - 1, prompt_completion_ids.shape[1])]
+                    texts = []
+                    discard = True
+
+                _case_inputs = {
+                    "input_ids": prompt_completion_ids[case_id:case_id + 1],
+                    "attention_mask": attention_mask[case_id:case_id + 1],
+                    "pixel_values": prompt_inputs["pixel_values"][
+                        patch_offsets[case_id]:patch_offsets[case_id + 1]
+                    ],
+                    "image_grid_thw": thw[case_id:case_id + 1],
+                }
+                if prompt_inputs.get("mm_token_type_ids") is not None:
+                    _compl_zeros = torch.zeros(1, completion_ids.size(1), dtype=torch.long, device=device)
+                    _case_inputs["mm_token_type_ids"] = torch.cat(
+                        [prompt_inputs["mm_token_type_ids"][case_id:case_id + 1], _compl_zeros], dim=1
+                    )
+
+                if _prof:
+                    torch.cuda.synchronize(device); _tsf = _time.perf_counter()
+                maps = step_grad_maps(
+                    _unwrapped, _case_inputs, spans, thw[case_id].tolist(), ps, tps,
+                    target=self.grad_target,
+                )
+                if _prof:
+                    torch.cuda.synchronize(device); _t_fwd += _time.perf_counter() - _tsf
+                    _n_spans += len(spans)
+
+                if discard:
+                    del maps
+                    continue
+                results[case_id] = [
+                    {"map": maps[k].astype(np.float32), "text": texts[k]}
+                    for k in range(len(texts))
+                ]
+
+        self._invalidate_zero3_trace("after the gradient re-forward")
+
+        if _prof and self.accelerator.is_main_process:
+            import sys as _sys
+            print(
+                f"[grad-profile] target={self.grad_target} cases={len(images)} "
+                f"spans={_n_spans} fwd+bwd={_t_fwd:.1f}s t5-segment={_t_seg:.1f}s",
+                file=_sys.stderr, flush=True,
+            )
+        return results
+
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
@@ -2203,6 +2367,14 @@ class GRPOTrainer(Trainer):
                 prompt_ids, prompt_length, completion_ids, output_text,
                 think_start_idx, think_end_idx, think_start, think_end, invalid, out, device,
             )
+        elif self.reward_variant == "grad":
+            # --- Roll-null gradient reward: the pixel gradient of each observe step's
+            # own tokens, instead of attention. Same per-step map contract. ---
+            attn_batch = self._compute_grad_step_maps(
+                inputs, images, prompt_inputs, prompt_completion_ids, attention_mask,
+                prompt_ids, prompt_length, completion_ids, output_text,
+                think_start_idx, think_end_idx, think_start, think_end, invalid, out, device,
+            )
         elif self.reforward_saliency:
             # --- Re-forward path: generate without output_attentions, then do a cheap
             # per-case forward pass to extract attention slices for saliency. ---
@@ -2411,6 +2583,24 @@ class GRPOTrainer(Trainer):
                 dtype=torch.float32, device=device,
             )
             self._metrics[mode]["overlap/natural_frac"].append(gather(_nat).mean().item())
+        if self.reward_variant == "grad":
+            # The roll-null closes box size and confidence; it does not close the centre
+            # hack (`ecc` rising, and correlating with the score), the reward going hollow
+            # (`n_image` collapsing while the score rises), or the step-set hacks
+            # (`dup_frac`, `n_steps`, `grounded_frac`). These are how those become
+            # visible; see trl/rewards/grad_rewards.py. Rank-local means, gathered here.
+            # pop_diagnostics returns a FIXED key set (NaN where this rank saw nothing),
+            # because `gather` below is a collective: a rank-dependent key set would mean
+            # a rank-dependent number of collectives, which hangs rather than fails.
+            from .rewards.grad_rewards import pop_diagnostics
+
+            for _k, _v in pop_diagnostics().items():
+                _t = torch.tensor([_v], dtype=torch.float32, device=device)
+                _g = gather(_t)
+                _g = _g[~torch.isnan(_g)]
+                # Uniform across ranks: the decision is taken on the GATHERED tensor.
+                if _g.numel():
+                    self._metrics[mode][f"grad/{_k}"].append(_g.mean().item())
         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
         # Overall (weighted-sum) reward mean/std across ALL rollouts, in the same

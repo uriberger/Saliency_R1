@@ -541,6 +541,30 @@ if __name__ == "__main__":
             natural_only=script_args.overlap_natural_only,
         )
         reward_funcs = [think_format_reward, think_overlap_reward, accuracy_reward, openai_reward]
+    elif script_args.reward_variant == "grad":
+        # Same slot in reward_funcs as the overlap reward, so --reward_weights lines up
+        # unchanged. The DINO-side knobs live in overlap_rewards._CFG -- grad_rewards
+        # calls its grounding helpers rather than duplicating them -- so both are
+        # configured here.
+        from trl.rewards.grad_rewards import configure as configure_grad
+        from trl.rewards.grad_rewards import think_grad_reward
+        from trl.rewards.overlap_rewards import configure as configure_overlap
+
+        configure_overlap(
+            box_threshold=script_args.box_threshold,
+            max_box_area=script_args.max_box_area,
+            max_union_area=script_args.max_union_area,
+            dino_api_base=script_args.dino_api_base,
+        )
+        configure_grad(
+            null_offsets=script_args.grad_null_offsets,
+            logratio_clip=script_args.grad_logratio_clip,
+            inframe_rolls=script_args.grad_inframe_rolls,
+            dedupe_steps=script_args.grad_dedupe_steps,
+            natural_only=script_args.grad_natural_only,
+            seed=script_args.grad_seed,
+        )
+        reward_funcs = [think_format_reward, think_grad_reward, accuracy_reward, openai_reward]
     elif script_args.reward_variant == "none":
         # Drop the saliency/overlap reward entirely: accuracy + judge + format only.
         reward_funcs = [think_format_reward, accuracy_reward, openai_reward]
@@ -562,7 +586,10 @@ if __name__ == "__main__":
         overlap_layer=script_args.overlap_layer,
         overlap_heads=script_args.overlap_heads,
         token_reduction=script_args.token_reduction,
-        overlap_natural_only=script_args.overlap_natural_only,
+        overlap_natural_only=(script_args.overlap_natural_only
+                              or (script_args.reward_variant == "grad"
+                                  and script_args.grad_natural_only)),
+        grad_target=script_args.grad_target,
     )
 
     # Benchmark scores are produced by a separate job (run_bench_eval.sh) and land

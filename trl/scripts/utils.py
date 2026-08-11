@@ -116,9 +116,74 @@ class ScriptArguments:
             "whole-completion rollout saliency reward. 'ours' = raw per-head observe->patch "
             "attention overlap reward (layer 22, 2-head mean, per observe step, DINO-grounded). "
             "'none' = accuracy + judge + format only (no saliency/overlap reward; skips the "
-            "attention re-forward pass entirely).",
-            "choices": ["saliency_r1", "ours", "none"],
+            "attention re-forward pass entirely). 'grad' = the roll-null gradient reward: "
+            "same per-observe-step, DINO-grounded shape as 'ours', but the map is the "
+            "PIXEL GRADIENT of the step's own tokens and the score is "
+            "log(||g_U|| / ||g_rolled||) -- see trl/rewards/grad_rewards.py.",
+            "choices": ["saliency_r1", "ours", "none", "grad"],
         },
+    )
+    # ---- roll-null gradient reward (reward_variant="grad") ----
+    grad_target: str = field(
+        default="clogit",
+        metadata={
+            "help": "reward_variant='grad': the scalar differentiated per generated token. "
+            "'clogit' (default) = the raw logit minus the vocabulary mean: it does not "
+            "saturate as the model grows confident (d log P/dz -> 0 as p -> 1, which would "
+            "make the reward pay for uncertain steps) and it drops the common-mode channel "
+            "shared by every vocabulary item, which is otherwise the SAME map for every "
+            "step and so a one-shot lift for all of them. 'logit' keeps that channel; "
+            "'logprob' saturates. Both are for probes.",
+            "choices": ["clogit", "logit", "logprob"],
+        },
+    )
+    grad_null_offsets: int = field(
+        default=16,
+        metadata={
+            "help": "reward_variant='grad': how many translated copies of the box union "
+            "form the null. Their SQUARED norms are pooled before the log, so one control "
+            "landing on a dead region cannot dominate. Pure numpy on a ~16x16 map: free."
+        },
+    )
+    grad_logratio_clip: float = field(
+        default=1.0,
+        metadata={
+            "help": "reward_variant='grad': clip |log(||g_U||/||g_null||)| to this. A ratio "
+            "has a heavy tail, and with scale_rewards=True one outlier completion takes "
+            "most of its group's normalised advantage. Set it from the measured spread "
+            "(overlap_metric_spread.py) rather than trusting the default."
+        },
+    )
+    grad_inframe_rolls: bool = field(
+        default=True,
+        metadata={
+            "help": "reward_variant='grad': draw the control placements so the translated "
+            "union stays inside the grid, instead of wrapping toroidally across the image "
+            "border. Falls back to toroidal (counted in grad/toroidal_frac) when a "
+            "near-full-frame union leaves too few in-frame positions."
+        },
+    )
+    grad_dedupe_steps: bool = field(
+        default=True,
+        metadata={
+            "help": "reward_variant='grad': drop repeated observe-step texts before the "
+            "mean over steps. The score is a mean, so re-quoting one easily-grounded "
+            "sentence pulls it up and dilutes the hard perception steps -- measured going "
+            "0.00 -> 0.19 in the wov0.4 run. grad/dup_frac is logged either way."
+        },
+    )
+    grad_natural_only: bool = field(
+        default=False,
+        metadata={
+            "help": "reward_variant='grad': score only rows whose 'natural' column is True. "
+            "Same rationale as --overlap_natural_only: Grounding-DINO is a photograph "
+            "detector, so on charts/documents the box union -- and the whole score -- is "
+            "noise."
+        },
+    )
+    grad_seed: int = field(
+        default=0,
+        metadata={"help": "reward_variant='grad': seed for the control placements."},
     )
     token_reduction: str = field(
         default="mean",

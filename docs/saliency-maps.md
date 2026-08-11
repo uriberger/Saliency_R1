@@ -152,6 +152,29 @@ Four variants: `gnorm` / `gxi` exclude the deepstack injection paths, `gnorm_ds`
 `gxi_ds` include them. `gxi` is gradient-times-input, `|⟨e_j, ∂F/∂e_j⟩|`, usually the
 less noisy.
 
+### 5b. The training-time gradient map (`trl/grad_maps.py`)
+
+The GRPO gradient reward (`--reward_variant grad`) uses the same idea with two changes,
+each of which closes a hole the probe version does not have to care about:
+
+```
+F_S = mean_{n in S} [ z_{t_n,n} − (1/V) Σ_v z_{v,n} ]        centered logit
+G_j = ‖ ∂F_S / ∂x_j ‖₂                                       x_j = token j's 32×32 px
+```
+
+- **the centered logit instead of the log-prob.** `∂ log P(t)/∂z = onehot(t) − p` vanishes
+  as `p_t → 1`, so a log-prob map shrinks everywhere for a step the model is sure of and
+  the reward would pay for uncertainty. The raw logit does not saturate but carries a
+  common-mode component shared by the whole vocabulary — the *same map for every step* —
+  so shaping it once would lift every step at no per-step cost. Subtracting the vocabulary
+  mean removes that channel and keeps the non-saturating property.
+- **w.r.t. pixels, not embeddings.** The vision tower stays in the graph, so the deepstack
+  taps are counted automatically and there is no `_ds` variant to choose. ~10% more
+  compute (the tower is 0.55 B params over ~1024 patches against 8 B over ~900 tokens).
+
+Mean-over-tokens versus sum differs by exactly `1/|S|`, which the roll-null ratio below
+cancels; the mean is used so the logged raw norms are comparable across step lengths.
+
 ---
 
 ## 6. The intervention edit
@@ -204,6 +227,24 @@ Both metrics score a map's length-`M` vector against the step's union mask.
 |---|---|---|
 | `mean_in_v2` | in-mask mean ÷ overall mean | **1.0** |
 | `auroc` | Mann-Whitney rank of in-mask patches vs out, average ranks for ties | **0.5** |
+| `logratio` | `log ‖g_U‖ − log N_0`, where `N_0² = (1/K) Σ_k ‖g_{U'_k}‖²` over `K` translates of `U` | **0.0** |
+
+`logratio` (`trl/rewards/grad_rewards.py`) is the roll-null: the map scored against
+*itself*, on the same mask moved elsewhere. Three properties the other two lack:
+
+- **exact size invariance.** On a flat map the score is 0 for a union of any area — the
+  translate has the same area by construction. `‖g_U‖` alone grows like `√|U|`, and even
+  `‖g_U‖ − ‖g_out‖` is monotone in `|U|` for a flat map, so both pay for bigger boxes.
+- **self-limiting.** Under a uniform translation `E|U ∩ U'| / |U| = |U|/n`, so a union
+  covering most of the image is compared against itself and the ratio collapses to 1.
+  That is a *pull toward smaller unions*, not merely a cap on large ones.
+- **scale invariance.** Any `G → cG` cancels, which removes the confidence and
+  image-sensitivity confounds that a subtractive control would only shift.
+
+`N_0` pools the **squared** norms over the `K` placements before the log, so one control
+landing on a dead region cannot dominate. Offsets are drawn in-frame (no border wrap) and
+exclude the identity. What it does not close: a radial prior in `G` still lets a centred
+box beat its translates for free — `grad/ecc` is the monitor, not a fix.
 
 `head_correlation_probe.metrics`. Ties get average ranks because attention maps have
 many near-identical near-zero patches and `argsort` would break those arbitrarily.
@@ -266,6 +307,8 @@ re-seed in the wrong place.
 |---|---|
 | `head_correlation_probe.py` | 1, and the scoring both correlation probes share |
 | `flow_correlation_probe.py` | 2, 3, 4, 5 |
+| `trl/grad_maps.py` | 5b — the training-time pixel gradient, shared with `saliency_viz.py` |
+| `trl/rewards/grad_rewards.py` | the `logratio` roll-null scoring, and the reward built on it |
 | `flow_intervene_probe.py` | 6 |
 | `intervene_probe.py` | the *direct* intervention (not a map — edits step→image attention at one layer) |
 | `test_flow_correlation_cpu.py`, `test_flow_intervene_cpu.py` | the algebra, against naive references |

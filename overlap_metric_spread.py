@@ -16,6 +16,20 @@ completions -- a paired comparison, not one across runs that generated different
 
     python overlap_metric_spread.py outputs/overlap_probe/<run>/probe_merged.json
 
+ONE PAIRING TRAP, on a `--map grad` probe run. Every row in the table is then computed on
+the GRADIENT map, including `mean_in` -- so the in-table "w that matches mean_in's
+pressure" is scaling against mean_in-on-gradients, which nothing was ever trained with.
+The incumbent's spread is a property of the ATTENTION map: sd_per_sample = 0.0086, from
+the 1074-grounded-step set_a run (see trl/rewards/overlap_rewards.py). So for w_grad, take
+`sd_per_sample` for `logratio` from the grad run and compute
+
+    w_grad = 0.4 * 0.0086 / sd_logratio
+
+by hand, rather than reading the table's mean_in column. This is the one comparison that
+cannot be paired -- the two maps cannot both be the incumbent -- so it inherits the +-25%
+the reference weights already carry. On an ATTENTION run there is no trap: all four rows,
+`logratio` included, are the same map and the table is paired as designed.
+
 The per-completion reward is reconstructed the way think_overlap_reward builds it:
 mean over the completion's grounded observe steps, times the format gate, None when
 there is no grounded step (masked, so it never enters the group). The optional mass
@@ -32,12 +46,16 @@ from pathlib import Path
 import numpy as np
 
 # (json key on a step, display name). The probe writes all of these per grounded step.
+# `logratio` is the roll-null score the gradient reward uses; it is recorded on every
+# step whatever map the probe built, so on an attention run it is a paired comparison
+# against the other three, and on a `--map grad` run it is the number w_grad comes from.
 METRICS = [
     ("mean_in_raw", "mean_in"),
     ("mean_in_v2_raw", "mean_in_v2"),
     ("auroc_raw", "auroc"),
+    ("logratio_raw", "logratio"),
 ]
-CHANCE = {"mean_in": None, "mean_in_v2": 1.0, "auroc": 0.5}
+CHANCE = {"mean_in": None, "mean_in_v2": 1.0, "auroc": 0.5, "logratio": 0.0}
 
 
 def completion_reward(completion, key):

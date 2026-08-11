@@ -87,6 +87,35 @@ def _load_module(name: str, relpath: str):
 
 OSTEPS = _load_module("_probe_overlap_steps", "trl/overlap_steps.py")
 OREW = _load_module("_probe_overlap_rewards", "trl/rewards/overlap_rewards.py")
+GM = _load_module("_probe_grad_maps", "trl/grad_maps.py")
+
+
+def _load_grad_rewards():
+    """grad_rewards imports its grounding helpers from overlap_rewards, relatively.
+
+    Stub the parent packages so that relative import resolves, and register the ALREADY
+    LOADED overlap_rewards under its dotted name first -- otherwise a second copy is
+    imported with its own `_CFG`, and the box_threshold / max_box_area this probe
+    configures would silently not be the ones the grounding call uses.
+    """
+    import types
+
+    for _n, _p in (("trl", REPO / "trl"), ("trl.rewards", REPO / "trl" / "rewards")):
+        if _n not in sys.modules:
+            _m = types.ModuleType(_n)
+            _m.__path__ = [str(_p)]
+            sys.modules[_n] = _m
+    sys.modules["trl.rewards.overlap_rewards"] = OREW
+    return _load_module("trl.rewards.grad_rewards", "trl/rewards/grad_rewards.py")
+
+
+GREW = _load_grad_rewards()
+
+# Which per-step number `score` (and therefore the aggregated overlap) reports:
+# "metric" = the configured overlap metric, "logratio" = the roll-null gradient score.
+# Set from --score in main(); a module global because score_steps is called from both
+# the shard path and the re-scoring path.
+SCORE_KIND = "metric"
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +522,7 @@ def score_steps(all_step_maps, images_per_completion, store_maps=True):
         if mask is None:
             rec.update(grounded=False, box_area_frac=None, score=None,
                        mean_in_raw=None, mean_in_v2_raw=None, auroc_raw=None,
+                       logratio_raw=None, ecc=None,
                        note=(f"union covers {union_frac_uncapped:.2f} of the image > "
                              f"--max-union-area {OREW._CFG['max_union_area']} -> SKIPPED, not scored 0"
                              if dropped_by_union_cap else
@@ -502,13 +532,24 @@ def score_steps(all_step_maps, images_per_completion, store_maps=True):
             # reward uses. Every metric is also recorded ungated on every step, so they
             # can be compared on identical maps and masks -- a paired comparison of
             # metrics rather than one across runs with different completions.
+            # logratio_raw is the roll-null score (chance 0), recorded on every step
+            # whatever the map is -- it is the number --map grad exists to measure, and
+            # on an attention map it is the paired comparison against mean_in/auroc.
+            # logratio_raw is the roll-null score (chance 0), recorded once per step
+            # whatever the map is -- it is the number --map grad exists to measure, and
+            # on an attention map it is the paired comparison against mean_in/auroc.
+            # Computed ONCE: it draws random control placements, so calling it twice
+            # would give the step two different scores and double the diagnostics.
+            _lr = GREW.step_logratio(smap, mask)
             rec.update(
                 grounded=True,
                 box_area_frac=float(mask.sum()) / float(mask.size),
-                score=OREW._step_score(smap, mask),
+                score=(_lr if SCORE_KIND == "logratio" else OREW._step_score(smap, mask)),
                 mean_in_raw=OREW._mean_in(smap, mask),
                 mean_in_v2_raw=OREW._mean_in_v2(smap, mask),
                 auroc_raw=OREW._auroc(smap, mask),
+                logratio_raw=_lr,
+                ecc=GREW._centroid_eccentricity(mask),
                 note="",
             )
         detail[c].append(rec)
@@ -525,14 +566,50 @@ def overlap_from_detail(detail, format_valid):
 # ---------------------------------------------------------------------------
 # main shard
 # ---------------------------------------------------------------------------
+def grad_step_maps(model, processor, prompt_inputs, prompt_len, comp_ids, steps, device,
+                   grad_target="clogit"):
+    """The GRPO gradient reward's map, per observe step -- the same call the trainer makes.
+
+    Same [{"map", "text", "tok_a", "tok_b"}] contract as step_maps_from_attention, so the
+    scoring, the HTML and every aggregate below are shared. `comp_ids` is one completion;
+    the prompt is re-forwarded with it, teacher-forced, exactly as in training.
+    """
+    ip = processor.image_processor
+    ps = int(getattr(ip, "patch_size", 16))
+    tps = int(getattr(ip, "temporal_patch_size", 2))
+    ids = torch.cat([prompt_inputs["input_ids"][0], comp_ids.to(device)])[None]
+    case = {
+        "input_ids": ids,
+        "attention_mask": torch.ones_like(ids),
+        "pixel_values": prompt_inputs["pixel_values"],
+        "image_grid_thw": prompt_inputs["image_grid_thw"],
+    }
+    kept, spans = [], []
+    for text, tok_a, tok_b in steps:
+        a, b = prompt_len + tok_a, prompt_len + tok_b
+        if b <= a or a <= 0 or b > ids.shape[1]:
+            continue
+        spans.append((a, b))
+        kept.append((text, tok_a, tok_b))
+    if not spans:
+        return []
+    grid = prompt_inputs["image_grid_thw"][0].tolist()
+    with GM.frozen_params(model):
+        maps = GM.step_grad_maps(model, case, spans, grid, ps, tps, target=grad_target)
+    return [{"map": maps[k].astype(np.float32), "text": t, "tok_a": a, "tok_b": b}
+            for k, (t, a, b) in enumerate(kept)]
+
+
 def run_model(spec, rows, args, device):
     processor, model = load_model(spec["path"], spec.get("adapter"), device, args.attn_impl)
-    attn_mod = find_attn_module(model, args.overlap_layer)
-    if attn_mod is None:
-        raise RuntimeError(
-            f"no Qwen3VLTextAttention with layer_idx={args.overlap_layer}; "
-            "the single-layer capture would silently fall back to an all-eager forward"
-        )
+    attn_mod = None
+    if args.map == "attn":
+        attn_mod = find_attn_module(model, args.overlap_layer)
+        if attn_mod is None:
+            raise RuntimeError(
+                f"no Qwen3VLTextAttention with layer_idx={args.overlap_layer}; "
+                "the single-layer capture would silently fall back to an all-eager forward"
+            )
     clf = OSTEPS.OverlapStepsClassifier.load(args.steps_ckpt, device=args.steps_device)
     heads = [int(h) for h in args.overlap_heads.split(",")]
     tok = processor.tokenizer
@@ -585,6 +662,12 @@ def run_model(spec, rows, args, device):
             steps = OSTEPS.segment_observe_steps(
                 output_text[c], ts_idx[c], te_idx[c], out, c, ts, te, row["question"], clf
             )
+            if args.map == "grad":
+                all_maps.append(grad_step_maps(
+                    model, processor, prompt_inputs, prompt_len, comp_ids[c], steps,
+                    device, grad_target=args.grad_target,
+                ))
+                continue
             per_tok = capture_layer_attention(
                 model, attn_mod, prompt_inputs, prompt_len, comp_ids[c], heads, device
             )
@@ -690,6 +773,22 @@ def main():
     p.add_argument("--overlap-heads", default="28,31")
     p.add_argument("--token-reduction", default="mean", choices=["mean", "max", "min"])
     p.add_argument("--overlap-metric", default="mean_in", choices=["mean_in", "mean_in_v2", "auroc"])
+    # --- the gradient reward (trl/rewards/grad_rewards.py) ---
+    p.add_argument("--map", default="attn", choices=["attn", "grad"],
+                   help="which per-step map to build: raw attention at --overlap-layer, or "
+                        "the PIXEL GRADIENT of the step's own tokens (the map reward_variant"
+                        "='grad' scores). 'grad' ignores --overlap-layer/--overlap-heads/"
+                        "--token-reduction.")
+    p.add_argument("--score", default="metric", choices=["metric", "logratio"],
+                   help="which per-step number is aggregated into the reported overlap: the "
+                        "--overlap-metric, or the roll-null log ratio (chance 0). logratio_raw "
+                        "is recorded on every step either way, so the two are comparable on "
+                        "identical maps and masks. Use --map grad --score logratio to measure "
+                        "the spread that sets w_grad.")
+    p.add_argument("--grad-target", default="clogit", choices=["clogit", "logit", "logprob"])
+    p.add_argument("--grad-null-offsets", type=int, default=16)
+    p.add_argument("--grad-logratio-clip", type=float, default=1.0)
+    p.add_argument("--grad-inframe-rolls", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--box-threshold", type=float, default=0.10)
     p.add_argument("--max-box-area", type=float, default=0.5,
                    help="per-BOX area cap; 0 disables it (keep every box above --box-threshold)")
@@ -741,6 +840,14 @@ def main():
         dino_device=args.dino_device or args.device,
         dino_batch_size=args.dino_batch_size,
     )
+    GREW.configure(
+        null_offsets=args.grad_null_offsets,
+        logratio_clip=args.grad_logratio_clip,
+        inframe_rolls=args.grad_inframe_rolls,
+        seed=args.seed,
+    )
+    global SCORE_KIND
+    SCORE_KIND = args.score
     if args.steps_device is None:
         args.steps_device = args.device
 

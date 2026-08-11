@@ -219,6 +219,10 @@ MAX_UNION_AREA=""        # unset -> off. Per-STEP cap on the union of the kept b
                          # --max-box-area does not bound the union -- N disjoint boxes
                          # each under the per-box cap can cover the whole image, and
                          # the measured median union is already 56% of it.
+REWARD_VARIANT=ours      # ours (attention overlap) | grad (roll-null pixel gradient)
+GRAD_TARGET=clogit       # clogit (default) | logit | logprob -- see trl/grad_maps.py
+GRAD_NULL_OFFSETS=16
+GRAD_LOGRATIO_CLIP=1.0
 OVERLAP_METRIC=mean_in   # mean_in (incumbent default) | mean_in_v2 (/mean not /max; see
                          # below) | auroc (hack-resistant; see above)
 MASS_FLOOR_TAU=""        # unset -> off for mean_in, 0.0022 for auroc (see below).
@@ -275,6 +279,10 @@ while [[ $# -gt 0 ]]; do
         --max-box-area)           MAX_BOX_AREA="$2";            shift 2 ;;
         --max-union-area)         MAX_UNION_AREA="$2";          shift 2 ;;
         --overlap-metric)         OVERLAP_METRIC="$2";          shift 2 ;;
+        --grad)                   REWARD_VARIANT=grad;          shift 1 ;;
+        --grad-target)            GRAD_TARGET="$2";             shift 2 ;;
+        --grad-null-offsets)      GRAD_NULL_OFFSETS="$2";       shift 2 ;;
+        --grad-logratio-clip)     GRAD_LOGRATIO_CLIP="$2";      shift 2 ;;
         --mass-floor-tau)         MASS_FLOOR_TAU="$2";          shift 2 ;;
         --natural-only)           NATURAL_ONLY=true;            shift ;;
         --no-natural-only)        NATURAL_ONLY=false;           shift ;;
@@ -357,12 +365,44 @@ if [[ "$OVERLAP_METRIC" == "mean_in_v2" ]]; then
     [[ -z "${W_OVERLAP_SET:-}" ]] && W_OVERLAP=0.033
 fi
 
+# --grad replaces the attention map with the PIXEL GRADIENT of each observe step's own
+# tokens and the metric with the roll-null log ratio. It carries NO weight default: the
+# spread of log(||g_U||/||g_null||) has not been measured on this corpus, and copying
+# 0.033 or 0.11 across would apply an unknown multiple of the intended pressure. Measure
+# it first and pass --w-overlap explicitly:
+#
+#   python overlap_probe.py --map grad --score logratio --n-samples 40 ...
+#   python overlap_metric_spread.py --field logratio_raw <that run's out-dir>
+#
+# then set --w-overlap so that w * sd matches the incumbent's (mean_in's 0.4 x 0.0086
+# ~ 0.0035). The mass floor does not apply -- it is an attention-mass gate, and the
+# gradient reward's analogous magnitude is logged as grad/n_image instead.
+if [[ "$REWARD_VARIANT" == "grad" ]]; then
+    if [[ -z "${W_OVERLAP_SET:-}" ]]; then
+        echo "ERROR: --grad needs an explicit --w-overlap." >&2
+        echo "  The roll-null log-ratio's spread is not known on this corpus, so no default" >&2
+        echo "  can be honest. Measure it first:" >&2
+        echo "    python overlap_probe.py --map grad --score logratio --n-samples 40 \\" >&2
+        echo "        --out-dir outputs/overlap_probe/grad_spread --dataset <set>" >&2
+        echo "    python overlap_metric_spread.py --field logratio_raw outputs/overlap_probe/grad_spread" >&2
+        echo "  then pass --w-overlap <w> with w * sd ~ 0.0035 (mean_in's wov0.4 pressure)." >&2
+        exit 1
+    fi
+    [[ -n "$MASS_FLOOR_TAU" ]] && { echo "ERROR: --mass-floor-tau does not apply to --grad." >&2; exit 1; }
+fi
+
 # ---------- naming: every swept HP appears in the model AND wandb name ----------
 N_HEADS=$(echo "$OVERLAP_HEADS" | awk -F, '{print NF}')
+if [[ "$REWARD_VARIANT" == "grad" ]]; then
+    # The attention knobs are not in the name because they do not apply: no layer, no
+    # heads, no token reduction. What does apply is in it, so a name states what ran.
+    SUFFIX="__wov${W_OVERLAP}_grad${GRAD_TARGET}_rn${GRAD_NULL_OFFSETS}_clip${GRAD_LOGRATIO_CLIP}"
+else
 SUFFIX="__wov${W_OVERLAP}_${N_HEADS}head_tr${TOKEN_REDUCTION}"
 # Only non-default metric settings extend the suffix, so existing mean_in run names
 # (and the checkpoints already on disk) stay exactly as they are.
 [[ "$OVERLAP_METRIC" != "mean_in" ]] && SUFFIX="${SUFFIX}_${OVERLAP_METRIC}"
+fi
 [[ -n "$MASS_FLOOR_TAU" ]] && SUFFIX="${SUFFIX}_mf${MASS_FLOOR_TAU}"
 [[ -n "$MAX_UNION_AREA" ]] && SUFFIX="${SUFFIX}_mu${MAX_UNION_AREA}"
 [[ "$MAX_BOX_AREA" == "0" ]] && SUFFIX="${SUFFIX}_nobox"
@@ -375,7 +415,8 @@ SUFFIX="__wov${W_OVERLAP}_${N_HEADS}head_tr${TOKEN_REDUCTION}"
 LORA_SLUG=$(echo "$LORA_TARGETS" | sed 's/_proj//g; s/,//g')
 [[ "$LORA_TARGETS" != "q_proj,v_proj" ]] && SUFFIX="${SUFFIX}_lora${LORA_SLUG}"
 MODEL_SLUG=$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g')
-RUN_NAME="grpo-${MODEL_SLUG}-overlap${SUFFIX}"
+REWARD_SLUG=$([[ "$REWARD_VARIANT" == "grad" ]] && echo grad || echo overlap)
+RUN_NAME="grpo-${MODEL_SLUG}-${REWARD_SLUG}${SUFFIX}"
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$REPO/checkpoint/${RUN_NAME}"
 mkdir -p "$OUTPUT_DIR"
 
@@ -660,7 +701,16 @@ MAX_UNION_FLAG=""
 # Omitted when off, so the dataclass default (False) applies and the command line of an
 # existing run is reproduced byte for byte.
 NATURAL_ONLY_FLAG=""
-[[ "$NATURAL_ONLY" == true ]] && NATURAL_ONLY_FLAG="--overlap_natural_only True"
+GRAD_NATURAL_ONLY_FLAG=""
+# --natural-only means the same thing in both variants (score photographs only, because
+# Grounding-DINO is a photograph detector), but each reward reads its own flag.
+if [[ "$NATURAL_ONLY" == true ]]; then
+    if [[ "$REWARD_VARIANT" == "grad" ]]; then
+        GRAD_NATURAL_ONLY_FLAG="--grad_natural_only True"
+    else
+        NATURAL_ONLY_FLAG="--overlap_natural_only True"
+    fi
+fi
 
 # Held-out validation. Omitted entirely when off, so eval_strategy stays "no" and the
 # command line of an existing run is unchanged.
@@ -734,7 +784,11 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --max_prompt_length 2048 \
     --max_completion_length "$MAX_COMPLETION_LENGTH" \
     --reforward_saliency "$REFORWARD_SALIENCY" \
-    --reward_variant ours \
+    --reward_variant "$REWARD_VARIANT" \
+    --grad_target "$GRAD_TARGET" \
+    --grad_null_offsets "$GRAD_NULL_OFFSETS" \
+    --grad_logratio_clip "$GRAD_LOGRATIO_CLIP" \
+    $GRAD_NATURAL_ONLY_FLAG \
     --overlap_layer "$OVERLAP_LAYER" \
     --overlap_heads "$OVERLAP_HEADS" \
     --token_reduction "$TOKEN_REDUCTION" \
