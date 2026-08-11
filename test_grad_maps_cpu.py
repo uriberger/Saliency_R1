@@ -327,22 +327,30 @@ def test_logprob_saturates_and_clogit_does_not():
         # show the sharpening and the gap is the only thing that moves.
         return model, fwd, span, float((1.0 - p).max())
 
+    # The anchor has to be an UNCONFIDENT model. At scale 1 this toy is already saturated
+    # to machine precision (1 - P underflows to 0), so sharpening it further cannot show
+    # anything; flattening it can. argmax is scale-invariant, so both scales teacher-force
+    # the SAME tokens and the only thing that differs is how peaked the softmax is.
+    LO, HI = 0.05, 1.0
     out = {}
-    for scale in (1.0, 8.0):     # scaling the logits sharpens the softmax
+    for scale in (LO, HI):
         model, fwd, span, gap = confident_case(scale)
         out[(scale, "gap")] = gap
         for tgt in ("logprob", "clogit"):
             out[(scale, tgt)] = float(np.linalg.norm(run(model, fwd, [span], target=tgt)[0]))
 
-    check("the model is confident in its own tokens, and sharpening makes it more so",
-          out[(1.0, "gap")] < 0.1 and out[(8.0, "gap")] < out[(1.0, "gap")],
-          f"worst 1 - P(t_n) {out[(1.0, 'gap')]:.2e} -> {out[(8.0, 'gap')]:.2e}")
-    lp = out[(8.0, "logprob")] / out[(1.0, "logprob")]
-    cl = out[(8.0, "clogit")] / out[(1.0, "clogit")]
+    # Thresholds from the measured values (1.65e-01 -> 0.00e+00), not guessed: at the
+    # anchor the model still has real uncertainty about its own next token, at HI it is
+    # certain to machine precision. That gap is the whole mechanism under test.
+    check("sharpening takes the model from uncertain to certain, on the same tokens",
+          out[(LO, "gap")] > 1e-2 and out[(HI, "gap")] < 1e-3,
+          f"worst 1 - P(t_n) {out[(LO, 'gap')]:.2e} -> {out[(HI, 'gap')]:.2e}")
+    lp = out[(HI, "logprob")] / out[(LO, "logprob")]
+    cl = out[(HI, "clogit")] / out[(LO, "clogit")]
     check("the clogit map scales with the logits, i.e. it does not saturate",
-          cl > 4.0, f"||map|| ratio {cl:.2f} (the logits were scaled 8x)")
-    check("the logprob map is suppressed by confidence instead",
-          lp / cl < 0.5, f"logprob ratio {lp:.3f} against clogit's {cl:.2f}")
+          cl > 10.0, f"||map|| ratio {cl:.2f} (the logits were scaled {HI / LO:.0f}x)")
+    check("the logprob map SHRINKS over the same range -- this is why it is not the default",
+          lp < 1.0 and lp / cl < 0.1, f"logprob ratio {lp:.3f} against clogit's {cl:.2f}")
 
 
 def test_frozen_params_restores():
