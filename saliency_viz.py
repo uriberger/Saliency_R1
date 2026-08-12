@@ -110,6 +110,12 @@ def repo_path(rel: str) -> Path:
 def _load_module(name: str, relpath: str):
     import importlib.util
 
+    # Idempotent, because the edge can also be walked the other way: the flow probe
+    # loads THIS file to reach glimpse_map, registering itself as `_sv_flow` first, and
+    # without this guard the load below would execute the probe a second time under a
+    # second module object -- two copies of it and of the three modules it loads.
+    if name in sys.modules:
+        return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, REPO / relpath)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod

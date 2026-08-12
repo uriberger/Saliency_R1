@@ -246,6 +246,61 @@ def test_grad_maps_returns_numpy():
           bool((np.abs(maps).sum(-1) > 0).all()))
 
 
+def test_glimpse_adapter():
+    """The boundary between this probe and map 6, which is where the grad probe broke.
+
+    Its first GPU run died on sample 1 because the adapter and the map disagreed about
+    a type; the second died on sample 4 of 4. Both are the same failure mode -- a
+    convention mismatch that only surfaces after an 8B model has loaded -- and both are
+    a millisecond of arithmetic to rule out. `spans` here are ABSOLUTE; glimpse_map
+    wants them chain-relative, and it must end up scoring exactly the tokens the grad
+    column scores or the two columns of this screen are not comparable.
+    """
+    print("\n[glimpse] the span adapter, and the map -> [K,1,S,P] reshape")
+    SV = FC._glimpse_module()
+    check("map 6 is reachable without re-executing this probe",
+          SV.glimpse_map.__name__ == "glimpse_map"
+          and sys.modules.get("_sv_flow") is not None)
+
+    prompt_len = 11
+    # ids[0, p] == p, so a token's VALUE is its absolute position and the two
+    # conventions can be compared directly rather than through a second index.
+    ids = torch.arange(prompt_len + 29)[None]
+    spans = [(prompt_len + 1, prompt_len + 4), (prompt_len + 6, prompt_len + 9)]
+    gsteps = [("", a - prompt_len, b - prompt_len) for a, b in spans]   # scan_case
+
+    # glimpse_map's own two lines, over what the adapter hands it.
+    rows = [prompt_len + a - 1 + i for _t, a, b in gsteps for i in range(b - a)]
+    targets = torch.cat([ids[0, prompt_len + a: prompt_len + b] for _t, a, b in gsteps])
+    # and what the grad column scores from the same absolute spans (FC.grad_maps).
+    grad_tokens = torch.cat([ids[0, a:b] for a, b in spans])
+
+    check("glimpse scores the same tokens as grad, so the columns are comparable",
+          torch.equal(targets, grad_tokens),
+          f"{targets.tolist()} vs {grad_tokens.tolist()}")
+    check("every row is the one that PREDICTS its token, p-1",
+          rows == [p - 1 for p in grad_tokens.tolist()], str(rows))
+    check("one row per scored token", len(rows) == sum(b - a for a, b in spans))
+
+    # The negative control: this is the bug, and it must not pass silently.
+    unshifted = [("", a, b) for a, b in spans]
+    bad = torch.cat([ids[0, prompt_len + a: prompt_len + b] for _t, a, b in unshifted])
+    check("forgetting the shift would score different tokens",
+          not torch.equal(bad, grad_tokens))
+
+    # [S, gh, gw] -> [K, 1, S, P]. The union mask is flattened with the same row-major
+    # (gh, gw) reshape a few lines away in scan; a swapped pair would score every step
+    # against a transposed union and still produce numbers that look like numbers.
+    gh, gw, S = 3, 5, len(spans)
+    g = np.arange(S * gh * gw, dtype=np.float32).reshape(S, gh, gw)
+    maps = np.ascontiguousarray(g.reshape(1, 1, S, gh * gw), dtype=np.float32)
+    check("reshapes to [1, 1, n_steps, gh*gw]", maps.shape == (1, 1, S, gh * gw))
+    check("flattening is row-major over (gh, gw), as the mask's is",
+          all(np.array_equal(maps[0, 0, si], g[si].reshape(-1)) for si in range(S)))
+    check("a transposed grid would not agree, so the check has teeth",
+          not np.array_equal(maps[0, 0, 0], g[0].T.reshape(-1)))
+
+
 def test_report_recovers_planted_effect():
     print("\n[report] recovers a planted correlation, held out")
     rng = np.random.default_rng(0)
@@ -401,6 +456,7 @@ def main():
     test_partial_corr()
     test_sample_columns()
     test_grad_maps_returns_numpy()
+    test_glimpse_adapter()
     test_report_recovers_planted_effect()
     test_union_cap_and_decile_table()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

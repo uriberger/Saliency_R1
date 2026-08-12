@@ -10,13 +10,40 @@ reads *those positions* rather than the patches. A direct map at layer 22 cannot
 that path at all, which is a candidate explanation for the layer-level intervention
 null, for ID accuracy sitting at 0.534, and for layers 0/1 topping the direct scan.
 
-Three replacement maps, scored by the same two metrics against the same per-step DINO
+Four replacement maps, scored by the same two metrics against the same per-step DINO
 unions as the direct scan, on the same prepared cases, so the numbers are directly
 comparable:
 
   rollout_mean   layer-wise attention rollout, heads merged by the mean
   rollout_wnorm  the same, heads merged by || sum_h A^h_{n,k} W_O^h v^h_k ||
   grad           || d log P(step's own tokens) / d e_j ||, e_j = image embedding j
+  glimpse        GLIMPSE, gradient-weighted attention adaptively propagated (map 6)
+
+---------------------------------------------------------------------------
+GLIMPSE, and why it is scored here before it is trained on
+---------------------------------------------------------------------------
+`saliency_viz.py` owns map 6 and this file borrows it -- see `_glimpse_module`. The
+point of running it through this probe is that a GLIMPSE-based grounding reward has
+two candidate metrics, `mean_in_v2` and `auroc`, and this scan already computes BOTH
+for every map at step and completion level. So one glimpse scan ranks the two reward
+variants against each other, and against chance, before either is trained.
+
+Read the LEVEL before the correlation, as with every other map here. Three independent
+map families have now come out anti-grounded on this corpus (the rollouts at every
+layer, the two rewarded direct heads at 0.410/0.392), and the one map that cleared
+chance -- `grad` -- correlates NEGATIVELY with correctness at -0.098. A glimpse column
+that lands at 0.5 is not "no result": it says the reward would be rewarding noise.
+
+Cost. GLIMPSE is one backward plus a per-layer eager replay per TARGET TOKEN, where
+`grad` amortises one backward over a whole step, so this variant is far and away the
+most expensive of the four -- budget hours on 8 GPUs where the other three take
+minutes. Run it with --max-cases first.
+
+Precision. The map carries 0.063-0.089 of its own bf16 rounding noise (measured in
+docs/glimpse-handoff.md, which is why its equivalence gate had to move to fp32). auroc
+is a rank statistic and mean_in_v2 a ratio of means, so both are far more tolerant of
+that than a max-deviation check -- but it is noise in the direction of attenuating any
+correlation, so read a null column as an upper bound on the effect, not a measurement.
 
 ---------------------------------------------------------------------------
 The rollout
@@ -129,11 +156,13 @@ and `--max-union` restricts every number after it. Fix that threshold before loo
 at a confirmation set.
 
 ---------------------------------------------------------------------------
-All five maps used in this project, side by side and with the notation stated once:
+All six maps used in this project, side by side and with the notation stated once:
 docs/saliency-maps.md.
 
     bash launch_flow_correlation.sh --gpus 8 --out-dir DIR --cases-dir <probe out-dir> \
          --maps rollout_mean,rollout_wnorm,grad
+    bash launch_flow_correlation.sh --gpus 8 --out-dir DIR --cases-dir <probe out-dir> \
+         --maps glimpse --max-cases 8          # hours, not minutes: size it first
     python flow_correlation_probe.py --stage report --out-dir DIR/rollout_mean
     python flow_correlation_probe.py --stage report --out-dir DIR/rollout_mean \
          --all-columns --max-union 0.5
@@ -176,7 +205,40 @@ IV = _load_module("_fc_intervene", "intervene_probe.py")
 HC = _load_module("_fc_head_corr", "head_correlation_probe.py")
 IMAGE_TOKEN_ID = PROBE.IMAGE_TOKEN_ID
 
-MAPS = ("rollout_mean", "rollout_wnorm", "grad")
+MAPS = ("rollout_mean", "rollout_wnorm", "grad", "glimpse")
+
+
+def _glimpse_module():
+    """saliency_viz.py, loaded lazily: it owns map 6 and this file only borrows it.
+
+    The dependency runs this way round because saliency_viz already loads THIS module
+    (as `_sv_flow`, for `build_forward`) -- so we register ourselves under that name
+    before loading it, and its `_load_module` finds us instead of executing this file a
+    second time. Lazy, so the other three maps never pay for the import.
+
+    This is deliberately not the final home. The reward needs the same map and cannot
+    import a probe script, so the code belongs in `trl/glimpse_maps.py` beside
+    `trl/grad_maps.py`. That move carries a constraint this screen does not: `trl/` is
+    copied into `trl_repo/` by patch_trl_qwen3.sh and executes there, where no probe
+    script exists, so `build_forward` and `causal_mask` have to travel with it. Doing
+    it here would produce a module that works in the probe and breaks in the trainer.
+    """
+    if "_fc_saliency_viz" not in sys.modules:
+        sys.modules.setdefault("_sv_flow", sys.modules[__name__])
+        _load_module("_fc_saliency_viz", "saliency_viz.py")
+    return sys.modules["_fc_saliency_viz"]
+
+
+class _NoEngine:
+    """Stand-in for a map that installs and removes its own hooks per case.
+
+    `scan` holds one engine for the whole shard and closes it in a finally; glimpse
+    builds a GlimpseGradCache inside every call and closes it in its own finally, so
+    there is nothing shard-lived to hold.
+    """
+
+    def close(self):
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +512,24 @@ def scan_case(model, processor, engine, case, image, device, args):
         names = ["gnorm", "gnorm_ds", "gxi", "gxi_ds"]
         return maps, names, answer, kept
 
+    if args.map == "glimpse":
+        SV = _glimpse_module()
+        # glimpse_map takes CHAIN-relative spans in (text, a, b) triples; `spans` here
+        # are absolute. The text slot is what saliency_viz captions a panel with and is
+        # never read by the map, so it stays empty rather than inventing a second
+        # meaning for it -- the probe grounds against the union `prepare` already built,
+        # not against text it re-derives here.
+        gsteps = [("", a - prompt_len, b - prompt_len) for a, b in spans]
+        gmaps, _info = SV.glimpse_map(model, processor, inputs, ids, prompt_len, gsteps,
+                                      gh, gw, case["question"], args, device)
+        # [S, gh, gw] -> the [K, 1, S, P] this scan scores, with one column. The patch
+        # order is row-major over the grid on both sides: `mask_q` is unpacked with the
+        # same (gh, gw) reshape a few lines below, and glimpse_map fills `out[si]` from
+        # `m.reshape(gh, gw)` over `img_cols`, which is image-token order.
+        maps = np.ascontiguousarray(
+            gmaps.reshape(1, 1, len(spans), gh * gw), dtype=np.float32)
+        return maps, ["glimpse"], answer, kept
+
     # rollout: snapshot every step token, plus the token before each step for `inc`
     need = sorted({int(p) for a, b in spans for p in range(a, b)}
                   | {int(a - 1) for a, _ in spans})
@@ -505,7 +585,10 @@ def scan(args, device):
     # The gradient map needs a graph, and from_pretrained leaves every parameter
     # trainable -- a backward would then allocate a full 8B set of .grad buffers for
     # gradients nobody reads. Only the image-embedding leaves should require grad.
-    attn_impl = "sdpa" if args.map == "grad" else args.attn_impl
+    # glimpse wants sdpa for the same reason grad does, from the other direction: it
+    # replays ONE layer at a time in eager on top of an sdpa forward, and an all-eager
+    # forward would put all 36 layers' [H, N, N] back in the graph and undo that.
+    attn_impl = "sdpa" if args.map in ("grad", "glimpse") else args.attn_impl
     processor, model = PROBE.load_model(args.base_model, args.adapter or None, device,
                                         attn_impl)
     model.requires_grad_(False)
@@ -514,11 +597,16 @@ def scan(args, device):
         if args.grad_checkpointing:
             model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False})
+    elif args.map == "glimpse":
+        # glimpse_map turns checkpointing off around its own forward regardless, since
+        # it needs that graph; --grad-checkpointing is a grad-only knob.
+        engine = _NoEngine()
     else:
         engine = RolloutFlow(model, args.map.split("_", 1)[1], args.alpha, args.chunk)
 
     print(f"[scan] shard {args.shard}: {len(cases)} cases, map={args.map}"
-          + (f", alpha={args.alpha}" if args.map != "grad" else ""), flush=True)
+          + (f", alpha={args.alpha}" if args.map.startswith("rollout") else ""),
+          flush=True)
     prog = IV.Progress(out / "progress" / f"scan{args.shard:02d}.json", len(cases),
                        f"scan{args.shard}", args.log_every)
 
@@ -801,6 +889,23 @@ def main():
     p.add_argument("--grad-checkpointing", action="store_true",
                    help="--map grad only; trades ~30%% compute for much less activation "
                         "memory. Not needed at 80 GB.")
+    # --map glimpse only. Every default is saliency_viz.py's, so a column in this scan
+    # and a drawn panel are the same object; see docs/saliency-maps.md section 6 and
+    # `glimpse_layer_alphas` for why 0.36 is the other candidate depth temperature.
+    p.add_argument("--glimpse-temp", type=float, default=0.5,
+                   help="lambda, head-fusion temperature (eq 6)")
+    p.add_argument("--glimpse-depth-temp", type=float, default=0.2,
+                   help="lambda_d, depth prior temperature (eq 9)")
+    p.add_argument("--glimpse-layer-frac", type=float, default=1.0,
+                   help="propagate the last frac of the stack; the paper's ablation "
+                        "loses nothing at 0.6, and here it is the one dial that buys "
+                        "back wall clock -- it cuts the per-token eager replay")
+    p.add_argument("--glimpse-target", default="logit",
+                   choices=["clogit", "logit", "logprob"],
+                   help="z_t in eqs 5 and 16; the paper's is the raw logit")
+    p.add_argument("--glimpse-token-weight", default="full",
+                   choices=["full", "confidence", "prompt", "uniform"],
+                   help="eq 18, and the paper's token-saliency ablation")
     p.add_argument("--no-tf32", dest="tf32", action="store_false",
                    help="exact fp32 for the rollout matmul; several times slower")
     p.add_argument("--device", default="cuda:0")
