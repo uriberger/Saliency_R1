@@ -522,8 +522,27 @@ def do_build(args):
                              f"VAL_OVERSAMPLE (currently {C.VAL_OVERSAMPLE}).")
         B.save_rows(name, rows, out_dir)
 
+    link_val_dir(out_dir)
     print(f"\nNow verify what was actually written:")
     print(f"  python build_set_d.py --verify --out-dir {out_dir}")
+
+
+def link_val_dir(out_dir):
+    """OUT_DIR/val_d/{val_natural,val_nonnatural} -> the val_d_* sets.
+
+    The launcher's --val-sets-dir looks for those two names, so each corpus needs its
+    own directory of aliases. Same shape as val_c/.
+    """
+    out_dir = Path(out_dir)
+    link_dir = out_dir / "val_d"
+    link_dir.mkdir(exist_ok=True)
+    for alias, target in (("val_natural", "val_d_natural"),
+                          ("val_nonnatural", "val_d_nonnatural")):
+        link = link_dir / alias
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(Path("..") / target)
+    print(f"\nvalidation aliases: {link_dir}/{{val_natural,val_nonnatural}}")
 
 
 def do_verify(args):
