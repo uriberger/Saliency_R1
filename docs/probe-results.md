@@ -8,7 +8,8 @@ boxes, the same 1,157 prepared cases in `outputs/intervene_probe/coldstart_setA_
 Read 1 and 2 together. The first is a *layer-level* null; the second shows why that
 null does not license the conclusion the plan drew from it. 3 replaces the direct
 attention map with three indirect ones and is the first place a signal survives
-correction.
+correction. 6 scores a fourth, GLIMPSE, and is the first map here that is grounded at
+all — which turns out not to be the good news it sounds like.
 
 ---
 
@@ -524,6 +525,97 @@ propagates into text positions more readily than content from equal-area backgro
 interesting in itself, and something no correlational measure here would have shown. But
 it biases `box − roll` **in box's favour**, and box − roll is still ~+0.01 nats with no
 behavioural effect. The bias works against the null and the null holds anyway.
+
+---
+
+## 6. GLIMPSE (2026-08-12) — the map is finally grounded, and it predicts being wrong
+
+`flow_correlation_probe.py --map glimpse` over the same 1,157 completions / 3,471
+observe steps and the same DINO unions, so every number below is directly comparable
+with results 2 and 3. Output in `outputs/flow_corr/glimpse_screen/glimpse`. 0 cases
+dropped, no OOM.
+
+Run as a **screen for a reward that does not exist yet**: the GLIMPSE grounding reward
+brief proposes `mean_in_v2`, and `auroc` was added as a second variant. This scan
+already computes both, at step and completion level, so one run ranks the two variants
+against each other and against chance before either is trained.
+
+Cost, since it is the one map here that is not cheap: 10.1 s per case, 0.198 s per
+target token, 62,159 target tokens — **~27 min on 8 GPUs**, against under 10 minutes
+for all three of result 3's variants combined. GLIMPSE pays one backward plus a
+per-layer eager replay per *target token*, where `grad` amortises one backward over a
+whole step.
+
+### The level: the strongest grounding ever measured here
+
+| map | `auroc` level |
+|---|---|
+| direct, the rewarded heads L22H28 / L22H31 | 0.410 / 0.392 |
+| `rollout_wnorm`, L0 → L35 | 0.490 → 0.430 |
+| `grad`, best column (`gxi_ds`) | 0.574 |
+| **`glimpse`** | **0.567** |
+| **`glimpse`, union ≤ 0.5** | **0.626** |
+
+Every result-3 map put *less* weight on the objects a step names than on the rest of the
+image. GLIMPSE does not. It is the second map to clear chance and the first to clear it
+by a margin, and on the half of steps whose union still localises anything it reaches
+0.626. The union curve is monotone over all ten deciles:
+
+| mean union | 0.11 | 0.26 | 0.37 | 0.45 | 0.51 | 0.56 | 0.62 | 0.69 | 0.77 | 0.89 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `glimpse` | 0.712 | 0.647 | 0.591 | 0.579 | 0.574 | 0.558 | 0.526 | 0.516 | 0.505 | 0.471 |
+
+`r(union) = −0.487` over steps, close to `gxi_ds`'s −0.50 and unlike `rollout_wnorm`'s
+−0.28 — GLIMPSE inherits the gradient map's union dependence, which is what a
+gradient-weighted map should do.
+
+### The correlation: negative, and it survives correction
+
+Union ≤ 0.5 (1,534 steps, 807 completions; Bonferroni |r| ≥ 0.0881):
+
+| metric | setup | r(all) | r(held out) | r(partial) | level |
+|---|---|---|---|---|---|
+| `auroc` | step | **−0.1120** | −0.1257 | −0.1067 | 0.6259 |
+| `auroc` | completion | **−0.1003** | −0.1209 | −0.1011 | 0.6232 |
+| `mean_in_v2` | step | −0.0532 | −0.0490 | −0.0550 | 1.5574 |
+| `mean_in_v2` | completion | −0.0365 | −0.0118 | −0.0532 | 1.5551 |
+
+Both `auroc` rows clear the threshold and survive the held-out half and partialling out
+union area, step count and the map's own mass. Uncapped, nothing clears (best is `auroc`
+at completion level, −0.0644 against a 0.0735 threshold), so the cap is doing work — but
+it is result 3's threshold, argued from unions above ~0.5 having stopped localising the
+thing the step names, not a value fitted here.
+
+**So the better GLIMPSE says the model looked at the object it just named, the less
+likely the answer is right.** The sign replicates `grad`'s `gxi` (−0.098 raw, −0.124
+partialled) and now matches its magnitude — and unlike `gxi`, it clears correction.
+Two independent gradient-based map families, same sign, same size.
+
+### What this settles about the two reward variants
+
+**`auroc` is the variant with a real result, and the result is negative.** It is the
+only column in this scan with a multiplicity-corrected association with correctness, and
+that association runs the wrong way. Training to maximise it is training toward what
+goes with being wrong. This is a *stronger* negative than the gradient reward ever
+produced, whose −0.098 never cleared result 3's threshold.
+
+**`mean_in_v2` is a null** — |r| between 0.01 and 0.06, clearing nothing at either cap.
+Its level reads high (1.275 uncapped, 1.557 capped) but that *rise* on capping is the
+mechanical ceiling: `mean_in_v2` is bounded by `n_patches / n_in`, so restricting to
+small unions inflates it. Its level is not evidence of grounding the way `auroc`'s is,
+and the offline `r +0.38` with box-area fraction says the same thing from the other side.
+
+Two limits on how hard to read this. **r = −0.11 is a reliable sign, not a large
+effect** — about 1% of variance. And this is correlational on the frozen cold-start
+policy: it says nothing about what training on it does, which is a separate question
+that results 1, 4 and 5 answer in the negative for the direct path. The map's own bf16
+rounding noise (0.063–0.089, docs/glimpse-handoff.md) attenuates rather than inflates,
+so the true |r| is if anything slightly larger.
+
+**What GLIMPSE is good for is the level, not the reward.** 0.626 is the first real
+grounding measurement in this line of work; it makes GLIMPSE the right map for
+diagnostic use — per-step LOC, `ov_share` — even though it is the wrong thing to hand a
+policy to maximise.
 
 ---
 

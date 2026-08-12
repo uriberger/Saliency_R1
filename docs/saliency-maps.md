@@ -312,6 +312,27 @@ no mask is bidirectional, and sdpa is entitled to hand the layer no mask at all,
 reproduce the forward's own output, or a dropped kwarg would give a plausible map built
 on the wrong tensor.
 
+### What it measures, on the same cases as maps 2–5
+
+Scored 2026-08-12 by `flow_correlation_probe.py --map glimpse` over the standard 1,157
+cold-start cases — probe-results.md result 6 has the full tables, and this is the part
+that decides what the map is for.
+
+**Level `auroc` 0.567, and 0.626 on unions ≤ 0.5.** The only map here that is grounded by
+a margin: maps 2–3 sit *below* chance at every layer (0.490 → 0.430) and the rewarded
+direct heads at 0.410/0.392, while map 5's best column reaches 0.574. `r(union) = −0.487`,
+i.e. it inherits map 5's union dependence rather than map 3's.
+
+**And it correlates NEGATIVELY with correctness**: on unions ≤ 0.5, `auroc` runs −0.112
+per step and −0.100 per completion, surviving both the held-out half and partialling out
+union area, step count and mass — the only column in that scan to clear Bonferroni. Same
+sign as map 5's `gxi` (−0.098) and now the same magnitude. `mean_in_v2` is a null there
+(|r| ≤ 0.06); its higher level is the `n_patches / n_in` ceiling, not grounding.
+
+So a GLIMPSE-based **reward** would be paying for the thing that goes with being wrong,
+under either metric — the good level is what makes this map worth using as a
+**diagnostic** (per-step LOC, `ov_share`), not what makes it a training signal.
+
 ---
 
 ## 7. The intervention edit
