@@ -634,7 +634,7 @@ class GlimpseGradCache:
 
 
 def glimpse_map(model, processor, inputs, ids, prompt_len, steps, gh, gw, question,
-                args, device):
+                args, device, *, collect=None):
     """-> ([n_steps, gh, gw] float32, the settings that produced it).
 
     One sdpa forward, then per target token one backward for the layer gradients and one
@@ -645,6 +645,13 @@ def glimpse_map(model, processor, inputs, ids, prompt_len, steps, gh, gw, questi
     Per token this costs one backward plus one layer-forward per layer -- roughly one
     extra full forward -- where an all-eager graph would cost one backward and tens of GiB.
     See GlimpseGradCache for the measurements.
+
+    `collect`, if given, receives one `(step_index, beta_weight, [gh, gw] map)` per TARGET
+    TOKEN -- the terms of eq 22 before they are summed. Purely additive: the returned map
+    is unchanged and the default costs nothing. It exists because the aggregation is a
+    weighted MEAN over the step's tokens, so how much a subsample of them moves the score
+    is an empirical question, and answering it needs the terms rather than the sum
+    (glimpse_token_cap_probe.py).
     """
     img_cols = (inputs["input_ids"][0] == IMAGE_TOKEN_ID).nonzero(as_tuple=True)[0]
     if img_cols.numel() != gh * gw:
@@ -701,6 +708,10 @@ def glimpse_map(model, processor, inputs, ids, prompt_len, steps, gh, gw, questi
                     v = glimpse_propagate(rows[k], mats, alphas)
                     w = glimpse_token_weight(conf[k], v[prompt_idx].mean(),
                                              args.glimpse_token_weight)
+                    if collect is not None:
+                        collect.append((si, float(w),
+                                        v[img_cols].detach().float().cpu().numpy()
+                                        .reshape(gh, gw)))
                     acc += w * v[img_cols]
                     plain += v[img_cols]
                     wsum += w
