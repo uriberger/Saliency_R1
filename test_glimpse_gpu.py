@@ -5,11 +5,23 @@
 
 Two parts, each of which can fail the run:
 
-  equivalence  the grad-cache map against the all-eager baseline commit, on real samples.
-               The two are the same quantity by the chain rule but not the same floating
-               point path -- the baseline runs the whole stack in eager, this runs it in
-               sdpa and replays one layer at a time -- so the gate is correlation, not
-               equality. Anything below --min-corr is a real disagreement, not noise.
+  equivalence  the grad-cache map against the all-eager baseline commit, on real samples,
+               IN FP32. The two are the same quantity by the chain rule but not the same
+               floating-point path -- the baseline runs the whole stack in eager, this
+               runs it in sdpa and replays one layer at a time -- so they agree only up
+               to rounding, and the dtype decides whether that gate means anything.
+
+               Measured on an H100, both paths against their own fp32 result: bf16 costs
+               this map 0.063-0.089 max relative deviation. That is its intrinsic noise,
+               and it is LARGER than the 0.017-0.071 between the two implementations --
+               so in bf16 the baseline fails this check against itself, and the reading
+               moved 0.071 -> 0.027 between two processes on one sample while being
+               bit-deterministic inside each. A bf16 gate measures cuBLAS reduction
+               order, not correctness.
+
+               In fp32 the two agree to 1.3e-06 (corr 1.000000), which is what makes a
+               tight --max-dev meaningful. TF32 must stay off with it: it would restore a
+               10-bit mantissa in every matmul, roughly bf16, and undo this.
 
   scaling      peak allocated as a function of sequence length, against the baseline's
                measured curve. The point of the rework is that this stops growing with
@@ -113,49 +125,74 @@ def test_equivalence(args, device):
     rows = PROBE.load_samples(args.dataset, args.n_samples, args.seed,
                               cache_tag="_glimpsegpu", split="all")
 
-    worst_corr, worst_dev = 1.0, 0.0
+    # The chain is generated at the model's native dtype, before any cast, so the tokens
+    # compared are the ones production actually produces. Only the map computation runs
+    # in fp32 -- both implementations get byte-identical ids either way.
+    prepared = []
     for i, row in enumerate(rows[: args.n_samples]):
         inputs, prompt_len, comp_ids = IV.greedy_chain(
             processor, model, row["image"], row["question"], args.max_new_tokens, device)
-        ids = torch.tensor([inputs["input_ids"][0].tolist() + list(comp_ids)],
-                           device=device)
-        gh = int(inputs["image_grid_thw"][0, 1].item()) // 2
-        gw = int(inputs["image_grid_thw"][0, 2].item()) // 2
         steps = synthetic_steps(len(comp_ids), args.n_steps, args.step_tokens)
         if not steps:
             print(f"  sample {i}: chain too short ({len(comp_ids)} tokens), skipped")
             continue
+        prepared.append((i, row, inputs, prompt_len, comp_ids, steps))
 
-        n = ids.shape[1]
-        new, new_peak = run_one(SV, model, processor, inputs, ids, prompt_len, steps,
-                                gh, gw, row["question"], args, device)
-        old, old_peak = run_one(base, model, processor, inputs, ids, prompt_len, steps,
-                                gh, gw, row["question"], args, device)
-        if new is None:
-            check(f"sample {i}: the grad cache fits", False, f"OOM at N={n}")
-            continue
-        if old is None:
-            print(f"  sample {i}: N={n}, baseline OOM ({old_peak:.1f} GiB), "
-                  f"grad cache {new_peak:.1f} GiB -- nothing to compare")
-            continue
+    tf32_was = torch.backends.cuda.matmul.allow_tf32
+    if args.equiv_dtype == "float32":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        model.float()
+        torch.cuda.empty_cache()
+    print(f"  comparing in {next(model.parameters()).dtype}, "
+          f"tf32 {torch.backends.cuda.matmul.allow_tf32}")
 
-        corr_i, dev_i = 1.0, 0.0
-        for si in range(len(steps)):
-            a, b = new[si].ravel(), old[si].ravel()
-            corr = float(np.corrcoef(a, b)[0, 1]) if a.std() and b.std() else 1.0
-            dev = float(np.abs(a - b).max() / max(np.abs(b).max(), 1e-12))
-            corr_i, dev_i = min(corr_i, corr), max(dev_i, dev)
-        worst_corr, worst_dev = min(worst_corr, corr_i), max(worst_dev, dev_i)
-        print(f"  sample {i}: N={n}, {len(steps)} step(s), grid {gh}x{gw} | "
-              f"peak {new_peak:.1f} vs {old_peak:.1f} GiB "
-              f"({old_peak / max(new_peak, 1e-9):.1f}x) | corr {corr_i:.5f} "
-              f"| max dev {dev_i:.3g}")
-        check(f"sample {i}: the grad cache costs less than the all-eager graph",
-              new_peak < old_peak, f"{new_peak:.1f} vs {old_peak:.1f} GiB")
+    worst_corr, worst_dev = 1.0, 0.0
+    try:
+        for i, row, inputs, prompt_len, comp_ids, steps in prepared:
+            ids = torch.tensor([inputs["input_ids"][0].tolist() + list(comp_ids)],
+                               device=device)
+            gh = int(inputs["image_grid_thw"][0, 1].item()) // 2
+            gw = int(inputs["image_grid_thw"][0, 2].item()) // 2
+
+            n = ids.shape[1]
+            new, new_peak = run_one(SV, model, processor, inputs, ids, prompt_len, steps,
+                                    gh, gw, row["question"], args, device)
+            old, old_peak = run_one(base, model, processor, inputs, ids, prompt_len,
+                                    steps, gh, gw, row["question"], args, device)
+            if new is None:
+                check(f"sample {i}: the grad cache fits", False, f"OOM at N={n}")
+                continue
+            if old is None:
+                print(f"  sample {i}: N={n}, baseline OOM ({old_peak:.1f} GiB), "
+                      f"grad cache {new_peak:.1f} GiB -- nothing to compare")
+                continue
+
+            corr_i, dev_i = 1.0, 0.0
+            for si in range(len(steps)):
+                a, b = new[si].ravel(), old[si].ravel()
+                corr = float(np.corrcoef(a, b)[0, 1]) if a.std() and b.std() else 1.0
+                dev = float(np.abs(a - b).max() / max(np.abs(b).max(), 1e-12))
+                corr_i, dev_i = min(corr_i, corr), max(dev_i, dev)
+            worst_corr, worst_dev = min(worst_corr, corr_i), max(worst_dev, dev_i)
+            print(f"  sample {i}: N={n}, {len(steps)} step(s), grid {gh}x{gw} | "
+                  f"peak {new_peak:.1f} vs {old_peak:.1f} GiB "
+                  f"({old_peak / max(new_peak, 1e-9):.1f}x) | corr {corr_i:.7f} "
+                  f"| max dev {dev_i:.3g}")
+            # The peaks are printed, not asserted. These samples are short (N ~ 400) and
+            # the equivalence half runs in fp32, so the peak is ~32 GiB of weights plus a
+            # graph too small to matter: the two paths land within 0.3 GiB of each other
+            # and the ordering flips on allocator noise. The memory claim is the scaling
+            # half's to make, at the N where the graph actually dominates.
+    finally:
+        # Scaling is a bf16 measurement against a bf16 baseline curve, so put the model
+        # and tf32 back the way they were before handing it over.
+        model.to(torch.bfloat16)
+        torch.backends.cuda.matmul.allow_tf32 = tf32_was
+        torch.cuda.empty_cache()
 
     check("every step correlates with the baseline map",
-          worst_corr >= args.min_corr, f"worst r = {worst_corr:.5f}")
-    check("no step deviates beyond bf16 noise",
+          worst_corr >= args.min_corr, f"worst r = {worst_corr:.7f}")
+    check("no step deviates beyond rounding",
           worst_dev <= args.max_dev, f"worst relative deviation = {worst_dev:.3g}")
     return processor, model
 
@@ -225,8 +262,15 @@ def main():
     p.add_argument("--n-steps", type=int, default=2)
     p.add_argument("--step-tokens", type=int, default=4)
     p.add_argument("--scale", type=int, nargs="*", default=[1600, 2400, 3600, 4800])
-    p.add_argument("--min-corr", type=float, default=0.99)
-    p.add_argument("--max-dev", type=float, default=0.05)
+    p.add_argument("--equiv-dtype", choices=["float32", "bfloat16"], default="float32",
+                   help="dtype for the equivalence half. fp32 (default) is where the "
+                        "two paths agree to ~1e-6 and a tight threshold means something; "
+                        "bfloat16 reproduces the old behaviour, where this map's own "
+                        "rounding noise (0.063-0.089) swamps the comparison.")
+    # Resolved below against --equiv-dtype: the thresholds that are meaningful in fp32
+    # are unreachable in bf16 by ANY implementation, the baseline included.
+    p.add_argument("--min-corr", type=float, default=None)
+    p.add_argument("--max-dev", type=float, default=None)
     p.add_argument("--glimpse-temp", type=float, default=0.5)
     p.add_argument("--glimpse-depth-temp", type=float, default=0.2)
     p.add_argument("--glimpse-layer-frac", type=float, default=1.0)
@@ -235,7 +279,18 @@ def main():
     p.add_argument("--skip-scaling", action="store_true")
     args = p.parse_args()
 
+    # fp32: measured agreement is corr 1.000000 / dev 1.3e-06, so these sit ~1000x above
+    # the noise and still catch anything real. bf16: measured intrinsic noise reaches
+    # 0.089, so 0.15 is the loosest useful bound rather than a meaningful one -- which is
+    # the reason fp32 is the default.
+    if args.min_corr is None:
+        args.min_corr = 0.9999 if args.equiv_dtype == "float32" else 0.99
+    if args.max_dev is None:
+        args.max_dev = 1e-3 if args.equiv_dtype == "float32" else 0.15
+
     device = args.device
+    # Scaling only. test_equivalence turns this off for its fp32 comparison and restores
+    # it, because TF32 would put a ~bf16 mantissa back into every matmul.
     torch.backends.cuda.matmul.allow_tf32 = True
     try:
         _processor, model = test_equivalence(args, device)
