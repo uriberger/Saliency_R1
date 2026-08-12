@@ -394,21 +394,32 @@ fi
 # 0.033 or 0.11 across would apply an unknown multiple of the intended pressure. Measure
 # it first and pass --w-overlap explicitly:
 #
-#   python overlap_probe.py --map grad --score logratio --n-samples 40 ...
-#   python overlap_metric_spread.py --field logratio_raw <that run's out-dir>
+#   bash launch_overlap_probe.sh --n-samples 40 --no-judge \
+#       --out-dir outputs/overlap_probe/grad_spread --map grad --score logratio
+#   python overlap_metric_spread.py outputs/overlap_probe/grad_spread
 #
-# then set --w-overlap so that w * sd matches the incumbent's (mean_in's 0.4 x 0.0086
-# ~ 0.0035). The mass floor does not apply -- it is an attention-mass gate, and the
-# gradient reward's analogous magnitude is logged as grad/n_image instead.
+# then take the `logratio` row's sd/sample and set --w-overlap = 0.4 x 0.0086 / sd, which
+# is mean_in's wov0.4 pressure (0.0035). The 0.0086 is the ATTENTION map's own
+# sd_per_sample and has to be written in by hand: do NOT read the table's own "w that
+# matches mean_in" column on a --map grad run, where every row INCLUDING mean_in is
+# computed on the gradient map, which nothing was ever trained with. That run also fixes
+# --grad-logratio-clip, and the clip has to be read off BOTH tails of logratio_raw rather
+# than p99 alone -- the metric runs negative here, so an upper-tail clip is one-sided in
+# effect and truncates the side that carries the signal. The mass floor does not apply --
+# it is an attention-mass gate, and the gradient reward's analogous magnitude is logged
+# as grad/n_image instead.
 if [[ "$REWARD_VARIANT" == "grad" ]]; then
     if [[ -z "${W_OVERLAP_SET:-}" ]]; then
         echo "ERROR: --grad needs an explicit --w-overlap." >&2
         echo "  The roll-null log-ratio's spread is not known on this corpus, so no default" >&2
         echo "  can be honest. Measure it first:" >&2
-        echo "    python overlap_probe.py --map grad --score logratio --n-samples 40 \\" >&2
-        echo "        --out-dir outputs/overlap_probe/grad_spread --dataset <set>" >&2
-        echo "    python overlap_metric_spread.py --field logratio_raw outputs/overlap_probe/grad_spread" >&2
-        echo "  then pass --w-overlap <w> with w * sd ~ 0.0035 (mean_in's wov0.4 pressure)." >&2
+        echo "    bash launch_overlap_probe.sh --n-samples 40 --no-judge \\" >&2
+        echo "        --out-dir outputs/overlap_probe/grad_spread --map grad --score logratio" >&2
+        echo "    python overlap_metric_spread.py outputs/overlap_probe/grad_spread" >&2
+        echo "  then pass --w-overlap = 0.4 * 0.0086 / sd, where sd is the LOGRATIO row's" >&2
+        echo "  sd/sample and 0.0086 is the attention map's -- not the table's own mean_in" >&2
+        echo "  column, which on a --map grad run is mean_in computed on the gradient map." >&2
+        echo "  Set --grad-logratio-clip from both tails of logratio_raw in the same run." >&2
         exit 1
     fi
     [[ -n "$MASS_FLOOR_TAU" ]] && { echo "ERROR: --mass-floor-tau does not apply to --grad." >&2; exit 1; }
