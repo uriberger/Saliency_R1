@@ -423,33 +423,22 @@ def prompt_positions(tok, question: str, prompt_ids: list[int], img_positions):
 
 
 @contextlib.contextmanager
-def eager_text_attention(model):
-    """Run the language model's attention in eager, so the softmax weights exist and are
-    IN the graph.
+def eager_one_attention(attn_mod):
+    """Run ONE attention module in eager, so its softmax weights exist and are in the graph.
 
-    The probes' usual trick -- re-running one module in eager inside a forward hook --
-    cannot be used here. That copy is a side computation the logits do not depend on, and
-    GLIMPSE needs the gradient of the logit w.r.t. the attention the forward actually
-    took. Flipping the flag on the text config covers both halves at once: it is the
-    object every Qwen3VLTextAttention dispatches on AND the one Qwen3VLTextModel hands to
-    `create_causal_mask`, which under sdpa is entitled to return no mask at all. The
-    vision tower keeps its own implementation.
+    The flag lives on the shared text config, so flipping it is global -- but only the
+    replayed layer runs inside the window, and it is handed an explicit causal mask, so
+    nothing else can observe either the flag or the mask. This is the same trick
+    `overlap_probe.capture_layer_attention` uses to read one layer's attention out of an
+    otherwise-sdpa forward; maps 1-3 have been built on it all along.
     """
-    cfgs, prev = [], []
-    for m in model.modules():
-        if type(m).__name__ == "Qwen3VLTextAttention":
-            if not any(m.config is c for c in cfgs):
-                cfgs.append(m.config)
-                prev.append(m.config._attn_implementation)
-    if not cfgs:
-        raise RuntimeError("no Qwen3VLTextAttention modules found")
+    cfg = attn_mod.config
+    prev = cfg._attn_implementation
     try:
-        for c in cfgs:
-            c._attn_implementation = "eager"
+        cfg._attn_implementation = "eager"
         yield
     finally:
-        for c, p in zip(cfgs, prev):
-            c._attn_implementation = p
+        cfg._attn_implementation = prev
 
 
 @contextlib.contextmanager
@@ -467,47 +456,64 @@ def checkpointing_off(model):
                 gradient_checkpointing_kwargs={"use_reentrant": False})
 
 
-class GlimpseCapture:
-    """Keeps each layer's attention in the graph and turns its gradient into `E` the
-    moment the backward produces it.
+class GlimpseGradCache:
+    """One sdpa forward, then `dz/dA` for one layer at a time.
 
-    Two hooks per pass. A forward hook holds `attn_weights` -- the tensor the attention
-    module returns and the o_proj matmul consumed, so its gradient is the `g^h` of eq 5 --
-    and attaches a tensor hook to it; the tensor hook fires during the backward, in
-    reverse layer order, folds `[H, N, N]` down to one `[N, N]` and lets the gradient go.
-    Holding all 36 layers' gradients to fold afterwards would cost another 5-10 GB per
-    token, on top of a graph that is already the biggest thing on the card.
+    Holding every layer's `[H, N, N]` attention in the graph at once -- what an all-eager
+    forward does -- costs ~9 KB of GPU memory per (query, key) pair across the 36 layers.
+    Measured on an A100-80GB: 26 GiB of activations at `N` = 1600, 52 GiB at 2400, OOM by
+    3600. Nothing else in this file pays that. Maps 1-3 re-run a single layer in eager
+    inside an otherwise-sdpa forward (`overlap_probe.capture_layer_attention`), and map 4
+    takes its gradient through sdpa, which never materialises `[H, N, N]` at all. Map 5 is
+    now built the same way, in two stages per target token:
 
-    A forward PRE-hook on the first propagated layer detaches its input and makes it a
-    leaf. That is what gives the backward something to be taken with respect to at all
-    (every weight is frozen), and it is what makes `--glimpse-layer-frac` save anything:
-    below the cut nothing requires grad, so those layers build no graph and their eager
-    attention is freed as it goes.
+      1. one backward on the sdpa graph gives `dz/dh_l`, the gradient w.r.t. every
+         propagated layer's OUTPUT hidden state -- `[N, d]` each, ~10 MB, not 400 MB;
+      2. layer by layer, that layer alone is re-run in eager from its own recorded input
+         and `dz/dh_l` is pushed into it, which is `dz/dA_l`. `E_l` is folded out and the
+         `[H, N, N]` freed before the next layer is touched.
+
+    `dz/dA_l = dz/dh_{l+1} . dh_{l+1}/dA_l` is the chain rule, not an approximation. The
+    layer is a function of its own input, and that input is RECORDED rather than
+    recomputed, so the deepstack features the text model adds between layers are already
+    inside the recorded value and need no special handling here.
+
+    What still scales as `N^2` is the `[N, N]` fp32 `E_l` kept per layer while the row is
+    propagated: 36 x 4 bytes per pair against the graph's ~9000, a factor of ~60.
+
+    Two hooks. A forward hook per propagated decoder layer records its input, its kwargs
+    and its output. A forward PRE-hook on the first propagated layer detaches its input
+    into a leaf -- every weight is frozen, so without it the forward would build no graph
+    and there would be nothing to differentiate.
     """
 
     def __init__(self, model, first_layer: int, temp: float):
         self.first_layer, self.temp = int(first_layer), float(temp)
-        self.layers, self.handles = [], []
-        self.attn, self.mats, self.g_l1 = {}, {}, {}
+        self.layers, self.handles, self.mods = [], [], {}
+        self.h_in, self.kw, self.out = {}, {}, {}
         self.leaf = None
-        self._checked = False
+        self.mask = None
+        self._reentry = False
+        self._checked = self._replay_checked = False
         cut = 0
         for m in model.modules():
-            name = type(m).__name__
-            if name == "Qwen3VLTextAttention" and getattr(m, "layer_idx", None) is not None:
-                li = int(m.layer_idx)
-                if li >= self.first_layer:
-                    self.layers.append(li)
-                    self.handles.append(m.register_forward_hook(self._keep(li)))
-            elif name == "Qwen3VLTextDecoderLayer" and \
-                    int(m.self_attn.layer_idx) == self.first_layer:
+            if type(m).__name__ != "Qwen3VLTextDecoderLayer":
+                continue
+            li = int(m.self_attn.layer_idx)
+            if li < self.first_layer:
+                continue
+            self.mods[li] = m
+            self.layers.append(li)
+            self.handles.append(
+                m.register_forward_hook(self._record(li), with_kwargs=True))
+            if li == self.first_layer:
                 self.handles.append(
                     m.register_forward_pre_hook(self._cut, with_kwargs=True))
                 cut += 1
         self.layers.sort()
         if not self.layers or cut != 1:
             self.close()
-            raise RuntimeError(f"glimpse: {len(self.layers)} attention layers at or above "
+            raise RuntimeError(f"glimpse: {len(self.layers)} decoder layers at or above "
                                f"{self.first_layer} and {cut} cut points (want 1)")
 
     def close(self):
@@ -517,20 +523,62 @@ class GlimpseCapture:
         self.release()
 
     def release(self):
-        self.attn, self.leaf = {}, None
-        self.arm()
+        self.h_in, self.kw, self.out = {}, {}, {}
+        self.leaf = self.mask = None
 
-    def arm(self):
-        """Forget the previous token's matrices, so a layer that fails to fire is loud."""
-        self.mats, self.g_l1 = {}, {}
+    def check(self):
+        """Every propagated layer must have recorded a forward, and the cut must have
+        fired -- a layer that silently failed to fire would drop out of the product."""
+        if sorted(self.out) != self.layers:
+            raise RuntimeError(f"glimpse: {len(self.out)} of {len(self.layers)} layers "
+                               "recorded a forward")
+        if self.leaf is None:
+            raise RuntimeError("glimpse: the leaf cut did not fire")
 
-    def take(self):
-        if sorted(self.mats) != self.layers:
-            raise RuntimeError(f"glimpse: {len(self.mats)} of {len(self.layers)} layers "
-                               "produced a gradient")
-        return [self.mats[li] for li in self.layers], [self.g_l1[li] for li in self.layers]
+    def layer_grads(self, scalar):
+        """-> {layer: dz/d(that layer's output)}, from ONE backward over the sdpa graph."""
+        outs = [self.out[li] for li in self.layers]
+        gs = torch.autograd.grad(scalar, outs, retain_graph=True)
+        return dict(zip(self.layers, gs))
+
+    def edge(self, li: int, g_out):
+        """Replay layer `li` in eager and turn `dz/dh` into `(E_l, ||sum_h g^h||_1)`."""
+        mod, cap = self.mods[li], {}
+
+        def grab(module, args, kwargs, output):
+            cap["a"] = output[1]
+            return None
+
+        kw = dict(self.kw[li])
+        kw.pop("hidden_states", None)
+        kw["attention_mask"] = self.mask      # eager with no mask is silently bidirectional
+        kw["past_key_values"] = None
+        kw["use_cache"] = False
+        # The recorded input is detached, so without a leaf here the replay would build no
+        # graph either -- same reason as the cut.
+        hs = self.h_in[li].detach().requires_grad_(True)
+        handle = mod.self_attn.register_forward_hook(grab, with_kwargs=True)
+        self._reentry = True                  # the replay re-enters this layer's own hook
+        try:
+            with eager_one_attention(mod.self_attn), torch.enable_grad():
+                out = mod(hs, **kw)
+                a = cap.get("a")
+                if a is None:
+                    raise RuntimeError(f"glimpse: layer {li} returned no attention weights "
+                                       "-- it did not run in eager")
+                self._check_causal(a)
+                self._check_replay(li, out)
+                (g,) = torch.autograd.grad(out, a, grad_outputs=g_out)
+        finally:
+            self._reentry = False
+            handle.remove()
+        e, g1 = glimpse_edge_matrix(a[0].detach(), g[0], self.temp)
+        del a, g, out, cap
+        return e, g1
 
     def _cut(self, module, args, kwargs):
+        if self._reentry:            # the replay brings its own leaf; leave it alone
+            return None
         hs = args[0] if args else kwargs["hidden_states"]
         leaf = hs.detach().requires_grad_(True)
         self.leaf = leaf
@@ -540,18 +588,14 @@ class GlimpseCapture:
         kw["hidden_states"] = leaf
         return args, kw
 
-    def _keep(self, li: int):
-        def hook(module, args, output):
-            aw = output[1]
-            if aw is None:
-                raise RuntimeError("glimpse: the forward returned no attention weights -- "
-                                   "it did not run in eager")
-            if not aw.requires_grad:
-                raise RuntimeError(f"glimpse: layer {li}'s attention is outside the graph "
-                                   "-- the leaf cut did not take")
-            self._check_causal(aw)
-            self.attn[li] = aw
-            aw.register_hook(self._fold(li))
+    def _record(self, li: int):
+        def hook(module, args, kwargs, output):
+            if self._reentry:
+                return None
+            hs = args[0] if args else kwargs["hidden_states"]
+            self.h_in[li] = hs.detach()
+            self.kw[li] = dict(kwargs)
+            self.out[li] = output if isinstance(output, torch.Tensor) else output[0]
             return None
         return hook
 
@@ -566,21 +610,35 @@ class GlimpseCapture:
             raise RuntimeError(f"glimpse: attention is not causal (row 0 puts {leak:.3g} "
                                "outside column 0) -- the causal mask did not reach eager")
 
-    def _fold(self, li: int):
-        def hook(grad):
-            e, g1 = glimpse_edge_matrix(self.attn[li][0], grad[0], self.temp)
-            self.mats[li], self.g_l1[li] = e, g1
-            return None                       # the gradient itself is left alone
-        return hook
+    def _check_replay(self, li: int, out):
+        """The replay must reproduce the layer's own output. A dropped kwarg or a wrong
+        mask would otherwise yield a plausible map built on the wrong tensor. The tolerance
+        is loose on purpose: eager and sdpa differ in the last bf16 bits, a replay mistake
+        differs by order 1."""
+        if self._replay_checked:
+            return
+        self._replay_checked = True
+        ref = self.out[li].detach().float()
+        rel = float((out.detach().float() - ref).abs().max()) / max(float(ref.abs().max()),
+                                                                    1e-6)
+        if rel > 0.05:
+            raise RuntimeError(f"glimpse: the eager replay of layer {li} differs from the "
+                               f"forward by {rel:.3g} relative -- the recorded kwargs or "
+                               "the causal mask are wrong")
 
 
 def glimpse_map(model, processor, inputs, ids, prompt_len, steps, gh, gw, question,
                 args, device):
     """-> ([n_steps, gh, gw] float32, the settings that produced it).
 
-    One forward, then one backward per step token: the relevance matrix of eqs 11-13 is
-    built from `d z_t / d A`, which is a different backward for every target token. The
-    graph is retained across the whole sample, so the forward is paid once.
+    One sdpa forward, then per target token one backward for the layer gradients and one
+    eager replay per propagated layer. The relevance matrix of eqs 11-13 is built from
+    `d z_t / d A`, which is a different backward for every target token; the forward and
+    its graph are retained across the whole sample, so the forward is paid once.
+
+    Per token this costs one backward plus one layer-forward per layer -- roughly one
+    extra full forward -- where an all-eager graph would cost one backward and tens of GiB.
+    See GlimpseGradCache for the measurements.
     """
     img_cols = (inputs["input_ids"][0] == IMAGE_TOKEN_ID).nonzero(as_tuple=True)[0]
     if img_cols.numel() != gh * gw:
@@ -603,13 +661,17 @@ def glimpse_map(model, processor, inputs, ids, prompt_len, steps, gh, gw, questi
 
     out = np.zeros((len(steps), gh, gw), dtype=np.float32)
     fell_back = []
-    cap = GlimpseCapture(model, first, args.glimpse_temp)
+    cap = GlimpseGradCache(model, first, args.glimpse_temp)
     try:
-        with checkpointing_off(model), eager_text_attention(model), torch.enable_grad():
+        with checkpointing_off(model), torch.enable_grad():
             res = model(**FC.build_forward(inputs, ids, prompt_len), use_cache=False,
                         logits_to_keep=rows_t)
             z = res.logits[0].float()
             del res
+            cap.check()
+            # The forward ran under sdpa, which is entitled to build no mask at all; the
+            # eager replay needs an explicit one or it would attend bidirectionally.
+            cap.mask = IV.causal_mask(ids.shape[1], next(model.parameters()).dtype, device)
             # `_row_scalars` is the reward's own definition of the per-token scalar, so
             # `--glimpse-target` means here exactly what `--grad_target` means there.
             f = GM._row_scalars(z, targets, args.glimpse_target)
@@ -621,9 +683,14 @@ def glimpse_map(model, processor, inputs, ids, prompt_len, steps, gh, gw, questi
                 plain = torch.zeros_like(acc)
                 wsum = torch.zeros((), dtype=torch.float32, device=device)
                 for _ in range(b - a):
-                    cap.arm()
-                    torch.autograd.grad(f[k], cap.leaf, retain_graph=True)
-                    mats, g_l1 = cap.take()
+                    g_out = cap.layer_grads(f[k])
+                    mats, g_l1 = [], []
+                    for li in cap.layers:
+                        # pop, so each [N, d] gradient dies as its layer is consumed
+                        e, g1 = cap.edge(li, g_out.pop(li))
+                        mats.append(e)
+                        g_l1.append(g1)
+                    del g_out
                     alphas = glimpse_layer_alphas(g_l1, cap.layers, args.glimpse_depth_temp)
                     v = glimpse_propagate(rows[k], mats, alphas)
                     w = glimpse_token_weight(conf[k], v[prompt_idx].mean(),
@@ -987,6 +1054,8 @@ def main():
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--device", default="cuda:0")
+    # glimpse replays one layer at a time in eager on top of this; `--attn-impl eager`
+    # would put all 36 layers' [H, N, N] back in the graph and undo that.
     p.add_argument("--attn-impl", default="sdpa")
     p.add_argument("--max-new-tokens", type=int, default=1024)
     p.add_argument("--max-steps", type=int, default=0,
@@ -1010,7 +1079,8 @@ def main():
                    help="lambda_d, depth prior temperature (eq 9)")
     p.add_argument("--glimpse-layer-frac", type=float, default=1.0,
                    help="propagate the last frac of the stack; the paper's ablation loses "
-                        "nothing at 0.6 and it is the memory knob")
+                        "nothing at 0.6. A method knob, not a memory knob -- peak memory "
+                        "no longer scales with the number of propagated layers")
     p.add_argument("--glimpse-target", default="logit", choices=list(GM.GRAD_TARGETS),
                    help="z_t in eqs 5 and 16; the paper's is the raw logit")
     p.add_argument("--glimpse-token-weight", default="full",

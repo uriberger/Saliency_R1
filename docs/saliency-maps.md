@@ -250,10 +250,46 @@ The relevance-flow redistribution (eqs 20–21, `λ_f`) is not implemented: §3.
 from the holistic map, and it exists to colour text, not to move a heatmap.
 
 Only the target token's row of `R` is ever read, and `v ↦ v(2I + αE)` is linear, so the
-row is carried through the product as a vector — `O(L·N²)` instead of `O(L·N³)`. The cost
-that is left is one backward per step token, with all layers' attention retained in the
-graph; `--glimpse-layer-frac` cuts the graph below the first propagated layer (the
-paper's ablation loses nothing at 0.6) and is the memory knob.
+row is carried through the product as a vector — `O(L·N²)` instead of `O(L·N³)`.
+
+### Why the forward is sdpa and the layers are replayed
+
+`E^l` needs both `A^l` and `∂z/∂A^l`, and the obvious way to get them — run the whole
+stack in eager so every `A^l` is in the graph — does not fit. HF's eager attention saves
+an fp32 softmax output *and* the bf16 copy the `A·V` matmul consumed, so across 36 layers
+and 32 heads it costs ≈ **9 KB of GPU memory per (query, key) pair**. Measured on an
+A100-80GB, peak allocated including the 16.3 GiB of weights:
+
+| `N` | all-eager graph | with `--glimpse-layer-frac 0.6` |
+|---|---|---|
+| 1200 | 32.5 GiB | — |
+| 1600 | 42.3 | 32.6 |
+| 2400 | 68.6 | 49.1 |
+| 3600 | **OOM** | — |
+
+`N` is the whole teacher-forced sequence, so with `--max-new-tokens 1024` a long chain
+crosses 2000 on its own and the map dies on samples the other four handle.
+
+So map 5 is built the way maps 1–3 already are: an **sdpa** forward, then one layer at a
+time re-run in eager. Per target token,
+
+1. one backward on the sdpa graph yields `∂z/∂h^l` for every propagated layer — `[N, d]`
+   each, ~10 MB, no `N²` term;
+2. each layer is replayed in eager from its own **recorded** input and `∂z/∂h^l` is pushed
+   into it, giving `∂z/∂A^l` by the chain rule — exact, not an approximation. Recording
+   the input rather than recomputing it is also what makes the deepstack additions the
+   text model performs *between* layers a non-issue.
+
+Peak drops ~60×: what is left scaling as `N²` is the `[N, N]` fp32 `E^l` held per layer
+during the propagation, 36 × 4 bytes per pair against the graph's ~9000. The price is
+compute — about one extra forward per target token. `--glimpse-layer-frac` (the paper's
+ablation loses nothing at 0.6) is therefore a **method** knob now, not a memory knob.
+
+Two guards, because both failure modes are silent. `_check_causal`: eager attention with
+no mask is bidirectional, and sdpa is entitled to hand the layer no mask at all, so query
+0 is asserted to put all its weight on key 0. `_check_replay`: the replayed layer must
+reproduce the forward's own output, or a dropped kwarg would give a plausible map built
+on the wrong tensor.
 
 ---
 

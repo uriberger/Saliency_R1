@@ -219,15 +219,23 @@ class ToyStack(torch.nn.Module):
                 p.copy_(torch.randn(p.shape, generator=gen) * 0.3)
             p.requires_grad_(False)
 
-    def forward(self, h):
+    def layer(self, i, h):
+        """One layer, exactly as `forward` runs it -> (output hidden states, its `A`).
+
+        Split out so the grad-cache test can replay a layer on its own, which is what
+        `GlimpseGradCache.edge` does to the real decoder layer.
+        """
         n = h.shape[0]
         mask = torch.full((n, n), float("-inf")).triu(1)
+        a = torch.softmax(self.q[i](h) @ self.k[i](h).T + mask, dim=-1)   # [N, N], causal
+        return h + a @ self.v[i](h), a
+
+    def forward(self, h):
         attns = []
-        for q, k, v in zip(self.q, self.k, self.v):
-            a = torch.softmax(q(h) @ k(h).T + mask, dim=-1)      # [N, N], causal
+        for i in range(len(self.q)):
+            h, a = self.layer(i, h)
             a.retain_grad()
             attns.append(a)
-            h = h + a @ v(h)
         return self.head(h), attns
 
 
@@ -334,9 +342,52 @@ def test_prompt_positions():
           how3 == "prompt_minus_image" and pos3 == [0, 1, 6, 7, 8, 9, 10], f"{how3}")
 
 
+def test_grad_cache_identity():
+    """The rework's whole claim: `dz/dA_l` can be had one layer at a time.
+
+    `glimpse_map` no longer runs the stack in eager to hold every `A` in one graph -- that
+    costs ~9 KB per (query, key) pair across 36 layers and OOMs a long sequence. It takes
+    `dz/dh_l` for every layer from ONE backward, then replays each layer alone and pushes
+    `dz/dh_l` into it. That is the chain rule, so it must reproduce what a single
+    all-in-one backward gives, exactly rather than approximately -- and this test is the
+    only place that claim is checked without a GPU.
+    """
+    print("\n[grad cache] dz/dA one layer at a time")
+    gen = torch.Generator().manual_seed(23)
+    n, dim, n_l = 9, 6, 4
+    net = ToyStack(n_l, dim, gen)
+    h0 = (torch.randn(n, dim, generator=gen) * 0.5).requires_grad_(True)
+    row, col = 6, 3
+
+    # reference: the whole stack in one graph, one backward
+    logits, attns = net(h0)
+    torch.autograd.grad(logits[row, col], h0, retain_graph=True)
+    ref = [a.grad.clone() for a in attns]
+
+    # grad cache: record each layer's input and output, one backward for dz/dh, then
+    # replay each layer from its own recorded input
+    h_in, h_out, h = [], [], h0
+    for i in range(n_l):
+        h_in.append(h)
+        h, _ = net.layer(i, h)
+        h_out.append(h)
+    g_out = torch.autograd.grad(net.head(h)[row, col], h_out, retain_graph=True)
+
+    got = []
+    for i in range(n_l):
+        out, a = net.layer(i, h_in[i].detach().requires_grad_(True))
+        got.append(torch.autograd.grad(out, a, grad_outputs=g_out[i])[0])
+
+    scale = max(float(r.abs().max()) for r in ref)
+    worst = max(float((g - r).abs().max()) for g, r in zip(got, ref))
+    check("the replayed gradient reproduces the all-in-one backward",
+          worst / scale < 1e-6, f"worst |diff| {worst:.3e}, scale {scale:.3e}")
+    check("...and the gradient it reproduces is not trivially zero", scale > 0)
+
+
 def test_causal_guard():
     print("\n[guard] eager attention with no mask")
-    cap = SV.GlimpseCapture.__new__(SV.GlimpseCapture)
+    cap = SV.GlimpseGradCache.__new__(SV.GlimpseGradCache)
     cap._checked = False
     n = 16
     good = torch.zeros(1, 2, n, n)
@@ -353,6 +404,24 @@ def test_causal_guard():
         check("an unmasked first row raises", "not causal" in str(e))
 
 
+def test_replay_guard():
+    print("\n[guard] the replay must reproduce the forward")
+    cap = SV.GlimpseGradCache.__new__(SV.GlimpseGradCache)
+    ref = torch.randn(1, 8, 4, generator=torch.Generator().manual_seed(5))
+    cap.out = {7: ref}
+
+    cap._replay_checked = False
+    cap._check_replay(7, ref + 1e-4)          # eager and sdpa differ in the last bits
+    check("last-bit disagreement passes", True)
+
+    cap._replay_checked = False
+    try:
+        cap._check_replay(7, ref * 0.5)       # a dropped kwarg looks like this
+        check("a replay that is not the forward raises", False, "it did not")
+    except RuntimeError as e:
+        check("a replay that is not the forward raises", "eager replay" in str(e))
+
+
 # ---------------------------------------------------------------------------
 def main():
     test_edge_matrix()
@@ -361,7 +430,9 @@ def main():
     test_the_row()
     test_token_weight()
     test_prompt_positions()
+    test_grad_cache_identity()
     test_causal_guard()
+    test_replay_guard()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED: " + ", ".join(FAIL))

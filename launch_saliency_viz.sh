@@ -10,7 +10,8 @@
 #
 # The last two maps cost one backward per step token each, which is what the run time is;
 # `--methods direct,rollout_mean,rollout_wnorm` is the cheap subset, and
-# `--glimpse-layer-frac 0.6` is the memory knob if a long sequence will not fit.
+# `--glimpse-layer-frac 0.6` shortens the propagated stack; it is a method knob, not a
+# memory knob -- glimpse's peak no longer scales with the number of propagated layers.
 #
 # Three phases, in order:
 #   selftest  CPU, seconds. Gates the pixel->token regrouping the grad map depends on.
