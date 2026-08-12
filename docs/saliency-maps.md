@@ -1,6 +1,6 @@
 # Saliency maps: every definition, in one place
 
-Five maps have been used to ask "was this reasoning step looking at the objects it
+Six maps have been used to ask "was this reasoning step looking at the objects it
 names", plus one intervention that edits the flow rather than measuring it. The maths
 lives in the probes' module docstrings, which is the right place to maintain it but the
 wrong place to compare them. This page states the notation once and defines each map
@@ -177,10 +177,90 @@ cancels; the mean is used so the logged raw norms are comparable across step len
 
 ---
 
-## 6. The intervention edit
+## 6. GLIMPSE (`glimpse`)
+
+`saliency_viz.py`, after [GLIMPSE](https://arxiv.org/abs/2506.18985) v1 (Shen, 2025).
+The only map here that is neither pure attention (1–3) nor pure gradient (5): the
+gradient decides which heads and which layers to believe, and the attention still says
+where to look. Everything below is per target token `t`, from one backward that yields
+`g^{l,h} = ∂z_t/∂A^{l,h}` for every layer at once.
+
+**Head fusion (eqs 5–7).**
+
+```
+G^{l,h} = ReLU( g^{l,h} ⊙ A^{l,h} )
+w^{l,h} = softmax_h( (1/λ) · Σ_ij G^{l,h}_ij / Σ_ij ReLU(g^{l,h})_ij )
+E^l     = Σ_h w^{l,h} G^{l,h}                             row-normalised
+```
+
+`G` is Chefer's gradient×attention: the positions that both attend strongly *and* carry
+a positive backward signal. What GLIMPSE adds is `w`, and the thing to notice is that it
+is a **ratio** — a head's gradient-weighted attention divided by its own positive
+gradient mass. It therefore ranks heads by how much of their gradient lies where they
+actually attend, not by gradient magnitude, and a head whose gradient sits off its
+attention is demoted at equal magnitude.
+
+**Layer weights (eqs 8–10).**
+
+```
+g^l = ‖ Σ_h g^{l,h} ‖₁ ,   s^l = softmax_l( λ_d (l+1) ) ,   α^l = g^l s^l / Σ_k g^k s^k
+```
+
+Heads are summed **before** the norm, so a layer whose heads pull against each other is
+scored as the small net force it is. `s` is an exponential recency prior; the paper's
+ablation makes it the single most important component (removing it takes their NSS from
+1.014 to −0.210), on the argument that undamped propagation lets early-layer noise
+swamp the semantic layers.
+
+**Propagation (eqs 11–13).** `R ← I_N`, then per layer `L^l = I + α^l E^l` and
+`R ← R + L^l R`. Additive accumulation rather than the full matrix product, as in GAE:
+the product of 36 row-stochastic matrices is numerically hopeless.
+
+**Token weights (eqs 14–18).** With `P` the prompt columns and `p_t` the model's softmax
+probability for the token it generated,
+
+```
+a_t = mean_{i∈P} R(t,i) ,     β_t ∝ p_t · a_t          (normalised over the tokens)
+```
+
+Eq 17 **crosses** the modalities on purpose: the *visual* map is weighted by *prompt*
+alignment. A token earns its say in where the model looked by being about the question —
+weighting it by its own visual alignment would be circular.
+
+**Aggregation (eq 22).** `R̃_V = Σ_t β_t · R(t, V)`, read off the image columns.
+
+### Three deviations, one of which is not cosmetic
+
+- **The relevance row is `t−1`, not `t`.** Taken literally, `R(t,:)` for the token *at*
+  position `t` is the identity row and its image columns are exactly zero: causality
+  means position `t`'s attention row cannot affect the logit that generated the token
+  sitting there, so `∂z_t/∂A` is zero on every row from `t` onward and `E` contributes
+  nothing. Read that way the map is blank for every step of every sample. The row used
+  is the query that produced the token. `test_glimpse_cpu.py` asserts both halves — blank
+  at `t`, not blank at `t−1` — against a real causal stack.
+- **`Y` is the step's span, not the whole response.** The paper builds one map per
+  response; every other map here is per observe step, and `β` is renormalised inside the
+  step so the comparison is like for like.
+- **The `2^L` is folded out.** Eq 13 with eq 12 is `R ← (2I + α^l E^l) R`, so the
+  identity path doubles at every layer and the row grows by `2^36` before anything is
+  read off it. `v + (α/2)·vE` per layer is the same product scaled by `2^-L` — one
+  constant, identical for every token, so every ratio the method takes is unchanged.
+
+The relevance-flow redistribution (eqs 20–21, `λ_f`) is not implemented: §3.4 excludes it
+from the holistic map, and it exists to colour text, not to move a heatmap.
+
+Only the target token's row of `R` is ever read, and `v ↦ v(2I + αE)` is linear, so the
+row is carried through the product as a vector — `O(L·N²)` instead of `O(L·N³)`. The cost
+that is left is one backward per step token, with all layers' attention retained in the
+graph; `--glimpse-layer-frac` cuts the graph below the first propagated layer (the
+paper's ablation loses nothing at 0.6) and is the memory knob.
+
+---
+
+## 7. The intervention edit
 
 `flow_intervene_probe.py`. The only entry here that *changes* the model rather than
-measuring it. Maps 1–5 are correlational; so is every result derived from them alone.
+measuring it. Maps 1–6 are correlational; so is every result derived from them alone.
 
 Carrying full `sal` per position would cost `O(P·M)`. It is not needed: the recursion is
 **linear in `sal`**, so any linear functional of it obeys the same recursion. Two scalars
@@ -272,14 +352,24 @@ reports open with a union-decile table.
 | `box_threshold` (DINO) | 0.1 | no |
 | `max_box_area` | 0.5 | no — caps each **box**, not the union |
 | `tight_union` | 0.35 | no |
+| `λ`, GLIMPSE head-fusion temperature | 0.5 | no — their ablation is flat over 0.2–1.0 |
+| `λ_d`, GLIMPSE depth prior | 0.2 | no — see below |
+| GLIMPSE propagation depth | all 36 layers | no — their ablation loses nothing at 0.6 |
 
 Two distinct things are called `a`/`alpha` and it is worth keeping them apart: the
 rollout retention constant, fixed at 0.5 throughout and never tested, and the
 intervention strength, which was swept.
 
+`λ_d = 0.2` is the paper's number and it is **not** the paper's shape here. It was tuned
+on a 64-layer backbone, where the prior falls by `e` every 5 layers — 7.8% of the depth.
+On this 36-layer model the same constant spans 14% of the depth, so `--glimpse-depth-temp
+0.36` is what reproduces their curve and `0.2` is what reproduces their text. Since
+removing depth weighting is the ablation that collapses their score, this is the first
+thing to vary if map 6 looks wrong.
+
 ---
 
-## Deepstack, which affects maps 2–6
+## Deepstack, which affects maps 2–7
 
 Qwen3-VL does not feed the image in once. The vision encoder taps features at **vision**
 layers 8/16/24, and those three tensors are **added into the residual stream at the
@@ -295,7 +385,11 @@ re-seed in the wrong place.
   exact.
 - **Map 5** captures both the merged embeds and every deepstack tensor as leaves, which
   is what the `_ds` variants are.
-- **Map 6** re-seeds `u` and `m` at layers 0/1/2, because fresh image content enters
+- **Map 6** does not model it either, and it starts from `I` rather than from the image
+  tokens, so it never claims to track image content in the first place — it accumulates
+  *relevance*, and the re-injected features are simply part of what the positions above
+  layer 2 are relevant to.
+- **Map 7** re-seeds `u` and `m` at layers 0/1/2, because fresh image content enters
   there that the recursion never saw arrive. Without it every mass downstream is
   understated and the targets built from `u` are wrong.
 
@@ -309,6 +403,7 @@ re-seed in the wrong place.
 | `flow_correlation_probe.py` | 2, 3, 4, 5 |
 | `trl/grad_maps.py` | 5b — the training-time pixel gradient, shared with `saliency_viz.py` |
 | `trl/rewards/grad_rewards.py` | the `logratio` roll-null scoring, and the reward built on it |
-| `flow_intervene_probe.py` | 6 |
+| `saliency_viz.py` | 6, and the pictures of 1, 2, 3 and 5b — the only place any of them is drawn rather than scored |
+| `flow_intervene_probe.py` | 7 |
 | `intervene_probe.py` | the *direct* intervention (not a map — edits step→image attention at one layer) |
-| `test_flow_correlation_cpu.py`, `test_flow_intervene_cpu.py` | the algebra, against naive references |
+| `test_flow_correlation_cpu.py`, `test_flow_intervene_cpu.py`, `test_glimpse_cpu.py` | the algebra, against naive references |

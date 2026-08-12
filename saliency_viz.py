@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Side-by-side pictures of four saliency maps, on the model's own observe steps.
+"""Side-by-side pictures of five saliency maps, on the model's own observe steps.
 
 Every number in docs/saliency-maps.md is a scalar against a Grounding-DINO union.
 This script draws the maps themselves instead: one directory per sample holding the
 question, the generated chain, the image the model actually saw, and that image with
 each map laid over it as a heatmap. No DINO, no scoring -- looking, not measuring.
 
-Four maps, all reduced the same way (mean over the tokens of the step), so the only
-difference between the four pictures is how a patch's saliency is defined:
+Five maps, all reduced over the same tokens (the step's own span), so the only
+difference between the five pictures is how a patch's saliency is defined:
 
   direct         mean_{p in S} mean_{h in {28,31}} A^{22,h}_{p, I_j}
                  docs/saliency-maps.md map 1 -- what the GRPO overlap reward paid for.
@@ -27,10 +27,23 @@ difference between the four pictures is how a patch's saliency is defined:
                  model actually generated at n, teacher-forced on its own chain. Taking
                  the norm per token and averaging the norms -- rather than differentiating
                  the summed logit once -- keeps the "average over the step's tokens"
-                 identical in meaning to the other three maps, at the price of one
+                 identical in meaning to the three attention maps, at the price of one
                  backward per token. Differentiating w.r.t. pixels rather than embeddings
                  means the vision tower is inside the graph, so the deepstack taps are
                  counted automatically and there is no `_ds` variant to choose.
+
+  glimpse        docs map 6 -- GLIMPSE (arXiv 2506.18985v1), gradient-weighted attention
+                 propagated with adaptive layer weights, aggregated over the step's
+                 tokens by a confidence x prompt-alignment weight rather than a plain
+                 mean. It is the one map here that is neither pure attention (1-3) nor
+                 pure gradient (4): the gradient only says which heads and which layers
+                 to believe, and the attention still says where to look.
+
+The GLIMPSE deviations from the paper are in `glimpse_map` and in docs map 6; the one
+that is not cosmetic is the relevance ROW. Taken literally, `R(t, :)` for the token at
+position `t` is identically zero -- causality means position `t`'s attention row cannot
+affect the logit that generated the token sitting there -- so the row read here is the
+query that produced the token, `t-1`, which is what the method has to mean.
 
 The pixel map has to be regrouped from the processor's patch layout to the language
 model's token grid. `Qwen2VLImageProcessor` flattens to
@@ -43,7 +56,7 @@ real processor with a synthetic image; it needs no GPU and no weights.
 Stages
 ------
   scan     GPU, shardable. Per sample: greedy chain -> observe-step segmentation
-           (the FLAN-T5 classifier the reward uses) -> the four maps. Writes
+           (the FLAN-T5 classifier the reward uses) -> the five maps. Writes
            maps.npz + question.txt + generation.txt + original.png per sample.
   render   CPU, single process. Turns maps.npz into the overlays and an index.html.
            Re-runnable with different --norm/--cmap/--overlay-alpha; no GPU needed.
@@ -56,11 +69,11 @@ Output layout
   <out-dir>/samples/sample_000_row001234/
       question.txt  generation.txt  meta.json  maps.npz  original.png
       sal_direct.png  sal_rollout_mean.png  sal_rollout_wnorm.png  sal_grad.png
-      contact_sheet.png
-      steps/step00/  step.txt + the same five images for that step alone
+      sal_glimpse.png  contact_sheet.png
+      steps/step00/  step.txt + the same six images for that step alone
   <out-dir>/index.html
 
-The five images at sample level are the maps averaged over every observe step of that
+The six images at sample level are the maps averaged over every observe step of that
 sample; steps/stepNN/ keeps them separated, which is the thing the maps are actually
 defined on.
 """
@@ -68,6 +81,7 @@ defined on.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import html
 import json
 import os
@@ -115,12 +129,13 @@ pixel_regroup = GM.pixel_regroup
 OSTEPS = PROBE.OSTEPS
 IMAGE_TOKEN_ID = PROBE.IMAGE_TOKEN_ID
 
-METHODS = ("direct", "rollout_mean", "rollout_wnorm", "grad")
+METHODS = ("direct", "rollout_mean", "rollout_wnorm", "grad", "glimpse")
 TITLES = {
     "direct": "direct  L{layer} heads {heads}",
     "rollout_mean": "rollout_mean  (L{rl})",
     "rollout_wnorm": "rollout_wnorm  (L{rl})",
     "grad": "grad  d {target} / d pixels",
+    "glimpse": "glimpse  L{gfirst}+  ld={gdepth}",
 }
 
 
@@ -261,6 +276,382 @@ def grad_map(model, processor, inputs, ids, prompt_len, steps, gh, gw, args, dev
 
 
 # ---------------------------------------------------------------------------
+# map 5: GLIMPSE -- gradient-weighted attention, adaptively propagated
+#
+# arXiv 2506.18985v1, sections 3.2-3.5. The equation numbers below are the paper's.
+# The algebra is split into three pure functions so test_glimpse_cpu.py can check it
+# against a naive [N, N] reference with no model and no GPU.
+# ---------------------------------------------------------------------------
+def glimpse_edge_matrix(a, g, temp: float, eps: float = 1e-12):
+    """[H, N, N] attention + its gradient -> (E, ||sum_h g^h||_1), eqs 5-8.
+
+        G^h = ReLU(g^h * A^h)                                            (5)
+        w^h = softmax_h( (1/lambda) * sum_ij G^h / sum_ij ReLU(g^h) )    (6)
+        E   = sum_h w^h G^h, row-normalised                              (7)
+
+    Eq 6 divides by the head's total positive gradient mass, so `w` ranks heads by how
+    much of the gradient they actually attend *along* rather than by gradient magnitude
+    -- a head whose positive gradient sits where it does not attend is demoted.
+
+    The head loop keeps the peak at one [N, N] fp32 temporary. The vectorised form would
+    need [H, N, N] in fp32 on top of the [H, N, N] the graph already holds, which at
+    H=32 and a 1700-token sequence is another 370 MB per layer, times 36 layers, per
+    backward.
+    """
+    h, n, _ = a.shape
+    # `_at_least_fp32` rather than `.float()`: bf16 attention has to be promoted, but a
+    # float64 reference must not be silently demoted to meet the code halfway.
+    up = GM._at_least_fp32
+    dt = torch.promote_types(up(a[:1, :1, :1]).dtype, up(g[:1, :1, :1]).dtype)
+    num = torch.zeros(h, dtype=dt, device=a.device)
+    den = torch.zeros(h, dtype=dt, device=a.device)
+    gsum = torch.zeros(n, n, dtype=dt, device=a.device)
+    for i in range(h):
+        gi = up(g[i]).to(dt)
+        num[i] = torch.relu(gi * up(a[i]).to(dt)).sum()
+        den[i] = torch.relu(gi).sum()
+        gsum += gi
+    w = torch.softmax((num / den.clamp_min(eps)) / temp, dim=0)
+
+    e = torch.zeros(n, n, dtype=dt, device=a.device)
+    for i in range(h):
+        e += w[i] * torch.relu(up(g[i]).to(dt) * up(a[i]).to(dt))
+    e = e / e.sum(-1, keepdim=True).clamp_min(eps)
+    # eq 8 sums the heads BEFORE the norm, so a layer whose heads pull against each other
+    # is scored as the small net force it is, not as the large forces it is made of.
+    return e, gsum.abs().sum()
+
+
+def glimpse_layer_alphas(g_l1, layer_ids, depth_temp: float, eps: float = 1e-12):
+    """Per-layer propagation weights, eqs 9-10: gradient evidence x an exponential
+    depth prior, `alpha_l = g_l s_l / sum_k g_k s_k` with `s_l = softmax(lambda_d(l+1))`.
+
+    `layer_ids` are the model's own indices. `softmax` is shift-invariant and the
+    propagated set is always a contiguous slice off the top of the stack, so re-basing
+    them at 0 would give the same `s`; they are passed in to keep this readable next to
+    eq 9, not because the offset changes anything.
+
+    The paper's lambda_d = 0.2 was tuned on a 64-layer backbone, where it makes the
+    prior fall by e every 5 layers -- 7.8% of the depth. On this 36-layer model the same
+    number spans 14% of the depth, so `--glimpse-depth-temp 0.36` is the setting that
+    matches the paper's *shape*, and 0.2 the setting that matches its *text*. The
+    ablation calls this the single most important component (removing it takes their NSS
+    from 1.014 to -0.210), which is exactly why the mismatch is worth naming.
+    """
+    g = GM._at_least_fp32(torch.stack([torch.as_tensor(v) for v in g_l1]))
+    ell = torch.as_tensor(list(layer_ids), dtype=g.dtype, device=g.device) + 1.0
+    s = torch.softmax(depth_temp * ell, dim=0)
+    tot = g.sum()
+    # A backward that produced no positive gradient anywhere would otherwise make every
+    # alpha NaN and silently blank the map; fall back to the depth prior alone.
+    g = torch.where(tot > 0, g / tot.clamp_min(eps), torch.full_like(g, 1.0 / g.numel()))
+    a = g * s
+    return a / a.sum().clamp_min(eps)
+
+
+def glimpse_propagate(row: int, mats, alphas):
+    """Row `row` of `R = prod_{l=L..first} (2I + alpha_l E_l)`, eqs 11-13, scaled by 2^-L.
+
+    Eq 13 is `R <- R + L_l R` with `L_l = I + alpha_l E_l` (eq 12), i.e. `R <- (2I +
+    alpha_l E_l) R`: the identity path DOUBLES at every layer, so over 36 layers the row
+    would grow by 2^36 before anything is read off it. Every quantity the method takes
+    from R is a ratio -- `beta` normalises over the tokens, the map is normalised for
+    display -- and the factor is identical for every token, so it is folded in per layer
+    as `v + (alpha/2) v E` instead.
+
+    R is only ever read one row at a time, and `v (2I + alpha E)` is linear in `v`, so the
+    row is carried through the product as a vector: O(L*N^2) rather than the O(L*N^3) of
+    the matrix form. The product applies the LAST layer's factor to the row first, hence
+    the reversed loop.
+    """
+    n = mats[0].shape[0]
+    v = torch.zeros(n, dtype=mats[0].dtype, device=mats[0].device)
+    v[row] = 1.0
+    for i in range(len(mats) - 1, -1, -1):
+        v = v + (0.5 * alphas[i]) * (v @ mats[i])
+    return v
+
+
+def glimpse_token_weight(conf, align, mode: str):
+    """The token's weight in the aggregation, eq 18 -- `beta_t ~ p_t * a_t`.
+
+    `a_t` is the token's alignment to the PROMPT (eq 14) even though the map being built
+    is the visual one: eq 17 crosses them on purpose, so a token earns its say in *where
+    the model looked* by being about the question, not by being visually grounded, which
+    would be circular. `mode` reproduces the paper's token-saliency ablation.
+    """
+    if mode == "full":
+        return conf * align
+    if mode == "confidence":
+        return conf
+    if mode == "prompt":
+        return align
+    if mode == "uniform":
+        return torch.ones_like(align)
+    raise ValueError(f"token weight {mode!r} not in full|confidence|prompt|uniform")
+
+
+def _find_subseq(hay: list[int], needle: list[int]) -> int:
+    """Last start index of `needle` in `hay`, or -1."""
+    if not needle or len(needle) > len(hay):
+        return -1
+    for s in range(len(hay) - len(needle), -1, -1):
+        if hay[s:s + len(needle)] == needle:
+            return s
+    return -1
+
+
+def prompt_positions(tok, question: str, prompt_ids: list[int], img_positions):
+    """-> (positions, how). The prompt columns `P` of eq 14: the question's own tokens.
+
+    The paper's `P` is the user prompt. Ours is a chat template wrapped around it -- a
+    system prompt about the reasoning format, then the image, then the question -- and
+    `a_t` is a MEAN over `P`, so folding in the boilerplate dilutes precisely the signal
+    the weight exists to carry. The question is located by matching its own tokenisation
+    inside the prompt, from the right (the template repeats nothing else there). A
+    leading space can merge differently at a template boundary, so the match is retried
+    without the first token; if both fail, every non-image prompt token is used and
+    meta.json records which of the three happened.
+    """
+    q = list(tok(question, add_special_tokens=False)["input_ids"])
+    for cand, how in ((q, "question"), (q[1:], "question_less_first")):
+        s = _find_subseq(prompt_ids, cand)
+        if s >= 0:
+            return list(range(s, s + len(cand))), how
+    img = set(int(i) for i in img_positions)
+    return [i for i in range(len(prompt_ids)) if i not in img], "prompt_minus_image"
+
+
+@contextlib.contextmanager
+def eager_text_attention(model):
+    """Run the language model's attention in eager, so the softmax weights exist and are
+    IN the graph.
+
+    The probes' usual trick -- re-running one module in eager inside a forward hook --
+    cannot be used here. That copy is a side computation the logits do not depend on, and
+    GLIMPSE needs the gradient of the logit w.r.t. the attention the forward actually
+    took. Flipping the flag on the text config covers both halves at once: it is the
+    object every Qwen3VLTextAttention dispatches on AND the one Qwen3VLTextModel hands to
+    `create_causal_mask`, which under sdpa is entitled to return no mask at all. The
+    vision tower keeps its own implementation.
+    """
+    cfgs, prev = [], []
+    for m in model.modules():
+        if type(m).__name__ == "Qwen3VLTextAttention":
+            if not any(m.config is c for c in cfgs):
+                cfgs.append(m.config)
+                prev.append(m.config._attn_implementation)
+    if not cfgs:
+        raise RuntimeError("no Qwen3VLTextAttention modules found")
+    try:
+        for c in cfgs:
+            c._attn_implementation = "eager"
+        yield
+    finally:
+        for c, p in zip(cfgs, prev):
+            c._attn_implementation = p
+
+
+@contextlib.contextmanager
+def checkpointing_off(model):
+    """Gradient checkpointing recomputes each layer during the backward, which would fire
+    the capture hooks a second time, on tensors that are not the ones the graph holds."""
+    on = bool(getattr(model, "is_gradient_checkpointing", False))
+    if on:
+        model.gradient_checkpointing_disable()
+    try:
+        yield
+    finally:
+        if on:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
+
+
+class GlimpseCapture:
+    """Keeps each layer's attention in the graph and turns its gradient into `E` the
+    moment the backward produces it.
+
+    Two hooks per pass. A forward hook holds `attn_weights` -- the tensor the attention
+    module returns and the o_proj matmul consumed, so its gradient is the `g^h` of eq 5 --
+    and attaches a tensor hook to it; the tensor hook fires during the backward, in
+    reverse layer order, folds `[H, N, N]` down to one `[N, N]` and lets the gradient go.
+    Holding all 36 layers' gradients to fold afterwards would cost another 5-10 GB per
+    token, on top of a graph that is already the biggest thing on the card.
+
+    A forward PRE-hook on the first propagated layer detaches its input and makes it a
+    leaf. That is what gives the backward something to be taken with respect to at all
+    (every weight is frozen), and it is what makes `--glimpse-layer-frac` save anything:
+    below the cut nothing requires grad, so those layers build no graph and their eager
+    attention is freed as it goes.
+    """
+
+    def __init__(self, model, first_layer: int, temp: float):
+        self.first_layer, self.temp = int(first_layer), float(temp)
+        self.layers, self.handles = [], []
+        self.attn, self.mats, self.g_l1 = {}, {}, {}
+        self.leaf = None
+        self._checked = False
+        cut = 0
+        for m in model.modules():
+            name = type(m).__name__
+            if name == "Qwen3VLTextAttention" and getattr(m, "layer_idx", None) is not None:
+                li = int(m.layer_idx)
+                if li >= self.first_layer:
+                    self.layers.append(li)
+                    self.handles.append(m.register_forward_hook(self._keep(li)))
+            elif name == "Qwen3VLTextDecoderLayer" and \
+                    int(m.self_attn.layer_idx) == self.first_layer:
+                self.handles.append(
+                    m.register_forward_pre_hook(self._cut, with_kwargs=True))
+                cut += 1
+        self.layers.sort()
+        if not self.layers or cut != 1:
+            self.close()
+            raise RuntimeError(f"glimpse: {len(self.layers)} attention layers at or above "
+                               f"{self.first_layer} and {cut} cut points (want 1)")
+
+    def close(self):
+        for h in self.handles:
+            h.remove()
+        self.handles = []
+        self.release()
+
+    def release(self):
+        self.attn, self.leaf = {}, None
+        self.arm()
+
+    def arm(self):
+        """Forget the previous token's matrices, so a layer that fails to fire is loud."""
+        self.mats, self.g_l1 = {}, {}
+
+    def take(self):
+        if sorted(self.mats) != self.layers:
+            raise RuntimeError(f"glimpse: {len(self.mats)} of {len(self.layers)} layers "
+                               "produced a gradient")
+        return [self.mats[li] for li in self.layers], [self.g_l1[li] for li in self.layers]
+
+    def _cut(self, module, args, kwargs):
+        hs = args[0] if args else kwargs["hidden_states"]
+        leaf = hs.detach().requires_grad_(True)
+        self.leaf = leaf
+        if args:
+            return (leaf,) + tuple(args[1:]), kwargs
+        kw = dict(kwargs)
+        kw["hidden_states"] = leaf
+        return args, kw
+
+    def _keep(self, li: int):
+        def hook(module, args, output):
+            aw = output[1]
+            if aw is None:
+                raise RuntimeError("glimpse: the forward returned no attention weights -- "
+                                   "it did not run in eager")
+            if not aw.requires_grad:
+                raise RuntimeError(f"glimpse: layer {li}'s attention is outside the graph "
+                                   "-- the leaf cut did not take")
+            self._check_causal(aw)
+            self.attn[li] = aw
+            aw.register_hook(self._fold(li))
+            return None
+        return hook
+
+    def _check_causal(self, aw):
+        """Query 0 may only see key 0. Eager attention with no mask is silently
+        bidirectional -- every map would be wrong and nothing would raise."""
+        if self._checked:
+            return
+        self._checked = True
+        leak = float(aw[0, :, 0, 1:].detach().abs().sum())
+        if leak > 1e-3:
+            raise RuntimeError(f"glimpse: attention is not causal (row 0 puts {leak:.3g} "
+                               "outside column 0) -- the causal mask did not reach eager")
+
+    def _fold(self, li: int):
+        def hook(grad):
+            e, g1 = glimpse_edge_matrix(self.attn[li][0], grad[0], self.temp)
+            self.mats[li], self.g_l1[li] = e, g1
+            return None                       # the gradient itself is left alone
+        return hook
+
+
+def glimpse_map(model, processor, inputs, ids, prompt_len, steps, gh, gw, question,
+                args, device):
+    """-> ([n_steps, gh, gw] float32, the settings that produced it).
+
+    One forward, then one backward per step token: the relevance matrix of eqs 11-13 is
+    built from `d z_t / d A`, which is a different backward for every target token. The
+    graph is retained across the whole sample, so the forward is paid once.
+    """
+    img_cols = (inputs["input_ids"][0] == IMAGE_TOKEN_ID).nonzero(as_tuple=True)[0]
+    if img_cols.numel() != gh * gw:
+        raise RuntimeError(f"{img_cols.numel()} image tokens, grid is {gh}x{gw}")
+    prompt_ids = inputs["input_ids"][0].tolist()
+    pos, how = prompt_positions(processor.tokenizer, question, prompt_ids,
+                                img_cols.tolist())
+    prompt_idx = torch.tensor(pos, device=device)
+
+    n_layers = sum(1 for m in model.modules()
+                   if type(m).__name__ == "Qwen3VLTextAttention")
+    keep = min(n_layers, max(1, int(round(args.glimpse_layer_frac * n_layers))))
+    first = n_layers - keep
+
+    # The row that produced the token at absolute position p is p-1 -- both the logit row
+    # and, for the same reason, the relevance row. See the module docstring.
+    rows = [prompt_len + a - 1 + i for _t, a, b in steps for i in range(b - a)]
+    rows_t = torch.tensor(rows, device=device)
+    targets = torch.cat([ids[0, prompt_len + a: prompt_len + b] for _t, a, b in steps])
+
+    out = np.zeros((len(steps), gh, gw), dtype=np.float32)
+    fell_back = []
+    cap = GlimpseCapture(model, first, args.glimpse_temp)
+    try:
+        with checkpointing_off(model), eager_text_attention(model), torch.enable_grad():
+            res = model(**FC.build_forward(inputs, ids, prompt_len), use_cache=False,
+                        logits_to_keep=rows_t)
+            z = res.logits[0].float()
+            del res
+            # `_row_scalars` is the reward's own definition of the per-token scalar, so
+            # `--glimpse-target` means here exactly what `--grad_target` means there.
+            f = GM._row_scalars(z, targets, args.glimpse_target)
+            conf = GM._row_scalars(z, targets, "logprob").detach().exp()      # eq 16
+
+            k = 0
+            for si, (_t, a, b) in enumerate(steps):
+                acc = torch.zeros(img_cols.numel(), dtype=torch.float32, device=device)
+                plain = torch.zeros_like(acc)
+                wsum = torch.zeros((), dtype=torch.float32, device=device)
+                for _ in range(b - a):
+                    cap.arm()
+                    torch.autograd.grad(f[k], cap.leaf, retain_graph=True)
+                    mats, g_l1 = cap.take()
+                    alphas = glimpse_layer_alphas(g_l1, cap.layers, args.glimpse_depth_temp)
+                    v = glimpse_propagate(rows[k], mats, alphas)
+                    w = glimpse_token_weight(conf[k], v[prompt_idx].mean(),
+                                             args.glimpse_token_weight)
+                    acc += w * v[img_cols]
+                    plain += v[img_cols]
+                    wsum += w
+                    del mats, alphas, v
+                    k += 1
+                # eq 22, with `Y` restricted to this step so the map stays comparable to
+                # the other four. A step whose tokens all weigh zero -- no positive
+                # gradient anywhere on the prompt -- would otherwise render as a blank.
+                if float(wsum) > 0:
+                    m = acc / wsum
+                else:
+                    fell_back.append(si)
+                    m = plain / max(b - a, 1)
+                out[si] = m.reshape(gh, gw).cpu().numpy()
+    finally:
+        cap.close()
+    info = {"prompt_tokens": how, "n_prompt_tokens": len(pos), "first_layer": first,
+            "n_layers": n_layers, "temp": args.glimpse_temp,
+            "depth_temp": args.glimpse_depth_temp, "target": args.glimpse_target,
+            "token_weight": args.glimpse_token_weight, "unweighted_steps": fell_back}
+    return out, info
+
+
+# ---------------------------------------------------------------------------
 # stage: scan
 # ---------------------------------------------------------------------------
 def sample_dir(out: Path, i: int, row_index: int) -> Path:
@@ -351,6 +742,10 @@ def scan_one(model, processor, tok, clf, row, d: Path, methods, heads, args, dev
         elif m == "grad":
             maps[m] = grad_map(model, processor, inputs, ids, prompt_len, steps, gh, gw,
                                args, device)
+        elif m == "glimpse":
+            maps[m], meta["glimpse"] = glimpse_map(model, processor, inputs, ids,
+                                                   prompt_len, steps, gh, gw,
+                                                   row["question"], args, device)
         torch.cuda.empty_cache()
 
     meta["methods"] = list(maps)
@@ -435,11 +830,14 @@ def render_sample(d: Path, cmap, args):
     z = np.load(d / "maps.npz")
     methods = [m for m in METHODS if m in z]
     steps = meta["steps"]
+    gm = meta.get("glimpse", {})
     label = {m: TITLES[m].format(layer=meta.get("direct_layer"),
                                  heads="/".join(str(h) for h in meta.get("direct_heads", [])),
                                  rl=("last" if meta.get("rollout_layer", -1) < 0
                                      else meta["rollout_layer"]),
-                                 target=meta.get("grad_target", "logprob"))
+                                 target=meta.get("grad_target", "logprob"),
+                                 gfirst=gm.get("first_layer", "?"),
+                                 gdepth=gm.get("depth_temp", "?"))
              for m in METHODS}
 
     def draw(dst: Path, get):
@@ -500,7 +898,8 @@ def write_index(out: Path, cards, args):
         f"<h1>saliency maps &mdash; {len(cards)} samples</h1>",
         f"<p>norm={e(args.norm)} ({args.norm_lo}&ndash;{args.norm_hi} pct), cmap={e(args.cmap)}, "
         f"overlay={e(args.overlay_mode)} alpha={args.overlay_alpha}. "
-        "Left to right in each strip: original, then the four maps.</p>",
+        "Left to right in each strip: original, then the maps that were scanned, in "
+        "docs/saliency-maps.md order.</p>",
     ]
     for d, meta, n in cards:
         r = d.name
@@ -603,6 +1002,20 @@ def main():
     p.add_argument("--grad-target", default="logprob", choices=["logprob", "logit"],
                    help="logprob is docs/saliency-maps.md map 5; logit is the raw score")
     p.add_argument("--grad-checkpointing", action="store_true")
+    # glimpse (docs/saliency-maps.md map 6). The defaults are the paper's, including
+    # --glimpse-depth-temp: see glimpse_layer_alphas for why 0.36 is the other candidate.
+    p.add_argument("--glimpse-temp", type=float, default=0.5,
+                   help="lambda, head-fusion temperature (eq 6)")
+    p.add_argument("--glimpse-depth-temp", type=float, default=0.2,
+                   help="lambda_d, depth prior temperature (eq 9)")
+    p.add_argument("--glimpse-layer-frac", type=float, default=1.0,
+                   help="propagate the last frac of the stack; the paper's ablation loses "
+                        "nothing at 0.6 and it is the memory knob")
+    p.add_argument("--glimpse-target", default="logit", choices=list(GM.GRAD_TARGETS),
+                   help="z_t in eqs 5 and 16; the paper's is the raw logit")
+    p.add_argument("--glimpse-token-weight", default="full",
+                   choices=["full", "confidence", "prompt", "uniform"],
+                   help="eq 18, and the paper's token-saliency ablation")
     p.add_argument("--tf32", action="store_true", default=True)
     p.add_argument("--no-tf32", dest="tf32", action="store_false")
     # render-only

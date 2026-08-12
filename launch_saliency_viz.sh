@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Draw the four saliency maps for N samples, sharded across an interactive node's GPUs.
+# Draw the five saliency maps for N samples, sharded across an interactive node's GPUs.
 #
 #   bash launch_saliency_viz.sh --gpus 8 --out-dir outputs/saliency_viz/run1
 #
 # Defaults: the coldstart SFT model, 20 samples from cold_data/grpo_sets/val_natural,
-# maps direct / rollout_mean / rollout_wnorm / grad. Anything unrecognised is forwarded
-# verbatim to saliency_viz.py, so e.g. `--n-samples 40 --cmap inferno` just works.
+# maps direct / rollout_mean / rollout_wnorm / grad / glimpse. Anything unrecognised is
+# forwarded verbatim to saliency_viz.py, so e.g. `--n-samples 40 --cmap inferno` just
+# works.
+#
+# The last two maps cost one backward per step token each, which is what the run time is;
+# `--methods direct,rollout_mean,rollout_wnorm` is the cheap subset, and
+# `--glimpse-layer-frac 0.6` is the memory knob if a long sequence will not fit.
 #
 # Three phases, in order:
 #   selftest  CPU, seconds. Gates the pixel->token regrouping the grad map depends on.
