@@ -90,6 +90,14 @@ cp "$REPO/trl/scripts/utils.py"           "$TRL_REPO/trl/scripts/utils.py"
 cp "$REPO/trl/grpo_vlm_qwen3.py"          "$TRL_REPO/examples/scripts/grpo_vlm_qwen3.py"
 echo "  copied overlap-reward files (overlap_steps, overlap_rewards, openai_rewards, rewards/__init__, scripts/utils, grpo_vlm_qwen3)"
 
+# ── 2c. roll-null gradient reward support (reward_variant=grad) ─────────────
+# grad_maps.py is imported by the trainer as `from .grad_maps import ...`, so it
+# lands next to it in trl/trainer/; grad_rewards.py does `from .overlap_rewards
+# import ...`, so it lands next to that in trl/rewards/.
+cp "$REPO/trl/grad_maps.py"               "$TRL_REPO/trl/trainer/grad_maps.py"
+cp "$REPO/trl/rewards/grad_rewards.py"    "$TRL_REPO/trl/rewards/grad_rewards.py"
+echo "  copied gradient-reward files (grad_maps, grad_rewards)"
+
 # ── 3a. trl/trainer/__init__.py ─────────────────────────────────────────────
 TINIT="$TRL_REPO/trl/trainer/__init__.py"
 [ -f "$TINIT" ] || { echo "MISSING: $TINIT"; exit 1; }
