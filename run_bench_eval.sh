@@ -57,7 +57,12 @@ SAMPLE_N=100
 # got -- see below. 0 disables the guard entirely.
 MIN_MINUTES=""
 MAX_CHECKPOINTS=0   # 0 = drain everything that is pending
+# Total wall clock this job was given, in minutes. Set by the dispatcher, because
+# asking Slurm does not work from inside submit_job's container -- see minutes_left.
+JOB_MINUTES=0
 DRY_RUN=false
+# When the script started, which is what --job-minutes is measured from.
+START_EPOCH=$(date +%s)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -66,6 +71,7 @@ while [[ $# -gt 0 ]]; do
         --every)           EVERY="$2";           shift 2 ;;
         --sample-n)        SAMPLE_N="$2";        shift 2 ;;
         --min-minutes)     MIN_MINUTES="$2";     shift 2 ;;
+        --job-minutes)     JOB_MINUTES="$2";     shift 2 ;;
         --max-checkpoints) MAX_CHECKPOINTS="$2"; shift 2 ;;
         --dry-run)         DRY_RUN=true;         shift ;;
         -h|--help)         sed -n '2,30p' "$0"; exit 0 ;;
@@ -178,8 +184,27 @@ pending_steps() {
 }
 
 # Minutes of wall clock left in this allocation. Unlimited outside Slurm.
+#
+# --job-minutes first, and squeue only as a fallback, because squeue is not
+# reachable from where this actually runs: submit_job executes the command in a
+# container that does not mount /cm/shared, so the slurm client is absent and the
+# query silently returns nothing. Believing the 99999 fallback in that situation is
+# what let earlier jobs run head-first into the wall clock and TIMEOUT rather than
+# stopping at a suite boundary.
+#
+# The countdown starts when this script does, which is a minute or two after the
+# allocation did -- the wrapper has to stage a container first. SAFETY_MARGIN
+# covers that gap plus teardown, so the estimate stays on the pessimistic side.
+SAFETY_MARGIN=5
 minutes_left() {
     local left
+    if (( JOB_MINUTES > 0 )); then
+        local elapsed=$(( ( $(date +%s) - START_EPOCH ) / 60 ))
+        left=$(( JOB_MINUTES - elapsed - SAFETY_MARGIN ))
+        (( left < 0 )) && left=0
+        echo "$left"
+        return
+    fi
     [[ -n "${SLURM_JOB_ID:-}" ]] || { echo 99999; return; }
     left=$(squeue -h -j "$SLURM_JOB_ID" -o "%L" 2>/dev/null | tr -d ' ')
     [[ -n "$left" ]] || { echo 99999; return; }

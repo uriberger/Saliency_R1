@@ -193,8 +193,14 @@ cooling_down() {
 BENCH_JUDGE_KEY=${OPENAI_API_KEY:-${NVIDIA_API_KEY:-}}
 [[ -n "$BENCH_JUDGE_KEY" ]] && export OPENAI_API_KEY="$BENCH_JUDGE_KEY"
 
+# --job-minutes is how the job learns its own wall clock. It cannot ask Slurm: the
+# submit_job backend runs the command inside a container that does not mount
+# /cm/shared, so squeue is not on PATH there and run_bench_eval.sh's fallback would
+# have it believe it has unlimited time -- it would start a suite it cannot finish
+# and be killed part-way. We know the budget here, so we simply tell it.
 INNER_CMD="bash $SCRIPT_DIR/run_bench_eval.sh \
-        --run-dir $RUN_DIR --num-gpus $NUM_GPUS --every $EVERY --sample-n $SAMPLE_N"
+        --run-dir $RUN_DIR --num-gpus $NUM_GPUS --every $EVERY --sample-n $SAMPLE_N \
+        --job-minutes $(( DURATION * 60 ))"
 
 submit_eval_job() {
     if [[ "$BACKEND" == "submit_job" ]]; then
