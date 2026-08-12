@@ -17,7 +17,7 @@
 #
 # Usage:
 #   bash watch_bench_evals.sh --run-dir DIR [--num-gpus 1] [--every 100]
-#                             [--interval 60] [--duration 4] [--once]
+#                             [--interval 60] [--duration 1] [--once]
 #
 # Environment: PARTITION, OPENAI_API_KEY / NVIDIA_API_KEY, HF_TOKEN
 set -uo pipefail
@@ -39,7 +39,11 @@ NUM_GPUS=1
 EVERY=100
 SAMPLE_N=100
 INTERVAL=60
-DURATION=4
+# Ask for one hour, not the partition's 4h maximum. batch_singlenode caps jobs at
+# 04:00:00, so a 4h request only ever backfills into a 4h hole -- the rarest window
+# there is, which is why these evals sat in (Priority) behind 55 jobs instead of
+# slipping into the gaps between them. An hour fits almost anywhere.
+DURATION=1
 ONCE=false
 DRY_RUN=false
 

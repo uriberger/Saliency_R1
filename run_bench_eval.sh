@@ -17,6 +17,18 @@
 #      and logs to WandB
 #   4. delete the merged model -- 16 GB each, and /lustre is not roomy
 #
+# Progress is banked per suite, not per checkpoint. A job that runs out of wall
+# clock after two of the three suites records what those two produced under
+# bench_eval/partial/step-<N>/ and leaves the merged model in place; the next job
+# reuses both and picks up at the third. That is what makes a one-hour allocation
+# useful: the unit of work it has to finish is a suite (~15-25 min on 1 GPU), not
+# a whole checkpoint (50-86 min) plus the merge.
+#
+# What is NOT banked is a partial step-<N>.json. It is written only once all three
+# suites are in hand, because a half-measured checkpoint on the benchmark curve is
+# indistinguishable from a real one. The merged model is deleted at that same
+# moment -- it exists only to serve the suites still owed for that checkpoint.
+#
 # Everything runs through vlm_reasoning's launch_lmms_eval_job.sh --direct, so a
 # mini benchmark is evaluated with exactly the recipe the full test suite uses
 # (--r1-mode: the Saliency-R1 system prompt, repetition_penalty 1.05,
@@ -40,9 +52,9 @@ RUN_DIR=""
 NUM_GPUS=1
 EVERY=100
 SAMPLE_N=100
-# Below this much wall-clock left, start nothing new: being killed halfway wastes
-# the whole checkpoint. Left empty here and filled in after parsing, because the
-# figure depends on how many GPUs this job got -- see below.
+# Below this much wall-clock left, start no further suite. Left empty here and
+# filled in after parsing, because the figure depends on how many GPUs this job
+# got -- see below. 0 disables the guard entirely.
 MIN_MINUTES=""
 MAX_CHECKPOINTS=0   # 0 = drain everything that is pending
 DRY_RUN=false
@@ -61,14 +73,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# A checkpoint costs a fixed ~10 min to merge (a copy, not GPU work, so it does not
-# shrink with the allocation) plus ~40 min of generation on 4 GPUs, which does. At
-# --num-gpus 4 that reproduces the 50 min this guard used to hardcode; at the
-# default 1 it asks for ~170, which still fits in the dispatcher's 4h job with room
-# to spare. Getting this wrong in the optimistic direction is the expensive
-# failure: the job starts a checkpoint it cannot finish, dies at the wall clock
-# having written no step file, and the dispatcher submits another to do the same.
-MIN_MINUTES=${MIN_MINUTES:-$(( 10 + 160 / NUM_GPUS ))}
+# The guard sizes ONE SUITE, because a suite is what gets banked. Measured on 1 GPU
+# (gaps between consecutive step-*.json in a draining job): 50-86 min per checkpoint,
+# of which ~10 is the merge, leaving ~15-25 for each of the three suites. The
+# generation part shrinks with the allocation; loading the model into each worker
+# does not, hence the fixed term.
+#
+# Getting this wrong in the optimistic direction is still the expensive failure --
+# a suite started and killed at the wall clock banks nothing and is redone from
+# scratch -- but it now costs one suite rather than a whole checkpoint.
+SUITE_MINUTES=${MIN_MINUTES:-$(( 5 + 25 / NUM_GPUS ))}
+# The merge is a file copy, not GPU work, so it costs the same at any allocation
+# size. Only charged against the clock when there is no merged model to reuse.
+MERGE_MINUTES=10
 
 [[ -n "$RUN_DIR" ]] || { echo "error: --run-dir is required" >&2; exit 2; }
 [[ -d "$RUN_DIR" ]] || { echo "error: no such run dir: $RUN_DIR" >&2; exit 2; }
@@ -77,7 +94,48 @@ RUN_DIR=$(cd "$RUN_DIR" && pwd)
 BENCH_DIR="$RUN_DIR/bench_eval"
 TASK_DIR="$BENCH_DIR/tasks"
 MERGE_ROOT="${BENCH_MERGE_ROOT:-$REPO/checkpoint/_bench_eval}"
-mkdir -p "$BENCH_DIR" "$MERGE_ROOT"
+# Where a finished suite is recorded so a later job can skip it. One directory per
+# step, deleted the moment that step's step-<N>.json is written.
+PARTIAL_DIR="$BENCH_DIR/partial"
+mkdir -p "$BENCH_DIR" "$MERGE_ROOT" "$PARTIAL_DIR"
+
+# ---------- banking a finished suite ----------
+# A suite is banked by recording WHERE lmms-eval put its results, not by copying
+# them. The sample size is recorded alongside because --sample-n changes what the
+# mini task contains but does not change lmms-eval's output directory: without
+# this, results produced at n=100 would be silently reused for a job asking for
+# n=500 and the curve would mix two different benchmarks.
+bank_suite() {
+    local marker="$1" results="$2"
+    mkdir -p "$(dirname "$marker")"
+    printf '{"sample_n": %s, "results": "%s"}\n' "$SAMPLE_N" "$results" > "$marker"
+}
+
+# Echo the banked results path if it is still usable, else fail. "Usable" has to
+# be checked, not assumed: the referenced file may have been cleaned up, and a
+# results.json from a run killed mid-write parses as truncated garbage.
+banked_suite() {
+    local marker="$1"
+    [[ -f "$marker" ]] || return 1
+    python - "$marker" "$SAMPLE_N" <<'PY' || return 1
+import json, os, sys
+try:
+    marker = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+if str(marker.get("sample_n")) != sys.argv[2]:
+    sys.exit(1)
+path = marker.get("results", "")
+if not os.path.isfile(path):
+    sys.exit(1)
+try:
+    if not json.load(open(path)).get("results"):
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+print(path)
+PY
+}
 
 # ---------- mini task configs ----------
 # Regenerated every job rather than committed: they carry the absolute path of the
@@ -145,8 +203,25 @@ PY
 # suite gets its own --tag so its results land in their own directory: attributing
 # a suite by "the newest file in a shared directory" would quietly mislabel
 # everything the first time a suite failed and left the previous one newest.
+# Exit status is three-valued, because "no results" and "no time" have to be told
+# apart by the caller: 0 results echoed, 1 the suite failed, 2 out of wall clock
+# (nothing attempted, nothing lost).
 run_suite() {
     local model="$1" tasks="$2" tag="$3"; shift 3
+    local marker="$PARTIAL_DIR/step-$STEP/$tag.json"
+    local banked
+    if banked=$(banked_suite "$marker"); then
+        echo "[step $STEP] $tag: reusing the suite banked by an earlier job" >&2
+        printf '%s\n' "$banked"
+        return 0
+    fi
+
+    local left; left=$(minutes_left)
+    if (( SUITE_MINUTES > 0 && left < SUITE_MINUTES )); then
+        echo "[step $STEP] $tag: ${left}min of wall clock left, a suite needs $SUITE_MINUTES -- stopping here" >&2
+        return 2
+    fi
+
     local -a common=(--model "$model" --tasks "$tasks" --max-new-tokens 4096
                      --num-gpus "$NUM_GPUS" --direct --r1-mode --tag "r1_$tag" "$@")
     local out_dir
@@ -156,7 +231,11 @@ run_suite() {
     bash "$VLM_REASONING/scripts/slurm/launch_lmms_eval_job.sh" \
         "${common[@]}" --include_path "$TASK_DIR" >&2 || return 1
 
-    ls -t "$out_dir"/*/*_results.json 2>/dev/null | head -1
+    local results
+    results=$(ls -t "$out_dir"/*/*_results.json 2>/dev/null | head -1)
+    [[ -n "$results" ]] || return 1
+    bank_suite "$marker" "$results"
+    printf '%s\n' "$results"
 }
 
 # ---------- drain ----------
@@ -165,15 +244,21 @@ done_count=0
 echo "=========================================================================="
 echo "Run dir:    $RUN_DIR"
 echo "Pending:    $(pending_steps | tr '\n' ' ')"
-echo "GPUs:       $NUM_GPUS   sample: $SAMPLE_N/benchmark   cadence: every $EVERY steps   need ${MIN_MINUTES}min/checkpoint"
+echo "GPUs:       $NUM_GPUS   sample: $SAMPLE_N/benchmark   cadence: every $EVERY steps   need ${SUITE_MINUTES}min/suite"
 echo "Natural:    $NATURAL_TASKS + mmerealworld_mini (at 3.2M pixels, as on test)"
 echo "Non-nat:    $NONNATURAL_TASKS"
+echo "Banked:     $PARTIAL_DIR"
 echo "=========================================================================="
 
 if $DRY_RUN; then
     echo "[dry-run] would evaluate, in order: $(pending_steps | tr '\n' ' ')"
-    echo "[dry-run] wall clock left: $(minutes_left) min (need $MIN_MINUTES per checkpoint)"
-    echo "[dry-run] merged models would go to $MERGE_ROOT and be deleted after each step"
+    echo "[dry-run] wall clock left: $(minutes_left) min (need $SUITE_MINUTES per suite, +$MERGE_MINUTES to merge)"
+    echo "[dry-run] merged models go to $MERGE_ROOT, kept across jobs while a step is"
+    echo "[dry-run] unfinished and deleted once its step-<N>.json is written"
+    for s in $(pending_steps); do
+        banked=$(ls "$PARTIAL_DIR/step-$s" 2>/dev/null | sed 's/\.json$//' | tr '\n' ' ')
+        echo "[dry-run] step $s: suites already banked: ${banked:-none}"
+    done
     exit 0
 fi
 
@@ -184,8 +269,16 @@ while true; do
         break
     fi
     LEFT=$(minutes_left)
-    if (( LEFT < MIN_MINUTES )); then
-        echo "[drain] only ${LEFT}min of wall clock left (need $MIN_MINUTES) -- exiting; the dispatcher will resubmit"
+    # What entering this checkpoint costs before anything can be banked: one suite,
+    # plus the merge if no earlier job already paid for it.
+    MERGED="$MERGE_ROOT/${RUN_NAME}_cp${STEP}_merged"
+    MERGE_DONE="$MERGED.complete"
+    NEED=$SUITE_MINUTES
+    if (( STEP != 0 )) && [[ ! -f "$MERGE_DONE" ]]; then
+        NEED=$(( NEED + MERGE_MINUTES ))
+    fi
+    if (( SUITE_MINUTES > 0 && LEFT < NEED )); then
+        echo "[drain] only ${LEFT}min of wall clock left (need $NEED to bank anything) -- exiting; the dispatcher will resubmit"
         break
     fi
     if (( MAX_CHECKPOINTS > 0 && done_count >= MAX_CHECKPOINTS )); then
@@ -208,35 +301,81 @@ while true; do
         fi
     else
         CKPT="$RUN_DIR/checkpoint-$STEP"
-        MERGED="$MERGE_ROOT/${RUN_NAME}_cp${STEP}_merged"
         MERGED_IS_TEMPORARY=true
-        echo "[step $STEP] merging $CKPT -> $MERGED   (${LEFT}min left)"
-        echo "--------------------------------------------------------------------------"
-        rm -rf "$MERGED"
-        if ! bash "$REPO/merge_lora_grpo_qwen3.sh" "$CKPT" "$MERGED"; then
-            echo "[step $STEP] merge FAILED -- skipping this checkpoint" >&2
-            rm -rf "$MERGED"
-            # Leave no step file: a later job retries it rather than recording a gap
-            # as if it had been measured.
-            break
+        # Any merged model still lying around for a DIFFERENT step of this run is
+        # from a job that died; it will never be reused, and at 16 GB each they
+        # accumulate. Only one step of one run is ever in flight (the dispatcher
+        # guarantees it), so this is safe to do unconditionally.
+        for stale in "$MERGE_ROOT/${RUN_NAME}"_cp*_merged; do
+            [[ -d "$stale" && "$stale" != "$MERGED" ]] || continue
+            echo "[step $STEP] removing stale merge $(basename "$stale")"
+            rm -rf "$stale" "$stale.complete"
+        done
+        # The sentinel is what makes reuse safe: a merge killed halfway leaves a
+        # directory that looks complete but is not, and loading it would fail (or,
+        # worse, load a truncated shard). It is written only after the merge
+        # returns, and lives beside the directory rather than inside it so nothing
+        # in the model dir is unexpected to from_pretrained.
+        if [[ -f "$MERGE_DONE" && -d "$MERGED" ]]; then
+            echo "[step $STEP] reusing the merge from an earlier job: $MERGED   (${LEFT}min left)"
+            echo "--------------------------------------------------------------------------"
+        else
+            echo "[step $STEP] merging $CKPT -> $MERGED   (${LEFT}min left)"
+            echo "--------------------------------------------------------------------------"
+            rm -rf "$MERGED" "$MERGE_DONE"
+            if ! bash "$REPO/merge_lora_grpo_qwen3.sh" "$CKPT" "$MERGED"; then
+                echo "[step $STEP] merge FAILED -- skipping this checkpoint" >&2
+                rm -rf "$MERGED" "$MERGE_DONE"
+                # Leave no step file: a later job retries it rather than recording a gap
+                # as if it had been measured.
+                break
+            fi
+            touch "$MERGE_DONE"
         fi
     fi
     echo "--------------------------------------------------------------------------"
 
     set +u; conda activate lmms_eval; set -u
+    # Each suite is attempted only if the clock allows, and banked the moment it
+    # succeeds. Status 2 means the clock ran out: stop the whole job rather than
+    # move on, since the remaining suites have no more time than this one did.
+    NAT_RESULTS=""; MMERW_RESULTS=""; NONNAT_RESULTS=""; OUT_OF_TIME=false
     NAT_RESULTS=$(run_suite "$MERGED" "$NATURAL_TASKS" natural)
-    MMERW_RESULTS=$(run_suite "$MERGED" "mmerealworld_mini" mmerw --max-pixels 3211264)
-    NONNAT_RESULTS=$(run_suite "$MERGED" "$NONNATURAL_TASKS" nonnatural)
+    (( $? == 2 )) && OUT_OF_TIME=true
+    if ! $OUT_OF_TIME; then
+        MMERW_RESULTS=$(run_suite "$MERGED" "mmerealworld_mini" mmerw --max-pixels 3211264)
+        (( $? == 2 )) && OUT_OF_TIME=true
+    fi
+    if ! $OUT_OF_TIME; then
+        NONNAT_RESULTS=$(run_suite "$MERGED" "$NONNATURAL_TASKS" nonnatural)
+        (( $? == 2 )) && OUT_OF_TIME=true
+    fi
+
+    if $OUT_OF_TIME; then
+        # Deliberately no step file and no cleanup: the suites already finished are
+        # banked in $PARTIAL_DIR/step-$STEP and the merged model is left in place,
+        # so the next job resumes at the first suite still owed instead of redoing
+        # the merge and everything before it.
+        echo "[drain] out of wall clock part-way through step $STEP -- finished suites are banked,"
+        echo "        the merge is kept, and the dispatcher will resubmit to finish it"
+        break
+    fi
 
     if [[ -n "$NAT_RESULTS$MMERW_RESULTS$NONNAT_RESULTS" ]]; then
         python "$SCRIPT_DIR/bench_eval.py" --collect --run-dir "$RUN_DIR" --step "$STEP" \
             --results $NAT_RESULTS $MMERW_RESULTS $NONNAT_RESULTS
         done_count=$((done_count + 1))
+        # The checkpoint is measured, so everything that existed to serve it goes:
+        # the banked suites have been folded into step-$STEP.json, and the merged
+        # model has nothing left to be evaluated against.
+        rm -rf "$PARTIAL_DIR/step-$STEP"
     else
         echo "[step $STEP] every suite failed -- not recording a result" >&2
     fi
 
-    $MERGED_IS_TEMPORARY && rm -rf "$MERGED"
+    if $MERGED_IS_TEMPORARY; then
+        rm -rf "$MERGED" "$MERGE_DONE"
+    fi
 done
 
 echo ""
