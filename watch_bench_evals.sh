@@ -138,11 +138,17 @@ else
 fi
 
 # Only used by the sbatch backend; submit_job sizes the allocation itself. The
-# defaults match what this cluster actually hands out (an 8-GPU interactive job
-# gets 224 CPUs and 1970 GB, i.e. 28 CPUs and ~246 GB per GPU); asking for more
-# per GPU than a node has makes the job unschedulable rather than merely large.
+# defaults match what this cluster actually hands out (an 8-GPU job gets 240 CPUs
+# and 1878736 MB, i.e. 30 CPUs and 234842 MB per GPU).
+#
+# Asking for more than that per GPU is not merely large, it is rejected outright:
+# slurm refuses any request whose memory-to-GPU ratio would strand GPUs on the
+# node ("For N GPUs, please only request MAX ... RAM"), so an over-ask means the
+# dispatcher never submits anything at all. 234842 MB is 229.4 GiB, so the ceiling
+# in the GiB units --mem=<n>G speaks is 229 -- the 240 that stood here read the
+# node's ~1970 GB as GiB and overshot by 4%.
 CPUS_PER_GPU=${CPUS_PER_GPU:-28}
-MEM_PER_GPU_GB=${MEM_PER_GPU_GB:-240}
+MEM_PER_GPU_GB=${MEM_PER_GPU_GB:-229}
 
 pending_steps() {
     local d step
