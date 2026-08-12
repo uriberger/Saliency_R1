@@ -46,8 +46,11 @@ counted automatically and there is no `_ds` variant to pick. It costs ~10%: the 
 0.55 B params over ~1024 patches against 8 B over ~900 tokens.
 
 Cost, per completion, at the 512px cap (256 image tokens, ~700-1000 sequence positions):
-one forward plus ONE backward for all of the completion's steps, via a vmapped VJP with a
-one-hot cotangent per step (`is_grads_batched`). No parameter gradients are needed, so
+one forward plus one backward per chunk of `span_chunk` steps, via a vmapped VJP with a
+one-hot cotangent per step (`is_grads_batched`). Batching every step into a single backward
+is what the first GPU run tried, and it OOMed an 80 GB card: the vmap holds one set of
+backward intermediates per cotangent at once, so peak memory grows with the completion's
+step count while the forward graph below stays fixed. No parameter gradients are needed, so
 `_frozen_params` clears `requires_grad` on every weight and autograd prunes every
 weight-gradient matmul -- which both makes the backward cost about the same as a forward
 rather than double it, and keeps DeepSpeed ZeRO-3's gradient hooks out of the pass
@@ -68,6 +71,15 @@ import numpy as np
 import torch
 
 GRAD_TARGETS = ("clogit", "logit", "logprob")
+
+# How many steps share one vmapped backward. `is_grads_batched` runs one backward per
+# cotangent *simultaneously*, so peak memory is the retained forward graph (~3.4 GB, fixed)
+# plus n_spans x the backward's own intermediates -- the term that OOMed an 80 GB card at
+# 76 GB on a completion with many observe steps, while shorter completions on the same card
+# passed. Chunking bounds that term without changing any result: the steps' gradients are
+# independent, so grouping them differently is exactly the same arithmetic. `None` or 0
+# restores the all-at-once behaviour.
+SPAN_CHUNK_DEFAULT = 4
 
 
 def _at_least_fp32(t: torch.Tensor) -> torch.Tensor:
@@ -156,6 +168,7 @@ def step_grad_maps(
     *,
     target: str = "clogit",
     batched: bool = True,
+    span_chunk: int | None = SPAN_CHUNK_DEFAULT,
 ) -> np.ndarray:
     """-> [n_steps, gh, gw] float32, the map `G` for each span.
 
@@ -167,6 +180,12 @@ def step_grad_maps(
 
     The caller is responsible for `frozen_params(model)` -- it wraps the whole per-case
     loop in the trainer, not one call.
+
+    `span_chunk` caps how many steps share one vmapped backward (see SPAN_CHUNK_DEFAULT).
+    It is a pure memory/speed dial: the result is identical for every value, because each
+    step's gradient depends only on its own cotangent. It does NOT affect ZeRO-3's trace
+    invariant -- the single forward per case is unchanged, and only the number of backward
+    calls varies, which already varies across ranks with the per-case step count.
     """
     if not spans:
         return np.zeros((0, int(grid_thw[1]) // 2, int(grid_thw[2]) // 2), dtype=np.float32)
@@ -206,14 +225,25 @@ def step_grad_maps(
         f = torch.zeros(len(spans), device=device, dtype=per_token.dtype)
         f = f.index_add(0, owner, per_token) / lens
 
-        if batched and len(spans) > 1:
-            eye = torch.eye(len(spans), device=device, dtype=f.dtype)
-            (g,) = torch.autograd.grad(f, leaf, grad_outputs=eye, is_grads_batched=True)
-            grads = list(g)                                  # [n_steps][n_patch, D]
+        n = len(spans)
+        chunk = n if not span_chunk else min(int(span_chunk), n)
+        if batched and n > 1:
+            grads = []                                       # [n_steps][n_patch, D]
+            for i in range(0, n, chunk):
+                j = min(i + chunk, n)
+                # One-hot rows i..j-1 of the identity: this chunk's cotangents, still
+                # indexing into the full f, so the graph is the one shared by every chunk.
+                cot = torch.zeros(j - i, n, device=device, dtype=f.dtype)
+                cot[torch.arange(j - i, device=device), torch.arange(i, j, device=device)] = 1
+                (g,) = torch.autograd.grad(
+                    f, leaf, grad_outputs=cot, is_grads_batched=True, retain_graph=(j < n)
+                )
+                grads.extend(list(g))
+                del g, cot
         else:
             grads = []
-            for k in range(len(spans)):
-                (gk,) = torch.autograd.grad(f[k], leaf, retain_graph=(k < len(spans) - 1))
+            for k in range(n):
+                (gk,) = torch.autograd.grad(f[k], leaf, retain_graph=(k < n - 1))
                 grads.append(gk)
 
     maps = torch.stack([pixel_regroup(gk, grid_thw, ps, tps) for gk in grads])

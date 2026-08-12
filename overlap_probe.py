@@ -579,7 +579,7 @@ def overlap_from_detail(detail, format_valid):
 # main shard
 # ---------------------------------------------------------------------------
 def grad_step_maps(model, processor, prompt_inputs, prompt_len, comp_ids, steps, device,
-                   grad_target="clogit"):
+                   grad_target="clogit", span_chunk=GM.SPAN_CHUNK_DEFAULT):
     """The GRPO gradient reward's map, per observe step -- the same call the trainer makes.
 
     Same [{"map", "text", "tok_a", "tok_b"}] contract as step_maps_from_attention, so the
@@ -601,8 +601,19 @@ def grad_step_maps(model, processor, prompt_inputs, prompt_len, comp_ids, steps,
     if not spans:
         return []
     grid = prompt_inputs["image_grid_thw"][0].tolist()
+    cuda = isinstance(device, str) and device.startswith("cuda")
+    if cuda:
+        torch.cuda.reset_peak_memory_stats(device)
     with GM.frozen_params(model):
-        maps = GM.step_grad_maps(model, case, spans, grid, ps, tps, target=grad_target)
+        maps = GM.step_grad_maps(model, case, spans, grid, ps, tps, target=grad_target,
+                                 span_chunk=span_chunk)
+    if cuda:
+        # The dial that decides whether this pass fits: peak scales with the chunk, not
+        # with the completion's step count. Logged every call so a run that OOMs says how
+        # far over it went, and one that survives says how much room --grad-span-chunk has.
+        print(f"[grad-mem] spans={len(spans)} chunk={span_chunk or len(spans)} "
+              f"len={ids.shape[1]} peak={torch.cuda.max_memory_allocated(device) / 2**30:.1f}GiB",
+              file=sys.stderr, flush=True)
     return [{"map": maps[k].astype(np.float32), "text": t, "tok_a": a, "tok_b": b}
             for k, (t, a, b) in enumerate(kept)]
 
@@ -672,7 +683,7 @@ def run_model(spec, rows, args, device):
             if args.map == "grad":
                 all_maps.append(grad_step_maps(
                     model, processor, prompt_inputs, prompt_len, comp_ids[c], steps,
-                    device, grad_target=args.grad_target,
+                    device, grad_target=args.grad_target, span_chunk=args.grad_span_chunk,
                 ))
                 continue
             per_tok = capture_layer_attention(
@@ -793,6 +804,10 @@ def main():
                         "identical maps and masks. Use --map grad --score logratio to measure "
                         "the spread that sets w_grad.")
     p.add_argument("--grad-target", default="clogit", choices=["clogit", "logit", "logprob"])
+    p.add_argument("--grad-span-chunk", type=int, default=GM.SPAN_CHUNK_DEFAULT,
+                   help="steps per vmapped backward; 0 = all at once. Pure memory/speed "
+                        "dial, identical maps at every value. Lower it if [grad-mem] "
+                        "peak approaches the card")
     p.add_argument("--grad-null-offsets", type=int, default=16)
     p.add_argument("--grad-logratio-clip", type=float, default=1.0)
     p.add_argument("--grad-inframe-rolls", action=argparse.BooleanOptionalAction, default=True)

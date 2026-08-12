@@ -181,6 +181,32 @@ def test_batched_vjp_matches_loop():
           not np.allclose(a[0], a[1], rtol=1e-6))
 
 
+def test_span_chunk_changes_nothing():
+    """The chunk is a memory dial, so every value must give the same maps.
+
+    Batching every step into one vmapped backward OOMed an 80 GB card: the vmap holds one
+    set of backward intermediates per cotangent at once. Chunking bounds that, and is only
+    safe to do because each step's gradient depends solely on its own cotangent.
+    """
+    print("\n[chunk] span_chunk is a memory dial, not a result")
+    gen = torch.Generator().manual_seed(7)
+    model, fwd, _, _ = toy_case(gen)
+    # More spans than any single chunk, so the loop runs several times with a remainder.
+    spans = [(12, 13), (13, 15), (15, 16), (16, 19), (19, 22)]
+    ref = run(model, fwd, spans, span_chunk=None)             # all at once, the old path
+    check("the reference keeps every step", ref.shape == (len(spans), GH, GW), str(ref.shape))
+    for chunk in (1, 2, 3, 4, 5, 9):
+        got = run(model, fwd, spans, span_chunk=chunk)
+        check(f"span_chunk={chunk} matches the unchunked maps",
+              np.allclose(got, ref, rtol=1e-10, atol=1e-12),
+              f"max |diff| {np.abs(got - ref).max():.2e}")
+    check("a chunk of 1 still equals the sequential loop",
+          np.allclose(run(model, fwd, spans, span_chunk=1),
+                      run(model, fwd, spans, batched=False), rtol=1e-10, atol=1e-12))
+    check("the steps are distinguishable, so agreement is not trivial",
+          not np.allclose(ref[0], ref[3], rtol=1e-6))
+
+
 def test_pixel_regroup_matches_finite_differences():
     print("\n[regroup] the map is the true gradient norm over a token's pixels")
     gen = torch.Generator().manual_seed(1)
@@ -378,6 +404,7 @@ def test_frozen_params_restores():
 def main():
     torch.manual_seed(0)
     test_batched_vjp_matches_loop()
+    test_span_chunk_changes_nothing()
     test_pixel_regroup_matches_finite_differences()
     test_matches_naive_reference()
     test_centering_identity()
