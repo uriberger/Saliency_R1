@@ -197,6 +197,125 @@ def run_glimpse(model, processor, inputs, ids, prompt_len, steps, gh, gw, questi
 
 
 # ---------------------------------------------------------------------------
+# how the per-token cost scales with N
+# ---------------------------------------------------------------------------
+def scale_timing(args, device):
+    """Seconds for ONE target token's map, against sequence length.
+
+    The case measurement lands wherever the model's own chains land, which on set_a is
+    N ~ 400. Training allows `--max_completion_length 1024`, so a long chain is 3x that,
+    and GLIMPSE's per-layer work is `[N, N]` -- the two `[N, N]` fp32 passes per head in
+    `glimpse_edge_matrix` plus the `[N] @ [N, N]` propagation. Whether the cost per token
+    is linear or quadratic in N therefore decides whether the case numbers extrapolate or
+    understate, and one number per N settles it.
+
+    Text-only synthetic input, like `test_glimpse_gpu.test_scaling`: the map needs an
+    image, but none of the cost above does -- what scales is `L x H x N^2`, and this
+    isolates it from the tokeniser and the sampler.
+    """
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32
+    processor, model = PROBE.load_model(args.base_model, args.adapter or None, device,
+                                        args.attn_impl)
+    model.requires_grad_(False)
+    dtype = next(model.parameters()).dtype
+    n_layers = sum(1 for m in model.modules()
+                   if type(m).__name__ == "Qwen3VLTextAttention")
+    out = []
+    for n in [int(x) for x in args.scale.split(",") if x]:
+        keep = min(n_layers, max(1, int(round(args.scale_layer_frac * n_layers))))
+        first = n_layers - keep
+        ids = torch.randint(1000, 20000, (1, n), device=device)
+        cap = SV.GlimpseGradCache(model, first, args.glimpse_temp)
+        rec = {"N": n, "n_layers_propagated": keep}
+        try:
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+            with SV.checkpointing_off(model), torch.enable_grad():
+                torch.cuda.synchronize(device)
+                t0 = time.perf_counter()
+                res = model(input_ids=ids, use_cache=False,
+                            logits_to_keep=torch.tensor([n - 2, n - 1], device=device))
+                z = res.logits[0].float()
+                del res
+                cap.check()
+                cap.mask = IV.causal_mask(n, dtype, device)
+                torch.cuda.synchronize(device)
+                rec["forward_seconds"] = time.perf_counter() - t0
+
+                # Twice: the first pass pays allocator growth and cuBLAS algorithm
+                # selection, which in the real path is amortised over ~100 tokens.
+                for it in range(2):
+                    torch.cuda.synchronize(device)
+                    t0 = time.perf_counter()
+                    g_out = cap.layer_grads(z[0, n // 2])
+                    torch.cuda.synchronize(device)
+                    t_bwd = time.perf_counter() - t0
+
+                    t0 = time.perf_counter()
+                    mats, g_l1 = [], []
+                    for li in cap.layers:
+                        e, g1 = cap.edge(li, g_out.pop(li))
+                        mats.append(e)
+                        g_l1.append(g1)
+                    torch.cuda.synchronize(device)
+                    t_edge = time.perf_counter() - t0
+
+                    t0 = time.perf_counter()
+                    alphas = SV.glimpse_layer_alphas(g_l1, cap.layers,
+                                                     args.glimpse_depth_temp)
+                    SV.glimpse_propagate(n - 2, mats, alphas)
+                    torch.cuda.synchronize(device)
+                    t_prop = time.perf_counter() - t0
+                    del mats, g_l1, alphas, g_out
+                rec.update(backward_seconds=t_bwd, edge_seconds=t_edge,
+                           propagate_seconds=t_prop,
+                           token_seconds=t_bwd + t_edge + t_prop)
+                del z
+            rec["peak_gib"] = torch.cuda.max_memory_allocated(device) / 2**30
+        except torch.cuda.OutOfMemoryError:
+            rec["oom"] = True
+        finally:
+            cap.close()
+            del ids
+            gc.collect()
+            torch.cuda.empty_cache()
+        out.append(rec)
+        if "oom" in rec:
+            print(f"[scale] N={n:5d}  OOM", flush=True)
+        else:
+            print(f"[scale] N={n:5d} layers={keep}  fwd {rec['forward_seconds']:5.2f}s | "
+                  f"per token {rec['token_seconds']:6.3f}s "
+                  f"(bwd {rec['backward_seconds']:.3f} edge {rec['edge_seconds']:.3f} "
+                  f"prop {rec['propagate_seconds']:.3f})  peak {rec['peak_gib']:5.1f}GiB",
+                  flush=True)
+    return {"config": vars(args), "scale": out}
+
+
+def summarise_scale(res):
+    v = [r for r in res["scale"] if "token_seconds" in r]
+    if len(v) < 2:
+        return "scaling: too few points"
+    out = ["N      layers  fwd s   s/token   bwd     edge    prop   peak GiB   exponent"]
+    prev = None
+    for r in v:
+        # local log-log slope: 1 = linear in N, 2 = quadratic
+        exp = ""
+        if prev:
+            exp = (f"{np.log(r['token_seconds'] / prev['token_seconds']) / np.log(r['N'] / prev['N']):.2f}")
+        out.append(f"{r['N']:<6d} {r['n_layers_propagated']:>6d} {r['forward_seconds']:>6.2f} "
+                   f"{r['token_seconds']:>9.3f} {r['backward_seconds']:>7.3f} "
+                   f"{r['edge_seconds']:>7.3f} {r['propagate_seconds']:>6.3f} "
+                   f"{r['peak_gib']:>10.1f} {exp:>10}")
+        prev = r
+    lo, hi = v[0], v[-1]
+    slope = np.log(hi["token_seconds"] / lo["token_seconds"]) / np.log(hi["N"] / lo["N"])
+    out.append(f"\noverall exponent on N, {lo['N']} -> {hi['N']}: {slope:.2f} "
+               "(1 = linear, 2 = quadratic)")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def measure(args, device, on_case=None):
@@ -440,6 +559,11 @@ def main():
     p.add_argument("--glimpse-target", default="clogit", choices=list(GM.GRAD_TARGETS))
     p.add_argument("--glimpse-token-weight", default="full",
                    choices=["full", "confidence", "prompt", "uniform"])
+    p.add_argument("--stage", default="cases", choices=["cases", "scale"],
+                   help="cases = the real per-completion cost; scale = per-target-token "
+                        "cost vs sequence length, on synthetic text-only input")
+    p.add_argument("--scale", default="400,800,1200,1600,2400")
+    p.add_argument("--scale-layer-frac", type=float, default=1.0)
     p.add_argument("--breakdown", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--breakdown-check", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True)
@@ -450,6 +574,14 @@ def main():
     fracs = [float(f) for f in args.glimpse_layer_fracs.split(",") if f]
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.stage == "scale":
+        res = scale_timing(args, args.device)
+        text = summarise_scale(res)
+        res["summary"] = text
+        out.write_text(json.dumps(res, indent=2, default=str))
+        print("\n" + text + f"\n\nwrote {out}", flush=True)
+        return
 
     def checkpoint(cases):
         out.write_text(json.dumps({"config": vars(args), "cases": cases}, indent=2,
