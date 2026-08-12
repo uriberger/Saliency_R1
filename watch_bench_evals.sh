@@ -1,5 +1,5 @@
 #!/bin/bash
-# Watch a GRPO run's checkpoint directory and submit a 4-GPU eval job whenever
+# Watch a GRPO run's checkpoint directory and submit a single-GPU eval job whenever
 # there is work for one. Run this on a node that can submit jobs; it uses no GPUs
 # of its own and can sit in a tmux window for the length of an experiment.
 #
@@ -16,7 +16,7 @@
 # and running it after training has finished backfills the remaining checkpoints.
 #
 # Usage:
-#   bash watch_bench_evals.sh --run-dir DIR [--num-gpus 4] [--every 100]
+#   bash watch_bench_evals.sh --run-dir DIR [--num-gpus 1] [--every 100]
 #                             [--interval 60] [--duration 4] [--once]
 #
 # Environment: PARTITION, OPENAI_API_KEY / NVIDIA_API_KEY, HF_TOKEN
@@ -31,7 +31,11 @@ ACCOUNT=nvr_israel_rlop
 PARTITION=${PARTITION:-$(sr1_pick_partition batch_singlenode batch_long batch)}
 
 RUN_DIR=""
-NUM_GPUS=4
+# One GPU per eval job. The mini suites are 100 docs per benchmark, so this is a
+# small job, and a single-GPU allocation gets scheduled while a 4-GPU one is still
+# queued behind the 8-GPU training run it is supposed to be tracking. The trade is
+# wall clock, which run_bench_eval.sh's --min-minutes guard scales with this number.
+NUM_GPUS=1
 EVERY=100
 SAMPLE_N=100
 INTERVAL=60
@@ -162,7 +166,7 @@ job_in_flight() {
 
 # Second line of defence. If squeue is ever unreachable, or a job is rejected in a
 # way that leaves nothing in the queue, the check above stops protecting anything --
-# and the cost of getting this wrong is a queue full of duplicate 4-GPU jobs. A
+# and the cost of getting this wrong is a queue full of duplicate eval jobs. A
 # cooldown bounds that to one job per COOLDOWN seconds no matter what.
 COOLDOWN=${COOLDOWN:-600}
 last_submit=0

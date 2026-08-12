@@ -1,6 +1,7 @@
 #!/bin/bash
 # Evaluate a GRPO run's checkpoints on the two mini test suites, oldest first,
-# then exit. This is the body of the 4-GPU job that watch_bench_evals.sh submits.
+# then exit. This is the body of the single-GPU job that watch_bench_evals.sh
+# submits.
 #
 # It drains, it does not idle: when no checkpoint is waiting it returns
 # immediately and releases the GPUs. The dispatcher submits a new job the next
@@ -22,7 +23,7 @@
 # max_new_tokens 4096).
 #
 # Usage:
-#   bash run_bench_eval.sh --run-dir CKPT_DIR [--num-gpus 4] [--every 100]
+#   bash run_bench_eval.sh --run-dir CKPT_DIR [--num-gpus 1] [--every 100]
 #
 # Environment:
 #   OPENAI_API_KEY / NVIDIA_API_KEY   needed by mathvista's llm_as_judge metric
@@ -36,12 +37,13 @@ LMMS_EVAL_DIR=${LMMS_EVAL_DIR:-/home/uberger/scratch/research/lmms-eval}
 CONDA_SH=/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh
 
 RUN_DIR=""
-NUM_GPUS=4
+NUM_GPUS=1
 EVERY=100
 SAMPLE_N=100
-# Below this much wall-clock left, start nothing new: a mini suite needs ~40
-# minutes on 4 GPUs and being killed halfway wastes the whole checkpoint.
-MIN_MINUTES=50
+# Below this much wall-clock left, start nothing new: being killed halfway wastes
+# the whole checkpoint. Left empty here and filled in after parsing, because the
+# figure depends on how many GPUs this job got -- see below.
+MIN_MINUTES=""
 MAX_CHECKPOINTS=0   # 0 = drain everything that is pending
 DRY_RUN=false
 
@@ -58,6 +60,15 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+# A checkpoint costs a fixed ~10 min to merge (a copy, not GPU work, so it does not
+# shrink with the allocation) plus ~40 min of generation on 4 GPUs, which does. At
+# --num-gpus 4 that reproduces the 50 min this guard used to hardcode; at the
+# default 1 it asks for ~170, which still fits in the dispatcher's 4h job with room
+# to spare. Getting this wrong in the optimistic direction is the expensive
+# failure: the job starts a checkpoint it cannot finish, dies at the wall clock
+# having written no step file, and the dispatcher submits another to do the same.
+MIN_MINUTES=${MIN_MINUTES:-$(( 10 + 160 / NUM_GPUS ))}
 
 [[ -n "$RUN_DIR" ]] || { echo "error: --run-dir is required" >&2; exit 2; }
 [[ -d "$RUN_DIR" ]] || { echo "error: no such run dir: $RUN_DIR" >&2; exit 2; }
@@ -154,7 +165,7 @@ done_count=0
 echo "=========================================================================="
 echo "Run dir:    $RUN_DIR"
 echo "Pending:    $(pending_steps | tr '\n' ' ')"
-echo "GPUs:       $NUM_GPUS   sample: $SAMPLE_N/benchmark   cadence: every $EVERY steps"
+echo "GPUs:       $NUM_GPUS   sample: $SAMPLE_N/benchmark   cadence: every $EVERY steps   need ${MIN_MINUTES}min/checkpoint"
 echo "Natural:    $NATURAL_TASKS + mmerealworld_mini (at 3.2M pixels, as on test)"
 echo "Non-nat:    $NONNATURAL_TASKS"
 echo "=========================================================================="

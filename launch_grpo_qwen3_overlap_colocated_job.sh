@@ -120,7 +120,7 @@
 #   benchmarks   13 of the test benchmarks -- all but the three that need an LLM
 #                judge to score (see eval_mini/benchmarks.py) -- cut to 100 docs
 #                and split into a natural and a non-natural suite, run on every kept
-#                checkpoint by a separate 4-GPU job. watch_bench_evals.sh starts
+#                checkpoint by a separate 1-GPU job. watch_bench_evals.sh starts
 #                with the run, holds no GPUs itself, and submits a job only when a
 #                checkpoint is waiting and none is already in flight. It submits
 #                with sbatch here on the compute node, because the submit_job
@@ -137,7 +137,7 @@
 #   PARTITION=batch_singlenode   DURATION=4 (hours)
 #   NATURAL_ONLY=true            (same as --natural-only; --no-natural-only to force off)
 #   SAVE_STEPS=10   CKPT_KEEP_EVERY=100
-#   EVAL_STEPS=100   VAL_SETS_DIR=<dir>   AUTO_BENCH=true   BENCH_GPUS=4
+#   EVAL_STEPS=100   VAL_SETS_DIR=<dir>   AUTO_BENCH=true   BENCH_GPUS=1
 #   DINO_PORT=8100   VLLM_PORT=8000   VLLM_MAX_MODEL_LEN=4096
 #   VLLM_GPU_MEM     (default 0.90, or 0.85 with --share-sidecar-gpu)
 #   SHARE_SIDECAR_GPU=true   (same as --share-sidecar-gpu; --no-share-sidecar-gpu to force off)
@@ -198,8 +198,13 @@ VAL_SETS_DIR=${VAL_SETS_DIR:-$REPO/cold_data/grpo_sets}
 # The benchmark-eval dispatcher (watch_bench_evals.sh) starts with the run and
 # submits a $BENCH_GPUS-GPU job whenever a kept checkpoint is waiting to be scored.
 # It holds no GPU itself. --no-auto-bench turns it off.
+#
+# One GPU, not four: a mini suite is 100 docs per benchmark, so the job is small
+# enough to fit in a single-GPU allocation, which schedules far sooner than a
+# 4-GPU one next to an 8-GPU training run. It takes proportionally longer in
+# wall clock, which run_bench_eval.sh accounts for in its --min-minutes guard.
 AUTO_BENCH=${AUTO_BENCH:-true}
-BENCH_GPUS=${BENCH_GPUS:-4}
+BENCH_GPUS=${BENCH_GPUS:-1}
 EXTRA_ARGS=""
 DIRECT=false
 
