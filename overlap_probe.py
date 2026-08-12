@@ -111,6 +111,21 @@ def _load_grad_rewards():
 
 GREW = _load_grad_rewards()
 
+
+def _load_glimpse_maps():
+    """trl/glimpse_maps.py does `from .grad_maps import ...`, which only resolves under a
+    dotted module name -- inside trl_repo/ that is the only way it can reach it.
+
+    `_load_grad_rewards` has already stubbed the `trl` package, so this only has to
+    register the ALREADY LOADED grad_maps under its dotted name before importing, or a
+    second copy would be created.
+    """
+    sys.modules.setdefault("trl.grad_maps", GM)
+    return _load_module("trl.glimpse_maps", "trl/glimpse_maps.py")
+
+
+GLM = _load_glimpse_maps()
+
 # Which per-step number `score` (and therefore the aggregated overlap) reports:
 # "metric" = the configured overlap metric, "logratio" = the roll-null gradient score.
 # Set from --score in main(); a module global because score_steps is called from both
@@ -618,6 +633,50 @@ def grad_step_maps(model, processor, prompt_inputs, prompt_len, comp_ids, steps,
             for k, (t, a, b) in enumerate(kept)]
 
 
+def glimpse_step_maps(model, processor, prompt_inputs, prompt_len, comp_ids, steps,
+                      question, device, args):
+    """The GLIMPSE reward's map, per observe step -- the same call the trainer makes.
+
+    Same [{"map", "text", "tok_a", "tok_b"}] contract as the other two producers, so the
+    scoring, the HTML and every aggregate below are shared. This is the run that sets
+    `w_glimpse`: `score_steps` records `mean_in_v2_raw` AND `auroc_raw` on every grounded
+    step, so ONE probe run calibrates both variants on identical maps and masks -- a
+    paired comparison, which two separate runs could not give.
+    """
+    case = teacher_forced_case(prompt_inputs, comp_ids, device)
+    ids = case["input_ids"]
+    kept, spans = [], []
+    for text, tok_a, tok_b in steps:
+        a, b = prompt_len + tok_a, prompt_len + tok_b
+        if b <= a or a <= 0 or b > ids.shape[1]:
+            continue
+        spans.append((a, b))
+        kept.append((text, tok_a, tok_b))
+    if not spans:
+        return []
+    grid = prompt_inputs["image_grid_thw"][0].tolist()
+    cuda = isinstance(device, str) and device.startswith("cuda")
+    if cuda:
+        torch.cuda.reset_peak_memory_stats(device)
+    with GM.frozen_params(model):
+        maps, info = GLM.step_glimpse_maps(
+            model, case, spans, grid, question=question, tokenizer=processor.tokenizer,
+            prompt_len=prompt_len, target=args.glimpse_target,
+            layer_frac=args.glimpse_layer_frac, temp=args.glimpse_temp,
+            depth_temp=args.glimpse_depth_temp, token_weight=args.glimpse_token_weight,
+            token_cap=args.glimpse_token_cap, seed=args.glimpse_seed)
+    if cuda:
+        # Cost is linear in target tokens and this is the only place that says how many a
+        # real completion actually had -- the number every projection off this run rests on.
+        print(f"[glimpse-mem] spans={len(spans)} tokens={info.get('n_target_tokens')} "
+              f"layers={info.get('n_layers', 0) - info.get('first_layer', 0)} "
+              f"len={ids.shape[1]} "
+              f"peak={torch.cuda.max_memory_allocated(device) / 2**30:.1f}GiB",
+              file=sys.stderr, flush=True)
+    return [{"map": maps[k].astype(np.float32), "text": t, "tok_a": a, "tok_b": b}
+            for k, (t, a, b) in enumerate(kept)]
+
+
 def run_model(spec, rows, args, device):
     processor, model = load_model(spec["path"], spec.get("adapter"), device, args.attn_impl)
     attn_mod = None
@@ -684,6 +743,12 @@ def run_model(spec, rows, args, device):
                 all_maps.append(grad_step_maps(
                     model, processor, prompt_inputs, prompt_len, comp_ids[c], steps,
                     device, grad_target=args.grad_target, span_chunk=args.grad_span_chunk,
+                ))
+                continue
+            if args.map == "glimpse":
+                all_maps.append(glimpse_step_maps(
+                    model, processor, prompt_inputs, prompt_len, comp_ids[c], steps,
+                    row["question"], device, args,
                 ))
                 continue
             per_tok = capture_layer_attention(
@@ -792,11 +857,13 @@ def main():
     p.add_argument("--token-reduction", default="mean", choices=["mean", "max", "min"])
     p.add_argument("--overlap-metric", default="mean_in", choices=["mean_in", "mean_in_v2", "auroc"])
     # --- the gradient reward (trl/rewards/grad_rewards.py) ---
-    p.add_argument("--map", default="attn", choices=["attn", "grad"],
-                   help="which per-step map to build: raw attention at --overlap-layer, or "
+    p.add_argument("--map", default="attn", choices=["attn", "grad", "glimpse"],
+                   help="which per-step map to build: raw attention at --overlap-layer, "
                         "the PIXEL GRADIENT of the step's own tokens (the map reward_variant"
-                        "='grad' scores). 'grad' ignores --overlap-layer/--overlap-heads/"
-                        "--token-reduction.")
+                        "='grad' scores), or GLIMPSE's gradient-weighted attention (the map "
+                        "reward_variant='glimpse' scores). 'grad' and 'glimpse' ignore "
+                        "--overlap-layer/--overlap-heads/--token-reduction. 'glimpse' is "
+                        "~0.2 s per target token, i.e. 55-59x 'grad' -- budget accordingly.")
     p.add_argument("--score", default="metric", choices=["metric", "logratio"],
                    help="which per-step number is aggregated into the reported overlap: the "
                         "--overlap-metric, or the roll-null log ratio (chance 0). logratio_raw "
@@ -810,6 +877,20 @@ def main():
                         "peak approaches the card")
     p.add_argument("--grad-null-offsets", type=int, default=16)
     p.add_argument("--grad-logratio-clip", type=float, default=1.0)
+    # --- the GLIMPSE reward (trl/rewards/glimpse_rewards.py). Defaults match the
+    # trainer's, so `--map glimpse` measures the map a `--glimpse` run would score.
+    p.add_argument("--glimpse-target", default="clogit", choices=list(GM.GRAD_TARGETS))
+    p.add_argument("--glimpse-layer-frac", type=float, default=1.0,
+                   help="fraction of the stack propagated, off the top. 0.6 is 1.64x "
+                        "cheaper and a METHOD change; the screened map is 1.0.")
+    p.add_argument("--glimpse-token-cap", type=int, default=0,
+                   help="target tokens scored per step, drawn at random; 0 = all. Cost is "
+                        "exactly linear in this.")
+    p.add_argument("--glimpse-temp", type=float, default=0.5)
+    p.add_argument("--glimpse-depth-temp", type=float, default=0.2)
+    p.add_argument("--glimpse-token-weight", default="full",
+                   choices=["full", "confidence", "prompt", "uniform"])
+    p.add_argument("--glimpse-seed", type=int, default=0)
     p.add_argument("--grad-inframe-rolls", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--box-threshold", type=float, default=0.10)
     p.add_argument("--max-box-area", type=float, default=0.5,

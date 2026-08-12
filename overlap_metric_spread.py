@@ -30,6 +30,29 @@ cannot be paired -- the two maps cannot both be the incumbent -- so it inherits 
 the reference weights already carry. On an ATTENTION run there is no trap: all four rows,
 `logratio` included, are the same map and the table is paired as designed.
 
+W_GLIMPSE, the same arithmetic, and the one thing that is EASIER here. `--map glimpse`
+records `mean_in_v2_raw` and `auroc_raw` on every grounded step like every other run, so a
+single glimpse probe run calibrates BOTH reward variants on identical maps, masks and
+completions -- the two rows are paired against each other even though neither is paired
+against the incumbent. Take `sd_per_sample` for the variant being trained and compute
+
+    w_glimpse = 0.4 * 0.0086 / sd_variant
+
+by hand, exactly as for w_grad and with the same caveat: 0.0086 is the ATTENTION map's
+spread (1074 grounded steps, set_a), so this is the one comparison that cannot be paired
+and it inherits the +-25% the reference weights already carry. Do NOT reuse mean_in_v2's
+incumbent 0.033 -- that was derived from mean_in_v2 on the ATTENTION map, and the GLIMPSE
+map's spread is a different number.
+
+    python overlap_probe.py --map glimpse --n-samples 40 \
+        --out-dir outputs/overlap_probe/glimpse_spread --dataset cold_data/grpo_sets/set_a
+    python overlap_metric_spread.py outputs/overlap_probe/glimpse_spread/probe_merged.json
+
+Read `union_frac`/`box_area_frac` in the same report while you are there: mean_in_v2's
+ceiling is n_patches/n_in, so its spread is partly a spread of union AREAS, and a w set
+from it is paying for that too. auroc has no such term, which is the main practical
+argument for the auroc variant over the mean_in_v2 one.
+
 The per-completion reward is reconstructed the way think_overlap_reward builds it:
 mean over the completion's grounded observe steps, times the format gate, None when
 there is no grounded step (masked, so it never enters the group). The optional mass

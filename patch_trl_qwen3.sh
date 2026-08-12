@@ -98,6 +98,15 @@ cp "$REPO/trl/grad_maps.py"               "$TRL_REPO/trl/trainer/grad_maps.py"
 cp "$REPO/trl/rewards/grad_rewards.py"    "$TRL_REPO/trl/rewards/grad_rewards.py"
 echo "  copied gradient-reward files (grad_maps, grad_rewards)"
 
+# ── 2d. GLIMPSE grounding reward support (reward_variant=glimpse) ───────────
+# Same placement rule as 2c: glimpse_maps.py is imported by the trainer as
+# `from .glimpse_maps import ...` and does `from .grad_maps import ...` itself, so
+# it lands beside both in trl/trainer/; glimpse_rewards.py imports from
+# .overlap_rewards and .grad_rewards, so it lands beside those in trl/rewards/.
+cp "$REPO/trl/glimpse_maps.py"            "$TRL_REPO/trl/trainer/glimpse_maps.py"
+cp "$REPO/trl/rewards/glimpse_rewards.py" "$TRL_REPO/trl/rewards/glimpse_rewards.py"
+echo "  copied GLIMPSE-reward files (glimpse_maps, glimpse_rewards)"
+
 # ── 3a. trl/trainer/__init__.py ─────────────────────────────────────────────
 TINIT="$TRL_REPO/trl/trainer/__init__.py"
 [ -f "$TINIT" ] || { echo "MISSING: $TINIT"; exit 1; }

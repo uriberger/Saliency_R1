@@ -119,8 +119,14 @@ class ScriptArguments:
             "attention re-forward pass entirely). 'grad' = the roll-null gradient reward: "
             "same per-observe-step, DINO-grounded shape as 'ours', but the map is the "
             "PIXEL GRADIENT of the step's own tokens and the score is "
-            "log(||g_U|| / ||g_rolled||) -- see trl/rewards/grad_rewards.py.",
-            "choices": ["saliency_r1", "ours", "none", "grad"],
+            "log(||g_U|| / ||g_rolled||) -- see trl/rewards/grad_rewards.py. "
+            "'glimpse' = the GLIMPSE grounding reward: same per-observe-step, "
+            "DINO-grounded shape, but the map is GLIMPSE's gradient-weighted attention "
+            "(docs/saliency-maps.md map 6) and the score is --glimpse_metric. It costs "
+            "55-59x the 'grad' variant per case (100-145 s added to a ~40 s optimizer "
+            "step) and its screened correlation with correctness is null to slightly "
+            "negative -- read trl/rewards/glimpse_rewards.py before using it.",
+            "choices": ["saliency_r1", "ours", "none", "grad", "glimpse"],
         },
     )
     # ---- roll-null gradient reward (reward_variant="grad") ----
@@ -184,6 +190,108 @@ class ScriptArguments:
     grad_seed: int = field(
         default=0,
         metadata={"help": "reward_variant='grad': seed for the control placements."},
+    )
+    # ---- GLIMPSE grounding reward (reward_variant="glimpse") ----
+    glimpse_metric: str = field(
+        default="mean_in_v2",
+        metadata={
+            "help": "reward_variant='glimpse': how to score a step's GLIMPSE map against "
+            "its DINO box union. The two variants, both run through the same "
+            "overlap_rewards implementations the incumbent uses. 'mean_in_v2' (default) = "
+            "mean inside the union / mean over the whole map; chance 1.0, rescale-"
+            "invariant, still sees magnitudes -- but its ceiling is n_patches/n_in, so "
+            "union area moves it MECHANICALLY and glimpse/union_frac must be read "
+            "alongside it. 'auroc' = P(in-union patch outranks out-of-union patch); "
+            "chance 0.5, depends only on patch order, so it is exactly immune to that "
+            "ceiling. On the 3,471-step screen both are null-to-negative against "
+            "correctness (r = -0.031 and -0.056 at step level; Bonferroni needs 0.0735), "
+            "which is the thing to know before choosing between them.",
+            "choices": ["mean_in_v2", "auroc"],
+        },
+    )
+    glimpse_target: str = field(
+        default="clogit",
+        metadata={
+            "help": "reward_variant='glimpse': the scalar differentiated per generated "
+            "token to get dz/dA. Means exactly what --grad_target means, and for the same "
+            "reasons: 'clogit' does not saturate as the model grows confident and drops "
+            "the common-mode channel shared by every vocabulary item.",
+            "choices": ["clogit", "logit", "logprob"],
+        },
+    )
+    glimpse_layer_frac: float = field(
+        default=1.0,
+        metadata={
+            "help": "reward_variant='glimpse': fraction of the decoder stack propagated, "
+            "taken off the TOP. THE FIRST COST DIAL: 0.6 measured 1.64x cheaper (34-36x "
+            "the gradient reward instead of 55-59x) and the paper's own ablation loses "
+            "nothing there -- but it is a METHOD change, not a memory one, and the map "
+            "that was screened is 1.0."
+        },
+    )
+    glimpse_token_cap: int = field(
+        default=0,
+        metadata={
+            "help": "reward_variant='glimpse': score at most this many target tokens per "
+            "observe step, drawn uniformly at random without replacement (never the first "
+            "k -- these maps carry a reading-order prior). THE SECOND COST DIAL, and the "
+            "strongest one: cost is exactly linear in it, so a cap of 6 against a median "
+            "~20 tokens per step is ~3.5x. Eq 18 renormalises beta inside the step, so a "
+            "random subset estimates the same weighted mean -- but what the cap does to "
+            "the SCORE has not been measured at scale, which is why 0 (every token) is "
+            "the default."
+        },
+    )
+    glimpse_temp: float = field(
+        default=0.5,
+        metadata={
+            "help": "reward_variant='glimpse': lambda in eq 6, the head-fusion softmax "
+            "temperature. The paper's value."
+        },
+    )
+    glimpse_depth_temp: float = field(
+        default=0.2,
+        metadata={
+            "help": "reward_variant='glimpse': lambda_d in eq 9, the exponential depth "
+            "prior. 0.2 is the paper's text; it was tuned on a 64-layer backbone where it "
+            "spans 7.8% of the depth, and 0.36 is what matches that SHAPE on this "
+            "36-layer model. The ablation calls this the single most important component."
+        },
+    )
+    glimpse_token_weight: str = field(
+        default="full",
+        metadata={
+            "help": "reward_variant='glimpse': eq 18's beta_t. 'full' = p_t x prompt "
+            "alignment (the paper); the other three reproduce its token-saliency "
+            "ablation. Eq 17 crosses the modalities on purpose -- a token earns its say "
+            "in where the model looked by being about the QUESTION, since weighting it by "
+            "its own visual alignment would be circular.",
+            "choices": ["full", "confidence", "prompt", "uniform"],
+        },
+    )
+    glimpse_dedupe_steps: bool = field(
+        default=True,
+        metadata={
+            "help": "reward_variant='glimpse': drop repeated observe-step texts before "
+            "the mean over steps. Same hack and same rationale as --grad_dedupe_steps; "
+            "glimpse/dup_frac is logged either way."
+        },
+    )
+    glimpse_natural_only: bool = field(
+        default=False,
+        metadata={
+            "help": "reward_variant='glimpse': score only rows whose 'natural' column is "
+            "True. Same rationale as --overlap_natural_only: Grounding-DINO is a "
+            "photograph detector, so on charts/documents the box union -- and the whole "
+            "score -- is noise."
+        },
+    )
+    glimpse_seed: int = field(
+        default=0,
+        metadata={
+            "help": "reward_variant='glimpse': seed for the --glimpse_token_cap draw. "
+            "Irrelevant when the cap is 0."
+        },
     )
     token_reduction: str = field(
         default="mean",

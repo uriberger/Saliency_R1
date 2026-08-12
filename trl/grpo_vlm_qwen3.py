@@ -565,6 +565,36 @@ if __name__ == "__main__":
             seed=script_args.grad_seed,
         )
         reward_funcs = [think_format_reward, think_grad_reward, accuracy_reward, openai_reward]
+    elif script_args.reward_variant == "glimpse":
+        # Same slot in reward_funcs as the overlap reward, so --reward_weights lines up
+        # unchanged. The METRIC and the DINO-side knobs live in overlap_rewards._CFG --
+        # glimpse_rewards calls its grounding AND scoring helpers rather than duplicating
+        # them, which is what makes "mean_in_v2 here" the same number as "mean_in_v2
+        # there" -- so both are configured here. Note --glimpse_metric overrides
+        # --overlap_metric for this variant: mean_in divides by the map's own peak, which
+        # is not one of the two variants this reward offers.
+        from trl.rewards.glimpse_rewards import configure as configure_glimpse
+        from trl.rewards.glimpse_rewards import think_glimpse_reward
+        from trl.rewards.overlap_rewards import configure as configure_overlap
+
+        # --mass_floor_tau is deliberately NOT forwarded. It gates on the fraction of an
+        # attention ROW spent on image tokens, and its recommended 0.0022 is the 10th
+        # percentile of that quantity on the reference model. A GLIMPSE map is a relevance
+        # row scaled by 2^-L with an arbitrary constant, so the same tau would be either
+        # inert or a constant zero -- a number that means nothing here. The launcher
+        # refuses the flag outright for this variant.
+        configure_overlap(
+            metric=script_args.glimpse_metric,
+            box_threshold=script_args.box_threshold,
+            max_box_area=script_args.max_box_area,
+            max_union_area=script_args.max_union_area,
+            dino_api_base=script_args.dino_api_base,
+        )
+        configure_glimpse(
+            dedupe_steps=script_args.glimpse_dedupe_steps,
+            natural_only=script_args.glimpse_natural_only,
+        )
+        reward_funcs = [think_format_reward, think_glimpse_reward, accuracy_reward, openai_reward]
     elif script_args.reward_variant == "none":
         # Drop the saliency/overlap reward entirely: accuracy + judge + format only.
         reward_funcs = [think_format_reward, accuracy_reward, openai_reward]
@@ -588,8 +618,17 @@ if __name__ == "__main__":
         token_reduction=script_args.token_reduction,
         overlap_natural_only=(script_args.overlap_natural_only
                               or (script_args.reward_variant == "grad"
-                                  and script_args.grad_natural_only)),
+                                  and script_args.grad_natural_only)
+                              or (script_args.reward_variant == "glimpse"
+                                  and script_args.glimpse_natural_only)),
         grad_target=script_args.grad_target,
+        glimpse_target=script_args.glimpse_target,
+        glimpse_layer_frac=script_args.glimpse_layer_frac,
+        glimpse_temp=script_args.glimpse_temp,
+        glimpse_depth_temp=script_args.glimpse_depth_temp,
+        glimpse_token_weight=script_args.glimpse_token_weight,
+        glimpse_token_cap=script_args.glimpse_token_cap,
+        glimpse_seed=script_args.glimpse_seed,
     )
 
     # Benchmark scores are produced by a separate job (run_bench_eval.sh) and land

@@ -225,9 +225,19 @@ MAX_UNION_AREA=""        # unset -> off. Per-STEP cap on the union of the kept b
                          # each under the per-box cap can cover the whole image, and
                          # the measured median union is already 56% of it.
 REWARD_VARIANT=ours      # ours (attention overlap) | grad (roll-null pixel gradient)
+                         # | glimpse (GLIMPSE grounding; 55-59x grad, read the warning)
 GRAD_TARGET=clogit       # clogit (default) | logit | logprob -- see trl/grad_maps.py
 GRAD_NULL_OFFSETS=16
 GRAD_LOGRATIO_CLIP=1.0
+# GLIMPSE (reward_variant=glimpse). The two variants the reward offers are the metric:
+# mean_in_v2 (chance 1.0, ceiling n_patches/n_in) and auroc (chance 0.5, rank-based).
+GLIMPSE_METRIC=mean_in_v2
+GLIMPSE_TARGET=clogit
+GLIMPSE_LAYER_FRAC=1.0   # cost dial 1: 0.6 is 1.64x cheaper, and a METHOD change
+GLIMPSE_TOKEN_CAP=0      # cost dial 2: tokens scored per step, 0 = all. Cost is linear
+GLIMPSE_DEPTH_TEMP=0.2   # the paper's text; 0.36 matches its shape on 36 layers
+GLIMPSE_TEMP=0.5
+GLIMPSE_TOKEN_WEIGHT=full
 OVERLAP_METRIC=mean_in   # mean_in (incumbent default) | mean_in_v2 (/mean not /max; see
                          # below) | auroc (hack-resistant; see above)
 MASS_FLOOR_TAU=""        # unset -> off for mean_in, 0.0022 for auroc (see below).
@@ -288,6 +298,14 @@ while [[ $# -gt 0 ]]; do
         --grad-target)            GRAD_TARGET="$2";             shift 2 ;;
         --grad-null-offsets)      GRAD_NULL_OFFSETS="$2";       shift 2 ;;
         --grad-logratio-clip)     GRAD_LOGRATIO_CLIP="$2";      shift 2 ;;
+        --glimpse)                REWARD_VARIANT=glimpse;       shift 1 ;;
+        --glimpse-metric)         GLIMPSE_METRIC="$2";          shift 2 ;;
+        --glimpse-target)         GLIMPSE_TARGET="$2";          shift 2 ;;
+        --glimpse-layer-frac)     GLIMPSE_LAYER_FRAC="$2";      shift 2 ;;
+        --glimpse-token-cap)      GLIMPSE_TOKEN_CAP="$2";       shift 2 ;;
+        --glimpse-depth-temp)     GLIMPSE_DEPTH_TEMP="$2";      shift 2 ;;
+        --glimpse-temp)           GLIMPSE_TEMP="$2";            shift 2 ;;
+        --glimpse-token-weight)   GLIMPSE_TOKEN_WEIGHT="$2";    shift 2 ;;
         --mass-floor-tau)         MASS_FLOOR_TAU="$2";          shift 2 ;;
         --natural-only)           NATURAL_ONLY=true;            shift ;;
         --no-natural-only)        NATURAL_ONLY=false;           shift ;;
@@ -396,12 +414,60 @@ if [[ "$REWARD_VARIANT" == "grad" ]]; then
     [[ -n "$MASS_FLOOR_TAU" ]] && { echo "ERROR: --mass-floor-tau does not apply to --grad." >&2; exit 1; }
 fi
 
+# GLIMPSE needs the same explicit --w-overlap, for the same reason -- neither metric's
+# spread is known on this corpus, and mean_in_v2's incumbent 0.033 was calibrated on the
+# ATTENTION map, not this one. It also gets a cost warning the other two do not need.
+if [[ "$REWARD_VARIANT" == "glimpse" ]]; then
+    if [[ -z "${W_OVERLAP_SET:-}" ]]; then
+        echo "ERROR: --glimpse needs an explicit --w-overlap." >&2
+        echo "  The GLIMPSE map's metric spread is not known on this corpus, and the" >&2
+        echo "  incumbent's 0.033 was calibrated on the ATTENTION map, so it does not" >&2
+        echo "  transfer. Measure it first:" >&2
+        echo "    python overlap_probe.py --map glimpse --n-samples 40 \\" >&2
+        echo "        --overlap-metric $GLIMPSE_METRIC \\" >&2
+        echo "        --out-dir outputs/overlap_probe/glimpse_spread --dataset <set>" >&2
+        echo "    python overlap_metric_spread.py outputs/overlap_probe/glimpse_spread" >&2
+        echo "  then pass --w-overlap <w> with w * sd ~ 0.0035 (mean_in's wov0.4 pressure)." >&2
+        exit 1
+    fi
+    # Same refusal as --grad, same reason: the mass floor gates on the fraction of an
+    # ATTENTION row spent on image tokens, and a GLIMPSE relevance row is not that.
+    [[ -n "$MASS_FLOOR_TAU" ]] && { echo "ERROR: --mass-floor-tau does not apply to --glimpse (it gates attention mass; glimpse/n_image is the analogous magnitude)." >&2; exit 1; }
+    cat >&2 <<GLIMPSE_WARN
+------------------------------------------------------------------------------
+ --glimpse is EXPENSIVE and screened NEGATIVE. Both measured, both on record:
+
+   cost   11.3-18.3 s per case at layer_frac 1.0 against the gradient reward's
+          0.20-0.25 -- 55-59x, or 100-145 s added to a ~40 s optimizer step.
+          --glimpse-layer-frac 0.6 buys 1.64x; --glimpse-token-cap is linear.
+   signal on 3,471 steps / 1,157 completions the map IS grounded (auroc level
+          0.567, 0.712 on the smallest union decile -- the first map here that
+          is), but its correlation with the model being RIGHT is null to
+          slightly negative for both metrics, and nothing clears Bonferroni.
+
+ The level decays hard with union area (r = -0.487), so --max-union-area is the
+ knob that decides which regime this run is in. Watch glimpse/union_frac next
+ to glimpse/score_raw: mean_in_v2's ceiling is n_patches/n_in, so a rising
+ score with a rising union is the ceiling moving, not grounding improving.
+------------------------------------------------------------------------------
+GLIMPSE_WARN
+fi
+
 # ---------- naming: every swept HP appears in the model AND wandb name ----------
 N_HEADS=$(echo "$OVERLAP_HEADS" | awk -F, '{print NF}')
 if [[ "$REWARD_VARIANT" == "grad" ]]; then
     # The attention knobs are not in the name because they do not apply: no layer, no
     # heads, no token reduction. What does apply is in it, so a name states what ran.
     SUFFIX="__wov${W_OVERLAP}_grad${GRAD_TARGET}_rn${GRAD_NULL_OFFSETS}_clip${GRAD_LOGRATIO_CLIP}"
+elif [[ "$REWARD_VARIANT" == "glimpse" ]]; then
+    # No layer, no heads, no token reduction -- those are attention-map knobs. What IS
+    # swept here is the metric (the two variants), the target, and the two cost dials,
+    # and a cost dial changes the map, so it belongs in the name.
+    SUFFIX="__wov${W_OVERLAP}_glimpse${GLIMPSE_METRIC}_${GLIMPSE_TARGET}"
+    [[ "$GLIMPSE_LAYER_FRAC" != "1.0" ]] && SUFFIX="${SUFFIX}_lf${GLIMPSE_LAYER_FRAC}"
+    [[ "$GLIMPSE_TOKEN_CAP" != "0" ]]    && SUFFIX="${SUFFIX}_tc${GLIMPSE_TOKEN_CAP}"
+    [[ "$GLIMPSE_DEPTH_TEMP" != "0.2" ]] && SUFFIX="${SUFFIX}_dt${GLIMPSE_DEPTH_TEMP}"
+    [[ "$GLIMPSE_TOKEN_WEIGHT" != "full" ]] && SUFFIX="${SUFFIX}_tw${GLIMPSE_TOKEN_WEIGHT}"
 else
 SUFFIX="__wov${W_OVERLAP}_${N_HEADS}head_tr${TOKEN_REDUCTION}"
 # Only non-default metric settings extend the suffix, so existing mean_in run names
@@ -420,7 +486,11 @@ fi
 LORA_SLUG=$(echo "$LORA_TARGETS" | sed 's/_proj//g; s/,//g')
 [[ "$LORA_TARGETS" != "q_proj,v_proj" ]] && SUFFIX="${SUFFIX}_lora${LORA_SLUG}"
 MODEL_SLUG=$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g')
-REWARD_SLUG=$([[ "$REWARD_VARIANT" == "grad" ]] && echo grad || echo overlap)
+case "$REWARD_VARIANT" in
+    grad)    REWARD_SLUG=grad ;;
+    glimpse) REWARD_SLUG=glimpse ;;
+    *)       REWARD_SLUG=overlap ;;
+esac
 RUN_NAME="grpo-${MODEL_SLUG}-${REWARD_SLUG}${SUFFIX}"
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$REPO/checkpoint/${RUN_NAME}"
 mkdir -p "$OUTPUT_DIR"
@@ -707,14 +777,28 @@ MAX_UNION_FLAG=""
 # existing run is reproduced byte for byte.
 NATURAL_ONLY_FLAG=""
 GRAD_NATURAL_ONLY_FLAG=""
-# --natural-only means the same thing in both variants (score photographs only, because
+GLIMPSE_NATURAL_ONLY_FLAG=""
+# --natural-only means the same thing in every variant (score photographs only, because
 # Grounding-DINO is a photograph detector), but each reward reads its own flag.
 if [[ "$NATURAL_ONLY" == true ]]; then
-    if [[ "$REWARD_VARIANT" == "grad" ]]; then
-        GRAD_NATURAL_ONLY_FLAG="--grad_natural_only True"
-    else
-        NATURAL_ONLY_FLAG="--overlap_natural_only True"
-    fi
+    case "$REWARD_VARIANT" in
+        grad)    GRAD_NATURAL_ONLY_FLAG="--grad_natural_only True" ;;
+        glimpse) GLIMPSE_NATURAL_ONLY_FLAG="--glimpse_natural_only True" ;;
+        *)       NATURAL_ONLY_FLAG="--overlap_natural_only True" ;;
+    esac
+fi
+
+# Omitted entirely unless --glimpse, so every existing run's command line is reproduced
+# byte for byte and the dataclass defaults apply.
+GLIMPSE_FLAGS=""
+if [[ "$REWARD_VARIANT" == "glimpse" ]]; then
+    GLIMPSE_FLAGS="--glimpse_metric $GLIMPSE_METRIC \
+    --glimpse_target $GLIMPSE_TARGET \
+    --glimpse_layer_frac $GLIMPSE_LAYER_FRAC \
+    --glimpse_token_cap $GLIMPSE_TOKEN_CAP \
+    --glimpse_temp $GLIMPSE_TEMP \
+    --glimpse_depth_temp $GLIMPSE_DEPTH_TEMP \
+    --glimpse_token_weight $GLIMPSE_TOKEN_WEIGHT"
 fi
 
 # Held-out validation. Omitted entirely when off, so eval_strategy stays "no" and the
@@ -794,6 +878,8 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --grad_null_offsets "$GRAD_NULL_OFFSETS" \
     --grad_logratio_clip "$GRAD_LOGRATIO_CLIP" \
     $GRAD_NATURAL_ONLY_FLAG \
+    $GLIMPSE_FLAGS \
+    $GLIMPSE_NATURAL_ONLY_FLAG \
     --overlap_layer "$OVERLAP_LAYER" \
     --overlap_heads "$OVERLAP_HEADS" \
     --token_reduction "$TOKEN_REDUCTION" \

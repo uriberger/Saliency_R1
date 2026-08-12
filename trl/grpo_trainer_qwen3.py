@@ -518,16 +518,31 @@ class GRPOTrainer(Trainer):
         token_reduction: str = "mean",
         overlap_natural_only: bool = False,
         grad_target: str = "clogit",
+        glimpse_target: str = "clogit",
+        glimpse_layer_frac: float = 1.0,
+        glimpse_temp: float = 0.5,
+        glimpse_depth_temp: float = 0.2,
+        glimpse_token_weight: str = "full",
+        glimpse_token_cap: int = 0,
+        glimpse_seed: int = 0,
     ):
         self.reforward_saliency = reforward_saliency
         # --- attention-overlap reward config (reward_variant="ours") ---
         self.reward_variant = reward_variant
-        # "ours" and "grad" differ only in what the per-case re-forward extracts -- raw
-        # attention at one layer, or the pixel gradient of the step's own tokens. Both
-        # segment observe steps, ground them with DINO and score per step, so every
-        # observe-step-shaped decision below applies to both.
-        self._per_step_reward = reward_variant in ("ours", "grad")
+        # "ours", "grad" and "glimpse" differ only in what the per-case re-forward
+        # extracts -- raw attention at one layer, the pixel gradient of the step's own
+        # tokens, or GLIMPSE's gradient-weighted attention. All three segment observe
+        # steps, ground them with DINO and score per step, so every observe-step-shaped
+        # decision below applies to all of them.
+        self._per_step_reward = reward_variant in ("ours", "grad", "glimpse")
         self.grad_target = grad_target
+        self.glimpse_target = glimpse_target
+        self.glimpse_layer_frac = float(glimpse_layer_frac)
+        self.glimpse_temp = float(glimpse_temp)
+        self.glimpse_depth_temp = float(glimpse_depth_temp)
+        self.glimpse_token_weight = glimpse_token_weight
+        self.glimpse_token_cap = int(glimpse_token_cap or 0)
+        self.glimpse_seed = int(glimpse_seed)
         # Score the overlap reward on natural (photographic) rows only; non-natural rows
         # fall back to format + accuracy + judge. See think_overlap_reward's docstring.
         self.overlap_natural_only = bool(overlap_natural_only) and self._per_step_reward
@@ -1897,6 +1912,172 @@ class GRPOTrainer(Trainer):
             )
         return results
 
+    @profiling_decorator
+    def _compute_glimpse_step_maps(
+        self, inputs, images, prompt_inputs, prompt_completion_ids, attention_mask,
+        prompt_ids, prompt_length, completion_ids, output_text,
+        think_start_idx, think_end_idx, think_start, think_end, invalid, out, device,
+    ):
+        """Per completion -> list of {"map": (gh, gw) float32, "text": str} per observe
+        step, where the map is the GLIMPSE map of that step's own tokens (docs map 6):
+        gradient-weighted attention, propagated with adaptive layer weights and
+        aggregated over the step by a confidence x prompt-alignment weight.
+
+        Same output contract as `_compute_grad_step_maps`, so the segmentation, the DINO
+        grounding and every probe that reads these maps are unchanged; only the map
+        differs. `trl/glimpse_maps.py` holds the definition; the reward is
+        `trl.rewards.glimpse_rewards.think_glimpse_reward`.
+
+        THE COST, because it is the fact that governs whether this variant is usable.
+        Measured on an H100-80GB against the gradient map on identical cases
+        (glimpse_cost_probe.py): 11.3-18.3 s per case at `layer_frac=1.0` against the
+        gradient map's 0.20-0.25, i.e. 55-59x, or 100-145 s added to one rank's optimizer
+        step against a step that is currently ~40 s in total. `--glimpse_layer_frac 0.6`
+        buys 1.64x and `--glimpse_token_cap` is linear. Peak memory is NOT the problem:
+        19.7 GiB against the gradient path's 20.1 on the same cases.
+
+        THE ZeRO-3 HAZARD is the gradient path's, plus one. The same three safeguards are
+        load-bearing here -- `frozen_params` so no weight gradient is ever accumulated,
+        exactly ONE model forward per case on EVERY rank whatever that case contains, and
+        the trace invalidated on both sides. What is new is that GLIMPSE also re-runs
+        individual decoder layers in eager, once per propagated layer per target token, so
+        the number of MODULE forwards varies across ranks and not just the number of
+        backwards. That is safe for the same reason the variable backward count is:
+        `unwrap_model_for_generation(..., gather_deepspeed3_params=True)` has already
+        gathered every parameter, so no per-module fetch is issued against the recorded
+        trace during this pass, and the trace is re-recorded afterwards either way.
+
+        `DISABLE_GLIMPSE_FORWARD=1` bisects the whole thing out (the reward then sees no
+        maps and contributes nothing) if a run starts dying in `reset_step`.
+        """
+        from .glimpse_maps import step_glimpse_maps
+        from .grad_maps import frozen_params
+        from .overlap_steps import segment_observe_steps
+        from .rewards.glimpse_rewards import record_map_info
+
+        if os.environ.get("DISABLE_GLIMPSE_FORWARD") == "1":
+            return [[] for _ in range(len(images))]
+
+        clf = self._get_overlap_classifier()
+        tokenizer = getattr(self.processing_class, "tokenizer", self.processing_class)
+
+        thw = prompt_inputs.get("image_grid_thw")  # [batch, 3]
+        if thw is None:
+            raise RuntimeError(
+                "reward_variant='glimpse' reads the map off the image-token columns, but "
+                "this batch carries no image_grid_thw. It needs an image corpus."
+            )
+        patch_offsets = [0]
+        for _i in range(thw.shape[0]):
+            patch_offsets.append(patch_offsets[-1] + int(thw[_i].prod().item()))
+
+        results = [[] for _ in range(len(images))]
+        self._invalidate_zero3_trace("before the glimpse re-forward")
+
+        import time as _time
+        _prof = os.environ.get("OVERLAP_PROFILE") == "1"
+        _t_fwd = _t_seg = 0.0
+        _n_spans = _n_tokens = 0
+
+        with (
+            unwrap_model_for_generation(
+                self.model_wrapped, self.accelerator,
+                gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+            ) as _unwrapped,
+            frozen_params(_unwrapped),
+            FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
+        ):
+            for case_id in range(len(images)):
+                ts, te = think_start[case_id], think_end[case_id]
+                # As in the gradient path, the spans have to be known BEFORE the forward:
+                # they select the rows that reach lm_head. Segmentation is rank-local
+                # (FLAN-T5, not the policy), so doing it first changes nothing about the
+                # ZeRO-3 trace -- but the forward below must still happen for every case,
+                # which is what `discard` is for.
+                discard = not invalid[case_id] or te <= ts
+                if not discard and self.overlap_natural_only:
+                    discard = not self._row_is_natural(inputs, case_id)
+
+                question = (inputs[case_id].get("problem", "")
+                            if isinstance(inputs[case_id], dict) else "")
+                steps = []
+                if not discard:
+                    if _prof:
+                        _tg = _time.perf_counter()
+                    steps = segment_observe_steps(
+                        output_text[case_id], think_start_idx[case_id], think_end_idx[case_id],
+                        out, case_id, ts, te, question, clf,
+                    )
+                    if _prof:
+                        _t_seg += _time.perf_counter() - _tg
+
+                spans, texts = [], []
+                for step_text, tok_a, tok_b in steps:
+                    a, b = prompt_length + tok_a, prompt_length + tok_b
+                    if b <= a or a <= 0 or b > prompt_completion_ids.shape[1]:
+                        continue
+                    spans.append((a, b))
+                    texts.append(step_text)
+                if not spans:
+                    # Nothing to score, but the forward is not optional: a one-token dummy
+                    # keeps this rank's module order identical to every other rank's.
+                    spans = [(prompt_completion_ids.shape[1] - 1, prompt_completion_ids.shape[1])]
+                    texts = []
+                    discard = True
+
+                _case_inputs = {
+                    "input_ids": prompt_completion_ids[case_id:case_id + 1],
+                    "attention_mask": attention_mask[case_id:case_id + 1],
+                    "pixel_values": prompt_inputs["pixel_values"][
+                        patch_offsets[case_id]:patch_offsets[case_id + 1]
+                    ],
+                    "image_grid_thw": thw[case_id:case_id + 1],
+                }
+                if prompt_inputs.get("mm_token_type_ids") is not None:
+                    _compl_zeros = torch.zeros(1, completion_ids.size(1), dtype=torch.long, device=device)
+                    _case_inputs["mm_token_type_ids"] = torch.cat(
+                        [prompt_inputs["mm_token_type_ids"][case_id:case_id + 1], _compl_zeros], dim=1
+                    )
+
+                if _prof:
+                    torch.cuda.synchronize(device); _tsf = _time.perf_counter()
+                maps, info = step_glimpse_maps(
+                    _unwrapped, _case_inputs, spans, thw[case_id].tolist(),
+                    question=question, tokenizer=tokenizer, prompt_len=prompt_length,
+                    target=self.glimpse_target, layer_frac=self.glimpse_layer_frac,
+                    temp=self.glimpse_temp, depth_temp=self.glimpse_depth_temp,
+                    token_weight=self.glimpse_token_weight,
+                    token_cap=self.glimpse_token_cap, seed=self.glimpse_seed,
+                    image_token_id=self.image_token_id or 151655,
+                )
+                if _prof:
+                    torch.cuda.synchronize(device); _t_fwd += _time.perf_counter() - _tsf
+                    _n_spans += len(spans)
+                    _n_tokens += int(info.get("n_target_tokens") or 0)
+
+                if discard:
+                    del maps
+                    continue
+                info["n_steps_built"] = len(texts)
+                record_map_info(info)
+                results[case_id] = [
+                    {"map": maps[k].astype(np.float32), "text": texts[k]}
+                    for k in range(len(texts))
+                ]
+
+        self._invalidate_zero3_trace("after the glimpse re-forward")
+
+        if _prof and self.accelerator.is_main_process:
+            import sys as _sys
+            print(
+                f"[glimpse-profile] target={self.glimpse_target} "
+                f"frac={self.glimpse_layer_frac} cap={self.glimpse_token_cap} "
+                f"cases={len(images)} spans={_n_spans} tokens={_n_tokens} "
+                f"fwd+bwd={_t_fwd:.1f}s t5-segment={_t_seg:.1f}s",
+                file=_sys.stderr, flush=True,
+            )
+        return results
+
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
@@ -2375,6 +2556,15 @@ class GRPOTrainer(Trainer):
                 prompt_ids, prompt_length, completion_ids, output_text,
                 think_start_idx, think_end_idx, think_start, think_end, invalid, out, device,
             )
+        elif self.reward_variant == "glimpse":
+            # --- GLIMPSE grounding reward: gradient-weighted attention propagated with
+            # adaptive layer weights, per observe step. Same per-step map contract, and
+            # 55-59x the gradient path's cost -- see _compute_glimpse_step_maps. ---
+            attn_batch = self._compute_glimpse_step_maps(
+                inputs, images, prompt_inputs, prompt_completion_ids, attention_mask,
+                prompt_ids, prompt_length, completion_ids, output_text,
+                think_start_idx, think_end_idx, think_start, think_end, invalid, out, device,
+            )
         elif self.reforward_saliency:
             # --- Re-forward path: generate without output_attentions, then do a cheap
             # per-case forward pass to extract attention slices for saliency. ---
@@ -2601,6 +2791,20 @@ class GRPOTrainer(Trainer):
                 # Uniform across ranks: the decision is taken on the GATHERED tensor.
                 if _g.numel():
                     self._metrics[mode][f"grad/{_k}"].append(_g.mean().item())
+        if self.reward_variant == "glimpse":
+            # `union_frac` and `ceiling` are the ones to read first, not `score_raw`:
+            # mean_in_v2's ceiling IS n_patches/n_in, so a union that grows raises the
+            # score with no change in the map, and the screen measured the map's own
+            # grounding decaying with union area (r = -0.487). The rest are the same
+            # hack monitors the gradient reward carries. Fixed key set, same NCCL reason.
+            from .rewards.glimpse_rewards import pop_diagnostics as pop_glimpse_diagnostics
+
+            for _k, _v in pop_glimpse_diagnostics().items():
+                _t = torch.tensor([_v], dtype=torch.float32, device=device)
+                _g = gather(_t)
+                _g = _g[~torch.isnan(_g)]
+                if _g.numel():
+                    self._metrics[mode][f"glimpse/{_k}"].append(_g.mean().item())
         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
         # Overall (weighted-sum) reward mean/std across ALL rollouts, in the same
