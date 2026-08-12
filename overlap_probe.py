@@ -345,6 +345,29 @@ def find_attn_module(model, layer: int):
     return None
 
 
+def teacher_forced_case(prompt_inputs, comp_ids, device):
+    """prompt ++ one completion, as the single teacher-forced forward both maps read off.
+
+    `comp_ids` is generate()'s `list[int]` (it returns `row.tolist()`), not a tensor.
+    `mm_token_type_ids` must be extended over the completion with zeros -- text -- or the
+    forward differs from the one training runs, which would silently change the quantity
+    being measured. Both saliency paths call this so they cannot drift apart again.
+    """
+    ids = torch.cat(
+        [prompt_inputs["input_ids"], torch.tensor([comp_ids], device=device)], dim=1
+    )
+    case = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+    if "pixel_values" in prompt_inputs:
+        case["pixel_values"] = prompt_inputs["pixel_values"]
+        case["image_grid_thw"] = prompt_inputs["image_grid_thw"]
+    if prompt_inputs.get("mm_token_type_ids") is not None:
+        zeros = torch.zeros(1, len(comp_ids), dtype=torch.long, device=device)
+        case["mm_token_type_ids"] = torch.cat(
+            [prompt_inputs["mm_token_type_ids"], zeros], dim=1
+        )
+    return case
+
+
 @torch.no_grad()
 def capture_layer_attention(model, attn_mod, prompt_inputs, prompt_len, comp_ids, heads, device):
     """Return [n_heads_sel, think_span_all, n_image_patches] float32 for one completion.
@@ -376,19 +399,8 @@ def capture_layer_attention(model, attn_mod, prompt_inputs, prompt_len, comp_ids
 
     handle = attn_mod.register_forward_hook(hook, with_kwargs=True)
     try:
-        ids = torch.cat(
-            [prompt_inputs["input_ids"], torch.tensor([comp_ids], device=device)], dim=1
-        )
-        am = torch.ones_like(ids)
-        case = {"input_ids": ids, "attention_mask": am}
-        if "pixel_values" in prompt_inputs:
-            case["pixel_values"] = prompt_inputs["pixel_values"]
-            case["image_grid_thw"] = prompt_inputs["image_grid_thw"]
-        if prompt_inputs.get("mm_token_type_ids") is not None:
-            zeros = torch.zeros(1, len(comp_ids), dtype=torch.long, device=device)
-            case["mm_token_type_ids"] = torch.cat(
-                [prompt_inputs["mm_token_type_ids"], zeros], dim=1
-            )
+        case = teacher_forced_case(prompt_inputs, comp_ids, device)
+        ids = case["input_ids"]
         seq = ids.shape[-1]
         masked = torch.triu(torch.ones(seq, seq, dtype=torch.bool, device=device), diagonal=1)
         add = torch.zeros(seq, seq, dtype=mdtype, device=device)
@@ -577,13 +589,8 @@ def grad_step_maps(model, processor, prompt_inputs, prompt_len, comp_ids, steps,
     ip = processor.image_processor
     ps = int(getattr(ip, "patch_size", 16))
     tps = int(getattr(ip, "temporal_patch_size", 2))
-    ids = torch.cat([prompt_inputs["input_ids"][0], comp_ids.to(device)])[None]
-    case = {
-        "input_ids": ids,
-        "attention_mask": torch.ones_like(ids),
-        "pixel_values": prompt_inputs["pixel_values"],
-        "image_grid_thw": prompt_inputs["image_grid_thw"],
-    }
+    case = teacher_forced_case(prompt_inputs, comp_ids, device)
+    ids = case["input_ids"]
     kept, spans = [], []
     for text, tok_a, tok_b in steps:
         a, b = prompt_len + tok_a, prompt_len + tok_b
