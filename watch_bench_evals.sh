@@ -17,7 +17,7 @@
 #
 # Usage:
 #   bash watch_bench_evals.sh --run-dir DIR [--num-gpus 1] [--every 100]
-#                             [--interval 60] [--duration 4] [--once]
+#                             [--interval 60] [--duration 1] [--once]
 #
 # Environment: PARTITION, OPENAI_API_KEY / NVIDIA_API_KEY, HF_TOKEN
 set -uo pipefail
@@ -39,7 +39,11 @@ NUM_GPUS=1
 EVERY=100
 SAMPLE_N=100
 INTERVAL=60
-DURATION=4
+# Ask for one hour, not the partition's 4h maximum. batch_singlenode caps jobs at
+# 04:00:00, so a 4h request only ever backfills into a 4h hole -- the rarest window
+# there is, which is why these evals sat in (Priority) behind 55 jobs instead of
+# slipping into the gaps between them. An hour fits almost anywhere.
+DURATION=1
 ONCE=false
 DRY_RUN=false
 
@@ -134,11 +138,17 @@ else
 fi
 
 # Only used by the sbatch backend; submit_job sizes the allocation itself. The
-# defaults match what this cluster actually hands out (an 8-GPU interactive job
-# gets 224 CPUs and 1970 GB, i.e. 28 CPUs and ~246 GB per GPU); asking for more
-# per GPU than a node has makes the job unschedulable rather than merely large.
+# defaults match what this cluster actually hands out (an 8-GPU job gets 240 CPUs
+# and 1878736 MB, i.e. 30 CPUs and 234842 MB per GPU).
+#
+# Asking for more than that per GPU is not merely large, it is rejected outright:
+# slurm refuses any request whose memory-to-GPU ratio would strand GPUs on the
+# node ("For N GPUs, please only request MAX ... RAM"), so an over-ask means the
+# dispatcher never submits anything at all. 234842 MB is 229.4 GiB, so the ceiling
+# in the GiB units --mem=<n>G speaks is 229 -- the 240 that stood here read the
+# node's ~1970 GB as GiB and overshot by 4%.
 CPUS_PER_GPU=${CPUS_PER_GPU:-28}
-MEM_PER_GPU_GB=${MEM_PER_GPU_GB:-240}
+MEM_PER_GPU_GB=${MEM_PER_GPU_GB:-229}
 
 pending_steps() {
     local d step
@@ -189,8 +199,14 @@ cooling_down() {
 BENCH_JUDGE_KEY=${OPENAI_API_KEY:-${NVIDIA_API_KEY:-}}
 [[ -n "$BENCH_JUDGE_KEY" ]] && export OPENAI_API_KEY="$BENCH_JUDGE_KEY"
 
+# --job-minutes is how the job learns its own wall clock. It cannot ask Slurm: the
+# submit_job backend runs the command inside a container that does not mount
+# /cm/shared, so squeue is not on PATH there and run_bench_eval.sh's fallback would
+# have it believe it has unlimited time -- it would start a suite it cannot finish
+# and be killed part-way. We know the budget here, so we simply tell it.
 INNER_CMD="bash $SCRIPT_DIR/run_bench_eval.sh \
-        --run-dir $RUN_DIR --num-gpus $NUM_GPUS --every $EVERY --sample-n $SAMPLE_N"
+        --run-dir $RUN_DIR --num-gpus $NUM_GPUS --every $EVERY --sample-n $SAMPLE_N \
+        --job-minutes $(( DURATION * 60 ))"
 
 submit_eval_job() {
     if [[ "$BACKEND" == "submit_job" ]]; then
