@@ -280,10 +280,31 @@ time re-run in eager. Per target token,
    the input rather than recomputing it is also what makes the deepstack additions the
    text model performs *between* layers a non-issue.
 
-Peak drops ~60×: what is left scaling as `N²` is the `[N, N]` fp32 `E^l` held per layer
-during the propagation, 36 × 4 bytes per pair against the graph's ~9000. The price is
-compute — about one extra forward per target token. `--glimpse-layer-frac` (the paper's
-ablation loses nothing at 0.6) is therefore a **method** knob now, not a memory knob.
+What is left scaling as `N²` is the `[N, N]` fp32 `E^l` held per layer during the
+propagation, 36 × 4 bytes per pair against the graph's ~9000. The price is compute —
+about one extra forward per target token. `--glimpse-layer-frac` (the paper's ablation
+loses nothing at 0.6) is therefore a **method** knob now, not a memory knob.
+
+Measured on an H100-80GB, all 36 layers propagated, peak allocated including weights:
+
+| `N` | all-eager graph | grad cache | |
+|---|---|---|---|
+| 1600 | 42.3 GiB | **26.17** | 1.6× |
+| 2400 | 68.6 | **31.98** | 2.1× |
+| 3600 | **OOM** | **42.03** | the OOM that motivated this |
+| 4800 | — | **53.56** | |
+
+The ratio grows with `N` because the fixed ~16.3 GiB of weights dominates the low end;
+what the rework removes is the part that scales. N=4800 is the largest measured point and
+it fits with room, so the ceiling is above it but has not been located. `test_glimpse_gpu.py
+--scale` reproduces this table.
+
+Equivalence against the pre-rework implementation is checked in **fp32**, where the two
+agree to `1.3e-06` at `corr 1.000000`. It cannot be checked in bf16: this map carries
+0.063–0.089 max relative deviation of its own rounding noise there — more than the two
+implementations differ from each other — so a bf16 comparison measures cuBLAS reduction
+order, and the all-eager baseline fails it against itself. `diag_glimpse_dev.py` is the
+harness that established this; rerun it before retuning those thresholds.
 
 Two guards, because both failure modes are silent. `_check_causal`: eager attention with
 no mask is bidirectional, and sdpa is entitled to hand the layer no mask at all, so query

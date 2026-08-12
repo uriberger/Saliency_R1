@@ -1,14 +1,42 @@
-# Handoff — GLIMPSE (map 5) memory rework, state as of 2026-08-12
+# GLIMPSE (map 5) memory rework — RESOLVED 2026-08-12
 
-Branch `feat/glimpse-map`, pushed to `origin`. Two commits on top of `main` at `10539ff`:
+**Done and merged.** Kept for the reasoning, and for the cluster-portability and
+login-node sections at the bottom, which still apply to anything run here.
 
 | commit | what |
 |---|---|
 | `feb1f4d` | the previous session's GLIMPSE implementation, committed unchanged as a baseline |
 | `a8cd0e8` | the memory rework — `dz/dA` one layer at a time |
+| `1c6ccb2` | equivalence gate moved to fp32, where the comparison is decidable |
+| `fed5580` | `diag_glimpse_dev.py`, the harness that calibrated those thresholds |
 
-**Nothing in `a8cd0e8` has ever been executed.** It passes `py_compile` and nothing else.
-The allocation expired before it could be run. Validating it is the whole remaining task.
+Merged to `main` as `92cd34b`; branch `feat/glimpse-map` deleted local and remote.
+
+## Outcome
+
+`a8cd0e8` is correct. Equivalence against the all-eager baseline in fp32: **corr
+1.000000, max deviation 1.3e-06**, on real `val_natural` samples. CPU gate 33/33,
+including the chain-rule identity at exactly `0.000e+00`.
+
+Peak allocated, H100-80GB, all 36 layers propagated:
+
+| `N` | all-eager | grad cache |
+|---|---|---|
+| 1600 | 42.3 GiB | **26.17** |
+| 2400 | 68.6 | **31.98** |
+| 3600 | **OOM** | **42.03** |
+| 4800 | — | **53.56** |
+
+The pre-run estimate for N=4800 was ~40 GiB; the measurement is 53.56, and it still fits.
+Confirmed end to end afterwards: a 20-sample, 8-GPU `launch_saliency_viz.sh` run drew
+glimpse on every sample at `--max-new-tokens 1024` with no OOM.
+
+**The one trap.** The gate originally compared in bf16 and failed at max dev 0.0707
+against a 0.05 threshold. The threshold was wrong, not the code: this map carries
+0.063–0.089 of its *own* bf16 rounding noise, so the baseline fails that check against
+itself, and the reading moved 0.0707 → 0.02675 between two processes on one sample while
+being bit-deterministic inside each. Hence fp32 — and TF32 must be off with it, since its
+~10-bit mantissa is roughly bf16 and would silently restore the problem.
 
 ## Why the rework exists
 
@@ -36,21 +64,24 @@ sdpa forward, 4 differentiates through sdpa.
 into it. Chain rule, so the same quantity by a different floating-point path. Full
 reasoning in `docs/saliency-maps.md` §6 and the `GlimpseGradCache` docstring.
 
-## The one task: run the two gates
+## Rerunning the two gates
 
 ```fish
-# 1. get a node. ONE free 80 GB GPU is enough; the equivalence half runs the OLD
-#    all-eager implementation too, so it needs ~25 GiB of genuinely free memory.
+# 1. get a node. ONE free 80 GB GPU is enough for the correctness half; the FULL run
+#    needs ~54 GiB free, since --scale goes to N=4800. The equivalence half now runs
+#    in fp32, which casts the 8B model and costs ~37 GiB on its own.
 srun -A nvr_israel_rlop -p interactive --time=1:00:00 --gres=gpu:1 --pty bash
 
 # 2. from the login shell, with $JOBID from `squeue -u $USER`:
 srun --jobid=$JOBID --overlap -n1 bash -lc '
-  cd <REPO>/.worktrees/feat-glimpse-map &&
+  cd <REPO> &&
   source <CONDA>/etc/profile.d/conda.sh && conda activate saliency_r1_qwen3_vllm &&
   export HF_HOME=<HF_HOME> HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
          CUDA_VISIBLE_DEVICES=0 &&
   python test_glimpse_cpu.py && python test_glimpse_gpu.py'
 ```
+
+Budget ~20 minutes for the full run: fp32 equivalence is the slow half.
 
 `test_glimpse_cpu.py` — pure algebra plus `test_grad_cache_identity`, which checks the
 chain-rule claim against an all-in-one backward on the toy stack. No model, no GPU, but
@@ -59,27 +90,29 @@ it imports torch, so it still goes through `srun` (see below).
 `test_glimpse_gpu.py` — the real gate, two halves:
 
 - **equivalence**: new map vs the `feb1f4d` all-eager map on identical inputs from real
-  `val_natural` samples. Passes at correlation ≥ 0.99 and max relative deviation ≤ 0.05.
-  They are the same quantity, so anything below that is a real disagreement, not bf16
-  noise. The baseline is materialised from git (`git show feb1f4d:saliency_viz.py`) so it
-  cannot drift; `--max-new-tokens` defaults to 256 so the baseline survives to be compared.
-- **scaling**: peak allocated at `N` = 1600 / 2400 / 3600 / 4800 against the table above.
-  N=3600 OOM'd on the baseline and has to fit now. Rough estimate for N=4800 is ~40 GiB —
-  an estimate, not a measurement, and it is the first thing that will fail if the rework
-  is wrong about where the memory went.
+  `val_natural` samples, **in fp32** (`--equiv-dtype`). Passes at corr ≥ 0.9999 and max
+  relative deviation ≤ 1e-3; measured 1.000000 / 1.3e-06, so those thresholds sit ~1000×
+  above the noise and will still catch anything real. The baseline is materialised from
+  git (`git show feb1f4d:saliency_viz.py`) so it cannot drift; `--max-new-tokens` defaults
+  to 256 so the baseline survives to be compared.
+- **scaling**: peak allocated at `N` = 1600 / 2400 / 3600 / 4800, in bf16, against the
+  table above. This half is what makes the memory claim — the per-sample peaks printed by
+  the equivalence half are informational, since at `N ≈ 400` in fp32 the peak is weights
+  plus a graph too small to matter and the ordering flips on allocator noise.
 
-If only a partly-occupied GPU is available: `--skip-scaling` drops the peak to ~25 GiB and
-keeps the correctness gate, which is the half that decides whether the rework is right.
+If only a partly-occupied GPU is available: `--skip-scaling` keeps the correctness gate,
+which is the half that decides whether the rework is right.
 
-### Reading the result
+### If a gate goes red
 
-- Both halves green → offer to merge: `./worktree.sh done feat/glimpse-map` **from the
-  central tree**, after asking. Do not merge unasked.
-- Equivalence fails → the rework is wrong, not the tolerance. Suspects, in order: the
-  causal mask handed to the eager replay (`IV.causal_mask`, `_check_causal`), the recorded
-  kwargs (`_check_replay` should have caught it), `--glimpse-layer-frac` < 1 changing which
-  layers are cut.
-- Scaling fails only at 4800 → not a defect; trim `--scale` and record the real ceiling in
+- **Equivalence, in fp32** → the rework is wrong, and the threshold is not the suspect:
+  the two paths agree to 1.3e-06 there. Look at the causal mask handed to the eager replay
+  (`IV.causal_mask`, `_check_causal`), the recorded kwargs (`_check_replay` should have
+  caught it), then `--glimpse-layer-frac` < 1 changing which layers are cut.
+- **Equivalence, in bf16** (`--equiv-dtype bfloat16`) → almost certainly the dtype, not the
+  code. Confirm with `diag_glimpse_dev.py --fp32` before touching `saliency_viz.py`; that
+  is exactly the trap described above.
+- **Scaling above 4800** → not a defect; trim `--scale` and record the real ceiling in
   `docs/saliency-maps.md`.
 
 ## Cluster portability — check before running
