@@ -1950,10 +1950,18 @@ class GRPOTrainer(Trainer):
         `DISABLE_GLIMPSE_FORWARD=1` bisects the whole thing out (the reward then sees no
         maps and contributes nothing) if a run starts dying in `reset_step`.
         """
+        # The reward modules are imported ABSOLUTELY and the map modules relatively, and
+        # the asymmetry is not a style slip: patch_trl_qwen3.sh copies this file and the
+        # map modules into trl_repo/trl/TRAINER/, but the reward modules into
+        # trl_repo/trl/REWARDS/. So `.glimpse_maps` resolves here and in trl_repo alike,
+        # while `.rewards.glimpse_rewards` resolves only in this tree and raises
+        # ModuleNotFoundError: trl.trainer.rewards in the one that actually executes.
+        # test_import_layout_cpu.py holds the line.
+        from trl.rewards.glimpse_rewards import record_map_info
+
         from .glimpse_maps import step_glimpse_maps
         from .grad_maps import frozen_params
         from .overlap_steps import segment_observe_steps
-        from .rewards.glimpse_rewards import record_map_info
 
         if os.environ.get("DISABLE_GLIMPSE_FORWARD") == "1":
             return [[] for _ in range(len(images))]
@@ -2782,7 +2790,7 @@ class GRPOTrainer(Trainer):
             # pop_diagnostics returns a FIXED key set (NaN where this rank saw nothing),
             # because `gather` below is a collective: a rank-dependent key set would mean
             # a rank-dependent number of collectives, which hangs rather than fails.
-            from .rewards.grad_rewards import pop_diagnostics
+            from trl.rewards.grad_rewards import pop_diagnostics
 
             for _k, _v in pop_diagnostics().items():
                 _t = torch.tensor([_v], dtype=torch.float32, device=device)
@@ -2797,7 +2805,7 @@ class GRPOTrainer(Trainer):
             # score with no change in the map, and the screen measured the map's own
             # grounding decaying with union area (r = -0.487). The rest are the same
             # hack monitors the gradient reward carries. Fixed key set, same NCCL reason.
-            from .rewards.glimpse_rewards import pop_diagnostics as pop_glimpse_diagnostics
+            from trl.rewards.glimpse_rewards import pop_diagnostics as pop_glimpse_diagnostics
 
             for _k, _v in pop_glimpse_diagnostics().items():
                 _t = torch.tensor([_v], dtype=torch.float32, device=device)
