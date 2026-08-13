@@ -420,14 +420,22 @@ fi
 if [[ "$REWARD_VARIANT" == "glimpse" ]]; then
     if [[ -z "${W_OVERLAP_SET:-}" ]]; then
         echo "ERROR: --glimpse needs an explicit --w-overlap." >&2
-        echo "  The GLIMPSE map's metric spread is not known on this corpus, and the" >&2
-        echo "  incumbent's 0.033 was calibrated on the ATTENTION map, so it does not" >&2
-        echo "  transfer. Measure it first:" >&2
-        echo "    python overlap_probe.py --map glimpse --n-samples 40 \\" >&2
-        echo "        --overlap-metric $GLIMPSE_METRIC \\" >&2
+        echo "  The incumbent's 0.033 was calibrated on the ATTENTION map and does not" >&2
+        echo "  transfer. MEASURED on set_a (base cold-start, 40 samples x 8 gens," >&2
+        echo "  1077 grounded steps / 308 completions, 2026-08-12):" >&2
+        echo "" >&2
+        echo "      metric        level    sd/sample    w_glimpse" >&2
+        echo "      mean_in_v2    1.2122      0.1696        0.020" >&2
+        echo "      auroc         0.5596      0.0542        0.063" >&2
+        echo "" >&2
+        echo "  w = 0.4 x 0.0086 / sd, anchored on the ATTENTION map's spread -- do NOT" >&2
+        echo "  read the mean_in column of that report, which is mean_in on GLIMPSE maps" >&2
+        echo "  and was never trained with (the pairing trap in overlap_metric_spread.py)." >&2
+        echo "  So: --w-overlap 0.020 for mean_in_v2, 0.063 for auroc." >&2
+        echo "  To re-measure on another corpus:" >&2
+        echo "    python overlap_probe.py --map glimpse --n-samples 40 --trained-adapter none \\" >&2
         echo "        --out-dir outputs/overlap_probe/glimpse_spread --dataset <set>" >&2
-        echo "    python overlap_metric_spread.py outputs/overlap_probe/glimpse_spread" >&2
-        echo "  then pass --w-overlap <w> with w * sd ~ 0.0035 (mean_in's wov0.4 pressure)." >&2
+        echo "    python overlap_metric_spread.py outputs/overlap_probe/glimpse_spread/probe_merged.json" >&2
         exit 1
     fi
     # Same refusal as --grad, same reason: the mass floor gates on the fraction of an

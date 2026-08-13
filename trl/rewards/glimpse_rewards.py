@@ -30,6 +30,20 @@ steps, times the format gate; no grounded step -> None (masked, neutral in the G
 advantage), exactly as in overlap_rewards and grad_rewards. `w_glimpse` is applied by the
 trainer via --reward_weights, not here.
 
+W_GLIMPSE, measured. set_a, base cold-start policy, 40 samples x 8 generations, 1077
+grounded steps over 308 completions (2026-08-12, `overlap_probe.py --map glimpse` ->
+`overlap_metric_spread.py`):
+
+    metric        level     sd/sample    w_glimpse    steps above chance
+    mean_in_v2    1.2122       0.1696        0.020            71.4%
+    auroc         0.5596       0.0542        0.063            69.0%
+
+`w = 0.4 * 0.0086 / sd`, anchored on the ATTENTION map's per-sample spread -- the same
+arithmetic w_grad uses and with the same caveat, that this one comparison cannot be
+paired. Do NOT take the incumbent 0.033: that is mean_in_v2 on the ATTENTION map. Both
+levels reproduce the 3,471-step screen (1.275 and 0.5673) on an independent draw, which
+is the main reason to trust the sd next to them.
+
 READ THIS BEFORE TRAINING ON IT. A 3,471-step / 1,157-completion screen of this exact map
 (`outputs/flow_corr/glimpse_screen/glimpse/report.txt`) found:
 
