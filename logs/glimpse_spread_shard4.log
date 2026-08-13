@@ -1,0 +1,50 @@
+[probe] shard 4/8: 5/40 samples
+[probe] === model base_coldstart ===
+Loading weights:   0%|          | 0/750 [00:00<?, ?it/s]Loading weights: 100%|██████████| 750/750 [00:00<00:00, 11218.32it/s]
+Loading weights:   0%|          | 0/111 [00:00<?, ?it/s]Loading weights: 100%|██████████| 111/111 [00:00<00:00, 10615.34it/s]
+[glimpse-mem] spans=2 tokens=37 layers=36 len=368 peak=19.0GiB
+[glimpse-mem] spans=5 tokens=123 layers=36 len=546 peak=20.2GiB
+[glimpse-mem] spans=6 tokens=107 layers=36 len=549 peak=20.2GiB
+[glimpse-mem] spans=5 tokens=81 layers=36 len=496 peak=19.8GiB
+[glimpse-mem] spans=4 tokens=65 layers=36 len=397 peak=19.2GiB
+[glimpse-mem] spans=3 tokens=53 layers=36 len=463 peak=19.6GiB
+[glimpse-mem] spans=4 tokens=79 layers=36 len=480 peak=19.7GiB
+[glimpse-mem] spans=3 tokens=55 layers=36 len=444 peak=19.5GiB
+Loading weights:   0%|          | 0/1182 [00:00<?, ?it/s]Loading weights: 100%|██████████| 1182/1182 [00:00<00:00, 20881.33it/s]
+[probe] base_coldstart sample 1/5 done
+[glimpse-mem] spans=2 tokens=37 layers=36 len=453 peak=20.4GiB
+[glimpse-mem] spans=1 tokens=12 layers=36 len=388 peak=20.0GiB
+[glimpse-mem] spans=3 tokens=40 layers=36 len=483 peak=20.6GiB
+[glimpse-mem] spans=1 tokens=16 layers=36 len=456 peak=20.4GiB
+[glimpse-mem] spans=1 tokens=12 layers=36 len=397 peak=20.1GiB
+[glimpse-mem] spans=3 tokens=49 layers=36 len=415 peak=20.2GiB
+[glimpse-mem] spans=4 tokens=63 layers=36 len=556 peak=21.0GiB
+[probe] base_coldstart sample 2/5 done
+[glimpse-mem] spans=7 tokens=139 layers=36 len=620 peak=21.5GiB
+[glimpse-mem] spans=7 tokens=161 layers=36 len=714 peak=22.0GiB
+[glimpse-mem] spans=11 tokens=169 layers=36 len=779 peak=22.4GiB
+[glimpse-mem] spans=2 tokens=37 layers=36 len=416 peak=20.2GiB
+[glimpse-mem] spans=6 tokens=117 layers=36 len=583 peak=21.2GiB
+[glimpse-mem] spans=5 tokens=87 layers=36 len=438 peak=20.3GiB
+[glimpse-mem] spans=4 tokens=66 layers=36 len=461 peak=20.5GiB
+[glimpse-mem] spans=7 tokens=102 layers=36 len=463 peak=20.5GiB
+[probe] base_coldstart sample 3/5 done
+[glimpse-mem] spans=6 tokens=81 layers=36 len=502 peak=20.7GiB
+[glimpse-mem] spans=3 tokens=100 layers=36 len=491 peak=20.6GiB
+[glimpse-mem] spans=4 tokens=66 layers=36 len=495 peak=20.6GiB
+[glimpse-mem] spans=5 tokens=94 layers=36 len=484 peak=20.6GiB
+[glimpse-mem] spans=2 tokens=33 layers=36 len=428 peak=20.2GiB
+[glimpse-mem] spans=2 tokens=34 layers=36 len=422 peak=20.2GiB
+[glimpse-mem] spans=3 tokens=41 layers=36 len=427 peak=20.2GiB
+[glimpse-mem] spans=3 tokens=62 layers=36 len=457 peak=20.4GiB
+[probe] base_coldstart sample 4/5 done
+[glimpse-mem] spans=2 tokens=31 layers=36 len=468 peak=20.5GiB
+[glimpse-mem] spans=2 tokens=47 layers=36 len=493 peak=20.6GiB
+[glimpse-mem] spans=2 tokens=39 layers=36 len=412 peak=20.1GiB
+[glimpse-mem] spans=4 tokens=52 layers=36 len=488 peak=20.6GiB
+[glimpse-mem] spans=1 tokens=29 layers=36 len=492 peak=20.6GiB
+[glimpse-mem] spans=1 tokens=37 layers=36 len=509 peak=20.7GiB
+[glimpse-mem] spans=2 tokens=60 layers=36 len=530 peak=20.9GiB
+[glimpse-mem] spans=1 tokens=29 layers=36 len=585 peak=21.2GiB
+[probe] base_coldstart sample 5/5 done
+[probe] wrote outputs/glimpse_reward_gpu/spread/probe_shard04.json
