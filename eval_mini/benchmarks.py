@@ -33,6 +33,24 @@ Fields:
              averages: a proportional draw of 50 pairs from 14 unequal categories
              misses the small ones outright, and a missing category is not a
              smaller contribution but no contribution.
+    local_data
+             (optional) load the rows from a file inside the repo's snapshot
+             instead of through `datasets`' hub resolution, as
+             {repo_id, builder, file}. Only visulogic needs it, and only because
+             the eval jobs run with HF_HUB_OFFLINE=1 on nodes with no internet:
+             its yaml says `dataset_kwargs: {data_files: data.jsonl}`, and offline
+             `datasets` does not resolve that against the hub snapshot -- it looks
+             the build up in the cache under the literal config name
+             `default-data_files=data.jsonl`, which nothing ever writes. The build
+             that IS cached is called `default-<hash>`, so the lookup raises and,
+             because lmms-eval constructs every task in a suite before running
+             any, it took the whole non-natural suite with it. See
+             make_mini_tasks.py for what is generated instead.
+
+             Note the plain `default` config in that cache is NOT the benchmark
+             (1003 rows of bare images, from the repo's assets/ and images.zip);
+             the questions live only in data.jsonl. Dropping data_files to dodge
+             the offline lookup would score a different dataset, quietly.
 
 Every benchmark here scores itself: none calls an LLM judge, so the eval job needs
 no API key and cannot be skewed by one being absent or rate-limited. Three of the
@@ -98,7 +116,8 @@ BENCHMARKS = {
         metric="exact_match,none", scale=1.0, in_mean=True),
     "visulogic": dict(
         suite="nonnatural", yaml="visulogic/visulogic.yaml",
-        metric="visulogic_acc,none", scale=1.0, in_mean=True),
+        metric="visulogic_acc,none", scale=1.0, in_mean=True,
+        local_data=dict(repo_id="VisuLogic/VisuLogic", builder="json", file="data.jsonl")),
 }
 
 SUITES = ("natural", "nonnatural")

@@ -97,6 +97,22 @@ MERGE_MINUTES=10
 [[ -d "$RUN_DIR" ]] || { echo "error: no such run dir: $RUN_DIR" >&2; exit 2; }
 RUN_DIR=$(cd "$RUN_DIR" && pwd)
 
+# The eval nodes have no internet, so every benchmark is served from the HF cache
+# whether or not this is set. Pin it anyway, because the two dispatchers that
+# submit this job do NOT agree on it and the difference is not cosmetic:
+# watch_bench_evals.sh started on the login node leaves it unset, while the copy
+# launch_grpo_qwen3_overlap_colocated_job.sh starts on the compute node inherits
+# `export HF_HUB_OFFLINE=1` from the training job and passes it on through
+# `#SBATCH --export=ALL`. Unset and set take different code paths inside
+# `datasets`, and the offline one aborted the entire non-natural suite on
+# visulogic (see `local_data` in eval_mini/benchmarks.py) -- for ~1100 steps of
+# two runs the eval jobs recorded natural-only results and nothing said so.
+#
+# Pinned to 1, not 0: with no route to the hub, offline is the truthful value and
+# the one both suites are now built to load under. 0 would only buy connection
+# attempts that must fail.
+export HF_HUB_OFFLINE=1
+
 BENCH_DIR="$RUN_DIR/bench_eval"
 TASK_DIR="$BENCH_DIR/tasks"
 MERGE_ROOT="${BENCH_MERGE_ROOT:-$REPO/checkpoint/_bench_eval}"
