@@ -91,7 +91,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from .grad_rewards import _centroid_eccentricity, _norm_text
+from .grad_rewards import _norm_text
+from .roll_null import centroid_eccentricity as _centroid_eccentricity
 from .overlap_rewards import _dino_boxes, _step_score, _union_mask
 
 # Config, set by grpo_vlm_qwen3.py via configure() from the CLI flags. The METRIC and the

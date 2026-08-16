@@ -205,8 +205,12 @@ class ScriptArguments:
             "chance 0.5, depends only on patch order, so it is exactly immune to that "
             "ceiling. On the 3,471-step screen both are null-to-negative against "
             "correctness (r = -0.031 and -0.056 at step level; Bonferroni needs 0.0735), "
-            "which is the thing to know before choosing between them.",
-            "choices": ["mean_in_v2", "auroc"],
+            "which is the thing to know before choosing between them. 'logratio' = the "
+            "roll-null, the same score the gradient reward uses, scored on GLIMPSE maps: "
+            "chance 0, and the only one of the three whose control has the union's own "
+            "shape and area, so it is the one to reach for given that the GLIMPSE map's "
+            "grounding decays hard with union size (r = -0.487). Knobs are --rollnull_*.",
+            "choices": ["mean_in_v2", "auroc", "logratio"],
         },
     )
     glimpse_target: str = field(
@@ -293,6 +297,40 @@ class ScriptArguments:
             "Irrelevant when the cap is 0."
         },
     )
+    # ---- the roll-null, when it is used as a METRIC (--overlap_metric logratio /
+    # --glimpse_metric logratio). reward_variant='grad' keeps its own --grad_* copies of
+    # these, because there the roll-null IS the reward rather than one metric of four,
+    # and separating them keeps every existing grad run reproducible byte for byte.
+    rollnull_offsets: int = field(
+        default=16,
+        metadata={
+            "help": "metric='logratio': how many translated copies of the box union form "
+            "the null. Their SQUARED masses are pooled BEFORE the log, so one control "
+            "landing on a dead region cannot dominate. Pure numpy on a ~16x16 map: free."
+        },
+    )
+    rollnull_clip: float = field(
+        default=1.0,
+        metadata={
+            "help": "metric='logratio': clip |log(N(U)/N_0)| to this. A ratio has a heavy "
+            "tail, and with scale_rewards=True one outlier completion takes most of its "
+            "group's normalised advantage. 1.0 == a ratio of e."
+        },
+    )
+    rollnull_inframe: bool = field(
+        default=True,
+        metadata={
+            "help": "metric='logratio': draw the control placements so the translated "
+            "union stays INSIDE the grid rather than wrapping toroidally across the image "
+            "border. Falls back to toroidal when a near-full-frame union leaves too few "
+            "in-frame positions -- watch <variant>/toroidal_frac, because that fallback "
+            "changes what the null means."
+        },
+    )
+    rollnull_seed: int = field(
+        default=0,
+        metadata={"help": "metric='logratio': seed for the control placements."},
+    )
     token_reduction: str = field(
         default="mean",
         metadata={
@@ -327,8 +365,15 @@ class ScriptArguments:
             "P(in-box patch outranks out-box patch), which depends "
             "only on patch order and is therefore exactly invariant to that flattening, and "
             "predicts correctness more stably (mean |r| 0.238 vs 0.181, sd 0.028 vs 0.089). "
+            "'logratio' = the ROLL-NULL: log of the map's mass inside the union over its "
+            "mass in the SAME union translated to random in-frame offsets. Chance is "
+            "exactly 0 and the control has the union's own shape and area by "
+            "construction, so this is the only one of the four that closes the box-size "
+            "confound rather than merely bounding it -- at the cost of being random "
+            "(it draws control placements) and of squaring the mass, which weights peaks "
+            "more than a plain sum. Its knobs are --rollnull_*. "
             "Sweep dimension — appears in the model/wandb name.",
-            "choices": ["mean_in", "mean_in_v2", "auroc"],
+            "choices": ["mean_in", "mean_in_v2", "auroc", "logratio"],
         },
     )
     mass_floor_tau: Optional[float] = field(

@@ -238,6 +238,11 @@ GLIMPSE_TOKEN_CAP=0      # cost dial 2: tokens scored per step, 0 = all. Cost is
 GLIMPSE_DEPTH_TEMP=0.2   # the paper's text; 0.36 matches its shape on 36 layers
 GLIMPSE_TEMP=0.5
 GLIMPSE_TOKEN_WEIGHT=full
+# Roll-null knobs, used only when the metric is 'logratio' (for --glimpse or for the
+# attention reward). reward_variant=grad keeps its own GRAD_* copies of these.
+ROLLNULL_OFFSETS=16
+ROLLNULL_CLIP=1.0
+ROLLNULL_SEED=0
 OVERLAP_METRIC=mean_in   # mean_in (incumbent default) | mean_in_v2 (/mean not /max; see
                          # below) | auroc (hack-resistant; see above)
 MASS_FLOOR_TAU=""        # unset -> off for mean_in, 0.0022 for auroc (see below).
@@ -306,6 +311,9 @@ while [[ $# -gt 0 ]]; do
         --glimpse-depth-temp)     GLIMPSE_DEPTH_TEMP="$2";      shift 2 ;;
         --glimpse-temp)           GLIMPSE_TEMP="$2";            shift 2 ;;
         --glimpse-token-weight)   GLIMPSE_TOKEN_WEIGHT="$2";    shift 2 ;;
+        --rollnull-offsets)       ROLLNULL_OFFSETS="$2";        shift 2 ;;
+        --rollnull-clip)          ROLLNULL_CLIP="$2";           shift 2 ;;
+        --rollnull-seed)          ROLLNULL_SEED="$2";           shift 2 ;;
         --mass-floor-tau)         MASS_FLOOR_TAU="$2";          shift 2 ;;
         --natural-only)           NATURAL_ONLY=true;            shift ;;
         --no-natural-only)        NATURAL_ONLY=false;           shift ;;
@@ -487,11 +495,17 @@ elif [[ "$REWARD_VARIANT" == "glimpse" ]]; then
     [[ "$GLIMPSE_TOKEN_CAP" != "0" ]]    && SUFFIX="${SUFFIX}_tc${GLIMPSE_TOKEN_CAP}"
     [[ "$GLIMPSE_DEPTH_TEMP" != "0.2" ]] && SUFFIX="${SUFFIX}_dt${GLIMPSE_DEPTH_TEMP}"
     [[ "$GLIMPSE_TOKEN_WEIGHT" != "full" ]] && SUFFIX="${SUFFIX}_tw${GLIMPSE_TOKEN_WEIGHT}"
+    [[ "$GLIMPSE_METRIC" == "logratio" ]] && SUFFIX="${SUFFIX}_rn${ROLLNULL_OFFSETS}_clip${ROLLNULL_CLIP}"
 else
 SUFFIX="__wov${W_OVERLAP}_${N_HEADS}head_tr${TOKEN_REDUCTION}"
 # Only non-default metric settings extend the suffix, so existing mean_in run names
 # (and the checkpoints already on disk) stay exactly as they are.
 [[ "$OVERLAP_METRIC" != "mean_in" ]] && SUFFIX="${SUFFIX}_${OVERLAP_METRIC}"
+# The roll-null is random and clipped, so two runs differing only in these
+# are different experiments and must not share a checkpoint dir.
+if [[ "$OVERLAP_METRIC" == "logratio" ]]; then
+    SUFFIX="${SUFFIX}_rn${ROLLNULL_OFFSETS}_clip${ROLLNULL_CLIP}"
+fi
 fi
 [[ -n "$MASS_FLOOR_TAU" ]] && SUFFIX="${SUFFIX}_mf${MASS_FLOOR_TAU}"
 [[ -n "$MAX_UNION_AREA" ]] && SUFFIX="${SUFFIX}_mu${MAX_UNION_AREA}"
@@ -898,6 +912,9 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --grad_logratio_clip "$GRAD_LOGRATIO_CLIP" \
     $GRAD_NATURAL_ONLY_FLAG \
     $GLIMPSE_FLAGS \
+    --rollnull_offsets "$ROLLNULL_OFFSETS" \
+    --rollnull_clip "$ROLLNULL_CLIP" \
+    --rollnull_seed "$ROLLNULL_SEED" \
     $GLIMPSE_NATURAL_ONLY_FLAG \
     --overlap_layer "$OVERLAP_LAYER" \
     --overlap_heads "$OVERLAP_HEADS" \

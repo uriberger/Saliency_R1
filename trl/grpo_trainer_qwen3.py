@@ -2781,6 +2781,22 @@ class GRPOTrainer(Trainer):
                 dtype=torch.float32, device=device,
             )
             self._metrics[mode]["overlap/natural_frac"].append(gather(_nat).mean().item())
+        if self.reward_variant in ("ours", "glimpse"):
+            # Roll-null by-products, when --overlap_metric/--glimpse_metric is 'logratio'.
+            # All NaN (and so dropped) for the other metrics, but drained unconditionally:
+            # the gather below is a collective, so the NUMBER of them must not depend on
+            # which metric a rank was configured with. `toroidal_frac` is the one to read
+            # -- it says the in-frame control pool was too small and the null wrapped
+            # across the image border, which changes what the score means.
+            from trl.rewards.overlap_rewards import pop_diagnostics as pop_roll_diagnostics
+
+            _pfx = "glimpse" if self.reward_variant == "glimpse" else "overlap"
+            for _k, _v in pop_roll_diagnostics().items():
+                _t = torch.tensor([_v], dtype=torch.float32, device=device)
+                _g = gather(_t)
+                _g = _g[~torch.isnan(_g)]
+                if _g.numel():
+                    self._metrics[mode][f"{_pfx}/roll_{_k}"].append(_g.mean().item())
         if self.reward_variant == "grad":
             # The roll-null closes box size and confidence; it does not close the centre
             # hack (`ecc` rising, and correlating with the score), the reward going hollow

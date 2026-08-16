@@ -571,7 +571,13 @@ def score_steps(all_step_maps, images_per_completion, store_maps=True):
             rec.update(
                 grounded=True,
                 box_area_frac=float(mask.sum()) / float(mask.size),
-                score=(_lr if SCORE_KIND == "logratio" else OREW._step_score(smap, mask)),
+                # The roll-null DRAWS random control placements, so asking for it twice
+                # gives the step two different scores. `_lr` above is the single draw;
+                # --overlap-metric logratio therefore reuses it rather than letting
+                # _step_score draw again with the other module's rng and knobs.
+                score=(_lr if (SCORE_KIND == "logratio"
+                               or OREW._CFG.get("metric") == "logratio")
+                       else OREW._step_score(smap, mask)),
                 mean_in_raw=OREW._mean_in(smap, mask),
                 mean_in_v2_raw=OREW._mean_in_v2(smap, mask),
                 auroc_raw=OREW._auroc(smap, mask),
@@ -855,7 +861,11 @@ def main():
     p.add_argument("--overlap-layer", type=int, default=22)
     p.add_argument("--overlap-heads", default="28,31")
     p.add_argument("--token-reduction", default="mean", choices=["mean", "max", "min"])
-    p.add_argument("--overlap-metric", default="mean_in", choices=["mean_in", "mean_in_v2", "auroc"])
+    p.add_argument("--overlap-metric", default="mean_in",
+                   choices=["mean_in", "mean_in_v2", "auroc", "logratio"],
+                   help="how a step's map is scored against its box union. 'logratio' is "
+                        "the roll-null and is identical to --score logratio; its knobs are "
+                        "the --grad-* ones, since the probe computes it once per step.")
     # --- the gradient reward (trl/rewards/grad_rewards.py) ---
     p.add_argument("--map", default="attn", choices=["attn", "grad", "glimpse"],
                    help="which per-step map to build: raw attention at --overlap-layer, "

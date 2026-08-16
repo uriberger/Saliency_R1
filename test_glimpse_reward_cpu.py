@@ -307,6 +307,94 @@ def test_diagnostics():
           tuple(cleared) == GL.DIAG_KEYS and set(centre) == set(GL.DIAG_KEYS))
 
 
+def test_rollnull_metric():
+    """The third variant: the roll-null, the same score the gradient reward uses.
+
+    It is the only one of the three whose control has the union's OWN shape and area, so
+    it is the only one that closes the box-size confound rather than bounding it. These
+    checks are the box-size and scale invariances stated as properties of the METRIC, so
+    they hold on a GLIMPSE map exactly as test_grad_reward_cpu asserts them on a gradient
+    one -- there is one implementation now (roll_null.py), and this is what says so.
+    """
+    print("\n[rollnull] the roll-null as a glimpse metric")
+    OR.configure(metric="logratio", null_offsets=16, logratio_clip=10.0,
+                 inframe_rolls=True, roll_seed=0)
+    GL.configure(dedupe_steps=True, natural_only=False)
+    GL.pop_diagnostics(); OR.pop_diagnostics()
+
+    flat = np.full((16, 16), 0.37, dtype=np.float32)
+    worst = max(abs(OR._step_score(flat, box(16, 16, 2, 2 + k, 3, 3 + k)))
+                for k in (1, 2, 4, 6, 8, 10, 12))
+    check("a flat map scores 0 at every box size -- the point of the roll-null",
+          worst < 1e-12, f"max |score| {worst:.2e}")
+
+    m = box(16, 16, 4, 10, 4, 10)
+    hot = np.full((16, 16), 0.1, dtype=np.float32); hot[m] = 3.0
+    cold = np.full((16, 16), 0.1, dtype=np.float32); cold[box(16, 16, 10, 15, 10, 15)] = 3.0
+    OR.configure(roll_seed=5)
+    s_hot = OR._step_score(hot, m)
+    OR.configure(roll_seed=5)
+    s_cold = OR._step_score(cold, m)
+    check("aimed at the union > 0 > aimed elsewhere", s_hot > 0 > s_cold,
+          f"{s_hot:+.3f} / {s_cold:+.3f}")
+
+    OR.configure(roll_seed=3)
+    base = OR._step_score(hot, m)
+    devs = []
+    for c in (1e-3, 7.0, 1e4):
+        OR.configure(roll_seed=3)
+        devs.append(abs(OR._step_score((hot * c).astype(np.float32), m) - base))
+    check("and is invariant to m -> c*m", max(devs) < 1e-6, f"max dev {max(devs):.2e}")
+
+    # end to end, through the reward
+    OR.configure(roll_seed=0, logratio_clip=10.0, box_threshold=0.1, max_box_area=0.5,
+                 max_union_area=None, mass_floor_tau=None)
+    stub_dino({"a cat": [[0.25, 0.25, 0.625, 0.625]], "nothing": []})
+    out = GL.think_glimpse_reward(
+        saliency_map=[steps(("a cat", hot)), steps(("a cat", flat)), steps(("nothing", hot))],
+        valid_list=[True, True, True], image=[None, None, None])
+    check("the reward runs on the logratio metric", out[0] > 0, f"{out[0]:+.3f}")
+    check("a flat map scores exactly chance (0), not None", abs(out[1]) < 1e-12,
+          f"{out[1]:+.3g}")
+    check("an ungroundable completion is still masked", out[2] is None)
+
+    d = OR.pop_diagnostics()
+    check("the roll-null's own diagnostics are logged",
+          np.isfinite(d["logratio_raw"]) and np.isfinite(d["toroidal_frac"])
+          and np.isfinite(d["n_offsets"]),
+          f"raw {d['logratio_raw']:+.3f}, toroidal {d['toroidal_frac']:.2f}, "
+          f"n_off {d['n_offsets']:.0f}")
+    check("with a fixed key set, whatever this rank saw",
+          tuple(OR.pop_diagnostics()) == OR.ROLL_DIAG_KEYS)
+    OR.configure(metric="mean_in_v2")
+
+
+def test_one_rollnull_implementation():
+    """grad, ours and glimpse must be scoring with the SAME roll-null, not three copies."""
+    print("\n[rollnull] one implementation, three callers")
+    import importlib
+    RN = sys.modules["trl.rewards.roll_null"]
+    GR = sys.modules["trl.rewards.grad_rewards"]
+    check("grad_rewards delegates its offsets to roll_null",
+          GR.inframe_offsets is RN.inframe_offsets)
+    check("glimpse_rewards takes its eccentricity from roll_null",
+          GL._centroid_eccentricity is RN.centroid_eccentricity)
+
+    # Same map, same mask, same knobs, same draw -> the two paths must agree exactly.
+    m = box(16, 16, 5, 11, 4, 9)
+    rs = np.random.default_rng(0)
+    mp = rs.random((16, 16)).astype(np.float32)
+    GR.configure(null_offsets=16, logratio_clip=10.0, inframe_rolls=True)
+    OR.configure(metric="logratio", null_offsets=16, logratio_clip=10.0,
+                 inframe_rolls=True, roll_seed=42)
+    a = GR.step_logratio(mp, m, np.random.default_rng(42))
+    b = OR._step_score(mp, m)
+    check("the gradient reward and the metric path give the identical number",
+          abs(a - b) < 1e-12, f"{a:.9f} vs {b:.9f}")
+    GR.pop_diagnostics(); OR.pop_diagnostics()
+    OR.configure(metric="mean_in_v2")
+
+
 def test_metric_comes_from_overlap_rewards():
     """The brief's instruction, made mechanical: score through the existing
     `configure(metric=...)` path rather than reimplementing either metric."""
@@ -330,6 +418,8 @@ def main():
     test_completion_level()
     test_dedupe()
     test_diagnostics()
+    test_rollnull_metric()
+    test_one_rollnull_implementation()
     test_metric_comes_from_overlap_rewards()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

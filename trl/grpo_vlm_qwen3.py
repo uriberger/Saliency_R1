@@ -536,6 +536,10 @@ if __name__ == "__main__":
             max_box_area=script_args.max_box_area,
             max_union_area=script_args.max_union_area,
             metric=script_args.overlap_metric,
+            null_offsets=script_args.rollnull_offsets,
+            logratio_clip=script_args.rollnull_clip,
+            inframe_rolls=script_args.rollnull_inframe,
+            roll_seed=script_args.rollnull_seed,
             mass_floor_tau=script_args.mass_floor_tau,
             dino_api_base=script_args.dino_api_base,
             natural_only=script_args.overlap_natural_only,
@@ -585,6 +589,10 @@ if __name__ == "__main__":
         # refuses the flag outright for this variant.
         configure_overlap(
             metric=script_args.glimpse_metric,
+            null_offsets=script_args.rollnull_offsets,
+            logratio_clip=script_args.rollnull_clip,
+            inframe_rolls=script_args.rollnull_inframe,
+            roll_seed=script_args.rollnull_seed,
             box_threshold=script_args.box_threshold,
             max_box_area=script_args.max_box_area,
             max_union_area=script_args.max_union_area,

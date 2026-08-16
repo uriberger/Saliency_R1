@@ -203,6 +203,8 @@ import os
 
 import numpy as np
 
+from . import roll_null as _RN
+
 GROUNDING_DINO_HF_ID = "IDEA-Research/grounding-dino-base"
 
 
@@ -240,7 +242,15 @@ _CFG = {
     "max_box_area": 0.5,     # per-box area cap; None or <= 0 disables it
     "max_union_area": None,  # per-step union coverage cap; None or <= 0 disables it
     # "mean_in" (incumbent, default) | "mean_in_v2" (/mean instead of /max) | "auroc"
+    # | "logratio" (the roll-null, chance 0 -- see roll_null.py and the knobs below)
     "metric": "mean_in",
+    # Roll-null knobs. Read ONLY when metric == "logratio"; the gradient reward keeps its
+    # own copies under --grad_* because there the roll-null is the reward, not a choice.
+    "null_offsets": 16,      # K translates of the union forming the null
+    "logratio_clip": 1.0,    # +-c on log(N(U)/N_0); 1.0 == a ratio of e ~ 2.7
+    "inframe_rolls": True,   # keep the translate inside the grid (no border wrap)
+    "min_inframe": 4,        # below this many in-frame offsets, fall back to toroidal
+    "roll_seed": 0,
     "mass_floor_tau": None,  # None/0 disables the image-mass floor; recommended 0.0022
     "dino_api_base": None,   # if set, hit a served batched DINO endpoint; else local
     "dino_device": None,     # local device override; default cuda if available
@@ -252,11 +262,43 @@ _CFG = {
 _DINO = {"proc": None, "model": None, "device": None}
 
 
+# Roll-null by-products, logged only when metric == "logratio". FIXED key set and always
+# all of it, for the same NCCL reason grad_rewards.DIAG_KEYS documents: the trainer
+# gathers these across ranks, and a key set that depended on what a rank happened to see
+# would mean a rank-dependent number of collectives, which hangs rather than fails.
+#
+# `toroidal_frac` is the one to watch. It says the in-frame control pool was too small --
+# a near-full-frame union -- so the null wrapped across the image border and stopped being
+# the same question. It rising means the scores are no longer comparable to earlier ones.
+ROLL_DIAG_KEYS = ("logratio_raw", "clip_frac", "toroidal_frac", "n_offsets",
+                  "union_frac", "ecc", "n_image")
+_DIAG: dict[str, list[float]] = {}
+_ROLL_RNG = np.random.default_rng(0)
+
+
+def _diag(key: str, value: float):
+    _DIAG.setdefault(key, []).append(float(value))
+
+
+def pop_diagnostics() -> dict[str, float]:
+    """Mean of each roll-null diagnostic since the last call, then clear.
+
+    Always all of ROLL_DIAG_KEYS; NaN for a key nothing was recorded under, including
+    every key when the configured metric is not "logratio".
+    """
+    out = {k: (float(np.mean(_DIAG[k])) if _DIAG.get(k) else float("nan"))
+           for k in ROLL_DIAG_KEYS}
+    _DIAG.clear()
+    return out
+
+
 def configure(**kwargs):
     """Set reward config from the CLI flags. None values are ignored (keep defaults)."""
+    global _ROLL_RNG
     for k, v in kwargs.items():
         if v is not None:
             _CFG[k] = v
+    _ROLL_RNG = np.random.default_rng(int(_CFG["roll_seed"]))
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +547,28 @@ def _mass_gate(step_map):
     return min(1.0, float(np.asarray(step_map).sum()) / float(tau))
 
 
+def _roll_logratio(step_map, mask):
+    """The roll-null score with THIS module's knobs, logging THIS module's diagnostics.
+
+    `roll_null.py` holds the definition and the reasoning; it is shared with the gradient
+    reward, where the same score is the only scoring mode rather than one metric of four.
+    Chance is exactly 0, so unlike the other three this metric is already centred.
+
+    Random by construction: it draws control placements. A caller that needs the value
+    twice must keep it, not call twice, or the step gets two different scores.
+    """
+    r, info = _RN.logratio(step_map, mask, _ROLL_RNG,
+                           n_offsets=int(_CFG["null_offsets"]),
+                           clip=float(_CFG["logratio_clip"]),
+                           inframe=bool(_CFG["inframe_rolls"]),
+                           min_inframe=int(_CFG["min_inframe"]))
+    if r is None:
+        return None
+    for key in ROLL_DIAG_KEYS:
+        _diag(key, info[key])
+    return r
+
+
 def _step_score(step_map, mask):
     """Per-step reward: the configured metric, times the optional mass floor."""
     metric = _CFG.get("metric")
@@ -512,6 +576,8 @@ def _step_score(step_map, mask):
         v = _auroc(step_map, mask)
     elif metric == "mean_in_v2":
         v = _mean_in_v2(step_map, mask)
+    elif metric == "logratio":
+        v = _roll_logratio(step_map, mask)
     else:
         v = _mean_in(step_map, mask)
     if v is None:

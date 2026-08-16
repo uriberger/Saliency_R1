@@ -98,6 +98,7 @@ import re
 
 import numpy as np
 
+from . import roll_null as _RN
 from .overlap_rewards import _dino_boxes, _union_mask
 
 # Config, set by grpo_vlm_qwen3.py via configure() from the CLI flags. The DINO-side
@@ -155,86 +156,38 @@ def pop_diagnostics() -> dict[str, float]:
 
 # ---------------------------------------------------------------------------
 # The roll-null
+#
+# The score itself now lives in `roll_null.py`, shared with the attention and GLIMPSE
+# rewards, which offer it as `--overlap_metric logratio` / `--glimpse_metric logratio`.
+# What stays here is this reward's CONFIG and its DIAGNOSTICS -- the two things that are
+# per-reward -- so `--grad_null_offsets` and friends keep meaning exactly what they did
+# and a grad run is byte-identical to one from before the split. The names below are
+# re-exported because test_grad_reward_cpu.py and the probes import them from here.
 # ---------------------------------------------------------------------------
 
-def inframe_offsets(mask: np.ndarray) -> list[tuple[int, int]]:
-    """Every translation that keeps all of `mask` inside the grid, excluding identity.
-
-    The mask is a union of boxes and need not be rectangular, so the constraint is on
-    its bounding box: shifting by (dy, dx) moves every True cell, and no cell leaves the
-    grid exactly when the bounding box does not.
-    """
-    gh, gw = mask.shape
-    rows = np.flatnonzero(mask.any(axis=1))
-    cols = np.flatnonzero(mask.any(axis=0))
-    if rows.size == 0 or cols.size == 0:
-        return []
-    r0, r1, c0, c1 = int(rows[0]), int(rows[-1]), int(cols[0]), int(cols[-1])
-    return [(dy, dx)
-            for dy in range(-r0, gh - r1)
-            for dx in range(-c0, gw - c1)
-            if (dy, dx) != (0, 0)]
+inframe_offsets = _RN.inframe_offsets
+_centroid_eccentricity = _RN.centroid_eccentricity
 
 
 def sample_offsets(mask: np.ndarray, k: int, rng) -> tuple[list[tuple[int, int]], bool]:
     """-> (offsets, fell_back_to_toroidal). Without replacement; identity excluded."""
-    pool = inframe_offsets(mask) if _CFG["inframe_rolls"] else []
-    toroidal = len(pool) < int(_CFG["min_inframe"])
-    if toroidal:
-        gh, gw = mask.shape
-        pool = [(dy, dx) for dy in range(gh) for dx in range(gw) if (dy, dx) != (0, 0)]
-    if not pool:
-        return [], toroidal
-    idx = rng.choice(len(pool), size=min(k, len(pool)), replace=False)
-    return [pool[int(i)] for i in idx], toroidal
-
-
-def _centroid_eccentricity(mask: np.ndarray) -> float:
-    """Distance of the union's centroid from the grid centre, 0 at centre, 1 at a corner.
-
-    The centre hack -- naming central objects because a centre-heavy map beats its
-    translates for free -- shows up as this rising, and as its correlation with the score.
-    """
-    gh, gw = mask.shape
-    ys, xs = np.nonzero(mask)
-    cy = (ys.mean() + 0.5) / gh - 0.5
-    cx = (xs.mean() + 0.5) / gw - 0.5
-    return float(np.hypot(cy, cx) / np.hypot(0.5, 0.5))
+    return _RN.sample_offsets(mask, k, rng, inframe=bool(_CFG["inframe_rolls"]),
+                              min_inframe=int(_CFG["min_inframe"]))
 
 
 def step_logratio(step_map: np.ndarray, mask: np.ndarray, rng=None) -> float | None:
-    """log N(U) - log N_0, clipped. None when the step cannot be scored.
-
-    None (rather than 0.0) on a degenerate step keeps it out of the mean over steps --
-    the same treatment an ungroundable step gets, and for the same reason: a 0 here is
-    not a low score, it is an absent measurement.
-    """
-    rng = _RNG if rng is None else rng
-    g2 = np.asarray(step_map, dtype=np.float64) ** 2
-    mask = np.asarray(mask, dtype=bool)
-    e_in = float(g2[mask].sum())
-    if not np.isfinite(e_in) or e_in <= 0:
+    """log N(U) - log N_0, clipped, with this reward's knobs and diagnostics."""
+    r, info = _RN.logratio(step_map, mask, _RNG if rng is None else rng,
+                           n_offsets=int(_CFG["null_offsets"]),
+                           clip=float(_CFG["logratio_clip"]),
+                           inframe=bool(_CFG["inframe_rolls"]),
+                           min_inframe=int(_CFG["min_inframe"]))
+    if r is None:
         return None
-
-    offsets, toroidal = sample_offsets(mask, int(_CFG["null_offsets"]), rng)
-    if not offsets:
-        return None
-    e_null = float(np.mean([g2[np.roll(mask, off, axis=(0, 1))].sum() for off in offsets]))
-    if not np.isfinite(e_null) or e_null <= 0:
-        return None
-
-    r = 0.5 * (np.log(e_in) - np.log(e_null))
-    c = float(_CFG["logratio_clip"])
-    clipped = abs(r) > c
-
-    _diag("union_frac", mask.mean())
-    _diag("ecc", _centroid_eccentricity(mask))
-    _diag("n_image", np.sqrt(g2.sum()))
-    _diag("logratio_raw", r)
-    _diag("clip_frac", 1.0 if clipped else 0.0)
-    _diag("toroidal_frac", 1.0 if toroidal else 0.0)
-    _diag("n_offsets", len(offsets))
-    return float(np.clip(r, -c, c))
+    for key in ("union_frac", "ecc", "n_image", "logratio_raw", "clip_frac",
+                "toroidal_frac", "n_offsets"):
+        _diag(key, info[key])
+    return r
 
 
 # ---------------------------------------------------------------------------

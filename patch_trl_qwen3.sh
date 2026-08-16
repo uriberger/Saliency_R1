@@ -83,12 +83,13 @@ echo "  copied grpo_trainer_qwen3.py -> $DST"
 # ── 2b. attention-overlap reward support (reward_variant=ours) ──────────────
 # Keep these tracked-source files in sync with the live trl_repo tree.
 cp "$REPO/trl/overlap_steps.py"           "$TRL_REPO/trl/trainer/overlap_steps.py"
+cp "$REPO/trl/rewards/roll_null.py"      "$TRL_REPO/trl/rewards/roll_null.py"
 cp "$REPO/trl/rewards/overlap_rewards.py" "$TRL_REPO/trl/rewards/overlap_rewards.py"
 cp "$REPO/trl/rewards/openai_rewards.py"  "$TRL_REPO/trl/rewards/openai_rewards.py"
 cp "$REPO/trl/rewards/__init__.py"        "$TRL_REPO/trl/rewards/__init__.py"
 cp "$REPO/trl/scripts/utils.py"           "$TRL_REPO/trl/scripts/utils.py"
 cp "$REPO/trl/grpo_vlm_qwen3.py"          "$TRL_REPO/examples/scripts/grpo_vlm_qwen3.py"
-echo "  copied overlap-reward files (overlap_steps, overlap_rewards, openai_rewards, rewards/__init__, scripts/utils, grpo_vlm_qwen3)"
+echo "  copied overlap-reward files (overlap_steps, roll_null, overlap_rewards, openai_rewards, rewards/__init__, scripts/utils, grpo_vlm_qwen3)"
 
 # ── 2c. roll-null gradient reward support (reward_variant=grad) ─────────────
 # grad_maps.py is imported by the trainer as `from .grad_maps import ...`, so it
