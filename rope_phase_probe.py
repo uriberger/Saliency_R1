@@ -108,6 +108,16 @@ def _load_module(name: str, relpath: str):
 
 IMAGE_TOKEN_ID = 151655          # checked against overlap_probe's copy in _probe()
 
+# The text tower's attention class, per model family.  All three take layer_idx,
+# resolve their kernel through config._attn_implementation, and return
+# (output, attn_weights) -- which is what the eager replay in EagerAttentionTap
+# needs.  The vision towers' attention classes are deliberately not here.
+TEXT_ATTENTION_CLASSES = (
+    "Qwen3VLTextAttention",      # Qwen3-VL: interleaved M-RoPE, H and W on fast channels
+    "Qwen2_5_VLAttention",       # Qwen2.5-VL: chunked M-RoPE, W on channels that barely turn
+    "Qwen2VLAttention",
+)
+
 _PROBE = None
 
 
@@ -410,17 +420,17 @@ class EagerAttentionTap:
         self.eps = 1e-20
         self._reentry = False
         self.handles, layers = [], []
-        for m in model.modules():
-            if type(m).__name__ == "Qwen3VLTextAttention" and hasattr(m, "layer_idx"):
-                layers.append(int(m.layer_idx))
-        self.layers = sorted(layers)
+        mods = [m for m in model.modules()
+                if type(m).__name__ in TEXT_ATTENTION_CLASSES and getattr(m, "layer_idx", None) is not None]
+        if not mods:
+            raise RuntimeError(
+                f"no text-tower attention modules found; looked for {TEXT_ATTENTION_CLASSES}. "
+                "Add this model's class there if it has the same forward contract.")
+        self.layers = sorted(int(m.layer_idx) for m in mods)
         self.row_of = {l: i for i, l in enumerate(self.layers)}
-        if not self.layers:
-            raise RuntimeError("no Qwen3VLTextAttention modules found")
-        for m in model.modules():
-            if type(m).__name__ == "Qwen3VLTextAttention" and hasattr(m, "layer_idx"):
-                self.handles.append(
-                    m.register_forward_hook(self._make(int(m.layer_idx)), with_kwargs=True))
+        for m in mods:
+            self.handles.append(
+                m.register_forward_hook(self._make(int(m.layer_idx)), with_kwargs=True))
 
     def close(self):
         for h in self.handles:
@@ -461,7 +471,7 @@ class EagerAttentionTap:
         return hook
 
 
-def token_distances(model, case, prompt_len: int):
+def token_distances(model, case, prompt_len: int, image_token_id: int):
     """d = p - s for every completion token, from the model's own position ids.
 
     s is the image anchor (the t/h/w value of the first patch, where r = c = 0);
@@ -480,7 +490,7 @@ def token_distances(model, case, prompt_len: int):
         video_grid_thw=None,
         attention_mask=case.get("attention_mask"),
     )
-    img_cols = (case["input_ids"][0] == IMAGE_TOKEN_ID).nonzero(as_tuple=True)[0]
+    img_cols = (case["input_ids"][0] == image_token_id).nonzero(as_tuple=True)[0]
     if img_cols.numel() == 0:
         raise SystemExit("no image tokens in the teacher-forced case")
     s = pos[0, 0, img_cols[0]]
@@ -515,6 +525,7 @@ def scan(args, device):
         print(f"       {b.name:7s} kind={b.kind:6s} theta={b.theta:.4f} "
               f"nbins={b.nbins:2d} axis={b.axis} predicted shift={b.predicted_shift:+.3f}")
 
+    image_token_id = int(getattr(model.config, "image_token_id", None) or IMAGE_TOKEN_ID)
     torch.manual_seed(args.seed + args.shard)
     rng = np.random.default_rng(args.seed + 1000 * args.shard)
 
@@ -551,7 +562,7 @@ def scan(args, device):
             continue
 
         case = PROBE.teacher_forced_case(inputs, comp_ids, device)
-        d, img_cols = token_distances(model, case, prompt_len)
+        d, img_cols = token_distances(model, case, prompt_len, image_token_id)
         if img_cols.numel() != gh * gw:
             print(f"[warn] case {ci} has {img_cols.numel()} image tokens, "
                   f"grid says {gh * gw}; skipped", flush=True)
