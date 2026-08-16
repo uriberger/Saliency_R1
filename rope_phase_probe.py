@@ -600,6 +600,8 @@ def scan(args, device):
     meta = {
         "gh": gh, "gw": gw, "n_heads": n_heads, "layers": tap.layers,
         "ntok": acc.ntok, "ncase": acc.ncase, "nclamped": acc.nclamped,
+        "shard": args.shard, "num_shards": args.num_shards,
+        "n_samples": args.n_samples, "seed": args.seed,
         "image_side": args.image_side, "d_min": args.d_min, "d_max": args.d_max,
         "base_model": args.base_model, "adapter": args.adapter or "",
         "dataset": args.dataset, "split": args.split,
@@ -619,6 +621,7 @@ def load_scan(out_dir: Path):
         raise SystemExit(f"no shards in {out_dir}/scan -- run --stage scan first")
     sums, counts, sumsq, meta = {}, {}, None, None
     ntok = ncase = nclamped = 0
+    seen_shards = {}
     for p in shards:
         z = np.load(p, allow_pickle=False)
         m = json.loads(bytes(z["__meta__"]).decode())
@@ -627,6 +630,21 @@ def load_scan(out_dir: Path):
         elif (m["gh"], m["gw"]) != (meta["gh"], meta["gw"]):
             raise SystemExit(f"{p.name} has grid {(m['gh'], m['gw'])}, expected "
                              f"{(meta['gh'], meta['gw'])} -- do not merge these")
+        # A --gpus 1 run writes shard00 = every case; a later --gpus 8 run skips
+        # shard00 as already done and adds seven shards that each re-cover part of
+        # it.  Merging those double-counts most of the corpus and the report would
+        # not look wrong.  Refuse instead.
+        for key in ("num_shards", "n_samples", "seed", "dataset", "base_model", "image_side"):
+            if key in m and key in meta and m[key] != meta[key]:
+                raise SystemExit(
+                    f"{p.name} was scanned with {key}={m[key]!r} but an earlier shard "
+                    f"used {key}={meta[key]!r}. These cover overlapping cases; merging "
+                    f"them would double-count. Delete {p.parent} and rescan with one "
+                    f"consistent setting.")
+        sid = m.get("shard")
+        if sid is not None and sid in seen_shards:
+            raise SystemExit(f"{p.name} and {seen_shards[sid]} are both shard {sid}")
+        seen_shards[sid] = p.name
         ntok += m["ntok"]
         ncase += m["ncase"]
         nclamped += m.get("nclamped", 0)
@@ -638,7 +656,12 @@ def load_scan(out_dir: Path):
                 name = k.split("::", 1)[1]
                 counts[name] = counts.get(name, 0) + z[k]
         sumsq = z["sumsq"] if sumsq is None else sumsq + z["sumsq"]
-    meta.update(ntok=ntok, ncase=ncase, nclamped=nclamped, n_shards=len(shards))
+    expected = meta.get("num_shards", len(shards))
+    meta.update(ntok=ntok, ncase=ncase, nclamped=nclamped,
+                n_shards=len(shards), shards_expected=expected)
+    if len(shards) != expected:
+        print(f"[report] WARNING: {len(shards)} of {expected} shards present -- this is "
+              f"a partial scan, not the full corpus", file=sys.stderr)
     return sums, counts, sumsq, meta
 
 
