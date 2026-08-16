@@ -24,7 +24,27 @@ def _load(name, relpath):
     spec.loader.exec_module(mod)
     return mod
 
-orw = _load("overlap_rewards", REWARDS_SRC)
+
+def _stub_rewards_package(pkg, rel_module):
+    """Stub `<pkg>` and `<pkg>.rewards` at the directory `rel_module` was read from.
+
+    overlap_rewards imports its siblings relatively (`from . import roll_null`), so a copy
+    loaded under a flat alias raises `ImportError: attempted relative import with no known
+    parent package`. The __path__ points at the tree under test and nothing else, so the
+    checkout's sources can never be spliced into a trl_repo/ run or the other way round.
+    """
+    import types
+
+    d = (ROOT / rel_module).parent
+    for name, path in ((pkg, d.parent), (f"{pkg}.rewards", d)):
+        m = types.ModuleType(name)
+        m.__path__ = [str(path)]
+        sys.modules[name] = m
+
+
+_PKG = "trl_local" if _LOCAL else "trl_running"
+_stub_rewards_package(_PKG, REWARDS_SRC)
+orw = _load(f"{_PKG}.rewards.overlap_rewards", REWARDS_SRC)
 ost = _load("overlap_steps", STEPS_SRC)
 print(f"[tree] testing {'this checkout' if _LOCAL else 'trl_repo/ (the running copy)'}")
 
@@ -210,7 +230,10 @@ print("[T6] mass floor OK: off by default, min(1, mass/tau) once set, penalises 
 # ---------------------------------------------------------------------------
 # Test 7: DEFAULTS ARE UNCHANGED -- a fresh import must reproduce the incumbent
 # ---------------------------------------------------------------------------
-orw_fresh = _load("overlap_rewards_fresh", REWARDS_SRC)
+# A SECOND stub package, so this really is a fresh module and not the one `configure`
+# has been mutating all the way down this file.
+_stub_rewards_package(f"{_PKG}_fresh", REWARDS_SRC)
+orw_fresh = _load(f"{_PKG}_fresh.rewards.overlap_rewards", REWARDS_SRC)
 assert orw_fresh._CFG["metric"] == "mean_in", orw_fresh._CFG
 assert orw_fresh._CFG["mass_floor_tau"] is None, orw_fresh._CFG
 assert orw_fresh._CFG["natural_only"] is False, orw_fresh._CFG

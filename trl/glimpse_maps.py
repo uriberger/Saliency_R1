@@ -240,8 +240,17 @@ def causal_mask(seq: int, dtype, device, attention_mask=None):
     make the replay disagree with the forward it is supposed to reproduce; `_check_replay`
     would then fire, which is the good outcome, but the mask is simply wrong.
 
-    The diagonal is restored after masking the pad columns. Without it a pad query row is
-    all -inf, its softmax is NaN, and the NaN spreads through `E` into every map.
+    The diagonal is restored after masking the pad columns, because a LEFT-PAD query row
+    is otherwise masked everywhere: causality leaves it only pad columns, and the padding
+    then takes those away. An all-min row softmaxes to a UNIFORM row -- the pad query
+    would read every real token in the sequence -- and one arithmetic step from -inf it is
+    NaN, which would spread through `E` into every map. Attending to itself is the cheap
+    well-defined answer.
+
+    It is not sdpa's answer, and cannot be: for a fully-masked row torch >= 2.5 returns
+    exactly ZERO (pytorch#110213), which no softmax can produce. Those rows therefore
+    disagree with the forward BY CONSTRUCTION -- see `valid_row_mask`, which is how the
+    replay check is kept off them.
     """
     m = torch.triu(torch.ones(seq, seq, dtype=torch.bool, device=device), diagonal=1)
     add = torch.zeros(seq, seq, dtype=dtype, device=device)
@@ -251,6 +260,29 @@ def causal_mask(seq: int, dtype, device, attention_mask=None):
         add.masked_fill_(pad[None, :], torch.finfo(dtype).min)
         add.fill_diagonal_(0.0)
     return add[None, None]
+
+
+def valid_row_mask(seq: int, attention_mask, device):
+    """-> bool [N] of the query rows the forward actually computed, or None if unpadded.
+
+    The rows a padded forward does NOT compute are not merely imprecise, they are a
+    different quantity: sdpa returns exact zero for a fully-masked row (see `causal_mask`),
+    the eager replay returns the row's own value vector, and neither is "the layer's
+    output" in any sense. Nothing reads them -- a pad row's `dz/dh` is exactly zero, so it
+    contributes nothing to `E`, to the head weights or to the layer alphas, and no
+    propagated row ever picks up mass on a pad column -- but `_check_replay` compared them
+    and could not tell that garbage from a dropped kwarg. Measured by
+    `diag_glimpse_pad_rows.py` on layer 0 of the real checkpoint in fp32, 120 pad rows in
+    1700: 4e-7 relative over the real rows, 0.38 over the pad rows, 0.17 over both,
+    against a tolerance of 0.05.
+
+    Layer 0 is where this bites, and it is the layer `layer_frac=1.0` -- the trainer's
+    default -- replays first: its residual stream peaks in the single digits, while deeper
+    layers carry outliers orders of magnitude larger that swamp the same absolute junk.
+    """
+    if attention_mask is None:
+        return None
+    return attention_mask.reshape(-1)[:seq].to(torch.bool).to(device)
 
 
 @contextlib.contextmanager
@@ -318,6 +350,7 @@ class GlimpseGradCache:
         self.h_in, self.kw, self.out = {}, {}, {}
         self.leaf = None
         self.mask = None
+        self.valid_rows = None                # set beside `mask`; see `valid_row_mask`
         self._reentry = False
         self._checked = self._replay_checked = False
         cut = 0
@@ -349,7 +382,7 @@ class GlimpseGradCache:
 
     def release(self):
         self.h_in, self.kw, self.out = {}, {}, {}
-        self.leaf = self.mask = None
+        self.leaf = self.mask = self.valid_rows = None
 
     def check(self):
         """Every propagated layer must have recorded a forward, and the cut must have
@@ -424,32 +457,52 @@ class GlimpseGradCache:
             return None
         return hook
 
+    def _first_row(self) -> int:
+        """The first query row the forward actually computed. In a left-padded case row 0
+        is a pad row, whose attention this class DEFINES (the restored diagonal) rather
+        than reproduces, so it can say nothing about the mask reaching eager."""
+        if self.valid_rows is None:
+            return 0
+        idx = self.valid_rows.nonzero()
+        return int(idx[0]) if idx.numel() else 0
+
     def _check_causal(self, aw):
-        """Query 0 may only see key 0. Eager attention with no mask is silently
-        bidirectional -- every map would be wrong and nothing would raise."""
+        """The first real query row may only see itself and what precedes it. Eager
+        attention with no mask is silently bidirectional -- every map would be wrong and
+        nothing would raise."""
         if self._checked:
             return
         self._checked = True
-        leak = float(aw[0, :, 0, 1:].detach().abs().sum())
+        r = self._first_row()
+        leak = float(aw[0, :, r, r + 1:].detach().abs().sum())
         if leak > 1e-3:
-            raise RuntimeError(f"glimpse: attention is not causal (row 0 puts {leak:.3g} "
-                               "outside column 0) -- the causal mask did not reach eager")
+            raise RuntimeError(f"glimpse: attention is not causal (row {r} puts {leak:.3g} "
+                               f"after column {r}) -- the causal mask did not reach eager")
 
     def _check_replay(self, li: int, out):
-        """The replay must reproduce the layer's own output. A dropped kwarg or a wrong
-        mask would otherwise yield a plausible map built on the wrong tensor. The tolerance
-        is loose on purpose: eager and sdpa differ in the last bf16 bits, a replay mistake
-        differs by order 1."""
+        """The replay must reproduce the layer's own output ON THE ROWS THE FORWARD
+        COMPUTED. A dropped kwarg or a wrong mask would otherwise yield a plausible map
+        built on the wrong tensor. The tolerance is loose on purpose: eager and sdpa differ
+        in the last bf16 bits, a replay mistake differs by order 1.
+
+        The pad rows are excluded because they are not a reproduction at all: sdpa returns
+        exact zero there and the replay returns the row's own value vector. Comparing them
+        made this check fire on the first colocated training run -- at 0.084-0.090 relative
+        against a tolerance of 0.05, on maps that were correct -- while `valid_rows`
+        reports 4e-7 on the rows that carry the map. `valid_row_mask` has the measurement.
+        """
         if self._replay_checked:
             return
         self._replay_checked = True
-        ref = self.out[li].detach().float()
-        rel = float((out.detach().float() - ref).abs().max()) / max(float(ref.abs().max()),
-                                                                    1e-6)
+        ref, got = self.out[li].detach().float(), out.detach().float()
+        if self.valid_rows is not None:
+            ref, got = ref[:, self.valid_rows], got[:, self.valid_rows]
+        rel = float((got - ref).abs().max()) / max(float(ref.abs().max()), 1e-6)
         if rel > 0.05:
             raise RuntimeError(f"glimpse: the eager replay of layer {li} differs from the "
-                               f"forward by {rel:.3g} relative -- the recorded kwargs or "
-                               "the causal mask are wrong")
+                               f"forward by {rel:.3g} relative on the {ref.shape[1]} rows "
+                               "the forward computed -- the recorded kwargs or the causal "
+                               "mask are wrong")
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +564,9 @@ def _glimpse_core(model, fwd, spans, *, img_cols, prompt_idx, attention_mask, gh
             cap.check()
             cap.mask = causal_mask(ids.shape[1], next(model.parameters()).dtype, device,
                                    attention_mask=attention_mask)
+            # Set from the SAME attention mask as `cap.mask`: the rows the replay defines
+            # rather than reproduces are exactly the rows that mask leaves empty.
+            cap.valid_rows = valid_row_mask(ids.shape[1], attention_mask, device)
             # `_row_scalars` is the gradient reward's own definition of the per-token
             # scalar, so `target` means here exactly what `--grad_target` means there.
             f = _row_scalars(z, targets, target)

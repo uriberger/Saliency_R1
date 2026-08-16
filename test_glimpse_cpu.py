@@ -27,7 +27,11 @@ by a comment:
   * `prompt_positions` finds the question inside the chat template, falls back exactly
     once, and never returns an image column;
   * the causality guard fires on an unmasked attention row -- eager attention with no
-    mask is silently bidirectional and every map would be wrong.
+    mask is silently bidirectional and every map would be wrong;
+  * BOTH guards read the rows the forward actually computed. A left-padded case's pad rows
+    are exact zero under sdpa and the row's own value vector under the eager replay, so
+    comparing them is comparing two kinds of garbage -- which is what stopped the first
+    colocated GLIMPSE run, at 0.084-0.090 against a 0.05 tolerance, on correct maps.
 
     python test_glimpse_cpu.py
 """
@@ -388,7 +392,7 @@ def test_grad_cache_identity():
 def test_causal_guard():
     print("\n[guard] eager attention with no mask")
     cap = SV.GlimpseGradCache.__new__(SV.GlimpseGradCache)
-    cap._checked = False
+    cap._checked, cap.valid_rows = False, None
     n = 16
     good = torch.zeros(1, 2, n, n)
     good[:, :, 0, 0] = 1.0
@@ -403,12 +407,34 @@ def test_causal_guard():
     except RuntimeError as e:
         check("an unmasked first row raises", "not causal" in str(e))
 
+    # LEFT-PADDED case: row 0 is a pad row, whose attention `causal_mask` DEFINES (the
+    # restored diagonal) rather than reproduces. The guard has to read the first REAL row,
+    # or it is testing the mask against itself.
+    pad = 3
+    cap._checked = False
+    cap.valid_rows = torch.tensor([False] * pad + [True] * (n - pad))
+    padded = torch.full((1, 2, n, n), 1.0 / n)          # pad rows: arbitrary, ignored
+    padded[:, :, pad:] = 0.0
+    for r in range(pad, n):
+        padded[:, :, r, :r + 1] = 1.0 / (r + 1)
+    cap._check_causal(padded)
+    check("a pad row does not stand in for the causality check", True)
+
+    cap._checked = False
+    padded[:, :, pad, :] = 1.0 / n                       # first real row, bidirectional
+    try:
+        cap._check_causal(padded)
+        check("...and an unmasked first REAL row still raises", False, "it did not")
+    except RuntimeError as e:
+        check("...and an unmasked first REAL row still raises", "not causal" in str(e))
+
 
 def test_replay_guard():
     print("\n[guard] the replay must reproduce the forward")
     cap = SV.GlimpseGradCache.__new__(SV.GlimpseGradCache)
     ref = torch.randn(1, 8, 4, generator=torch.Generator().manual_seed(5))
     cap.out = {7: ref}
+    cap.valid_rows = None
 
     cap._replay_checked = False
     cap._check_replay(7, ref + 1e-4)          # eager and sdpa differ in the last bits
@@ -420,6 +446,30 @@ def test_replay_guard():
         check("a replay that is not the forward raises", False, "it did not")
     except RuntimeError as e:
         check("a replay that is not the forward raises", "eager replay" in str(e))
+
+    # The regression that killed the first colocated glimpse run: on a left-padded case the
+    # forward returns exact ZERO for a fully-masked pad row and the replay returns that
+    # row's own value vector, so the two disagree by order 1 on rows no map ever reads.
+    # Layer 0, real weights, fp32: 4e-7 over the real rows, 0.38 over the pad rows.
+    pad = 2
+    cap.valid_rows = torch.tensor([False] * pad + [True] * (ref.shape[1] - pad))
+    forward = ref.clone()
+    forward[:, :pad] = 0.0                    # what sdpa returns for a fully-masked row
+    cap.out = {7: forward}
+    replay = ref.clone()
+    replay[:, :pad] *= 4.0                    # what the restored diagonal returns instead
+
+    cap._replay_checked = False
+    cap._check_replay(7, replay)
+    check("pad rows disagreeing by order 1 pass", True)
+
+    cap._replay_checked = False
+    replay[:, pad] += 3.0 * float(ref.abs().max())
+    try:
+        cap._check_replay(7, replay)
+        check("...but a real row that is wrong still raises", False, "it did not")
+    except RuntimeError as e:
+        check("...but a real row that is wrong still raises", "eager replay" in str(e))
 
 
 # ---------------------------------------------------------------------------

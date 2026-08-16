@@ -85,18 +85,16 @@ def _load_module(name: str, relpath: str):
     return mod
 
 
-OSTEPS = _load_module("_probe_overlap_steps", "trl/overlap_steps.py")
-OREW = _load_module("_probe_overlap_rewards", "trl/rewards/overlap_rewards.py")
-GM = _load_module("_probe_grad_maps", "trl/grad_maps.py")
+def _stub_rewards_package():
+    """Stub `trl` and `trl.rewards` so a rewards module's RELATIVE imports resolve.
 
-
-def _load_grad_rewards():
-    """grad_rewards imports its grounding helpers from overlap_rewards, relatively.
-
-    Stub the parent packages so that relative import resolves, and register the ALREADY
-    LOADED overlap_rewards under its dotted name first -- otherwise a second copy is
-    imported with its own `_CFG`, and the box_threshold / max_box_area this probe
-    configures would silently not be the ones the grounding call uses.
+    The reward modules import their siblings relatively -- `from . import roll_null` in
+    overlap_rewards, the grounding helpers in grad_rewards -- because inside trl_repo/ that
+    is the only way to reach them. A module loaded under a flat alias has no package, so
+    that import raises `ImportError: attempted relative import with no known parent
+    package` and this probe (and everything that loads it) dies at import time. Stubbing
+    the parents keeps trl/__init__.py's heavy imports out of the way while still giving the
+    import machinery a `__path__` to search.
     """
     import types
 
@@ -105,11 +103,16 @@ def _load_grad_rewards():
             _m = types.ModuleType(_n)
             _m.__path__ = [str(_p)]
             sys.modules[_n] = _m
-    sys.modules["trl.rewards.overlap_rewards"] = OREW
-    return _load_module("trl.rewards.grad_rewards", "trl/rewards/grad_rewards.py")
 
 
-GREW = _load_grad_rewards()
+OSTEPS = _load_module("_probe_overlap_steps", "trl/overlap_steps.py")
+_stub_rewards_package()
+# Loaded under its DOTTED name, and registered there, so grad_rewards' relative import
+# finds this very object: a second copy would carry its own `_CFG`, and the box_threshold /
+# max_box_area this probe configures would silently not be the ones grounding uses.
+OREW = _load_module("trl.rewards.overlap_rewards", "trl/rewards/overlap_rewards.py")
+GM = _load_module("_probe_grad_maps", "trl/grad_maps.py")
+GREW = _load_module("trl.rewards.grad_rewards", "trl/rewards/grad_rewards.py")
 
 
 def _load_glimpse_maps():

@@ -108,9 +108,13 @@ def main():
     p.add_argument("--seq-len", type=int, default=520,
                    help="synthetic sequence length; the hazards are the wrapper's, not "
                         "the content's, so no dataset or DINO is needed")
-    p.add_argument("--layer-frac", type=float, default=0.25,
-                   help="propagate a quarter of the stack: this gate is about the "
-                        "distributed plumbing, and the full stack only makes it slower")
+    p.add_argument("--layer-frac", type=float, default=1.0,
+                   help="propagate the whole stack, which is the trainer's default. It "
+                        "used to be 0.25 on the grounds that this gate is about the "
+                        "distributed plumbing -- and that quarter never replays LAYER 0, "
+                        "which is the one layer where the left-pad rows the padded case "
+                        "here carries are large next to the residual stream. The first "
+                        "colocated run died there on a check this gate had reported green")
     args = p.parse_args()
 
     from accelerate import Accelerator
