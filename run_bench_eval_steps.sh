@@ -34,9 +34,16 @@
 # a training job on the same node.
 set -uo pipefail
 
-RUN=grpo-coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged-overlap__wov0.033_2head_trmean_50k_set_a_mean_in_v2_k_proj_beta_004
-STEPS=(3000 300 800 1300 1800 2300 2700 3300)
-NUM_GPUS=8
+# Both may be overridden from the environment, so draining a long list across
+# several allocations does not need an edit (and a commit) per allocation:
+#
+#   RUN=<run-name> STEPS="3990 900 2000" bash run_bench_eval_steps.sh
+#
+# STEPS is a space-separated string there, not an array -- the environment has no
+# arrays -- and is split back into one here.
+RUN=${RUN:-grpo-coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged-overlap__wov0.11_2head_trmean_saliency_r1_8k_auroc}
+read -r -a STEPS <<< "${STEPS:-3990 900 2000 3000 1500 2500 3500 1000 1100 1200 1300 1400 1600 1700 1800 1900 2100 2200 2300 2400 2600 2700 2800 2900 3100 3200 3300 3400 3600 3700 3800 3900}"
+NUM_GPUS=${NUM_GPUS:-8}
 
 SCRIPT_DIR=$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)
 REPO=${REPO:-/home/uberger/scratch/research/saliency_r1}
