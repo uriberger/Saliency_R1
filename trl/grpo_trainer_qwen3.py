@@ -2781,8 +2781,11 @@ class GRPOTrainer(Trainer):
                 dtype=torch.float32, device=device,
             )
             self._metrics[mode]["overlap/natural_frac"].append(gather(_nat).mean().item())
-        if self.reward_variant in ("ours", "glimpse"):
-            # Roll-null by-products, when --overlap_metric/--glimpse_metric is 'logratio'.
+        if self.reward_variant in ("ours", "grad", "glimpse"):
+            # Roll-null by-products, when --overlap_metric is 'logratio'. For 'grad'
+            # that metric takes grad_rewards' own path instead, so these stay NaN
+            # there and the grad/* block above carries them -- drained either way,
+            # because the number of collectives must not depend on the metric.
             # All NaN (and so dropped) for the other metrics, but drained unconditionally:
             # the gather below is a collective, so the NUMBER of them must not depend on
             # which metric a rank was configured with. `toroidal_frac` is the one to read
@@ -2790,7 +2793,7 @@ class GRPOTrainer(Trainer):
             # across the image border, which changes what the score means.
             from trl.rewards.overlap_rewards import pop_diagnostics as pop_roll_diagnostics
 
-            _pfx = "glimpse" if self.reward_variant == "glimpse" else "overlap"
+            _pfx = {"glimpse": "glimpse", "grad": "grad"}.get(self.reward_variant, "overlap")
             for _k, _v in pop_roll_diagnostics().items():
                 _t = torch.tensor([_v], dtype=torch.float32, device=device)
                 _g = gather(_t)

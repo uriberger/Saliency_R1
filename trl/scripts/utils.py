@@ -109,6 +109,24 @@ class ScriptArguments:
         },
     )
     # ---- attention-overlap reward (reward_variant="ours"; see grpo-reward-port-plan) ----
+    saliency_method: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "WHICH SALIENCY MAP the per-observe-step reward scores. This is the "
+            "flag to use; --reward_variant is the older spelling and is kept only so "
+            "existing command lines keep working. "
+            "'attention' = raw observe->patch attention at --overlap_layer, mean of "
+            "--overlap_heads (docs/saliency-maps.md map 1); 'grad' = the PIXEL GRADIENT "
+            "of the step's own tokens (map 5b); 'glimpse' = GLIMPSE's gradient-weighted "
+            "attention (map 6, ~55x the cost of grad -- see trl/glimpse_maps.py). "
+            "All three produce the same per-step map contract and are scored by "
+            "--overlap_metric, so the map and the metric are now independent choices. "
+            "Maps to --reward_variant ours|grad|glimpse; set both and this one wins. "
+            "Leave unset (with --reward_variant saliency_r1|none) for the two variants "
+            "that are not per-observe-step rewards at all.",
+            "choices": ["attention", "grad", "glimpse"],
+        },
+    )
     reward_variant: str = field(
         default="saliency_r1",
         metadata={
@@ -122,7 +140,7 @@ class ScriptArguments:
             "log(||g_U|| / ||g_rolled||) -- see trl/rewards/grad_rewards.py. "
             "'glimpse' = the GLIMPSE grounding reward: same per-observe-step, "
             "DINO-grounded shape, but the map is GLIMPSE's gradient-weighted attention "
-            "(docs/saliency-maps.md map 6) and the score is --glimpse_metric. It costs "
+            "(docs/saliency-maps.md map 6) and the score is --overlap_metric. It costs "
             "55-59x the 'grad' variant per case (100-145 s added to a ~40 s optimizer "
             "step) and its screened correlation with correctness is null to slightly "
             "negative -- read trl/rewards/glimpse_rewards.py before using it.",
@@ -192,27 +210,6 @@ class ScriptArguments:
         metadata={"help": "reward_variant='grad': seed for the control placements."},
     )
     # ---- GLIMPSE grounding reward (reward_variant="glimpse") ----
-    glimpse_metric: str = field(
-        default="mean_in_v2",
-        metadata={
-            "help": "reward_variant='glimpse': how to score a step's GLIMPSE map against "
-            "its DINO box union. The two variants, both run through the same "
-            "overlap_rewards implementations the incumbent uses. 'mean_in_v2' (default) = "
-            "mean inside the union / mean over the whole map; chance 1.0, rescale-"
-            "invariant, still sees magnitudes -- but its ceiling is n_patches/n_in, so "
-            "union area moves it MECHANICALLY and glimpse/union_frac must be read "
-            "alongside it. 'auroc' = P(in-union patch outranks out-of-union patch); "
-            "chance 0.5, depends only on patch order, so it is exactly immune to that "
-            "ceiling. On the 3,471-step screen both are null-to-negative against "
-            "correctness (r = -0.031 and -0.056 at step level; Bonferroni needs 0.0735), "
-            "which is the thing to know before choosing between them. 'logratio' = the "
-            "roll-null, the same score the gradient reward uses, scored on GLIMPSE maps: "
-            "chance 0, and the only one of the three whose control has the union's own "
-            "shape and area, so it is the one to reach for given that the GLIMPSE map's "
-            "grounding decays hard with union size (r = -0.487). Knobs are --rollnull_*.",
-            "choices": ["mean_in_v2", "auroc", "logratio"],
-        },
-    )
     glimpse_target: str = field(
         default="clogit",
         metadata={
@@ -298,13 +295,13 @@ class ScriptArguments:
         },
     )
     # ---- the roll-null, when it is used as a METRIC (--overlap_metric logratio /
-    # --glimpse_metric logratio). reward_variant='grad' keeps its own --grad_* copies of
+    # metric). reward_variant='grad' keeps its own --grad_* copies of
     # these, because there the roll-null IS the reward rather than one metric of four,
     # and separating them keeps every existing grad run reproducible byte for byte.
     rollnull_offsets: int = field(
         default=16,
         metadata={
-            "help": "metric='logratio': how many translated copies of the box union form "
+            "help": "--overlap_metric logratio: how many translated copies of the box union form "
             "the null. Their SQUARED masses are pooled BEFORE the log, so one control "
             "landing on a dead region cannot dominate. Pure numpy on a ~16x16 map: free."
         },
@@ -312,7 +309,7 @@ class ScriptArguments:
     rollnull_clip: float = field(
         default=1.0,
         metadata={
-            "help": "metric='logratio': clip |log(N(U)/N_0)| to this. A ratio has a heavy "
+            "help": "--overlap_metric logratio: clip |log(N(U)/N_0)| to this. A ratio has a heavy "
             "tail, and with scale_rewards=True one outlier completion takes most of its "
             "group's normalised advantage. 1.0 == a ratio of e."
         },
@@ -320,7 +317,7 @@ class ScriptArguments:
     rollnull_inframe: bool = field(
         default=True,
         metadata={
-            "help": "metric='logratio': draw the control placements so the translated "
+            "help": "--overlap_metric logratio: draw the control placements so the translated "
             "union stays INSIDE the grid rather than wrapping toroidally across the image "
             "border. Falls back to toroidal when a near-full-frame union leaves too few "
             "in-frame positions -- watch <variant>/toroidal_frac, because that fallback "
@@ -329,7 +326,7 @@ class ScriptArguments:
     )
     rollnull_seed: int = field(
         default=0,
-        metadata={"help": "metric='logratio': seed for the control placements."},
+        metadata={"help": "--overlap_metric logratio: seed for the control placements."},
     )
     token_reduction: str = field(
         default="mean",
@@ -350,10 +347,14 @@ class ScriptArguments:
             "together (default the fixed 2-head (22,28)+(22,31) option)."
         },
     )
-    overlap_metric: str = field(
-        default="mean_in",
+    overlap_metric: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "reward_variant='ours': how to score a step's map against its box union. "
+            "help": "How to score a step's map against its DINO box union, for EVERY "
+            "--saliency_method (attention, grad and glimpse alike). UNSET means the "
+            "historical default OF THAT MAP -- mean_in for attention, logratio for grad, "
+            "mean_in_v2 for glimpse -- so an existing command line keeps its behaviour "
+            "now that one flag serves all three. "
             "'mean_in' (default, the incumbent) = mean of the MAX-normalized map inside the "
             "box; it divides by the map's own peak, so a map that merely FLATTENS scores "
             "higher (measured: 32x more movement under flattening than under real "

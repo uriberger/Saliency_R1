@@ -98,6 +98,7 @@ import re
 
 import numpy as np
 
+from . import overlap_rewards as _OR
 from . import roll_null as _RN
 from .overlap_rewards import _dino_boxes, _union_mask
 
@@ -105,6 +106,10 @@ from .overlap_rewards import _dino_boxes, _union_mask
 # knobs (box_threshold, max_box_area, dino_api_base, ...) live in overlap_rewards._CFG
 # and are configured there -- this module calls its grounding helpers unchanged.
 _CFG = {
+    # Which metric scores a grounded step. Defaults to this reward's historical mode --
+    # `--overlap_metric` is one flag across three maps whose defaults differ, so an unset
+    # metric must still give THIS map the roll-null it has always used.
+    "metric": "logratio",
     "null_offsets": 16,      # K translates per step
     "logratio_clip": 1.0,    # +-c on log(N(U)/N_0); 1.0 == a ratio of e ~ 2.7
     "inframe_rolls": True,   # keep the translate inside the grid (no border wrap)
@@ -225,6 +230,33 @@ def _dedupe(steps: list[dict]) -> tuple[list[dict], float]:
     return (kept if _CFG["dedupe_steps"] else steps), dup_frac
 
 
+def _score_step(step_map, mask):
+    """One grounded step's score: the roll-null, or any of the three overlap metrics.
+
+    The gradient map used to have exactly one scoring mode. It now shares the metric
+    dispatcher with the attention and GLIMPSE maps, so `--overlap_metric` means the same
+    thing whichever `--saliency_method` produced the map.
+
+    'logratio' keeps this module's OWN path rather than going through
+    `overlap_rewards._step_score`, and that is deliberate: the roll-null is the gradient
+    reward's historical mode, its knobs are `--grad_null_offsets` and friends, and its
+    by-products are logged as `grad/*`. Routing it through the shared dispatcher would
+    silently move it onto `--rollnull_*` and change what an existing command line means.
+    The other three have no such history here, so they use the shared implementations
+    unchanged -- there is no second copy of mean_in_v2 in this file.
+    """
+    metric = _CFG.get("metric", "logratio")
+    if metric == "logratio":
+        return step_logratio(step_map, mask)
+    # The union monitors come free with the roll-null; on the other metrics nothing else
+    # records them, and they are exactly what says whether a rising score is the union
+    # growing rather than the map improving.
+    _diag("union_frac", mask.mean())
+    _diag("ecc", _centroid_eccentricity(mask))
+    _diag("n_image", float(np.sqrt((np.asarray(step_map, dtype=np.float64) ** 2).sum())))
+    return _OR._step_score(step_map, mask, metric=metric)
+
+
 def think_grad_reward(
     completions=None, saliency_map=None, valid_list=None, image=None, natural=None, **kwargs
 ):
@@ -273,7 +305,7 @@ def think_grad_reward(
         mask = _union_mask(boxes, gh, gw)
         if mask is None:
             continue  # DINO couldn't ground this step -> skip (do NOT score 0)
-        r = step_logratio(step_map, mask)
+        r = _score_step(step_map, mask)
         if r is not None:
             n_grounded += 1
             per_completion[c].append(r)

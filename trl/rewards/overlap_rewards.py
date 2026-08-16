@@ -569,9 +569,15 @@ def _roll_logratio(step_map, mask):
     return r
 
 
-def _step_score(step_map, mask):
-    """Per-step reward: the configured metric, times the optional mass floor."""
-    metric = _CFG.get("metric")
+def _step_score(step_map, mask, metric=None):
+    """Per-step reward: the configured metric, times the optional mass floor.
+
+    `metric` overrides `_CFG["metric"]` for this call. The gradient reward passes its own,
+    because its historical default is the roll-null while this module's is `mean_in`: with
+    one flag now serving three maps, the alternative is two copies of the setting that
+    have to agree, and they eventually would not.
+    """
+    metric = metric or _CFG.get("metric")
     if metric == "auroc":
         v = _auroc(step_map, mask)
     elif metric == "mean_in_v2":

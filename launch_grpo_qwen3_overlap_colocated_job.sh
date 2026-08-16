@@ -231,7 +231,6 @@ GRAD_NULL_OFFSETS=16
 GRAD_LOGRATIO_CLIP=1.0
 # GLIMPSE (reward_variant=glimpse). The two variants the reward offers are the metric:
 # mean_in_v2 (chance 1.0, ceiling n_patches/n_in) and auroc (chance 0.5, rank-based).
-GLIMPSE_METRIC=mean_in_v2
 GLIMPSE_TARGET=clogit
 GLIMPSE_LAYER_FRAC=1.0   # cost dial 1: 0.6 is 1.64x cheaper, and a METHOD change
 GLIMPSE_TOKEN_CAP=0      # cost dial 2: tokens scored per step, 0 = all. Cost is linear
@@ -243,7 +242,9 @@ GLIMPSE_TOKEN_WEIGHT=full
 ROLLNULL_OFFSETS=16
 ROLLNULL_CLIP=1.0
 ROLLNULL_SEED=0
-OVERLAP_METRIC=mean_in   # mean_in (incumbent default) | mean_in_v2 (/mean not /max; see
+OVERLAP_METRIC=""        # unset -> per-method default (mean_in for attention,
+                         # logratio for grad, mean_in_v2 for glimpse). Otherwise
+                         # mean_in | mean_in_v2 (/mean not /max; see
                          # below) | auroc (hack-resistant; see above)
 MASS_FLOOR_TAU=""        # unset -> off for mean_in, 0.0022 for auroc (see below).
                          # Pass 0 to force it off explicitly.
@@ -299,12 +300,12 @@ while [[ $# -gt 0 ]]; do
         --max-box-area)           MAX_BOX_AREA="$2";            shift 2 ;;
         --max-union-area)         MAX_UNION_AREA="$2";          shift 2 ;;
         --overlap-metric)         OVERLAP_METRIC="$2";          shift 2 ;;
+        --saliency-method)        SALIENCY_METHOD="$2";         shift 2 ;;
         --grad)                   REWARD_VARIANT=grad;          shift 1 ;;
         --grad-target)            GRAD_TARGET="$2";             shift 2 ;;
         --grad-null-offsets)      GRAD_NULL_OFFSETS="$2";       shift 2 ;;
         --grad-logratio-clip)     GRAD_LOGRATIO_CLIP="$2";      shift 2 ;;
         --glimpse)                REWARD_VARIANT=glimpse;       shift 1 ;;
-        --glimpse-metric)         GLIMPSE_METRIC="$2";          shift 2 ;;
         --glimpse-target)         GLIMPSE_TARGET="$2";          shift 2 ;;
         --glimpse-layer-frac)     GLIMPSE_LAYER_FRAC="$2";      shift 2 ;;
         --glimpse-token-cap)      GLIMPSE_TOKEN_CAP="$2";       shift 2 ;;
@@ -341,6 +342,40 @@ while [[ $# -gt 0 ]]; do
         *)                        EXTRA_ARGS="$EXTRA_ARGS $1";  shift ;;
     esac
 done
+
+# ---------- saliency method and metric, resolved once ----------
+# --saliency-method is the flag; --grad / --glimpse are kept as shorthand and
+# REWARD_VARIANT remains the internal name, so nothing downstream had to change.
+case "${SALIENCY_METHOD:-}" in
+    attention) REWARD_VARIANT=ours ;;
+    grad)      REWARD_VARIANT=grad ;;
+    glimpse)   REWARD_VARIANT=glimpse ;;
+    "")        ;;
+    *) echo "ERROR: --saliency-method must be attention|grad|glimpse (got '$SALIENCY_METHOD')" >&2; exit 1 ;;
+esac
+# One metric flag now serves three maps that had three different historical defaults, so
+# an unset metric resolves per map -- otherwise a bare --grad would silently stop using
+# the roll-null it has always used.
+if [[ -z "$OVERLAP_METRIC" ]]; then
+    case "$REWARD_VARIANT" in
+        grad)    OVERLAP_METRIC=logratio ;;
+        glimpse) OVERLAP_METRIC=mean_in_v2 ;;
+        *)       OVERLAP_METRIC=mean_in ;;
+    esac
+fi
+case "$OVERLAP_METRIC" in
+    mean_in|mean_in_v2|auroc|logratio) ;;
+    *) echo "ERROR: --overlap-metric must be mean_in|mean_in_v2|auroc|logratio (got '$OVERLAP_METRIC')" >&2; exit 1 ;;
+esac
+# mean_in divides by the map's own PEAK, so a map that merely flattens scores higher --
+# the mechanism behind the wov0.4 hack. It stays available for the attention map because
+# every trained run used it, but on a map with no such history it is a trap, not a default.
+if [[ "$OVERLAP_METRIC" == "mean_in" && "$REWARD_VARIANT" != "ours" ]]; then
+    echo "WARNING: --overlap-metric mean_in on the $REWARD_VARIANT map. It normalises by the" >&2
+    echo "         map's peak, which rewards FLATTENING; mean_in_v2 is the same numerator" >&2
+    echo "         over the map's mean and has no such hole. Continuing." >&2
+fi
+
 
 if [ "$SHARE_SIDECAR_GPU" = true ]; then MIN_GPUS=2; else MIN_GPUS=3; fi
 if (( NUM_GPUS < MIN_GPUS )); then
@@ -384,7 +419,7 @@ REFORWARD_SALIENCY=True
 # previous run is the metric flag itself. An explicit --w-overlap / --mass-floor-tau
 # still wins (pass --mass-floor-tau 0 to force the floor off). mean_in is untouched,
 # so a bare invocation is still bit-identical to the runs already trained.
-if [[ "$OVERLAP_METRIC" == "auroc" ]]; then
+if [[ "$OVERLAP_METRIC" == "auroc" && "$REWARD_VARIANT" == "ours" ]]; then
     [[ -z "$MASS_FLOOR_TAU" ]] && MASS_FLOOR_TAU=0.0022
     [[ -z "${W_OVERLAP_SET:-}" ]] && W_OVERLAP=0.11
 fi
@@ -392,7 +427,7 @@ fi
 # by default: the tau that fits this corpus is not auroc's 0.0022 (p10 of image_mass on
 # set_a is 0.00078, and 0.0022 bites on 30% of steps here), and 0.033 was measured with
 # the floor OFF. If you pass --mass-floor-tau anyway, drop the weight to ~0.024.
-if [[ "$OVERLAP_METRIC" == "mean_in_v2" ]]; then
+if [[ "$OVERLAP_METRIC" == "mean_in_v2" && "$REWARD_VARIANT" == "ours" ]]; then
     [[ -z "${W_OVERLAP_SET:-}" ]] && W_OVERLAP=0.033
 fi
 
@@ -485,17 +520,18 @@ N_HEADS=$(echo "$OVERLAP_HEADS" | awk -F, '{print NF}')
 if [[ "$REWARD_VARIANT" == "grad" ]]; then
     # The attention knobs are not in the name because they do not apply: no layer, no
     # heads, no token reduction. What does apply is in it, so a name states what ran.
-    SUFFIX="__wov${W_OVERLAP}_grad${GRAD_TARGET}_rn${GRAD_NULL_OFFSETS}_clip${GRAD_LOGRATIO_CLIP}"
+    SUFFIX="__wov${W_OVERLAP}_grad${GRAD_TARGET}_${OVERLAP_METRIC}"
+    [[ "$OVERLAP_METRIC" == "logratio" ]] && SUFFIX="${SUFFIX}_rn${GRAD_NULL_OFFSETS}_clip${GRAD_LOGRATIO_CLIP}"
 elif [[ "$REWARD_VARIANT" == "glimpse" ]]; then
     # No layer, no heads, no token reduction -- those are attention-map knobs. What IS
     # swept here is the metric (the two variants), the target, and the two cost dials,
     # and a cost dial changes the map, so it belongs in the name.
-    SUFFIX="__wov${W_OVERLAP}_glimpse${GLIMPSE_METRIC}_${GLIMPSE_TARGET}"
+    SUFFIX="__wov${W_OVERLAP}_glimpse${OVERLAP_METRIC}_${GLIMPSE_TARGET}"
     [[ "$GLIMPSE_LAYER_FRAC" != "1.0" ]] && SUFFIX="${SUFFIX}_lf${GLIMPSE_LAYER_FRAC}"
     [[ "$GLIMPSE_TOKEN_CAP" != "0" ]]    && SUFFIX="${SUFFIX}_tc${GLIMPSE_TOKEN_CAP}"
     [[ "$GLIMPSE_DEPTH_TEMP" != "0.2" ]] && SUFFIX="${SUFFIX}_dt${GLIMPSE_DEPTH_TEMP}"
     [[ "$GLIMPSE_TOKEN_WEIGHT" != "full" ]] && SUFFIX="${SUFFIX}_tw${GLIMPSE_TOKEN_WEIGHT}"
-    [[ "$GLIMPSE_METRIC" == "logratio" ]] && SUFFIX="${SUFFIX}_rn${ROLLNULL_OFFSETS}_clip${ROLLNULL_CLIP}"
+    [[ "$OVERLAP_METRIC" == "logratio" ]] && SUFFIX="${SUFFIX}_rn${ROLLNULL_OFFSETS}_clip${ROLLNULL_CLIP}"
 else
 SUFFIX="__wov${W_OVERLAP}_${N_HEADS}head_tr${TOKEN_REDUCTION}"
 # Only non-default metric settings extend the suffix, so existing mean_in run names
@@ -825,8 +861,7 @@ fi
 # byte for byte and the dataclass defaults apply.
 GLIMPSE_FLAGS=""
 if [[ "$REWARD_VARIANT" == "glimpse" ]]; then
-    GLIMPSE_FLAGS="--glimpse_metric $GLIMPSE_METRIC \
-    --glimpse_target $GLIMPSE_TARGET \
+    GLIMPSE_FLAGS="--glimpse_target $GLIMPSE_TARGET \
     --glimpse_layer_frac $GLIMPSE_LAYER_FRAC \
     --glimpse_token_cap $GLIMPSE_TOKEN_CAP \
     --glimpse_temp $GLIMPSE_TEMP \
@@ -912,6 +947,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --grad_logratio_clip "$GRAD_LOGRATIO_CLIP" \
     $GRAD_NATURAL_ONLY_FLAG \
     $GLIMPSE_FLAGS \
+    --overlap_metric "$OVERLAP_METRIC" \
     --rollnull_offsets "$ROLLNULL_OFFSETS" \
     --rollnull_clip "$ROLLNULL_CLIP" \
     --rollnull_seed "$ROLLNULL_SEED" \

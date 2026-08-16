@@ -294,6 +294,46 @@ def test_dedupe():
           GR._norm_text("A  Cat. ") == GR._norm_text("a cat."))
 
 
+def test_metric_dispatch():
+    """The gradient map is scored by all four metrics now, not only the roll-null.
+
+    The point of the check is the DEFAULT: `--overlap_metric` is one flag across three
+    maps that had three different historical defaults, so an unset metric must still give
+    the gradient map its roll-null. If that regresses, every existing --grad command line
+    silently changes meaning, which is the kind of break that shows up as a training
+    curve nobody can explain.
+    """
+    print("\n[metric] all four metrics, and the historical default")
+    m = box(16, 16, 4, 10, 4, 10)
+    hot = np.full((16, 16), 0.1, dtype=np.float32)
+    hot[m] = 3.0
+    stub_dino({"a cat": [[0.25, 0.25, 0.625, 0.625]]})
+    GR.configure(logratio_clip=10.0, dedupe_steps=True, natural_only=False)
+
+    got = {}
+    for met in ("mean_in", "mean_in_v2", "auroc", "logratio"):
+        OR.configure(metric=met, box_threshold=0.1, max_box_area=0.5, max_union_area=None,
+                     mass_floor_tau=None, null_offsets=16, logratio_clip=10.0)
+        GR.pop_diagnostics()
+        out = GR.think_grad_reward(saliency_map=[steps(("a cat", hot))],
+                                   valid_list=[True], image=[None])
+        got[met] = out[0]
+        check(f"the gradient map scores under {met}", out[0] is not None,
+              f"{out[0]:+.3f}" if out[0] is not None else "None")
+    check("and the four metrics are not all the same number",
+          len({round(v, 6) for v in got.values()}) >= 3, str({k: round(v, 3) for k, v in got.items()}))
+
+    # the union monitors must survive the switch away from the roll-null
+    OR.configure(metric="mean_in_v2")
+    GR.pop_diagnostics()
+    GR.think_grad_reward(saliency_map=[steps(("a cat", hot))], valid_list=[True], image=[None])
+    d = GR.pop_diagnostics()
+    check("union_frac and ecc are still logged on a non-roll-null metric",
+          np.isfinite(d["union_frac"]) and np.isfinite(d["ecc"]),
+          f"union {d['union_frac']:.3f}, ecc {d['ecc']:.3f}")
+    OR.configure(metric="logratio")
+
+
 def test_diagnostics():
     print("\n[reward] the diagnostics the hacks show up in")
     GR.configure(logratio_clip=10.0)
@@ -328,6 +368,7 @@ def main():
     test_clip()
     test_completion_level()
     test_dedupe()
+    test_metric_dispatch()
     test_diagnostics()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

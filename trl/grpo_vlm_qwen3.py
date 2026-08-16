@@ -527,6 +527,20 @@ if __name__ == "__main__":
     # Keep reward_funcs order stable so --reward_weights lines up:
     #   [format, <saliency|overlap>, accuracy, judge]   (saliency_r1 / ours)
     #   [format, accuracy, judge]                        (none)
+    # --saliency_method is the flag; --reward_variant is the older spelling kept so
+    # existing command lines still run. Normalise here, once, so every branch below and
+    # the whole trainer keep working off the single `reward_variant` string they always
+    # have -- introducing a second thing to branch on is how the two drift apart.
+    _METHOD_TO_VARIANT = {"attention": "ours", "grad": "grad", "glimpse": "glimpse"}
+    if script_args.saliency_method is not None:
+        script_args.reward_variant = _METHOD_TO_VARIANT[script_args.saliency_method]
+    # One metric flag now serves three maps that had three different historical defaults,
+    # so an UNSET metric has to resolve per map or every existing --reward_variant grad
+    # command line would silently switch from the roll-null to mean_in.
+    if script_args.overlap_metric is None:
+        script_args.overlap_metric = {"grad": "logratio", "glimpse": "mean_in_v2"}.get(
+            script_args.reward_variant, "mean_in")
+
     if script_args.reward_variant == "ours":
         from trl.rewards.overlap_rewards import configure as configure_overlap
         from trl.rewards.overlap_rewards import think_overlap_reward
@@ -555,12 +569,21 @@ if __name__ == "__main__":
         from trl.rewards.overlap_rewards import configure as configure_overlap
 
         configure_overlap(
+            # The gradient map is scored by the same four metrics as the other two now.
+            # 'logratio' still takes grad_rewards' own path and its own --grad_* knobs --
+            # see _score_step there for why that asymmetry is deliberate.
+            metric=script_args.overlap_metric,
             box_threshold=script_args.box_threshold,
             max_box_area=script_args.max_box_area,
             max_union_area=script_args.max_union_area,
+            null_offsets=script_args.rollnull_offsets,
+            logratio_clip=script_args.rollnull_clip,
+            inframe_rolls=script_args.rollnull_inframe,
+            roll_seed=script_args.rollnull_seed,
             dino_api_base=script_args.dino_api_base,
         )
         configure_grad(
+            metric=script_args.overlap_metric,
             null_offsets=script_args.grad_null_offsets,
             logratio_clip=script_args.grad_logratio_clip,
             inframe_rolls=script_args.grad_inframe_rolls,
@@ -574,9 +597,8 @@ if __name__ == "__main__":
         # unchanged. The METRIC and the DINO-side knobs live in overlap_rewards._CFG --
         # glimpse_rewards calls its grounding AND scoring helpers rather than duplicating
         # them, which is what makes "mean_in_v2 here" the same number as "mean_in_v2
-        # there" -- so both are configured here. Note --glimpse_metric overrides
-        # --overlap_metric for this variant: mean_in divides by the map's own peak, which
-        # is not one of the two variants this reward offers.
+        # there" -- so both are configured here. --overlap_metric selects the metric for
+        # this map exactly as it does for the other two.
         from trl.rewards.glimpse_rewards import configure as configure_glimpse
         from trl.rewards.glimpse_rewards import think_glimpse_reward
         from trl.rewards.overlap_rewards import configure as configure_overlap
@@ -588,7 +610,7 @@ if __name__ == "__main__":
         # inert or a constant zero -- a number that means nothing here. The launcher
         # refuses the flag outright for this variant.
         configure_overlap(
-            metric=script_args.glimpse_metric,
+            metric=script_args.overlap_metric,
             null_offsets=script_args.rollnull_offsets,
             logratio_clip=script_args.rollnull_clip,
             inframe_rolls=script_args.rollnull_inframe,
