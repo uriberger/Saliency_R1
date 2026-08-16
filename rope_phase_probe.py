@@ -275,6 +275,7 @@ class BinAccumulator:
         self.sumsq = torch.zeros(n_layers, n_heads, n_patch, dtype=torch.float32, device=device)
         self.ntok = 0
         self.ncase = 0
+        self.dmin = self.dmax = None
         # Kept on the device: an .item() here would sync 36 times per case for one
         # integer, which is what RolloutFlow's comment warns about.
         self.clamped = torch.zeros((), dtype=torch.float64, device=device)
@@ -289,12 +290,16 @@ class BinAccumulator:
             self.sum[b.name][row].index_add_(1, bins[b.name], x)
         self.sumsq[row] += x.pow(2).sum(1)
 
-    def add_case(self, bins: dict, n_tok: int):
+    def add_case(self, bins: dict, d_keep):
+        n_tok = int(len(d_keep))
         for b in self.binnings:
             ones = torch.ones(n_tok, dtype=torch.float64, device=self.count[b.name].device)
             self.count[b.name].index_add_(0, bins[b.name], ones)
         self.ntok += n_tok
         self.ncase += 1
+        lo, hi = float(d_keep.min()), float(d_keep.max())
+        self.dmin = lo if self.dmin is None else min(self.dmin, lo)
+        self.dmax = hi if self.dmax is None else max(self.dmax, hi)
 
     def to_npz(self, meta: dict) -> dict:
         out = {"__meta__": np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8)}
@@ -647,7 +652,7 @@ def scan(args, device):
         finally:
             tap.disarm()
             del add
-        acc.add_case(bins, int(keep.sum()))
+        acc.add_case(bins, d_keep)
         kept_cases += 1
         if (ci + 1) % args.log_every == 0:
             print(f"[scan] {ci + 1}/{len(rows)} cases, {acc.ntok} tokens kept", flush=True)
@@ -661,6 +666,7 @@ def scan(args, device):
         "gh": gh, "gw": gw, "n_heads": n_heads, "layers": tap.layers,
         "ntok": acc.ntok, "ncase": acc.ncase, "nclamped": acc.nclamped,
         "shard": args.shard, "num_shards": args.num_shards,
+        "d_observed": [acc.dmin, acc.dmax],
         "n_samples": args.n_samples, "seed": args.seed,
         "image_side": args.image_side, "d_min": args.d_min, "d_max": args.d_max,
         "base_model": args.base_model, "adapter": args.adapter or "",
@@ -779,13 +785,34 @@ def report(args):
     P("")
 
     shifts = list(range(-args.max_shift, args.max_shift + 1))
-    results = {}
+    dlo, dhi = (meta.get("d_observed") or [None, None])
+    dspan = (dhi - dlo) if (dlo is not None and dhi is not None) else None
+    results, degenerate = {}, []
     for b in binnings:
+        empty = int((counts[b.name] <= 0).sum())
+        if empty:
+            turn = b.theta * dspan if dspan else float("nan")
+            degenerate.append(
+                f"{b.name}: {empty}/{b.nbins} buckets are empty. theta={b.theta:.3g} turns "
+                f"{turn:.3g} rad over the observed d range ({dlo:.0f}..{dhi:.0f}), i.e. "
+                f"{turn / TWO_PI:.3g} of a cycle, so every token falls in the same phase "
+                f"bucket. This channel is too slow to separate the data -- which is itself "
+                f"the measurement, not a failure.")
+            continue
         resid = bucket_residuals(sums[b.name], counts[b.name], gh, gw)
         sc = shift_scores(resid, b.axis, shifts)
         results[b.name] = (b, resid, summarize(resid, sc, shifts, b.predicted_shift))
+    if degenerate:
+        P("--- degenerate binnings (skipped)")
+        for line in degenerate:
+            P("    " + line)
+        P("")
+    if not results:
+        raise SystemExit("every binning was degenerate; nothing to report")
 
     floor = results["perm8"][2]["resid_power"] if "perm8" in results else float("nan")
+    if "perm8" not in results:
+        P("NOTE perm8 is absent, so /floor and null% are undefined for this run")
 
     # 1/#shifts is a poor reference: the null's argmax is edge-heavy, because bucket
     # residuals sum to zero across buckets and so are mildly anti-correlated at zero

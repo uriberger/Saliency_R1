@@ -119,7 +119,7 @@ def synth(amp: float, seed: int = 0, gh: int = 24, gw: int = 24, n_heads: int = 
             xt = torch.as_tensor(x, dtype=torch.float32)
             xt -= xt.mean(-1, keepdim=True)          # the probe's mean-centring
             acc.add_layer(li, xt, bins)
-        acc.add_case(bins, per_case)
+        acc.add_case(bins, dt)
     return acc, binnings, gh, gw
 
 
