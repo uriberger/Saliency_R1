@@ -33,6 +33,11 @@ bucket; the fastest W channel is theta = 0.6175, so 10 buckets => +1.02 columns
 per bucket.  Halving the bucket count doubles the predicted shift -- a second
 prediction from the same law, free, on the same data.
 
+What survives the bucket average is only the channel you bucketed on: consecutive
+h8 buckets differ in d by 8.0, over which the W channel turns 4.9 rad, so the
+column half of the diagonal averages away inside the bucket.  Expect a march
+along the binning's own axis and none on the other -- see predicted_pair_2d.
+
 WHY LOG-ATTENTION, MEAN-CENTRED OVER THE PATCHES
 ------------------------------------------------
 log softmax_i = z_i - logZ and logZ does not depend on i, so mean-centring the log
@@ -359,6 +364,64 @@ def shift_scores(resid: np.ndarray, axis: str, shifts) -> np.ndarray:
     return out
 
 
+def shift_scores_2d(resid: np.ndarray, shifts) -> np.ndarray:
+    """[L, H, B, gh, gw] -> [L, H, len(shifts), len(shifts)] over (row, col) shifts jointly.
+
+    This is the actual prediction.  Bucketing by ANY channel's phase separates
+    consecutive buckets by the same step in d, and d enters as both d-r and d-c,
+    so the overlay translates DIAGONALLY by (delta, delta) -- not along one axis.
+    Sliding rows alone leaves the column component unmatched, which drags the
+    best row-only shift back toward zero and splits heads between 0 and +1.
+    """
+    nxt, cur = resid[:, :, 1:], resid[:, :, :-1]
+    out = np.zeros(resid.shape[:2] + (len(shifts), len(shifts)), dtype=np.float64)
+    for i, sr in enumerate(shifts):
+        a1, b1 = _crop_pair(nxt, cur, int(sr), 3)
+        for j, sc in enumerate(shifts):
+            a2, b2 = _crop_pair(a1, b1, int(sc), 4)
+            out[:, :, i, j] = _corr(a2, b2).mean(axis=2)
+    return out
+
+
+def bracket_ints(p: float) -> list[int]:
+    """Whole-patch shifts a predicted rate is allowed to land on.
+
+    2*pi/(theta*B) is 0.9995 for h8, not 1: bracketing that as {0, 1} would accept
+    a head that found no march at all.  Snap when the prediction is within 0.15 of
+    an integer, bracket only when it genuinely falls between two.
+    """
+    return [int(round(p))] if abs(p - round(p)) < 0.15 else [int(math.floor(p)), int(math.ceil(p))]
+
+
+def predicted_pair_2d(predicted: float, axis: str):
+    """(row shifts, col shifts) expected under a binning on `axis`.
+
+    NOT (delta, delta).  A true step in d does translate the overlay diagonally,
+    but bucketing by one channel's phase only makes THAT channel coherent inside a
+    bucket: consecutive h8 buckets differ in d by 8.0, over which the W channel
+    turns 4.9 rad, so the column component averages away within the bucket and
+    only the rows march.  Bucketing on W is the mirror image.  So each binning
+    should show a march along its own axis and nothing along the other, which is a
+    sharper prediction than the diagonal and distinguishes the two channels.
+    """
+    b = bracket_ints(predicted)
+    return (b, [0]) if axis == "row" else ([0], b)
+
+
+def summarize_2d(scores2d, shifts, predicted: float, axis: str):
+    shifts = np.asarray(shifts)
+    L, H = scores2d.shape[:2]
+    flat = scores2d.reshape(L * H, -1).argmax(axis=1)
+    sr = shifts[flat // len(shifts)]
+    sc = shifts[flat % len(shifts)]
+    pr, pc = predicted_pair_2d(predicted, axis)
+    ok = np.isin(sr, pr) & np.isin(sc, pc)
+    return {"row": sr, "col": sc, "frac_at_predicted": float(ok.mean()),
+            "predicted_pair": (pr, pc),
+            "mode": (int(np.bincount(sr - shifts.min()).argmax() + shifts.min()),
+                     int(np.bincount(sc - shifts.min()).argmax() + shifts.min()))}
+
+
 def summarize(resid, scores, shifts, predicted: float):
     """Per-head argmax, the fraction landing on the predicted shift, residual power."""
     shifts = np.asarray(shifts)
@@ -370,10 +433,7 @@ def summarize(resid, scores, shifts, predicted: float):
     # that case, and widen the chance rate to match, rather than rounding and then
     # calling a correct answer a miss.
     p = float(predicted)
-    if abs(p - round(p)) < 0.15:
-        pred_set = [int(round(p))]
-    else:
-        pred_set = [int(math.floor(p)), int(math.ceil(p))]
+    pred_set = bracket_ints(p)
     return {
         "predicted_shift": p,
         "predicted_ints": pred_set,
@@ -727,16 +787,56 @@ def report(args):
 
     floor = results["perm8"][2]["resid_power"] if "perm8" in results else float("nan")
 
+    # 1/#shifts is a poor reference: the null's argmax is edge-heavy, because bucket
+    # residuals sum to zero across buckets and so are mildly anti-correlated at zero
+    # shift, and because the crop leaves fewer, noisier elements at large shifts.
+    # Quote what perm8 actually does at each binning's predicted shift instead.
+    null_arg = results["perm8"][2]["argmax"].reshape(-1) if "perm8" in results else None
+
+    def null_rate(pred_ints):
+        if null_arg is None:
+            return float("nan")
+        return float(np.isin(null_arg, pred_ints).mean())
+
     P(f"{'binning':8s} {'axis':4s} {'theta':>7s} {'B':>3s} {'pred':>6s} {'median':>7s} "
-      f"{'%@pred':>7s} {'chance':>7s} {'power':>9s} {'/floor':>7s}")
+      f"{'%@pred':>7s} {'null%':>7s} {'power':>9s} {'/floor':>7s}")
     P("-" * 78)
     for name, (b, resid, s) in results.items():
         P(f"{name:8s} {b.axis:4s} {b.theta:7.4f} {b.nbins:3d} "
           f"{b.predicted_shift:+6.2f} {s['median_argmax']:+7.1f} "
-          f"{100 * s['frac_at_predicted']:6.1f}% {100 * s['frac_expected_by_chance']:6.1f}% "
+          f"{100 * s['frac_at_predicted']:6.1f}% {100 * null_rate(s['predicted_ints']):6.1f}% "
           f"{s['resid_power']:9.2e} {s['resid_power'] / floor:7.2f}")
     P("")
+
+    # The diagonal test.  d enters as both d-r and d-c, so the overlay translates in
+    # BOTH axes at once; sliding rows alone leaves the column component unmatched and
+    # drags the best row-only shift toward zero.
+    shifts2 = list(range(-3, 4))
+    res2 = {n: summarize_2d(shift_scores_2d(r, shifts2), shifts2, b_.predicted_shift, b_.axis)
+            for n, (b_, r, _s) in results.items()}
+
+    def null_rate_2d(pred, axis):
+        if "perm8" not in res2:
+            return float("nan")
+        pr, pc = predicted_pair_2d(pred, axis)
+        n = res2["perm8"]
+        return float((np.isin(n["row"], pr) & np.isin(n["col"], pc)).mean())
+
+    P("--- 2-D shift test: rows and columns slid jointly")
+    P("    A bucketing on one channel only makes THAT channel coherent inside a bucket,")
+    P("    so the expected signature is a march along its own axis and none on the other.")
+    P(f"    {'binning':8s} {'predicted':>12s} {'mode(row,col)':>14s} {'%@pred':>8s} {'null%':>7s}")
+    for name, (b, _r, _s) in results.items():
+        r2 = res2[name]
+        pr, pc = r2["predicted_pair"]
+        lbl = f"({'/'.join(map(str, pr))},{'/'.join(map(str, pc))})"
+        P(f"    {name:8s} {lbl:>12s} "
+          f"{str(r2['mode']):>14s} {100 * r2['frac_at_predicted']:7.1f}% "
+          f"{100 * null_rate_2d(b.predicted_shift, b.axis):6.1f}%")
+    P("")
     P("pred   = shift in patches per bucket predicted by 2*pi/(theta*B), no fitting")
+    P("null%  = what perm8, the matched control, puts at that same shift -- the")
+    P("         empirical false-positive rate, which is what %@pred must beat")
     P("median = median over heads of the shift that best aligns bucket k+1 with bucket k")
     P("%@pred = fraction of heads whose best shift is the predicted one; when the")
     P("         predicted rate is not a whole number of patches the two bracketing")
