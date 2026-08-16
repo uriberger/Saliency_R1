@@ -35,3 +35,6 @@ _glimpse_baseline.py
 # the command that made them, and a `git add -A` from a worktree otherwise sweeps
 # a whole run's stdout into a commit.
 logs/
+
+# wandb keeps a local mirror of every run it syncs, wherever it is invoked from
+wandb/
