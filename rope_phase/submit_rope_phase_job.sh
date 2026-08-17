@@ -9,6 +9,7 @@
 #   ROPE_PHASE_DATASET=/path/to/dataset bash submit_rope_phase_job.sh
 #   N_SAMPLES=256 DURATION=2 OUT_DIR=$PWD/outputs/run2 bash submit_rope_phase_job.sh
 #   bash submit_rope_phase_job.sh --base-model Qwen/Qwen2.5-VL-7B-Instruct
+#   SCRIPT=rope_phase_e1.py N_SAMPLES=20 bash submit_rope_phase_job.sh   # the causal arm
 #
 # Anything not parsed here is forwarded verbatim to rope_phase_probe.py.
 #
@@ -57,6 +58,7 @@ CONDA_SH=${CONDA_SH:-/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh}
 CONDA_ENV=${CONDA_ENV:-saliency_r1_qwen3_vllm}   # needs transformers with qwen*_vl + peft
 HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 
+SCRIPT=${SCRIPT:-rope_phase_probe.py}     # or rope_phase_e1.py for the causal arm
 N_SAMPLES=${N_SAMPLES:-32}
 OUT_DIR=${OUT_DIR:-$HERE/outputs/e0}
 JOB_NAME=${JOB_NAME:-rope_phase_e0}
@@ -71,6 +73,7 @@ mkdir -p "$LOG_ROOT" "$OUT_DIR"
 
 echo "Project    : $HERE"
 echo "Out dir    : $OUT_DIR"
+echo "Script     : $SCRIPT"
 echo "Cases      : $N_SAMPLES (1 shard, 1 GPU)"
 echo "Partition  : $PARTITION (duration ${DURATION}h)"
 echo "Env        : $CONDA_ENV"
@@ -95,8 +98,8 @@ submit_job \
         ${DATASET:+export ROPE_PHASE_DATASET=$DATASET;}
         cd $HERE;
         nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
-        python -u rope_phase_probe.py --stage scan \
+        python -u $SCRIPT --stage scan \
             --out-dir $OUT_DIR --shard 0 --num-shards 1 \
             --n-samples $N_SAMPLES --device cuda:0 $EXTRA_ARGS;
-        python -u rope_phase_probe.py --stage report --out-dir $OUT_DIR;
+        python -u $SCRIPT --stage report --out-dir $OUT_DIR;
     '"

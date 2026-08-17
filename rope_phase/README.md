@@ -86,6 +86,41 @@ run) were left in the host repo at `outputs/rope_phase/{e0_pilot,e0_qwen3_256,
 e0_qwen25}/scan/` rather than copied here; only the reports travel with this
 directory.  Re-running regenerates them.
 
+## E1 — the causal arm (built, not yet run)
+
+E0 is observational. E1 intervenes on `position_ids` and nothing else: the tokens,
+pixels, weights and causal mask are byte-identical between arms, so any difference
+is attributable to position alone. "Tail" is everything after the image.
+
+| arm | intervention | what it isolates |
+|---|---|---|
+| `null` | +delta to **every** token, image included | logits must come back identical — validates the harness and that nothing else reads absolute position |
+| `full` | +delta to all three tail axes | the honest "query is further from the image" condition |
+| `t` | +delta to the tail's t axis only | every patch shares the image's t index, so this offset is *constant across patches*: it can move mass but cannot reshape the profile. The visual-fading arm |
+| `hw` | +delta to the tail's h/w axes only | tail↔tail and image↔image offsets are untouched, so this moves **exactly** the cross-modal spatial offsets. The hypothesis, surgically isolated |
+| `fix` | tail h/w frozen at the first post-image value | removes the p-dependence outright, so its curve must be **flat**. The positive control |
+
+Predictions, stated before running: `null` at fp noise; `t` leaves shape alone but
+moves mass; `hw` drifts the profile centroid with delta and **ripples at period 8.0
+(rows) / 10.2 (cols)** — a monotone curve would be a decay story, and no decay story
+produces a ripple at a pre-specified period; `fix` flat. Deltas are swept densely
+(0–16 by 1, then out to 256) because log spacing would miss the signature entirely.
+
+Mass and shape are reported separately throughout — conflating them is exactly how
+this effect gets mistaken for visual fading.
+
+`test_rope_phase_e1_cpu.py` does not test the implementation against itself: it
+enumerates the pairwise offsets that actually reach the attention logit
+(tail↔tail, image↔image, tail↔image) and asserts which ones each arm is allowed to
+move. That is where an off-by-one would silently invalidate the GPU run.
+
+```fish
+SCRIPT=rope_phase_e1.py N_SAMPLES=20 OUT_DIR=$PWD/outputs/e1 bash submit_rope_phase_job.sh
+```
+
+Cost is ~120 forwards per case (5 arms x 24 deltas), so roughly 15–25 min for 20
+cases on one H100 — estimated from E0's rate, not measured.
+
 ## Controls
 
 - `perm8` — the `h8` buckets with their **labels permuted per case**. Counts per
@@ -125,8 +160,10 @@ comes back when nothing is planted.
 
 | | |
 |---|---|
-| `rope_phase_probe.py` | `--stage scan` (GPU) and `--stage report` (CPU) |
-| `test_rope_phase_cpu.py` | CPU tests of the analysis, incl. plant-and-recover |
+| `rope_phase_probe.py` | E0 observational probe: `--stage scan` (GPU) / `--stage report` (CPU) |
+| `test_rope_phase_cpu.py` | CPU tests of the E0 analysis, incl. plant-and-recover |
+| `rope_phase_e1.py` | E1 causal probe: the position-id gap sweep |
+| `test_rope_phase_e1_cpu.py` | CPU tests that each E1 arm perturbs only what it claims |
 | `submit_rope_phase_job.sh` | single-GPU batch submission (what produced `results/`) |
 | `launch_rope_phase.sh` | 8-way fan-out on a held interactive node (untested) |
 | `results/` | reports from the runs above |
@@ -139,8 +176,5 @@ fading. Circle-RoPE and DIPE both incidentally remove this drift, since they sto
 text tokens' spatial coordinates from advancing, but neither states the invariance
 as their motivation. The *shape drift* measured here appears unclaimed.
 
-Not done: the causal arm. Everything above is observational. The next experiment is
-a position-id gap sweep — token-identical, only `position_ids` change, with a global
-shift as an exact null, a per-axis decomposition separating this from visual fading,
-and a `fix` arm freezing text tokens' h/w coordinates — which would price the drift
-on a grounding task rather than only demonstrating it.
+The E1 harness (below) is built and CPU-tested but **has not been run on a GPU**, so
+there is as yet no measurement of what the drift costs.
