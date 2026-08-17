@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
-# E0 -- the RoPE phase lock-in test, sharded across an interactive node's GPUs.
+# E0 sharded across the GPUs of a node you already hold interactively.
 #
-# Asks whether the positional overlay M-RoPE lays on the image marches across the
-# patch grid as the generating token moves away from the image, at the rate the
-# config predicts and nothing else does.  See rope_phase_probe.py's docstring.
+# For one GPU through the batch queue use submit_rope_phase_job.sh instead; this
+# one exists for runs large enough to want 8-way fan-out.  UNTESTED as of the
+# recorded results, which were all produced single-GPU by submit_rope_phase_job.sh.
 #
-#   bash launch_rope_phase.sh --gpus 8 --out-dir outputs/rope_phase/e0_qwen3
-#   python rope_phase_probe.py --stage report --out-dir outputs/rope_phase/e0_qwen3
+#   ROPE_PHASE_DATASET=/path/to/dataset bash launch_rope_phase.sh --gpus 8 \
+#       --out-dir $PWD/outputs/e0_8way
+#   python rope_phase_probe.py --stage report --out-dir $PWD/outputs/e0_8way
 #
-# The differential is the cheap part of the experiment: run it twice, once per
-# model.  Qwen2.5-VL's W axis turns 0.0055 rad across a whole image, Qwen3-VL's
-# turns 19 rad, so the column march should be absent on one and obvious on the
-# other -- same code, same data, a prediction nothing about content can imitate.
-#
-#   bash launch_rope_phase.sh --gpus 8 --out-dir outputs/rope_phase/e0_qwen25 \
-#        --base-model Qwen/Qwen2.5-VL-7B-Instruct
+# Use a fresh --out-dir per run, and keep --gpus constant within one: the report
+# refuses to merge shards scanned with different num_shards, because a 1-shard run
+# writes shard00 covering every case and would then be double-counted.
 #
 # Resuming: re-run the identical command; a shard whose scan/shardNN.npz exists is
 # skipped (--overwrite to redo).
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$REPO"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$HERE"
 
 GPUS=8
 OUT_DIR=""
@@ -36,8 +33,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$OUT_DIR" ]] || { echo "--out-dir is required" >&2; exit 2; }
+[[ -n "${ROPE_PHASE_DATASET:-}" || "${EXTRA[*]:-}" == *--dataset* ]] || {
+    echo "set ROPE_PHASE_DATASET or pass --dataset" >&2; exit 2; }
 
-CONDA_ENV=${CONDA_ENV:-saliency_r1_qwen3_vllm}
+CONDA_ENV=${CONDA_ENV:-saliency_r1_qwen3_vllm}   # transformers with qwen*_vl + peft
 set +u
 source "/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"

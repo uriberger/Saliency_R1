@@ -127,7 +127,8 @@ comes back when nothing is planted.
 |---|---|
 | `rope_phase_probe.py` | `--stage scan` (GPU) and `--stage report` (CPU) |
 | `test_rope_phase_cpu.py` | CPU tests of the analysis, incl. plant-and-recover |
-| `submit_rope_phase_job.sh` | single-GPU batch submission |
+| `submit_rope_phase_job.sh` | single-GPU batch submission (what produced `results/`) |
+| `launch_rope_phase.sh` | 8-way fan-out on a held interactive node (untested) |
 | `results/` | reports from the runs above |
 
 ## Prior art, and what is not done
