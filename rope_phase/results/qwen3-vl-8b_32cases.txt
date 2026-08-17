@@ -1,0 +1,89 @@
+==============================================================================
+E0 -- RoPE phase lock-in test
+==============================================================================
+model    : /home/uberger/scratch/research/saliency_r1/outputs/bench_baselines/_models/Qwen3-VL-8B-Instruct
+data     : /lustre/fs1/portfolios/nvr/projects/nvr_israel_rlop/users/uberger/research/saliency_r1/cold_data/grpo_sets/val_natural (split=all)
+scan     : 1 shards, 32 cases, 5066 tokens, 36 layers x 32 heads = 1152 heads total
+grid     : 24 x 24 patches (image_side=768), d in [0, 1000000000]
+per-token variance of the mean-centred log-attention: 4.0659
+NOTE 10 attention entries hit the 1e-20 floor (3e-07% of entries) -- bf16 underflow, see the docstring
+
+binning  axis   theta   B   pred  median  %@pred   null%     power  /floor
+------------------------------------------------------------------------------
+h8       row   0.7858   8  +1.00    +1.0   50.8%    0.5%  3.66e-02   11.64
+h4       row   0.7858   4  +2.00    +2.0   69.3%   14.4%  3.09e-02    9.83
+w10      col   0.6175  10  +1.02    +0.0   42.8%    0.5%  2.51e-02    7.98
+decoy8   row   0.3100   8  +2.53    +0.0    8.1%   47.0%  2.92e-02    9.30
+perm8    row   0.7858   8  +0.00    +2.0    0.0%    0.0%  3.15e-03    1.00
+
+--- 2-D shift test: rows and columns slid jointly
+    A bucketing on one channel only makes THAT channel coherent inside a bucket,
+    so the expected signature is a march along its own axis and none on the other.
+    binning     predicted  mode(row,col)   %@pred   null%
+    h8              (1,0)         (1, 0)    23.8%    0.0%
+    h4              (2,0)         (2, 3)    14.5%    0.6%
+    w10             (0,1)         (0, 0)    22.1%    0.0%
+    decoy8        (2/3,0)         (0, 3)     0.0%    2.3%
+    perm8           (0,0)         (3, 3)     0.0%    0.0%
+
+pred   = shift in patches per bucket predicted by 2*pi/(theta*B), no fitting
+null%  = what perm8, the matched control, puts at that same shift -- the
+         empirical false-positive rate, which is what %@pred must beat
+median = median over heads of the shift that best aligns bucket k+1 with bucket k
+%@pred = fraction of heads whose best shift is the predicted one; when the
+         predicted rate is not a whole number of patches the two bracketing
+         integers both count, and the chance column widens to match
+/floor = residual power relative to perm8, the matched noise floor
+
+--- h8: score curve averaged over heads (predicted peak at +1.00)
+      shift :    -4    -3    -2    -1    +0    +1    +2    +3    +4
+      score : -0.26 -0.39 -0.27 +0.02 +0.39 +0.43 +0.29 +0.01 -0.28
+      heads :     2     1     0     1   558   585     4     1     0
+
+--- h4: score curve averaged over heads (predicted peak at +2.00)
+      shift :    -4    -3    -2    -1    +0    +1    +2    +3    +4
+      score : -0.01 -0.33 -0.46 -0.35 -0.12 +0.27 +0.41 +0.27 -0.03
+      heads :    91    53    29     6     0     5   798    75    95
+
+--- w10: score curve averaged over heads (predicted peak at +1.02)
+      shift :    -4    -3    -2    -1    +0    +1    +2    +3    +4
+      score : -0.35 -0.27 -0.09 +0.16 +0.42 +0.40 +0.33 +0.14 -0.08
+      heads :     0     1     0     1   643   493     9     2     3
+
+--- decoy8: score curve averaged over heads (predicted peak at +2.53)
+      shift :    -4    -3    -2    -1    +0    +1    +2    +3    +4
+      score : +0.13 +0.13 +0.13 +0.14 +0.18 +0.14 +0.15 +0.14 +0.14
+      heads :   211    13    10     6   634    17    55    38   168
+
+--- perm8: score curve averaged over heads (predicted peak at +0.00)
+      shift :    -4    -3    -2    -1    +0    +1    +2    +3    +4
+      score : +0.01 -0.04 -0.09 -0.10 -0.16 -0.02 +0.03 +0.04 +0.01
+      heads :   279    97    43    11     0     6   166   376   174
+
+--- h8: strongest head = layer 22 head 12 (residual power 2.50e+00, best shift +1)
+    residual collapsed onto the row axis, one line per bucket:
+  bucket 0: |*%#=. .=#%#=. .=#%#-. :+|  crest@17
+  bucket 1: |-#%#=. .=#%#=. .+#%#=. :|  crest@18
+  bucket 2: |.=#%#=. .=#@#=. .+#%#-  |  crest@19
+  bucket 3: | .=#%#=. .=#%#=. .+#%#-.|  crest@20
+  bucket 4: |: .=#%#=. .=#%#=. .=#%*-|  crest@21
+  bucket 5: |+. .=#%#=. .=#%#-. .+#%*|  crest@22
+  bucket 6: |#=. .=#%#=. .=#%#=. .+%%|  crest@23
+  bucket 7: |%#=. .=#%#=. .=#%#-. .+#|  crest@23
+
+--- fraction of heads at the predicted shift, by layer
+      layer :    0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19   20   21   22   23   24   25   26   27   28   29   30   31   32   33   34   35
+      h8    : 1.00 0.97 0.94 0.75 0.84 0.94 0.97 0.81 0.75 0.75 0.59 0.53 0.94 0.41 0.75 0.00 0.00 0.06 0.62 0.34 0.00 0.31 0.53 0.34 0.22 0.50 0.16 0.00 0.38 0.00 0.41 0.28 0.53 0.31 0.44 0.91
+      h4    : 1.00 0.97 0.94 0.81 0.94 1.00 1.00 0.97 0.97 0.88 0.84 0.88 1.00 0.91 0.94 0.06 0.22 0.50 0.75 0.78 0.16 0.72 0.78 0.56 0.38 0.78 0.31 0.09 0.72 0.00 0.78 0.59 0.66 0.44 0.62 1.00
+      w10   : 0.94 0.94 0.78 0.69 0.75 0.78 0.94 0.75 0.50 0.28 0.75 0.81 0.41 0.50 0.62 0.44 0.47 0.00 0.25 0.19 0.12 0.28 0.00 0.34 0.00 0.44 0.16 0.00 0.28 0.00 0.53 0.00 0.22 0.12 0.31 0.81
+      decoy8: 0.28 0.00 0.00 0.16 0.03 0.16 0.06 0.12 0.06 0.16 0.09 0.06 0.12 0.03 0.19 0.00 0.09 0.03 0.03 0.06 0.00 0.03 0.06 0.00 0.03 0.16 0.06 0.06 0.16 0.00 0.09 0.00 0.19 0.06 0.19 0.06
+      perm8 : 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00
+
+positional share of the profile: (power(h8) - power(perm8)) / var_token = 0.0082
+  i.e. the part of a token's image-attention profile that is explained by where the token
+  sits relative to the image, rather than by content.
+
+READING IT: the hypothesis predicts %@pred well above chance for h8, w10 and h4,
+with h4's peak at twice h8's, and perm8 flat at chance.  If every binning sits at
+chance with a tight noise floor, the language model is not using M-RoPE's spatial
+channels to select image patches -- which is the other horn, and also a result.

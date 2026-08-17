@@ -1,0 +1,84 @@
+==============================================================================
+E0 -- RoPE phase lock-in test
+==============================================================================
+model    : Qwen/Qwen2.5-VL-7B-Instruct
+data     : /lustre/fs1/portfolios/nvr/projects/nvr_israel_rlop/users/uberger/research/saliency_r1/cold_data/grpo_sets/val_natural (split=all)
+scan     : 1 shards, 32 cases, 3219 tokens, 28 layers x 28 heads = 784 heads total
+grid     : 27 x 27 patches (image_side=768), d in [0, 1000000000]
+per-token variance of the mean-centred log-attention: 4.0034
+NOTE 13076966 attention entries hit the 1e-20 floor (0.71% of entries) -- bf16 underflow, see the docstring
+
+--- degenerate binnings (skipped)
+    w10: 9/10 buckets are empty. theta=0.000178 turns 0.0569 rad over the observed d range (37..357), i.e. 0.00906 of a cycle, so every token falls in the same phase bucket. This channel is too slow to separate the data -- which is itself the measurement, not a failure.
+
+binning  axis   theta   B   pred  median  %@pred   null%     power  /floor
+------------------------------------------------------------------------------
+h8       row   0.0316   8 +24.84    +0.0    0.0%    0.0%  1.18e-01    1.86
+h4       row   0.0316   4 +49.67    +3.0    0.0%    0.0%  6.99e-02    1.10
+decoy8   row   0.3100   8  +2.53    +0.0    0.6%   60.6%  5.81e-03    0.09
+perm8    row   0.0316   8  +0.00    +3.0    0.0%    0.0%  6.37e-02    1.00
+
+--- 2-D shift test: rows and columns slid jointly
+    A bucketing on one channel only makes THAT channel coherent inside a bucket,
+    so the expected signature is a march along its own axis and none on the other.
+    binning     predicted  mode(row,col)   %@pred   null%
+    h8          (24/25,0)         (0, 0)     0.0%    0.0%
+    h4          (49/50,0)         (3, 3)     0.0%    0.0%
+    decoy8        (2/3,0)         (0, 0)     0.0%    8.7%
+    perm8           (0,0)        (3, -3)     0.0%    0.0%
+
+pred   = shift in patches per bucket predicted by 2*pi/(theta*B), no fitting
+null%  = what perm8, the matched control, puts at that same shift -- the
+         empirical false-positive rate, which is what %@pred must beat
+median = median over heads of the shift that best aligns bucket k+1 with bucket k
+%@pred = fraction of heads whose best shift is the predicted one; when the
+         predicted rate is not a whole number of patches the two bracketing
+         integers both count, and the chance column widens to match
+/floor = residual power relative to perm8, the matched noise floor
+
+--- h8: score curve averaged over heads (predicted peak at +24.84)
+      shift :    -4    -3    -2    -1    +0    +1    +2    +3    +4
+      score : +0.07 +0.07 +0.09 +0.12 +0.35 +0.13 +0.11 +0.11 +0.11
+      heads :     0     2     1     0   774     0     1     0     6
+
+--- h4: score curve averaged over heads (predicted peak at +49.67)
+      shift :    -4    -3    -2    -1    +0    +1    +2    +3    +4
+      score : -0.10 -0.09 -0.08 -0.07 -0.19 -0.06 -0.03 -0.03 -0.02
+      heads :    84    30    47    24     2    14   120   124   339
+
+--- decoy8: score curve averaged over heads (predicted peak at +2.53)
+      shift :    -4    -3    -2    -1    +0    +1    +2    +3    +4
+      score : +0.09 +0.09 +0.08 +0.10 +0.20 +0.09 +0.07 +0.08 +0.08
+      heads :    10     3     6     8   736     1     1     4    15
+
+--- perm8: score curve averaged over heads (predicted peak at +0.00)
+      shift :    -4    -3    -2    -1    +0    +1    +2    +3    +4
+      score : -0.04 -0.03 -0.04 -0.04 -0.16 -0.04 -0.02 -0.00 -0.01
+      heads :    30    15     4     4     0    10    41   434   246
+
+--- h8: strongest head = layer 19 head 15 (residual power 5.08e-01, best shift +0)
+    residual collapsed onto the row axis, one line per bucket:
+  bucket 0: |===-=:=++=-----.:--+=--=-+@|  crest@26
+  bucket 1: |++====--:-=-===-==-:-===-=-|  crest@23
+  bucket 2: |-=++-+--.-===++*++=:-=---: |  crest@21
+  bucket 3: |--++-===:=+++++++=-:-=::=:.|  crest@21
+  bucket 4: |=-=+=+------=--++========-:|  crest@24
+  bucket 5: |+===++=-=:-:---==-=--:==+==|  crest@24
+  bucket 6: |*-::-:=-*=-==-:.::=+==*+==+|  crest@22
+  bucket 7: | ::.-:=+**++-=+--+=*+==-:=*|  crest@19
+
+--- fraction of heads at the predicted shift, by layer
+      layer :    0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19   20   21   22   23   24   25   26   27
+      h8    : 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00
+      h4    : 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00
+      decoy8: 0.07 0.00 0.00 0.04 0.04 0.00 0.00 0.00 0.00 0.00 0.04 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00
+      perm8 : 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00
+
+positional share of the profile: (power(h8) - power(perm8)) / var_token = 0.0136
+  i.e. the part of a token's image-attention profile that is explained by where the token
+  sits relative to the image, rather than by content.
+
+READING IT: the hypothesis predicts %@pred well above chance for h8, w10 and h4,
+with h4's peak at twice h8's, and perm8 flat at chance.  If every binning sits at
+chance with a tight noise floor, the language model is not using M-RoPE's spatial
+channels to select image patches -- which is the other horn, and also a result.

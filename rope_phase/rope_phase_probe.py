@@ -81,7 +81,7 @@ STAGES
   python rope_phase_probe.py --stage report --out-dir DIR
 
 Cost: one generation plus one teacher-forced forward with a 36-layer eager replay
-per case, i.e. about the same as one flow_correlation_probe rollout case.
+per case: ~5 s/case on an H100, so ~21 min for 256 cases on one GPU.
 """
 
 from __future__ import annotations
@@ -98,20 +98,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-REPO = Path(__file__).resolve().parent
-
-
-def _load_module(name: str, relpath: str):
-    spec = importlib.util.spec_from_file_location(name, REPO / relpath)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"cannot load {relpath}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-IMAGE_TOKEN_ID = 151655          # checked against overlap_probe's copy in _probe()
+IMAGE_TOKEN_ID = 151655          # Qwen2-VL/2.5-VL/3-VL all share it; config wins when present
 
 # The text tower's attention class, per model family.  All three take layer_idx,
 # resolve their kernel through config._attn_implementation, and return
@@ -123,28 +110,105 @@ TEXT_ATTENTION_CLASSES = (
     "Qwen2VLAttention",
 )
 
-_PROBE = None
+# Kept verbatim from the host project's trainer.  It only has to put the model on
+# the distribution it was tuned for; nothing here parses the completion.
+SYSTEM_PROMPT = (
+    "A conversation between user and assistant. The user asks a question, and the assistant solves it. "
+    "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+    "The reasoning process and answer are enclosed within <think></think> tags, "
+    "i.e., <think>\nThis is my reasoning.\n</think>\nThis is my answer."
+)
+
+# Both are external to this directory on purpose: point them wherever the model and
+# an image+question dataset happen to live.  The dataset needs `image` and `problem`
+# columns, which is all this probe reads.
+DEFAULT_DATASET = os.environ.get("ROPE_PHASE_DATASET", "")
+DEFAULT_MODEL = os.environ.get("ROPE_PHASE_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
 
 
-def _probe():
-    """overlap_probe, imported lazily.
+def load_samples(dataset_path: str, n: int, seed: int):
+    """n rows drawn without replacement from the whole dataset, by seed.
 
-    It pulls in the trl/ reward modules at import time, which costs ~2 min and is
-    pointless for --stage report and for the CPU test -- both of which only touch
-    the analysis half of this file.
+    Deliberately no train/holdout carve: that is host-project trainer semantics and
+    this probe does not care which rows the model was tuned on -- the overlay it
+    measures is a property of positions, not of content.
     """
-    global _PROBE
-    if _PROBE is None:
-        _PROBE = _load_module("_rope_phase_overlap", "overlap_probe.py")
-        if _PROBE.IMAGE_TOKEN_ID != IMAGE_TOKEN_ID:
-            raise SystemExit(f"IMAGE_TOKEN_ID drifted: overlap_probe says "
-                             f"{_PROBE.IMAGE_TOKEN_ID}, this file says {IMAGE_TOKEN_ID}")
-    return _PROBE
+    from datasets import load_dataset, load_from_disk
 
-# cold_data/ is untracked and is NOT symlinked into a worktree, so default to the
-# central tree's copy rather than a relative path that only resolves in main.
-DEFAULT_DATASET = "/lustre/fs1/portfolios/nvr/projects/nvr_israel_rlop/users/uberger/research/saliency_r1/cold_data/grpo_sets/val_natural"
-DEFAULT_MODEL = "/home/uberger/scratch/research/saliency_r1/outputs/bench_baselines/_models/Qwen3-VL-8B-Instruct"
+    if os.path.isfile(os.path.join(dataset_path, "state.json")):
+        ds = load_from_disk(dataset_path)
+        if hasattr(ds, "keys"):
+            ds = ds["train"]
+    elif os.path.isdir(dataset_path):
+        ds = load_dataset(dataset_path, split="train")
+    else:
+        raise SystemExit(f"dataset not found: {dataset_path} (pass --dataset)")
+    rng = np.random.default_rng(seed)
+    idx = sorted(rng.choice(np.arange(len(ds)), size=min(n, len(ds)), replace=False).tolist())
+    return [{"row_index": int(i), "question": ds[int(i)]["problem"], "image": ds[int(i)]["image"]}
+            for i in idx]
+
+
+def load_model(base_path: str, adapter: str | None, device: str, attn_impl: str = "sdpa"):
+    import transformers
+    from transformers import AutoConfig, AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(base_path, padding_side="left")
+    config = AutoConfig.from_pretrained(base_path)
+    architecture = getattr(transformers, config.architectures[0])
+    model = architecture.from_pretrained(
+        base_path, torch_dtype=torch.bfloat16, attn_implementation=attn_impl)
+    if adapter:
+        from peft import PeftModel
+
+        # Merging in-memory keeps the module tree plain, so the attention hook still
+        # finds the bare attention class rather than a PEFT wrapper.
+        model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
+    return processor, model.to(device).eval()
+
+
+def build_prompt(processor, question: str):
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": question}]},
+    ]
+    return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+@torch.no_grad()
+def generate(processor, model, image, question, max_new_tokens, temperature, device):
+    inputs = processor(
+        text=[build_prompt(processor, question)], images=[[image]], return_tensors="pt",
+        padding=True, padding_side="left", add_special_tokens=False,
+    ).to(device)
+    prompt_len = inputs["input_ids"].shape[1]
+    out = model.generate(**inputs, do_sample=True, temperature=temperature, top_p=1.0,
+                         top_k=0, max_new_tokens=max_new_tokens,
+                         pad_token_id=processor.tokenizer.pad_token_id)
+    ids = out[0, prompt_len:].tolist()
+    eos = processor.tokenizer.eos_token_id
+    if eos in ids:
+        ids = ids[: ids.index(eos) + 1]
+    return inputs, prompt_len, ids
+
+
+def teacher_forced_case(prompt_inputs, comp_ids, device):
+    """prompt ++ one completion, as a single teacher-forced forward.
+
+    mm_token_type_ids must be extended over the completion with zeros -- text -- or
+    M-RoPE position ids come out wrong rather than missing.
+    """
+    ids = torch.cat([prompt_inputs["input_ids"],
+                     torch.tensor([comp_ids], device=device)], dim=1)
+    case = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+    for k in ("pixel_values", "image_grid_thw"):
+        if k in prompt_inputs:
+            case[k] = prompt_inputs[k]
+    if prompt_inputs.get("mm_token_type_ids") is not None:
+        zeros = torch.zeros(1, len(comp_ids), dtype=torch.long, device=device)
+        case["mm_token_type_ids"] = torch.cat([prompt_inputs["mm_token_type_ids"], zeros], dim=1)
+    return case
+
 
 TWO_PI = 2.0 * math.pi
 
@@ -465,15 +529,19 @@ def square_image(image, side: int):
     """
     if image.mode != "RGB":
         image = image.convert("RGB")
+    w, h = image.size
+    if max(w, h) > side:                       # cap the long side first, aspect kept,
+        f = side / max(w, h)                   # so the square resize is not an upsample
+        image = image.resize((max(1, round(w * f)), max(1, round(h * f))), 2)
     return image.resize((side, side), 2)  # BICUBIC
 
 
 class EagerAttentionTap:
     """Forward hook on every Qwen3VLTextAttention that replays its own module in eager.
 
-    Copied in spirit from flow_correlation_probe.RolloutFlow: sdpa throws the
-    softmax weights away, so each layer is re-run in eager, reduced into the
-    accumulator, and dropped.  Peak memory is one layer's [H, P, P], not 36.
+    sdpa throws the softmax weights away, so each layer is re-run in eager,
+    reduced into the accumulator, and dropped.  Peak memory is one layer's
+    [H, P, P] rather than all of them at once.
     """
 
     def __init__(self, model, acc: BinAccumulator, img_cols, prompt_len: int):
@@ -571,19 +639,15 @@ def scan(args, device):
         return
     shard_path.parent.mkdir(parents=True, exist_ok=True)
 
-    PROBE = _probe()
-    # overlap_probe shrinks every image to 512 on the long side.  Squaring that up to
-    # 768 afterwards would be an upsample of an already-downsampled image, so raise its
-    # ceiling first and let the one resize in square_image do the work.
-    PROBE.MAX_IMAGE_SIDE = max(PROBE.MAX_IMAGE_SIDE, args.image_side)
-    rows = PROBE.load_samples(args.dataset, args.n_samples, args.seed,
-                              cache_tag=f"_rope{args.shard}", split=args.split)
+    if not args.dataset:
+        raise SystemExit("--dataset is required (or set ROPE_PHASE_DATASET)")
+    rows = load_samples(args.dataset, args.n_samples, args.seed)
     rows = rows[args.shard::args.num_shards]
     if args.max_cases:
         rows = rows[: args.max_cases]
     print(f"[scan] shard {args.shard}/{args.num_shards}: {len(rows)} cases", flush=True)
 
-    processor, model = PROBE.load_model(args.base_model, args.adapter or None, device, "sdpa")
+    processor, model = load_model(args.base_model, args.adapter or None, device)
     tcfg = model.config.text_config
     binnings = default_binnings(tcfg, args.decoy_theta)
     for b in binnings:
@@ -602,13 +666,12 @@ def scan(args, device):
     for ci, row in enumerate(rows):
         image = square_image(row["image"], args.image_side)
         try:
-            inputs, prompt_len, seqs = PROBE.generate(
-                processor, model, image, row["question"], 1,
+            inputs, prompt_len, comp_ids = generate(
+                processor, model, image, row["question"],
                 args.max_new_tokens, args.temperature, device)
         except Exception as exc:                      # OOM or a bad sample: skip, keep going
             print(f"[warn] case {ci} generate failed: {exc}", flush=True)
             continue
-        comp_ids = seqs[0][0]
         if len(comp_ids) < args.min_tokens:
             continue
 
@@ -626,7 +689,7 @@ def scan(args, device):
             print(f"[warn] case {ci} grid {(g_h, g_w)} != {(gh, gw)}; skipped", flush=True)
             continue
 
-        case = PROBE.teacher_forced_case(inputs, comp_ids, device)
+        case = teacher_forced_case(inputs, comp_ids, device)
         d, img_cols = token_distances(model, case, prompt_len, image_token_id)
         if img_cols.numel() != gh * gw:
             print(f"[warn] case {ci} has {img_cols.numel()} image tokens, "
@@ -670,7 +733,7 @@ def scan(args, device):
         "n_samples": args.n_samples, "seed": args.seed,
         "image_side": args.image_side, "d_min": args.d_min, "d_max": args.d_max,
         "base_model": args.base_model, "adapter": args.adapter or "",
-        "dataset": args.dataset, "split": args.split,
+        "dataset": args.dataset,
         "binnings": [b.__dict__ for b in binnings],
     }
     np.savez(shard_path, **acc.to_npz(meta))
@@ -771,7 +834,7 @@ def report(args):
     P("E0 -- RoPE phase lock-in test")
     P("=" * 78)
     P(f"model    : {meta['base_model']}" + (f" + {meta['adapter']}" if meta["adapter"] else ""))
-    P(f"data     : {meta['dataset']} (split={meta['split']})")
+    P(f"data     : {meta['dataset']}")
     P(f"scan     : {meta['n_shards']} shards, {meta['ncase']} cases, {meta['ntok']} tokens, "
       f"{len(meta['layers'])} layers x {meta['n_heads']} heads = "
       f"{len(meta['layers']) * meta['n_heads']} heads total")
@@ -932,7 +995,6 @@ def main():
     ap.add_argument("--base-model", default=DEFAULT_MODEL)
     ap.add_argument("--adapter", default="")
     ap.add_argument("--dataset", default=DEFAULT_DATASET)
-    ap.add_argument("--split", default="all", choices=["train", "holdout", "all"])
     ap.add_argument("--n-samples", type=int, default=256)
     ap.add_argument("--max-cases", type=int, default=0, help="cap per shard, 0 = no cap")
     ap.add_argument("--seed", type=int, default=0)
