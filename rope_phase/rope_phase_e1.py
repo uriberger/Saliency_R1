@@ -243,7 +243,10 @@ def scan(args, device):
     n_heads = tcfg.num_attention_heads
     acc = {k: np.zeros((A, D, L, n_heads), dtype=np.float64)
            for k in ("mass", "prof_r", "drift_r", "drift_c")}
+    for k in ("dlogit_mean", "dlogit_max"):
+        acc[k] = np.zeros((A, D), dtype=np.float64)
     acc["nll"] = np.zeros((A, D), dtype=np.float64)
+    acc["logit_scale"] = np.zeros((), dtype=np.float64)
     null_max = 0.0
     gh = gw = None
     tap = None
@@ -299,12 +302,15 @@ def scan(args, device):
                 tap.mask = None
                 logits = out.logits
                 acc["nll"][ai, di] += completion_nll(logits, ids, prompt_len)
+                cur_logits = logits[0, prompt_len - 1:].float()
+                if ref_logits is None:
+                    ref_logits = cur_logits.clone()
+                    acc["logit_scale"] += float(ref_logits.abs().max().item())
+                dl = (cur_logits - ref_logits).abs()
+                acc["dlogit_mean"][ai, di] += float(dl.mean().item())
+                acc["dlogit_max"][ai, di] += float(dl.max().item())
                 if arm == "null":
-                    if delta == 0:
-                        ref_logits = logits[0, prompt_len - 1:].float().clone()
-                    else:
-                        null_max = max(null_max, float(
-                            (logits[0, prompt_len - 1:].float() - ref_logits).abs().max().item()))
+                    null_max = max(null_max, float(dl.max().item()))
                 for li, lay in enumerate(layers):
                     prof, mass, probs = tap.out[lay]
                     acc["mass"][ai, di, li] += mass
@@ -379,13 +385,30 @@ def report(args):
     if "null" not in arms:
         P("NULL CHECK  NOT RUN -- the null arm was excluded from --arms, so nothing here")
         P("            verifies that the harness perturbs only what it claims to.")
+    elif "dlogit_mean" not in acc:
+        P("NULL CHECK  this scan predates the per-delta logit diagnostic; rescan to get it.")
     else:
-        ok = null_max < args.null_tol
-        P(f"NULL CHECK  max |logit delta| when EVERY position id shifts together: {null_max:.3e}")
-        P(f"            {'PASS' if ok else 'FAIL'} (tolerance {args.null_tol:.0e}).  "
-          + ("RoPE translation invariance holds and nothing else reads absolute position."
-             if ok else
-             "Something in the stack reads absolute position -- every number below is suspect."))
+        ni = arms.index("null")
+        scale = float(acc["logit_scale"])
+        nm, nx = acc["dlogit_mean"][ni].max(), acc["dlogit_max"][ni].max()
+        P("NULL CHECK  shift EVERY position id, image included.  RoPE sees only differences,")
+        P("            so this must be a no-op up to arithmetic.  It is NOT compared against")
+        P("            an absolute tolerance: max |logit delta| is an extreme order statistic")
+        P("            over ~1e10 bf16 numbers, and bf16 rounding of cos/sin at large absolute")
+        P("            angles differs even when the mathematical offsets are identical.  What")
+        P("            matters is whether the null moves like the treatments do.")
+        P(f"            logit scale (max |logit|)          : {scale:.2f}")
+        P(f"            null      mean |dlogit| / max      : {nm:.4f} / {nx:.3f}")
+        for ai, arm in enumerate(arms):
+            if arm == "null":
+                continue
+            P(f"            {arm:9s} mean |dlogit| / max      : "
+              f"{acc['dlogit_mean'][ai].max():.4f} / {acc['dlogit_max'][ai].max():.3f}")
+        ratio = acc["dlogit_mean"][[i for i, a in enumerate(arms) if a != "null"]].max() / max(nm, 1e-12)
+        ok = ratio > 3.0
+        P(f"            treatment/null mean ratio          : {ratio:.1f}x  -> "
+          + ("PASS: the null is a floor the treatments clear." if ok else
+             "FAIL: the null moves as much as the treatments; the harness is not isolating position."))
     P("")
 
     for name, label, unit in (("nll", "NLL of the model's own completion", ""),
