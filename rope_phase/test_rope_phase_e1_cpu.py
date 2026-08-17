@@ -10,6 +10,11 @@ Rather than testing the implementation against itself, these tests enumerate the
 pairwise offsets that actually reach the attention logit -- tail-to-tail,
 image-to-image, tail-to-image -- and assert which ones each arm is allowed to move.
 
+The second half tests the phase-bucketed analysis: plant a pattern that translates
+by a known amount, impose a gap, and check the gap is read back out -- including
+that it wraps at one period, and that half a period is reported as the genuinely
+ambiguous quantity it is.
+
     python test_rope_phase_e1_cpu.py        # or: pytest test_rope_phase_e1_cpu.py
 """
 
@@ -131,25 +136,71 @@ def test_parse_deltas():
     assert E1.parse_deltas("3,3,1") == [1, 3], "duplicates collapse, order normalised"
 
 
-def test_centroid_is_in_patch_units():
-    gh = gw = 4
-    m = np.zeros((1, gh * gw)); m[0, 0] = 1.0                 # top-left patch
-    r, c = E1.centroid(m, gh, gw)
-    assert np.allclose(r, 0) and np.allclose(c, 0)
-    m = np.zeros((1, gh * gw)); m[0, gh * gw - 1] = 1.0       # bottom-right
-    r, c = E1.centroid(m, gh, gw)
-    assert np.allclose(r, gh - 1) and np.allclose(c, gw - 1)
-    m = np.ones((1, gh * gw))                                 # uniform -> centre
-    r, c = E1.centroid(m, gh, gw)
-    assert np.allclose(r, (gh - 1) / 2) and np.allclose(c, (gw - 1) / 2)
-
-
 def test_unknown_arm_is_refused():
     try:
         E1.build_position_ids(base_positions(), TAIL_START, "sideways", 1)
     except ValueError:
         return
     raise AssertionError("an unknown arm must not silently pass through unchanged")
+
+
+# ---------------------------------------------------------------------------
+# the phase-bucketed analysis: does an imposed gap come back as itself?
+# ---------------------------------------------------------------------------
+def test_sawtooth_prediction():
+    """A gap of one period is indistinguishable from no gap; half a period aliases."""
+    f = E1.sawtooth
+    assert [f(g, 8.0, -4, 4) for g in range(9)] == [0, 1, 2, 3, 4, -3, -2, -1, 0]
+    assert f(16, 8.0, -4, 4) == 0 and f(9, 8.0, -4, 4) == 1
+    assert f(8, 7.996, -4, 4) == 0, "the true period is a shade under 8; still wraps"
+    assert f(10, 10.17, -4, 4) == 0, "the column clock wraps on its own period"
+
+
+def _recover(cur, base, shifts, axis=2):
+    sc = [E1.RP._corr(*E1.RP._crop_pair(cur, base, int(s), axis)).mean() for s in shifts]
+    return shifts[int(np.argmax(sc))]
+
+
+def test_imposed_gap_is_recovered_and_wraps():
+    """Plant a translating pattern, impose a gap, and read the gap back out.
+
+    This is the whole logic of the rebuilt E1: a bucket at gap N should be that
+    bucket at gap 0 translated by N, so the fitted shift should return N -- and
+    wrap once N reaches a full period.
+    """
+    gh = gw = 24
+    period = 8.0
+    rng = np.random.default_rng(0)
+    rows = np.arange(gh)[None, None, :, None]
+    phase = rng.uniform(0, 2 * np.pi, size=(3, 8, 1, 1))     # heads x buckets
+
+    def pattern(gap):
+        clean = np.cos(2 * np.pi * (rows - gap) / period + phase)
+        return clean + 0.05 * rng.normal(size=(3, 8, gh, gw))
+
+    base = pattern(0)
+    shifts = list(range(-4, 5))
+    for gap in (0, 1, 2, 3, 5, 6, 7, 8, 9, 11, 16):
+        got = _recover(pattern(gap), base, shifts)
+        assert got == E1.sawtooth(gap, period, -4, 4), (gap, got)
+
+    # half a period is genuinely ambiguous: +4 and -4 are the same pattern, so the
+    # measurement cannot tell them apart and the report must not pretend otherwise
+    assert abs(_recover(pattern(4), base, shifts)) == 4
+
+
+def test_a_pattern_that_does_not_move_recovers_zero():
+    """The `t` and `fix` arms must land here: no translation, no recovered shift."""
+    gh = gw = 24
+    rng = np.random.default_rng(1)
+    rows = np.arange(gh)[None, None, :, None]
+    phase = rng.uniform(0, 2 * np.pi, size=(3, 8, 1, 1))
+    still = np.cos(2 * np.pi * rows / 8.0 + phase)
+    shifts = list(range(-4, 5))
+    for _ in range(3):
+        cur = still + 0.05 * rng.normal(size=still.shape)
+        base = still + 0.05 * rng.normal(size=still.shape)
+        assert _recover(cur, base, shifts) == 0
 
 
 def main():

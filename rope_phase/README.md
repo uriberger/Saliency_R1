@@ -100,11 +100,27 @@ is attributable to position alone. "Tail" is everything after the image.
 | `hw` | +delta to the tail's h/w axes only | tail↔tail and image↔image offsets are untouched, so this moves **exactly** the cross-modal spatial offsets. The hypothesis, surgically isolated |
 | `fix` | tail h/w frozen at the first post-image value | removes the p-dependence outright, so its curve must be **flat**. The positive control |
 
-Predictions, stated before running: `null` at fp noise; `t` leaves shape alone but
-moves mass; `hw` drifts the profile centroid with delta and **ripples at period 8.0
-(rows) / 10.2 (cols)** — a monotone curve would be a decay story, and no decay story
-produces a ripple at a pre-specified period; `fix` flat. Deltas are swept densely
-(0–16 by 1, then out to 256) because log spacing would miss the signature entirely.
+**Phase bucketing.** The first build averaged the profile over every post-image
+token before comparing, which cancelled the very thing worth measuring: tokens in a
+case sit at hundreds of different distances, spanning ~30 turns of the fast row
+clock, so their stripes are at ~30 phases and averaging wipes them out. Adding a gap
+shifts every phase equally but cannot un-cancel what already cancelled. That build
+saw only the slow channels.
+
+This build buckets by phase first — as E0 does, and using each token's *unmodified*
+distance, so the same tokens share a bucket in every arm at every gap and the
+comparison is exactly paired. That turns E1 into a **calibration**: a bucket at gap
+N should be that bucket at gap 0 translated by N, so the fitted shift should give
+back N — and must **wrap**, since the row clock repeats every 8 patches. A gap of 8
+is indistinguishable from no gap; a gap of 5 reads as −3.
+
+**The prediction is a sawtooth of period 8, with nothing fitted.** No decay story
+produces a sawtooth. Half a period (a gap of 4) is genuinely ambiguous between +4
+and −4, and the report scores it as such rather than pretending otherwise.
+
+Stated before running: `null` at arithmetic noise; `t` recovers shift 0 at every gap,
+because its offset is identical for every patch and cannot reshape anything; `hw` and
+`full` trace the sawtooth; `fix` flat at 0.
 
 Mass and shape are reported separately throughout — conflating them is exactly how
 this effect gets mistaken for visual fading.
@@ -118,8 +134,8 @@ move. That is where an off-by-one would silently invalidate the GPU run.
 SCRIPT=rope_phase_e1.py N_SAMPLES=20 OUT_DIR=$PWD/outputs/e1 bash submit_rope_phase_job.sh
 ```
 
-Cost is ~120 forwards per case (5 arms x 24 deltas), so roughly 15–25 min for 20
-cases on one H100 — estimated from E0's rate, not measured.
+Cost is ~105 forwards per case (5 arms x 21 gaps): about 13 min for 20 cases on one
+H100, measured.
 
 ## Controls
 
