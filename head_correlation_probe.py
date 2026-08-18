@@ -45,6 +45,13 @@ anything else, and `--max-union` restricts every number after it to a subset. Fi
 threshold before looking at a confirmation set; chosen afterwards it is a researcher
 degree of freedom, and the confirmation draws are single use.
 
+The scan also writes the box-free columns of `saliency_sharpness.py` -- how CONCENTRATED
+each head's map is, with no boxes involved -- plus the head's total image mass and the
+covariates (patch count, step token count, dataset) those need to be controlled for.
+They cost one sort over the patch axis and are scored by `sharpness_report.py`, not by
+`--stage report` here, because the question they answer is a comparison ACROSS map
+families rather than a ranking within this one.
+
     bash launch_head_correlation.sh --gpus 8 --out-dir DIR --cases-dir <probe out-dir>
     python head_correlation_probe.py --stage report --out-dir DIR [--max-union 0.5]
 """
@@ -83,6 +90,7 @@ def _load_module(name: str, relpath: str):
 
 PROBE = _load_module("_hc_overlap_probe", "overlap_probe.py")
 IV = _load_module("_hc_intervene", "intervene_probe.py")
+SHARP = _load_module("_hc_sharpness", "saliency_sharpness.py")
 IMAGE_TOKEN_ID = PROBE.IMAGE_TOKEN_ID
 
 
@@ -264,7 +272,8 @@ def scan(args, device):
     prog = IV.Progress(out / "progress" / f"scan{args.shard:02d}.json", len(cases),
                        f"scan{args.shard}", args.log_every)
 
-    V2, AU, ROW, STEP, COR, UNI = [], [], [], [], [], []
+    V2, AU, SH, NEG, MASS, ROW, STEP, COR, UNI, NPAT, NTOK, DSET = (
+        [], [], [], [], [], [], [], [], [], [], [], [])
     dropped = 0
     try:
         for case in cases:
@@ -286,6 +295,17 @@ def scan(args, device):
             masks = np.stack([IV.unb64u8(st["mask_q"], (gh, gw)).astype(bool).reshape(-1)
                               for st in steps])
             v2, au = metrics(maps, masks)
+            # Box-free concentration, on the same maps in the same pass. This costs a
+            # sort over the patch axis and nothing else, so it rides along free rather
+            # than justifying a second 8-GPU scan of the same 1,157 cases.
+            sh, neg = SHARP.sharpness(maps, (gh, gw))        # [L,H,S,M], [L,H,S]
+            # This head's total attention to the image, the magnitude that goes with
+            # the shape. It is the covariate the concentration columns have to be
+            # held against: image mass is the strongest single correlate of
+            # correctness measured on this corpus, and "sharper" must not be it in
+            # disguise -- which the sharpness columns cannot be, since they are
+            # computed on the L1-normalised map, but the control should still run.
+            mass = maps.sum(-1)                              # [L,H,S]
             grade = PROBE.accuracy_reward(
                 [[{"role": "assistant", "content": f"</think> {answer}"}]],
                 [case["gold"]])[0]
@@ -296,10 +316,16 @@ def scan(args, device):
             for si, st in enumerate(steps):
                 V2.append(v2[:, :, si])
                 AU.append(au[:, :, si])
+                SH.append(sh[:, :, si])
+                NEG.append(neg[:, :, si])
+                MASS.append(mass[:, :, si])
                 ROW.append(case["row_index"])
                 STEP.append(si)
                 COR.append(float(grade))
                 UNI.append(st["union_frac"])
+                NPAT.append(gh * gw)
+                NTOK.append(st["tok_b"] - st["tok_a"])
+                DSET.append(case.get("dataset", ""))
             prog.tick()
     finally:
         cap.close()
@@ -309,11 +335,17 @@ def scan(args, device):
     np.savez_compressed(
         dest,
         v2=np.stack(V2).astype(np.float32), auroc=np.stack(AU).astype(np.float32),
+        sharp=np.stack(SH).astype(np.float32),
+        neg_frac=np.stack(NEG).astype(np.float32),
+        mass=np.stack(MASS).astype(np.float32),
+        sharp_names=np.array(SHARP.SHARP_NAMES),
         row=np.array(ROW), step=np.array(STEP),
         correct=np.array(COR, dtype=np.float32), union=np.array(UNI, dtype=np.float32),
+        npatch=np.array(NPAT), ntok=np.array(NTOK), dataset=np.array(DSET),
         layers=np.array(cap.layers))
     print(f"[scan] shard {args.shard}: {len(V2)} steps from "
           f"{len(set(ROW))} completions, {dropped} cases dropped -> {dest}")
+    print(SHARP.describe(np.stack(SH)))
 
 
 # ---------------------------------------------------------------------------

@@ -115,6 +115,12 @@ predicting correctness is a different claim from its *magnitude* doing so. A col
 whose raw r survives but whose partial r does not is measuring difficulty, not
 grounding.
 
+Sharpness. The scan also writes the box-free concentration columns of
+`saliency_sharpness.py` for every map above -- how peaked it is, never where the peak
+is -- plus the covariates they have to be controlled for. Scored by
+`sharpness_report.py`, which races them against the DINO columns computed here on the
+same steps; `--stage report` below is unchanged and ignores them.
+
 DEEPSTACK CAVEAT. Qwen3-VL re-injects visual features at the image positions at several
 decoder layers (`_deepstack_process`). The recursion does not model that addition; it
 only pushes those positions further toward their own patch, so `sal` at image positions
@@ -203,6 +209,7 @@ def _load_module(name: str, relpath: str):
 PROBE = _load_module("_fc_overlap_probe", "overlap_probe.py")
 IV = _load_module("_fc_intervene", "intervene_probe.py")
 HC = _load_module("_fc_head_corr", "head_correlation_probe.py")
+SHARP = _load_module("_fc_sharpness", "saliency_sharpness.py")
 IMAGE_TOKEN_ID = PROBE.IMAGE_TOKEN_ID
 
 MAPS = ("rollout_mean", "rollout_wnorm", "grad", "glimpse")
@@ -611,6 +618,7 @@ def scan(args, device):
                        f"scan{args.shard}", args.log_every)
 
     V2, AU, ROW, STEP, COR, UNI, MASS = [], [], [], [], [], [], []
+    SH, NEG, NPAT, NTOK, DSET = [], [], [], [], []
     names = None
     dropped = 0
     try:
@@ -638,6 +646,11 @@ def scan(args, device):
             # in that fraction and may be negative; for the gradient map it is a scale
             # with no such interpretation, kept only so the control can run.
             mass = maps.sum(-1)                              # [K, 1, S]
+            # Box-free concentration of the same maps: how sharp, never where. Rides
+            # along with the scan for the cost of one sort over the patch axis. The
+            # `incL` columns go negative and are rectified first -- `neg_frac` records
+            # how much of their absolute mass that threw away.
+            sh, neg = SHARP.sharpness(maps, (gh, gw))        # [K,1,S,M], [K,1,S]
             grade = PROBE.accuracy_reward(
                 [[{"role": "assistant", "content": f"</think> {answer}"}]],
                 [case["gold"]])[0]
@@ -649,10 +662,15 @@ def scan(args, device):
                 V2.append(v2[:, 0, si])
                 AU.append(au[:, 0, si])
                 MASS.append(mass[:, 0, si])
+                SH.append(sh[:, 0, si])
+                NEG.append(neg[:, 0, si])
                 ROW.append(case["row_index"])
                 STEP.append(si)
                 COR.append(float(grade))
                 UNI.append(st["union_frac"])
+                NPAT.append(gh * gw)
+                NTOK.append(st["tok_b"] - st["tok_a"])
+                DSET.append(case.get("dataset", ""))
             prog.tick()
     finally:
         engine.close()
@@ -665,9 +683,14 @@ def scan(args, device):
         row=np.array(ROW), step=np.array(STEP),
         correct=np.array(COR, dtype=np.float32), union=np.array(UNI, dtype=np.float32),
         mass=np.stack(MASS).astype(np.float32),
+        sharp=np.stack(SH).astype(np.float32),
+        neg_frac=np.stack(NEG).astype(np.float32),
+        sharp_names=np.array(SHARP.SHARP_NAMES),
+        npatch=np.array(NPAT), ntok=np.array(NTOK), dataset=np.array(DSET),
         names=np.array(names), map=np.array(args.map), alpha=np.array(args.alpha))
     print(f"[scan] shard {args.shard}: {len(V2)} steps from "
           f"{len(set(ROW))} completions, {dropped} cases dropped -> {dest}")
+    print(SHARP.describe(np.stack(SH)))
 
 
 # ---------------------------------------------------------------------------
