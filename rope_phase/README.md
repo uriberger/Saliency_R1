@@ -86,7 +86,7 @@ run) were left in the host repo at `outputs/rope_phase/{e0_pilot,e0_qwen3_256,
 e0_qwen25}/scan/` rather than copied here; only the reports travel with this
 directory.  Re-running regenerates them.
 
-## E1 — the causal arm (built, not yet run)
+## E1 — the causal arm
 
 E0 is observational. E1 intervenes on `position_ids` and nothing else: the tokens,
 pixels, weights and causal mask are byte-identical between arms, so any difference
@@ -121,6 +121,48 @@ and −4, and the report scores it as such rather than pretending otherwise.
 Stated before running: `null` at arithmetic noise; `t` recovers shift 0 at every gap,
 because its offset is identical for every patch and cannot reshape anything; `hw` and
 `full` trace the sawtooth; `fix` flat at 0.
+
+### E1 result (2026-08-18, Qwen3-VL-8B, 19 cases, gaps 0-20)
+
+**Shape — confirmed, strongly.** Similarity of the phase-bucketed profile to gap 0:
+
+| gap | 0 | 2 | **4** | 6 | **8** | 10 | **12** | 14 | **16** | 18 | **20** |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `null` | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `t` | 1.00 | 1.00 | 0.99 | 1.00 | 0.99 | 0.99 | 0.99 | 0.99 | 0.99 | 0.99 | 0.99 |
+| `hw` | 1.00 | 0.61 | **0.20** | 0.56 | **0.94** | 0.56 | **0.18** | 0.54 | **0.92** | 0.56 | **0.20** |
+| `fix` | 0.51 | 0.50 | 0.50 | 0.50 | 0.50 | 0.49 | 0.50 | 0.50 | 0.49 | 0.49 | 0.49 |
+
+Three clean cycles on the predicted period. The column bucketing oscillates on *its*
+own period instead (minima ~5 and ~15, maxima 0, 10, 20). Four predictions, four hits.
+
+**Behaviour — negative.** Fraction of greedy tokens that change:
+
+| `null` (a no-op) | `t` | `hw` | `full` | `fix` |
+|---|---|---|---|---|
+| **1.0-1.5%** | 1.1-1.6% | **1.1-1.8%** | 1.2-2.1% | **~30%** |
+
+bf16 arithmetic alone flips 1.2% of tokens over a 250-token completion, and `hw`
+barely clears it — with **no period-8 structure in any arm**. `fix` flips 30%, so the
+readout spans 1.2 to 30 per cent and the null in between is a measurement, not
+insensitivity. Only 5.5% of positions are near-indifferent to begin with.
+
+**So the drift massively reshapes where the model looks and does not change what it
+says.** Where a VLM looks and what it then says are weakly coupled — which is worth
+knowing on its own, and is direct causal evidence for something attention-attribution
+work usually has to infer.
+
+Untested, and where a one-to-two patch displacement should actually bite: pointing
+and bounding boxes, dense document and chart reading, counting, and within-answer
+self-consistency (ask the same spatial question twice at different depths — the
+disagreement should be worse at half a period than at a full one).
+
+Two analysis traps this went through, both worth knowing before reusing the code.
+Averaging the profile over tokens before comparing cancels the fast channel, because
+tokens span ~30 turns of it; bucket by phase first. And subtracting the across-bucket
+mean is not optional: leave the shared content in and it sits identically on both
+sides of every comparison, pinning the fitted shift at zero however far the pattern
+actually moved.
 
 Mass and shape are reported separately throughout — conflating them is exactly how
 this effect gets mistaken for visual fading.
@@ -179,7 +221,7 @@ comes back when nothing is planted.
 | `rope_phase_probe.py` | E0 observational probe: `--stage scan` (GPU) / `--stage report` (CPU) |
 | `test_rope_phase_cpu.py` | CPU tests of the E0 analysis, incl. plant-and-recover |
 | `rope_phase_e1.py` | E1 causal probe: the position-id gap sweep |
-| `test_rope_phase_e1_cpu.py` | CPU tests that each E1 arm perturbs only what it claims |
+| `test_rope_phase_e1_cpu.py` | CPU tests of the E1 arms and the shift recovery (13) |
 | `submit_rope_phase_job.sh` | single-GPU batch submission (what produced `results/`) |
 | `launch_rope_phase.sh` | 8-way fan-out on a held interactive node (untested) |
 | `results/` | reports from the runs above |
@@ -192,5 +234,5 @@ fading. Circle-RoPE and DIPE both incidentally remove this drift, since they sto
 text tokens' spatial coordinates from advancing, but neither states the invariance
 as their motivation. The *shape drift* measured here appears unclaimed.
 
-The E1 harness (below) is built and CPU-tested but **has not been run on a GPU**, so
-there is as yet no measurement of what the drift costs.
+E1 (below) measured what the drift costs: it reshapes the attention profile
+enormously and does not change the model's output.

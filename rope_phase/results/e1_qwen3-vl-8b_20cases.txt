@@ -1,0 +1,101 @@
+==============================================================================
+E1 -- position-id gap sweep, phase-bucketed
+==============================================================================
+model  : /home/uberger/scratch/research/saliency_r1/outputs/bench_baselines/_models/Qwen3-VL-8B-Instruct
+data   : /lustre/fs1/portfolios/nvr/projects/nvr_israel_rlop/users/uberger/research/saliency_r1/cold_data/grpo_sets/val_natural
+scan   : 19 cases, 5 arms x 21 gaps, layers [0, 7, 14, 21, 28, 35]
+grid   : 24 x 24 patches
+
+NULL CHECK  shift EVERY position id, image included: must be a no-op up to
+            arithmetic.  Judged against the treatments, not an absolute number:
+            a max over ~1e10 bf16 values is an extreme order statistic, and bf16
+            rounding of cos/sin differs at large absolute angles even when the
+            offsets are mathematically identical.
+            logit scale 56.2 | null mean |dlogit| 0.0529 | largest treatment 3.7758 | ratio 71.4x
+            PASS
+
+--- row clock: period 8.00 positions, 8 buckets, sliding rows
+    RECOVERED SHIFT per arm.  Predicted for a real translation: the gap itself,
+    wrapping every 8.0 -- a sawtooth.  Nothing is fitted.
+    gap       :    0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19   20
+    PREDICTED :   +0   +1   +2   +3   -4   -3   -2   -1   +0   +1   +2   +3   -4   -3   -2   -1   +0   +1   +2   +3   -4
+    null      :   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0
+    full      :   +0   +0   +0   +3   +4   -3   +0   +0   +0   +0   +0   +3   -4   -3   +0   +0   +0   +0   +0   +3   +4
+    t         :   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0
+    hw        :   +0   +0   +0   +3   +4   -3   +0   +0   +0   +0   +0   +3   -4   -3   +0   +0   +0   +0   +0   +3   +4
+    fix       :   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0
+    fraction of gaps where the recovered shift equals the prediction:
+      null=14%   full=52%   t=14%   hw=52%   fix=14%
+
+    SIMILARITY AT ZERO SHIFT -- how much the pattern still looks like gap 0.
+    Predicted to dip and recover with period 8.0 for a translating
+    pattern, and to stay flat for anything that only changes total attention.
+    gap       :     0     1     2     3     4     5     6     7     8     9    10    11    12    13    14    15    16    17    18    19    20
+    null      :  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00
+    full      :  1.00  0.88  0.60  0.32  0.20  0.29  0.55  0.82  0.93  0.82  0.55  0.29  0.17  0.28  0.54  0.80  0.91  0.81  0.55  0.29  0.19
+    t         :  1.00  1.00  1.00  0.99  0.99  0.99  1.00  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99
+    hw        :  1.00  0.88  0.61  0.33  0.20  0.30  0.56  0.82  0.94  0.83  0.56  0.30  0.18  0.28  0.54  0.81  0.92  0.82  0.56  0.30  0.20
+    fix       :  0.51  0.50  0.50  0.50  0.50  0.50  0.50  0.50  0.50  0.49  0.49  0.50  0.50  0.50  0.50  0.49  0.49  0.49  0.49  0.49  0.49
+
+--- col clock: period 10.17 positions, 10 buckets, sliding columns
+    RECOVERED SHIFT per arm.  Predicted for a real translation: the gap itself,
+    wrapping every 10.2 -- a sawtooth.  Nothing is fitted.
+    gap       :    0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19   20
+    PREDICTED :   +0   +1   +2   +3   +4   +4   -4   -3   -2   -1   +0   +1   +2   +3   +4   +4   -4   -3   -2   -1   +0
+    null      :   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0
+    full      :   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0
+    t         :   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0
+    hw        :   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0
+    fix       :   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0   +0
+    fraction of gaps where the recovered shift equals the prediction:
+      null=14%   full=14%   t=14%   hw=14%   fix=14%
+
+    SIMILARITY AT ZERO SHIFT -- how much the pattern still looks like gap 0.
+    Predicted to dip and recover with period 10.2 for a translating
+    pattern, and to stay flat for anything that only changes total attention.
+    gap       :     0     1     2     3     4     5     6     7     8     9    10    11    12    13    14    15    16    17    18    19    20
+    null      :  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00  1.00
+    full      :  1.00  0.94  0.77  0.57  0.41  0.34  0.39  0.53  0.69  0.82  0.87  0.82  0.69  0.54  0.41  0.35  0.39  0.50  0.65  0.78  0.86
+    t         :  1.00  1.00  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.99  0.98  0.98  0.99  0.99  0.99
+    hw        :  1.00  0.94  0.78  0.58  0.42  0.35  0.40  0.54  0.70  0.84  0.88  0.83  0.70  0.54  0.42  0.36  0.40  0.51  0.66  0.80  0.87
+    fix       :  0.55  0.55  0.55  0.54  0.54  0.54  0.54  0.54  0.54  0.54  0.54  0.54  0.54  0.54  0.54  0.54  0.53  0.54  0.54  0.54  0.54
+
+--- TOKENS CHANGED: fraction of positions where the top token differs from
+    the unmodified run.  NLL averages over the distribution and barely moves;
+    which token comes out is a threshold decision, so this is the readout that
+    can see a behavioural effect at all.  `null` is the floor -- it is a
+    mathematical no-op, so its flips are pure bf16 arithmetic.
+    baseline near-ties (top two within 0.1): 5.5% of positions -- the population that is flippable at all
+    gap       :     0     1     2     3     4     5     6     7     8     9    10    11    12    13    14    15    16    17    18    19    20
+    null      :   0.0   1.0   0.9   1.5   1.4   1.3   1.2   1.2   1.3   1.2   1.1   1.3   1.2   1.1   1.3   1.1   1.4   1.3   1.3   1.1   1.3
+    full      :   0.0   1.2   1.3   1.4   1.3   1.4   1.5   1.5   1.8   1.8   1.8   1.9   1.7   1.9   2.0   1.7   1.8   2.1   1.9   1.8   1.9
+    t         :   0.0   1.1   1.6   1.6   1.5   1.1   1.1   1.4   1.4   1.4   1.4   1.1   1.3   1.6   1.5   1.3   1.3   1.3   1.1   1.3   1.3
+    hw        :   0.0   1.1   1.2   1.2   1.6   1.4   1.5   1.6   1.4   1.7   1.6   1.5   1.5   1.6   1.6   1.7   1.6   1.6   1.8   1.5   1.6
+    fix       :  29.8  29.7  29.7  29.9  30.2  30.1  30.1  29.9  30.1  29.7  30.0  30.1  30.0  29.7  29.8  29.8  29.7  29.8  29.9  29.8  29.9
+    A rate that climbs smoothly is any-perturbation-flips-near-ties.  A rate
+    that oscillates with the clock period -- worse at gaps 4 and 12, better at
+    8 and 16 -- is this mechanism changing the output.
+
+--- NLL of the model's own completion
+    gap       :     0     1     2     3     4     5     6     7     8     9    10    11    12    13    14    15    16    17    18    19    20
+    null      : 0.462 0.462 0.462 0.463 0.463 0.462 0.462 0.462 0.463 0.462 0.462 0.462 0.462 0.462 0.464 0.463 0.463 0.462 0.462 0.461 0.463
+    full      : 0.462 0.463 0.464 0.464 0.464 0.462 0.462 0.461 0.461 0.463 0.461 0.462 0.463 0.462 0.463 0.463 0.463 0.463 0.464 0.465 0.465
+    t         : 0.462 0.463 0.463 0.462 0.462 0.463 0.461 0.462 0.462 0.462 0.462 0.462 0.462 0.462 0.463 0.462 0.462 0.462 0.461 0.463 0.462
+    hw        : 0.462 0.464 0.464 0.463 0.461 0.461 0.462 0.461 0.461 0.461 0.463 0.463 0.464 0.464 0.464 0.463 0.463 0.463 0.463 0.464 0.464
+    fix       : 1.238 1.237 1.240 1.241 1.241 1.239 1.238 1.240 1.240 1.241 1.241 1.241 1.238 1.239 1.240 1.242 1.242 1.241 1.239 1.239 1.241
+
+--- attention mass on the image
+    gap       :     0     1     2     3     4     5     6     7     8     9    10    11    12    13    14    15    16    17    18    19    20
+    null      : 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057
+    full      : 0.057 0.057 0.056 0.056 0.056 0.056 0.056 0.056 0.055 0.055 0.055 0.055 0.055 0.055 0.055 0.055 0.054 0.054 0.054 0.054 0.054
+    t         : 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.057 0.056 0.056 0.056 0.056 0.056 0.056 0.056 0.056 0.056 0.056 0.056 0.056 0.056
+    hw        : 0.057 0.057 0.057 0.056 0.056 0.056 0.056 0.056 0.056 0.056 0.056 0.056 0.055 0.055 0.055 0.055 0.055 0.055 0.055 0.055 0.055
+    fix       : 0.059 0.059 0.059 0.059 0.059 0.059 0.058 0.058 0.058 0.058 0.058 0.058 0.058 0.058 0.058 0.058 0.058 0.058 0.058 0.058 0.058
+
+READING IT
+  The sawtooth is the whole point.  A translating pattern must give back the gap
+  you imposed and wrap when the gap reaches one period.  Nothing that merely
+  weakens attention to the image can produce a non-monotone, periodic recovery.
+  `t` moves an offset that is identical for every patch, so it cannot reshape the
+  profile at all: it should recover shift 0 at every gap.  `fix` removes the
+  p-dependence outright and should also stay at 0.
