@@ -211,6 +211,38 @@ def nanstd(tensor: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(variance)
 
 
+def impute_unscored_rewards(rewards_per_func: torch.Tensor, num_generations: int) -> torch.Tensor:
+    """Replace every NaN in `rewards_per_func` with its own GROUP's mean of that func.
+
+    `rewards_per_func` is `(n_groups * num_generations, n_funcs)`, already gathered across
+    processes and ordered so that consecutive `num_generations` rows form one group -- the
+    same layout `rewards.view(-1, num_generations)` relies on when it normalises the
+    advantage.
+
+    A NaN means "this reward func did not score this completion", not "it scored badly":
+    no groundable observe step, every step over `--max_union_area`, or
+    `--overlap_natural_only` masking the row. Imputing the group mean makes such a
+    completion's deviation on that dimension exactly 0, so an unmeasured reward drops out
+    of its advantage instead of being scored 0 -- which is a real, and for a metric whose
+    chance level is not 0 a very large, reward. See the call site for the measured sizes.
+
+    Returns a NEW tensor. The caller keeps `rewards_per_func` un-imputed so the logged
+    `rewards/<func>/mean` and `/std` stay nanmean/nanstd over the scored completions only.
+
+    A group where no completion at all was scored imputes 0.0, which is equally neutral:
+    every row then shares one value and the func contributes nothing to that group's
+    spread whatever that value is.
+    """
+    # reshape, not view: `rewards_per_func` arrives from a gather and need not be contiguous.
+    x = rewards_per_func.reshape(-1, num_generations, rewards_per_func.size(-1))
+    scored = ~torch.isnan(x)
+    n = scored.sum(dim=1, keepdim=True)                                       # (G, 1, F)
+    total = torch.where(scored, x, torch.zeros_like(x)).sum(dim=1, keepdim=True)
+    group_mean = total / n.clamp(min=1).to(total.dtype)
+    group_mean = torch.where(n > 0, group_mean, torch.zeros_like(group_mean))
+    return torch.where(scored, x, group_mean.expand_as(x)).reshape(rewards_per_func.shape)
+
+
 def split_tensor_dict(
     tensor_dict: dict[str, Optional[torch.Tensor]], num_chunks: int
 ) -> list[dict[str, Optional[torch.Tensor]]]:
@@ -2721,8 +2753,33 @@ class GRPOTrainer(Trainer):
         # rewards_per_func to extract each process's subset.
         rewards_per_func = self._calculate_rewards(inputs, original_prompts, completions, completion_ids_list, attn_batch, invalid)
 
-        # Apply weights to each reward function's output and sum
-        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+        # Apply weights to each reward function's output and sum.
+        #
+        # A reward func returns None -> NaN when it did not APPLY to a completion, not
+        # when the completion scored badly: every observe step ungroundable, every step
+        # dropped by --max_union_area, or --overlap_natural_only masking the row. The
+        # `nansum` this replaces read that NaN as 0, which is only neutral for a metric
+        # whose chance level happens to BE 0. Measured on the four 8k runs (2026-08-18):
+        #
+        #   mean_in_v2 (level ~1.27, chance 1.0)  masked completion scored 0 -> mean
+        #                                         advantage -1.86 in answer-tied groups
+        #   roll-null  (level ~-0.28, chance 0)   masked completion scored 0 -> mean
+        #                                         advantage +1.05, i.e. masking PAID
+        #
+        # and the magnitude is not w's to control: scale_rewards renormalises each group
+        # by its own std, so in a group whose answer-side rewards tie -- 25-44% of them,
+        # rising as accuracy saturates -- an unmeasured saliency reward was the ENTIRE
+        # advantage. That also makes the cap self-defeating on a roll-null run, which is
+        # why this is fixed before --max_union_area is turned on rather than after.
+        #
+        # Impute the GROUP's mean over the completions the func did score. The masked
+        # completion then deviates from the group mean by exactly 0 on that dimension:
+        # it neither gains nor loses advantage from a reward that was never measured on
+        # it, while its groupmates still score against each other. This is the "masked ->
+        # neutral in the GRPO advantage" that overlap_rewards / grad_rewards /
+        # glimpse_rewards already promise in their docstrings.
+        rewards = (impute_unscored_rewards(rewards_per_func, self.num_generations)
+                   * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
