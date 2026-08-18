@@ -95,7 +95,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rope_phase_probe as RP  # noqa: E402  (same directory, deliberate)
 
 ARMS = ("null", "full", "t", "hw", "fix")
-SCHEMA = 3          # 1 token-averaged, 2 phase-bucketed, 3 + content removed
+SCHEMA = 4          # 1 token-averaged, 2 phase-bucketed, 3 + content removed, 4 + flips
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +234,30 @@ class BucketTap:
         return hook
 
 
+def greedy_tokens(logits, prompt_len: int):
+    """The token the model would emit at each completion position.
+
+    Same slice the NLL uses: position prompt_len-1 predicts the first completion
+    token, and the final row predicts one past the end and is dropped.  An
+    off-by-one here would compare each position against its neighbour and
+    manufacture flips, so it is tested rather than assumed.
+    """
+    return logits[0, prompt_len - 1: -1].argmax(-1)
+
+
+def flip_rate(logits, ref_tokens, prompt_len: int) -> float:
+    """Fraction of positions where the top token differs from the unmodified run.
+
+    NLL averages over the whole distribution and barely moves under a small
+    perturbation.  Which token actually comes out is a threshold decision, so
+    wherever the top two candidates are close, an arbitrarily small nudge flips
+    it.  This is the readout that can see that; NLL cannot.
+    """
+    # double, not float: these rates are summed over hundreds of case-arm-gap
+    # combinations, and float32 rounding of a mean-of-booleans is visible at 1e-8.
+    return float((greedy_tokens(logits, prompt_len) != ref_tokens).double().mean().item())
+
+
 def completion_nll(logits, ids, prompt_len: int) -> float:
     lg = logits[0, prompt_len - 1: -1].float()
     tgt = ids[0, prompt_len:]
@@ -285,6 +309,8 @@ def scan(args, device):
     acc["dlogit_mean"] = np.zeros((A, D), dtype=np.float64)
     acc["dlogit_max"] = np.zeros((A, D), dtype=np.float64)
     acc["logit_scale"] = np.zeros((), dtype=np.float64)
+    acc["flip"] = np.zeros((A, D), dtype=np.float64)
+    acc["near_ties"] = np.zeros((), dtype=np.float64)   # how flippable the baseline is
     gh = gw = None
     tap = None
     ncase = 0
@@ -340,7 +366,7 @@ def scan(args, device):
                                     diagonal=1), torch.finfo(mdtype).min)
         mask = add[None, None]
 
-        ref_logits, baseline = None, {}
+        ref_logits, ref_tokens, baseline = None, None, {}
         for ai, arm in enumerate(arms):
             for di, delta in enumerate(deltas):
                 pos = build_position_ids(base_pos, tail_start, arm, delta)
@@ -353,7 +379,13 @@ def scan(args, device):
                 cur = logits[0, prompt_len - 1:].float()
                 if ref_logits is None:
                     ref_logits = cur.clone()
+                    ref_tokens = greedy_tokens(logits, prompt_len).clone()
                     acc["logit_scale"] += float(ref_logits.abs().max().item())
+                    # how often the model is near-indifferent, i.e. flippable at all
+                    pr = torch.softmax(logits[0, prompt_len - 1: -1].float(), dim=-1)
+                    top2 = pr.topk(2, dim=-1).values
+                    acc["near_ties"] += float(((top2[:, 0] - top2[:, 1]) < 0.1).float().mean().item())
+                acc["flip"][ai, di] += flip_rate(logits, ref_tokens, prompt_len)
                 dl = (cur - ref_logits).abs()
                 acc["dlogit_mean"][ai, di] += float(dl.mean().item())
                 acc["dlogit_max"][ai, di] += float(dl.max().item())
@@ -484,6 +516,22 @@ def report(args):
         for ai, arm in enumerate(arms):
             v = C[ai, :, z0].mean(axis=(1, 2))
             P(f"    {arm:9s} : " + " ".join(f"{x:>5.2f}" for x in v))
+        P("")
+
+    if "flip" in acc:
+        P("--- TOKENS CHANGED: fraction of positions where the top token differs from")
+        P("    the unmodified run.  NLL averages over the distribution and barely moves;")
+        P("    which token comes out is a threshold decision, so this is the readout that")
+        P("    can see a behavioural effect at all.  `null` is the floor -- it is a")
+        P("    mathematical no-op, so its flips are pure bf16 arithmetic.")
+        P(f"    baseline near-ties (top two within 0.1): {100 * float(acc['near_ties']):.1f}% "
+          f"of positions -- the population that is flippable at all")
+        P("    gap       : " + " ".join(f"{d:>5d}" for d in deltas))
+        for ai, arm in enumerate(arms):
+            P(f"    {arm:9s} : " + " ".join(f"{100 * x:>5.1f}" for x in acc["flip"][ai]))
+        P("    A rate that climbs smoothly is any-perturbation-flips-near-ties.  A rate")
+        P("    that oscillates with the clock period -- worse at gaps 4 and 12, better at")
+        P("    8 and 16 -- is this mechanism changing the output.")
         P("")
 
     for nm_, lab in (("nll", "NLL of the model's own completion"),

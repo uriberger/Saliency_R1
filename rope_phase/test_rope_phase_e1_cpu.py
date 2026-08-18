@@ -228,6 +228,29 @@ def test_content_must_be_removed_or_the_shift_test_is_blind():
     assert _recover(dec(raw_cur), dec(raw_base), shifts) == 3, "and removing it should fix it"
 
 
+def test_flip_rate_slice_is_aligned():
+    """An off-by-one here would compare each position with its neighbour.
+
+    The logits row at prompt_len-1 predicts the FIRST completion token, and the
+    last row predicts one past the end and must be dropped -- the same slice the
+    NLL uses.  Get it wrong and every position looks flipped.
+    """
+    V, prompt_len, n_comp = 7, 4, 5
+    logits = torch.full((1, prompt_len + n_comp, V), -10.0)
+    want = torch.tensor([1, 2, 3, 4, 5])
+    for i, tok in enumerate(want):          # row prompt_len-1+i predicts completion i
+        logits[0, prompt_len - 1 + i, tok] = 10.0
+    got = E1.greedy_tokens(logits, prompt_len)
+    assert got.shape == want.shape, (got.shape, want.shape)
+    assert torch.equal(got, want), (got, want)
+    assert E1.flip_rate(logits, want, prompt_len) == 0.0
+
+    moved = logits.clone()
+    moved[0, prompt_len] = -10.0
+    moved[0, prompt_len, 6] = 10.0          # change exactly one position
+    assert abs(E1.flip_rate(moved, want, prompt_len) - 1 / n_comp) < 1e-9
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     fails = 0
