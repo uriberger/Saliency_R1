@@ -58,7 +58,7 @@ CONDA_SH=${CONDA_SH:-/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh}
 CONDA_ENV=${CONDA_ENV:-saliency_r1_qwen3_vllm}   # needs transformers with qwen*_vl + peft
 HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 
-SCRIPT=${SCRIPT:-rope_phase_probe.py}     # or rope_phase_e1.py for the causal arm
+SCRIPT=${SCRIPT:-rope_phase_probe.py}     # or rope_phase_e1.py / rope_phase_e2.py
 N_SAMPLES=${N_SAMPLES:-32}
 OUT_DIR=${OUT_DIR:-$HERE/outputs/e0}
 JOB_NAME=${JOB_NAME:-rope_phase_e0}
@@ -66,8 +66,14 @@ LOG_ROOT=${LOG_ROOT:-$HERE/outputs/logs}
 DATASET=${ROPE_PHASE_DATASET:-}
 EXTRA_ARGS="$*"
 
-[[ -n "$DATASET" || "$EXTRA_ARGS" == *--dataset* ]] || {
+# E2 builds its own stimuli and needs no dataset
+[[ "$SCRIPT" == *e2* || -n "$DATASET" || "$EXTRA_ARGS" == *--dataset* ]] || {
     echo "ERROR: set ROPE_PHASE_DATASET or pass --dataset" >&2; exit 2; }
+
+# E0/E1 take a sharded, n-sample sweep; E2 takes neither, so both halves of the
+# command line are overridable rather than baked in.
+SCAN_ARGS=${SCAN_ARGS:---stage scan --out-dir $OUT_DIR --shard 0 --num-shards 1 --n-samples $N_SAMPLES --device cuda:0}
+REPORT_CMD=${REPORT_CMD---stage report --out-dir $OUT_DIR}
 
 mkdir -p "$LOG_ROOT" "$OUT_DIR"
 
@@ -98,8 +104,6 @@ submit_job \
         ${DATASET:+export ROPE_PHASE_DATASET=$DATASET;}
         cd $HERE;
         nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
-        python -u $SCRIPT --stage scan \
-            --out-dir $OUT_DIR --shard 0 --num-shards 1 \
-            --n-samples $N_SAMPLES --device cuda:0 $EXTRA_ARGS;
-        python -u $SCRIPT --stage report --out-dir $OUT_DIR;
+        python -u $SCRIPT $SCAN_ARGS $EXTRA_ARGS;
+        ${REPORT_CMD:+python -u $SCRIPT $REPORT_CMD;}
     '"

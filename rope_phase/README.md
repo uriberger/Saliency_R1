@@ -179,6 +179,46 @@ SCRIPT=rope_phase_e1.py N_SAMPLES=20 OUT_DIR=$PWD/outputs/e1 bash submit_rope_ph
 Cost is ~105 forwards per case (5 arms x 21 gaps): about 13 min for 20 cases on one
 H100, measured.
 
+## E2 — does it move where the model thinks things ARE?
+
+E1's flip count was measured over prose, which never asks the model to care about
+one or two patches. E2 builds a task that does: a grey canvas with one coloured
+square, a controlled number of **patches** above or below the midline, and the
+question "top half or bottom half?" read straight off the two answer tokens'
+logits. The offset is a dial; the readout is where the answer flips sign — the
+model's perceived midline, in the same units as the drift.
+
+Baseline curve (job 6163837): monotone, unsaturated, crossing at −0.71 patches,
+moving 3.3 logits per patch with a colour-to-colour spread of ~0.5, so the midline
+is pinned to about ±0.08 patches. Run the `pilot` stage first — a saturated model
+has no crossing point to move, and the sweep would measure nothing while looking
+like it had.
+
+**Perceived-midline shift, in patches, versus the gap:**
+
+| gap | 4 | 16 | 64 | 128 | 192 | **256** |
+|---|---|---|---|---|---|---|
+| `null` (arithmetic floor) | 0.00 | +0.02 | −0.01 | 0.00 | +0.01 | **0.00** |
+| `t` | −0.10 | −0.12 | −0.18 | −0.26 | −0.17 | **−0.34** |
+| `hw` | −0.03 | −0.21 | −0.31 | −0.36 | −0.47 | **−0.36** |
+| `full` | −0.10 | −0.28 | −0.40 | −0.52 | −0.59 | **−0.63** |
+
+**The effect is real**: 30x the arithmetic floor, on an instrument resolving ±0.08
+patches. Unlike E1's flip count, this task can see it — which is partly a lesson
+about the task, not only about the effect.
+
+**But it is small and it has the wrong shape.** At a realistic reasoning length the
+whole effect is 0.63 patches, about 20 px on a 768 px canvas, under 3% of image
+height; growth is roughly logarithmic in the gap. And it is **monotone, with no
+wrap** — the striped drift's hallmark is that it returns at one period, and this
+does not. More than half is reproduced by `t` alone, which provably cannot reshape
+the profile (E1 measured it flat at 0.99). So the measurable behavioural shift is
+mostly the general "the image is further away" effect, with a spatial-axis
+component of similar size, and is **not** the marching stripes E0 characterised.
+
+So: attention moves 1-2 patches, judgement moves a fifth of that. `fix` is noisy
+here (wandering, no trend) because it is far off-distribution; do not read it.
+
 ## Controls
 
 - `perm8` — the `h8` buckets with their **labels permuted per case**. Counts per
@@ -222,6 +262,8 @@ comes back when nothing is planted.
 | `test_rope_phase_cpu.py` | CPU tests of the E0 analysis, incl. plant-and-recover |
 | `rope_phase_e1.py` | E1 causal probe: the position-id gap sweep |
 | `test_rope_phase_e1_cpu.py` | CPU tests of the E1 arms and the shift recovery (13) |
+| `rope_phase_e2.py` | E2 pointing probe: perceived-midline shift |
+| `test_rope_phase_e2_cpu.py` | CPU tests of the stimulus and crossing estimator (6) |
 | `submit_rope_phase_job.sh` | single-GPU batch submission (what produced `results/`) |
 | `launch_rope_phase.sh` | 8-way fan-out on a held interactive node (untested) |
 | `results/` | reports from the runs above |
