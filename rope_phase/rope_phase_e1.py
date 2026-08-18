@@ -64,7 +64,11 @@ READOUTS, KEPT SEPARATE
          trajectory.
   mass   total attention on image tokens.  The fading channel.
   corr   correlation of each phase bucket's profile against the SAME bucket at
-         gap 0, at every candidate shift.  Two things come off it: the best-fitting
+         gap 0, at every candidate shift -- after subtracting what all buckets
+         share, which is the head's content-driven preference.  Skipping that
+         subtraction leaves a large identical term in both sides of every
+         comparison, which pins the fitted shift at zero however far the
+         positional part actually moves.  Two things come off it: the best-fitting
          shift, which should track the imposed gap and wrap every 8; and the
          correlation at zero shift, which should dip and recover on the same
          period, since a gap of 8 puts the pattern back where it started.
@@ -91,7 +95,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rope_phase_probe as RP  # noqa: E402  (same directory, deliberate)
 
 ARMS = ("null", "full", "t", "hw", "fix")
-SCHEMA = 2          # 1 = token-averaged (blunt), 2 = phase-bucketed
+SCHEMA = 3          # 1 token-averaged, 2 phase-bucketed, 3 + content removed
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +365,12 @@ def scan(args, device):
                     for n, _t, nb, ax in BK:
                         prof = (bk_sums[n] / counts[n][None, :, None]
                                 ).reshape(n_heads, nb, gh, gw)
+                        # Remove what every bucket has in common -- the head's actual,
+                        # content-driven preference.  It is identical at every gap, so
+                        # leaving it in dominates the correlation and pins the fitted
+                        # shift at zero no matter how far the positional part moves.
+                        # This is the same subtraction E0 does across its buckets.
+                        prof = prof - prof.mean(axis=1, keepdims=True)
                         key = (n, lay)
                         if key not in baseline:
                             baseline[key] = prof.copy()      # arm 0, gap 0: unmodified

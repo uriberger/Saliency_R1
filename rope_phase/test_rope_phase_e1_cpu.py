@@ -203,6 +203,31 @@ def test_a_pattern_that_does_not_move_recovers_zero():
         assert _recover(cur, base, shifts) == 0
 
 
+def test_content_must_be_removed_or_the_shift_test_is_blind():
+    """Why the bucket mean is subtracted: a shared static term hides the translation.
+
+    A head's real, content-driven preference is the same in every bucket and at
+    every gap.  Left in, it sits on both sides of the comparison and dominates the
+    correlation, so the fitted shift stays at zero however far the positional part
+    has actually moved.  This test plants exactly that situation.
+    """
+    gh = gw = 24
+    rng = np.random.default_rng(3)
+    rows = np.arange(gh)[None, None, :, None]
+    phase = rng.uniform(0, 2 * np.pi, size=(3, 8, 1, 1))
+    content = rng.normal(size=(3, 1, gh, gw)) * 3.0          # same in every bucket
+
+    def profile(gap):
+        return content + np.cos(2 * np.pi * (rows - gap) / 8.0 + phase)
+
+    shifts = list(range(-4, 5))
+    raw_base, raw_cur = profile(0), profile(3)
+    assert _recover(raw_cur, raw_base, shifts) == 0, "content should swamp it"
+
+    dec = lambda x: x - x.mean(axis=1, keepdims=True)         # the subtraction
+    assert _recover(dec(raw_cur), dec(raw_base), shifts) == 3, "and removing it should fix it"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     fails = 0
