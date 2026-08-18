@@ -302,6 +302,34 @@ class TestReportStats(unittest.TestCase):
         ok = np.isfinite(X[:, 1])
         self.assertAlmostEqual(got[1], np.corrcoef(X[ok, 1], y[ok])[0, 1], places=12)
 
+    def test_paired_corr_matches_numpy_column_by_column(self):
+        rng = np.random.default_rng(9)
+        A = rng.normal(size=(400, 12))
+        B = A * rng.normal(size=(1, 12)) + rng.normal(size=(400, 12))
+        A[::11, 3] = np.nan
+        got = SR.paired_corr(A, B)
+        for k in range(12):
+            ok = np.isfinite(A[:, k]) & np.isfinite(B[:, k])
+            self.assertAlmostEqual(got[k], np.corrcoef(A[ok, k], B[ok, k])[0, 1],
+                                   places=10, msg=str(k))
+
+    def test_pairwise_partial_matches_the_explicit_regression(self):
+        """The closed form must equal residualising column by column, NaNs and all."""
+        rng = np.random.default_rng(10)
+        n, k = 300, 6
+        C = rng.normal(size=(n, k))
+        X = C * 0.7 + rng.normal(size=(n, k))
+        y = C[:, 0] * 0.5 + rng.normal(size=n)
+        X[::13, 2] = np.nan
+        got = SR.pairwise_partial(X, y, C)
+        for j in range(k):
+            ok = np.isfinite(X[:, j]) & np.isfinite(y) & np.isfinite(C[:, j])
+            des = np.column_stack([np.ones(int(ok.sum())), C[ok, j]])
+            rx = X[ok, j] - des @ np.linalg.lstsq(des, X[ok, j], rcond=None)[0]
+            ry = y[ok] - des @ np.linalg.lstsq(des, y[ok], rcond=None)[0]
+            want = float((rx * ry).mean() / (rx.std() * ry.std()))
+            self.assertAlmostEqual(got[j], want, places=9, msg=str(j))
+
     def test_partial_removes_a_planted_confound(self):
         """y and X share only a common cause: the raw r is large, the partial is not."""
         rng = np.random.default_rng(6)

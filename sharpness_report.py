@@ -180,22 +180,47 @@ class Family:
 # ---------------------------------------------------------------------------
 # statistics
 # ---------------------------------------------------------------------------
+def _masked_corr(A, B, ok):
+    """Column-wise r between matching columns of A and B [N,K], over rows `ok` [N,K].
+
+    One pass of sums rather than one call per column: the head family asks for this
+    8,064 columns at a time and a Python loop over them is the difference between a
+    report that runs in seconds and one that runs in minutes.
+    """
+    n = ok.sum(0).astype(np.float64)
+    a = np.where(ok, A, 0.0)
+    b = np.where(ok, B, 0.0)
+    sa, sb = a.sum(0), b.sum(0)
+    saa, sbb, sab = (a * a).sum(0), (b * b).sum(0), (a * b).sum(0)
+    num = n * sab - sa * sb
+    den = (np.sqrt(np.maximum(n * saa - sa ** 2, 0))
+           * np.sqrt(np.maximum(n * sbb - sb ** 2, 0)))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where((den > 0) & (n >= 8), num / den, np.nan)
+
+
 def col_corr(X, y):
     """Pearson r of every column of X [N, ...] against y [N], NaN-aware. -> [...]."""
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
-    sl = (slice(None),) + (None,) * (X.ndim - 1)
-    ok = np.isfinite(X) & np.isfinite(y)[sl]
-    n = ok.sum(0).astype(np.float64)
-    Xs = np.where(ok, X, 0.0)
-    ys = np.where(ok, np.broadcast_to(y[sl], X.shape), 0.0)
-    sx, sy = Xs.sum(0), ys.sum(0)
-    sxx, syy, sxy = (Xs * Xs).sum(0), (ys * ys).sum(0), (Xs * ys).sum(0)
-    num = n * sxy - sx * sy
-    den = (np.sqrt(np.maximum(n * sxx - sx ** 2, 0))
-           * np.sqrt(np.maximum(n * syy - sy ** 2, 0)))
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return np.where((den > 0) & (n >= 8), num / den, np.nan)
+    shape = X.shape[1:]
+    X2 = X.reshape(len(X), -1)
+    if np.isfinite(X2).all() and np.isfinite(y).all():
+        xc = X2 - X2.mean(0)
+        yc = y - y.mean()
+        den = np.sqrt((xc * xc).sum(0)) * np.sqrt((yc * yc).sum())
+        with np.errstate(invalid="ignore", divide="ignore"):
+            r = np.where(den > 0, (xc.T @ yc) / den, np.nan)
+        return r.reshape(shape)
+    ok = np.isfinite(X2) & np.isfinite(y)[:, None]
+    return _masked_corr(X2, np.broadcast_to(y[:, None], X2.shape), ok).reshape(shape)
+
+
+def paired_corr(A, B):
+    """r between column k of A and column k of B, for every k. -> [K]."""
+    A = np.asarray(A, dtype=np.float64)
+    B = np.asarray(B, dtype=np.float64)
+    return _masked_corr(A, B, np.isfinite(A) & np.isfinite(B))
 
 
 def _impute(X):
@@ -215,11 +240,15 @@ def _impute(X):
 
 
 def residualize(X, Z):
-    """Least-squares residuals of every column of X [N,K] on [1, Z]. -> [N,K]."""
+    """Least-squares residuals of every column of X [N,K] on [1, Z]. -> [N,K].
+
+    Via the pseudo-inverse of the (tall, thin) design rather than lstsq on 8,064
+    right-hand sides at once, which is the same answer for a fraction of the work.
+    Constant covariates are dropped rather than left to make the design rank-deficient.
+    """
     des = np.column_stack([np.ones(len(X))]
                           + [Z[:, j] for j in range(Z.shape[1]) if Z[:, j].std() > 0])
-    beta = np.linalg.lstsq(des, X, rcond=None)[0]
-    return X - des @ beta
+    return X - des @ (np.linalg.pinv(des) @ X)
 
 
 def partial_col_corr(X, y, Z):
@@ -232,21 +261,24 @@ def partial_col_corr(X, y, Z):
 def pairwise_partial(X, y, C):
     """Partial r of X[:,k] with y holding C[:,k] fixed, column by column. -> [K].
 
-    Not the same as partial_col_corr: the covariate is the column's OWN partner
-    (its grounding score, or its sharpness), which differs per column.
+    Not the same as partial_col_corr: the covariate is the column's OWN partner (its
+    grounding score, or its sharpness), which differs per column. Computed from the
+    three pairwise correlations,
+
+        r(x,y|c) = (r_xy - r_xc * r_yc) / sqrt((1 - r_xc^2)(1 - r_yc^2))
+
+    which is exact as long as all three are taken over the SAME rows -- hence the one
+    shared mask below rather than three pairwise-complete ones.
     """
     X, y, C = (np.asarray(a, dtype=np.float64) for a in (X, y, C))
-    out = np.full(X.shape[1], np.nan)
-    for k in range(X.shape[1]):
-        ok = np.isfinite(X[:, k]) & np.isfinite(y) & np.isfinite(C[:, k])
-        if ok.sum() < 12 or C[ok, k].std() <= 0:
-            continue
-        des = np.column_stack([np.ones(int(ok.sum())), C[ok, k]])
-        rx = X[ok, k] - des @ np.linalg.lstsq(des, X[ok, k], rcond=None)[0]
-        ry = y[ok] - des @ np.linalg.lstsq(des, y[ok], rcond=None)[0]
-        if rx.std() > 0 and ry.std() > 0:
-            out[k] = float((rx * ry).mean() / (rx.std() * ry.std()))
-    return out
+    Y = np.broadcast_to(y[:, None], X.shape)
+    ok = np.isfinite(X) & np.isfinite(C) & np.isfinite(Y)
+    rxy = _masked_corr(X, Y, ok)
+    rxc = _masked_corr(X, C, ok)
+    ryc = _masked_corr(C, Y, ok)
+    den = np.sqrt(np.maximum((1 - rxc ** 2) * (1 - ryc ** 2), 0))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(den > 0, (rxy - rxc * ryc) / den, np.nan)
 
 
 def max_abs_null(X, y, n_perm, seed=0):
@@ -431,13 +463,11 @@ def run_family(fam, args):
           + f"  {'auroc':>9}  {'mass':>9}")
     for mi, nm in enumerate(sharp_names):
         Xm = fam.c_sharp[:, :, mi]
-        cells = [np.nanmean(np.abs(col_corr(Xm, Z[:, j]))) for j in range(4)]
         with np.errstate(invalid="ignore"):
-            ra = np.nanmean(np.abs(np.array(
-                [col_corr(Xm[:, k], fam.c_au[:, k]) for k in range(Xm.shape[1])])))
-            rm = (np.nanmean(np.abs(np.array(
-                [col_corr(Xm[:, k], fam.c_mass[:, k]) for k in range(Xm.shape[1])])))
-                if fam.c_mass is not None else np.nan)
+            cells = [np.nanmean(np.abs(col_corr(Xm, Z[:, j]))) for j in range(4)]
+            ra = np.nanmean(np.abs(paired_corr(Xm, fam.c_au)))
+            rm = (np.nanmean(np.abs(paired_corr(Xm, fam.c_mass)))
+                  if fam.c_mass is not None else np.nan)
         print(f"   {nm:>7}  " + "  ".join(f"{c:>9.3f}" for c in cells)
               + f"  {ra:>9.3f}  {rm:>9.3f}")
     print("   These are |r| against the covariate, not against correctness. A metric "
