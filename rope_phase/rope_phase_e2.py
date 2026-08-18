@@ -72,6 +72,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rope_phase_probe as RP      # noqa: E402
 import rope_phase_e1 as E1         # noqa: E402
 
+SELF_CONTAINED_STIMULI = True   # builds its own images; no dataset needed
+
 QUESTION = ("Is the coloured square in the top half or the bottom half of the image? "
             "Answer with exactly one word.")
 ANSWER_PREFIX = "The square is in the"

@@ -66,9 +66,13 @@ LOG_ROOT=${LOG_ROOT:-$HERE/outputs/logs}
 DATASET=${ROPE_PHASE_DATASET:-}
 EXTRA_ARGS="$*"
 
-# E2 builds its own stimuli and needs no dataset
-[[ "$SCRIPT" == *e2* || -n "$DATASET" || "$EXTRA_ARGS" == *--dataset* ]] || {
-    echo "ERROR: set ROPE_PHASE_DATASET or pass --dataset" >&2; exit 2; }
+# E0/E1 read images from a dataset; E2/E3 build their own stimuli and need none.
+# Keyed off the script declaring it rather than a list of names to keep extending.
+NEEDS_DATASET=1
+grep -q "SELF_CONTAINED_STIMULI" "$HERE/$SCRIPT" 2>/dev/null && NEEDS_DATASET=0
+[[ $NEEDS_DATASET -eq 0 || -n "$DATASET" || "$EXTRA_ARGS" == *--dataset* ]] || {
+    echo "ERROR: $SCRIPT reads a dataset -- set ROPE_PHASE_DATASET or pass --dataset" >&2
+    exit 2; }
 
 # E0/E1 take a sharded, n-sample sweep; E2 takes neither, so both halves of the
 # command line are overridable rather than baked in.
