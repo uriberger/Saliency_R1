@@ -316,23 +316,83 @@ def fw_p(null, obs):
 # ---------------------------------------------------------------------------
 # per-family blocks
 # ---------------------------------------------------------------------------
-def block_stats(fam, X, y, sel, tag, n_perm, seed):
+def block_stats(fam, X, y, sel, tag, n_perm, seed, resid=False):
     """r(all/select/held-out), the covariate-partial r, and the family-wise threshold.
 
     X is [C, K] at completion level; `sel` is the odd-row_index half the columns are
     ranked on, its complement the half they are re-scored on.
+
+    With `resid`, X and y are replaced by their residuals on the covariate design
+    FIRST, so every number after that -- including the permutation threshold and the
+    held-out split -- is a partial correlation. Without it the report can say a raw r
+    clears its threshold and a partial r is smaller, but not whether the partial itself
+    survives the 8,064 tests it was chosen from, which is the question that decides
+    this experiment.
     """
+    level = np.nanmean(X, axis=0)                 # the level is of the RAW column
     Z, _ = fam.covariates()
+    if resid:
+        Xi, _ = _impute(np.asarray(X, dtype=np.float64))
+        ok = np.isfinite(y) & np.isfinite(Z).all(axis=1)
+        Xr = np.full(Xi.shape, np.nan)
+        yr = np.full(len(y), np.nan)
+        Xr[ok] = residualize(Xi[ok], Z[ok])
+        yr[ok] = residualize(np.asarray(y, dtype=np.float64)[ok, None], Z[ok])[:, 0]
+        X, y = Xr, yr
     out = {
         "tag": tag,
         "r_all": col_corr(X, y),
         "r_sel": col_corr(X[sel], y[sel]),
         "r_held": col_corr(X[~sel], y[~sel]),
-        "r_partial": partial_col_corr(X, y, Z),
-        "level": np.nanmean(X, axis=0),
+        "r_partial": (col_corr(X, y) if resid else partial_col_corr(X, y, Z)),
+        "level": level,
     }
     thr, null, nimp = max_abs_null(X, y, n_perm, seed)
     out["thr95"], out["null"], out["n_imputed"] = thr, null, nimp
+    return out
+
+
+def ref_corr(fam, X, y, resid):
+    """r of columns that are not part of a block, matched to the block's convention.
+
+    The synthetic "mean over all heads" column and the corpus-by-corpus table are
+    computed outside block_stats, so under --residualize they have to be residualised
+    here too. Reporting one row raw next to a table of partials, with the same heading
+    and no marking, is how a report ends up being read backwards.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if not resid:
+        return X, y
+    Z, _ = fam.covariates()
+    Xi, _ = _impute(X if X.ndim == 2 else X[:, None])
+    ok = np.isfinite(y) & np.isfinite(Z).all(axis=1)
+    Xr = np.full(Xi.shape, np.nan)
+    yr = np.full(len(y), np.nan)
+    Xr[ok] = residualize(Xi[ok], Z[ok])
+    yr[ok] = residualize(y[ok, None], Z[ok])[:, 0]
+    return (Xr if X.ndim == 2 else Xr[:, 0]), yr
+
+
+def by_dataset(fam, x, y, acc):
+    """r(x, y) inside each source corpus. -> [(name, n, r, accuracy), ...].
+
+    `acc` is the RAW label, so the accuracy column stays readable when x and y have
+    been residualised (residualised labels average to zero by construction).
+
+    The blunter, more readable form of the dataset dummies in `covariates()`: accuracy
+    on this corpus runs from one source dataset to another by far more than any map
+    statistic moves, so a correlation pooled across all six can be nothing but that
+    difference. A column that holds its sign and size inside every dataset is measuring
+    something about the map.
+    """
+    out = []
+    for name in sorted(set(fam.c_dataset)):
+        m = fam.c_dataset == name
+        if m.sum() < 30:
+            continue
+        out.append((name, int(m.sum()), float(col_corr(x[m, None], y[m])[0]),
+                    float(acc[m].mean())))
     return out
 
 
@@ -391,16 +451,25 @@ def run_family(fam, args):
     y = fam.ccor
     sharp_names = list(fam.sharp_names)
 
+    rz = args.residualize
+    if rz:
+        print("\n[--residualize] every r below is a PARTIAL correlation: X and the "
+              "label are\n  residualised on log(patches), step tokens, step count, "
+              "union area and dataset\n  dummies before anything is computed, so the "
+              "permutation thresholds and the\n  held-out split apply to the partial "
+              "rather than to the raw r. `level` is still\n  the raw column's mean. "
+              "The covariate fit uses all completions, so the held-out\n  half is held "
+              "out of the correlation, not of the 9-parameter residualisation.")
     blocks = {}
     blocks["SHARP"] = block_stats(fam, fam.c_sharp.reshape(C, -1), y, sel, "SHARP",
-                                  args.perm, args.seed)
+                                  args.perm, args.seed, rz)
     for k in ("r_all", "r_sel", "r_held", "r_partial", "level"):
         blocks["SHARP"][k] = blocks["SHARP"][k].reshape(len(fam.cols), M)
     dino = np.concatenate([fam.c_v2, fam.c_au], axis=1)
-    blocks["DINO"] = block_stats(fam, dino, y, sel, "DINO", args.perm, args.seed)
+    blocks["DINO"] = block_stats(fam, dino, y, sel, "DINO", args.perm, args.seed, rz)
     if fam.c_mass is not None:
         blocks["MASS"] = block_stats(fam, fam.c_mass, y, sel, "MASS", args.perm,
-                                     args.seed)
+                                     args.seed, rz)
 
     dino_cols = [f"{c}/v2" for c in fam.cols] + [f"{c}/auroc" for c in fam.cols]
     best = {
@@ -418,7 +487,32 @@ def run_family(fam, args):
     print("  '*' = |r| at or above that block's max-|r| 95th percentile under shuffled "
           "labels.\n  thr95 differs between blocks because they run different numbers "
           "of correlated tests;\n  comparing raw |r| across blocks without it is the "
-          "mistake this line exists to prevent.")
+          "mistake this line exists to prevent.\n  These columns were chosen using ALL "
+          "completions, so their `held` is not a clean confirmation.\n  The next table "
+          "is.")
+
+    # --- the honest split: choose on one half, score on the other
+    n_even = int((~sel).sum())
+    thr_1 = 1.96 / np.sqrt(max(n_even - 3, 1))
+    print(f"\n--- ranked on the ODD half, re-scored on the EVEN half (n={n_even}) ---")
+    print(f"   {'block':>5}  {'column':>16}  {'r(odd, chosen on)':>18}  "
+          f"{'r(EVEN, held out)':>18}")
+    honest = {}
+    for k in ("DINO", "SHARP", "MASS"):
+        if k not in blocks:
+            continue
+        cols_k = (fam.cols if k != "DINO" else dino_cols)
+        b = best_of(blocks[k], cols_k, sharp_names if k == "SHARP" else None,
+                    key="r_sel")
+        if b is None:
+            continue
+        honest[k] = b
+        mark = "*" if abs(b["r_held"]) >= thr_1 else " "
+        print(f"   {k:>5}  {b['label']:>16}  {b['r_sel']:>+18.4f}  "
+              f"{b['r_held']:>+17.4f}{mark}")
+    print(f"   Only one column per block is scored on the even half, so no multiplicity "
+          f"correction is\n   owed there: '*' is the plain single-test threshold "
+          f"{thr_1:.4f}. This is the number to quote.")
 
     # --- every sharpness metric, on the family's un-selected reference columns
     prim = primary_columns(fam)
@@ -427,7 +521,8 @@ def run_family(fam, args):
     print(f"   {'column':>14}  " + "  ".join(f"{n:>7}" for n in sharp_names))
     for label, ci in prim:
         if ci is None:                          # the synthetic mean over all columns
-            r = col_corr(np.nanmean(fam.c_sharp, axis=1), y)
+            Xr, yr = ref_corr(fam, np.nanmean(fam.c_sharp, axis=1), y, rz)
+            r = col_corr(Xr, yr)
         else:
             r = blocks["SHARP"]["r_all"][ci]
         print(f"   {label:>14}  " + "  ".join(f"{v:>+7.4f}" for v in r) + "   r")
@@ -445,8 +540,9 @@ def run_family(fam, args):
           f"{'auroc level':>11}")
     for label, ci in prim:
         if ci is None:
-            rv = col_corr(np.nanmean(fam.c_v2, axis=1), y)
-            ra = col_corr(np.nanmean(fam.c_au, axis=1), y)
+            Xr, yr = ref_corr(fam, np.column_stack(
+                [np.nanmean(fam.c_v2, axis=1), np.nanmean(fam.c_au, axis=1)]), y, rz)
+            rv, ra = col_corr(Xr, yr)
             lv = np.nanmean(fam.c_v2)
             la = np.nanmean(fam.c_au)
         else:
@@ -498,6 +594,33 @@ def run_family(fam, args):
               "partial and\n   grounding does not, the correlation was never about "
               "location.")
 
+    # --- the best columns, corpus by corpus
+    print("\n--- the winning columns inside each source corpus ---")
+    picks = []
+    if best["SHARP"] is not None and best["SHARP"]["metric"] is not None:
+        picks.append((f"SHARP {best['SHARP']['label']}",
+                      fam.c_sharp[:, best["SHARP"]["col"], best["SHARP"]["metric"]]))
+    if best["DINO"] is not None:
+        bi = best["DINO"]["col"]
+        picks.append((f"DINO {best['DINO']['label']}",
+                      (fam.c_v2 if bi < len(fam.cols) else fam.c_au)
+                      [:, bi % len(fam.cols)]))
+    rows_ds = []
+    for _, x in picks:
+        xr, yr = ref_corr(fam, x, y, rz)
+        rows_ds.append(by_dataset(fam, xr, yr, y))
+    if rows_ds and rows_ds[0]:
+        names_ds = [d[0] for d in rows_ds[0]]
+        print(f"   {'':>22}" + "".join(f"{n[:9]:>10}" for n in names_ds))
+        print(f"   {'n completions':>22}"
+              + "".join(f"{d[1]:>10d}" for d in rows_ds[0]))
+        print(f"   {'accuracy':>22}" + "".join(f"{d[3]:>10.3f}" for d in rows_ds[0]))
+        for (label, _), ds in zip(picks, rows_ds):
+            print(f"   {label:>22}" + "".join(f"{d[2]:>+10.3f}" for d in ds))
+        print("   Accuracy varies more across these corpora than any map statistic "
+              "varies within one,\n   so a column that changes sign between them is "
+              "reading the corpus, not the map.")
+
     # --- step level, for continuity with the earlier reports only
     s_sharp = np.stack([col_corr(fam.sharp[:, :, m], fam.correct)
                         for m in range(M)], axis=1)          # [K, M], one metric at a
@@ -514,6 +637,9 @@ def run_family(fam, args):
             "sharp_names": sharp_names,
             "best": {k: {kk: vv for kk, vv in v.items() if kk != "null"}
                      for k, v in best.items() if v is not None},
+            "honest_split": {k: {"label": v["label"], "r_sel": v["r_sel"],
+                                 "r_held": v["r_held"], "thr_single": thr_1}
+                             for k, v in honest.items()},
             "reference": {
                 label: {"r_sharp": blocks["SHARP"]["r_all"][ci].tolist(),
                         "level_sharp": blocks["SHARP"]["level"][ci].tolist(),
@@ -555,6 +681,9 @@ def main():
                     help="drop steps whose DINO union exceeds this (0 = off)")
     ap.add_argument("--perm", type=int, default=2000,
                     help="label shuffles for the max-|r| family-wise threshold")
+    ap.add_argument("--residualize", action="store_true",
+                    help="run everything on covariate residuals, so the permutation "
+                         "threshold and the held-out split apply to the PARTIAL r")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--json", default="", help="also write every number here")
     args = ap.parse_args()
@@ -572,24 +701,27 @@ def main():
     for fam in fams:
         js, blocks, best = run_family(fam, args)
         summary.append(js)
-        rows.append((fam.name, len(fam.uniq), best))
+        rows.append((fam.name, len(fam.uniq), best, js["honest_split"]))
 
     print("\n" + "=" * 78)
     print("=== HEADLINE: the best column of each block, per family "
           "(completion level) ===")
     print("=" * 78)
     print(f"{'family':>14} {'n':>5}  {'block':>5}  {'best column':>16} "
-          f"{'r':>8} {'held':>8} {'partial':>8} {'thr95':>7} {'p_fw':>7} {'tests':>6}")
-    for name, n, best in rows:
+          f"{'r':>8} {'thr95':>7} {'p_fw':>7} {'tests':>6}   "
+          f"{'odd-half pick':>16} {'r(EVEN)':>8}")
+    for name, n, best, hon in rows:
         for k in ("DINO", "SHARP", "MASS"):
             b = best.get(k)
             if b is None:
                 continue
             star = "*" if abs(b["r_all"]) >= b["thr95"] else " "
+            h = hon.get(k, {})
+            hstar = ("*" if h and abs(h["r_held"]) >= h["thr_single"] else " ")
             print(f"{name:>14} {n:>5}  {k:>5}  {b['label']:>16} "
-                  f"{b['r_all']:>+8.4f}{star}{b['r_held']:>+7.4f} "
-                  f"{b['r_partial']:>+8.4f} {b['thr95']:>7.4f} {b['p_fw']:>7.4f} "
-                  f"{b['n_tests']:>6}")
+                  f"{b['r_all']:>+8.4f}{star}{b['thr95']:>6.4f} {b['p_fw']:>7.4f} "
+                  f"{b['n_tests']:>6}   {h.get('label', ''):>16} "
+                  f"{h.get('r_held', float('nan')):>+8.4f}{hstar}")
     print("\nDINO  = the box metrics (mean_in_v2, auroc): does the map sit on the "
           "objects the step names.")
     print("SHARP = the box-free concentration metrics: how peaked the map is, six of "
