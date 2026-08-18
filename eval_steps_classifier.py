@@ -215,8 +215,10 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=42, help="split seed (train_classifier default)")
     p.add_argument("--val-fraction", type=float, default=0.15)
     p.add_argument("--holdout-json", default=None,
-                   help='JSON list of [source_file, sample_id] pairs to evaluate on; '
-                        'overrides --split and suppresses the contamination warning')
+                   help='held-out chains to evaluate on: either a JSON list of '
+                        '[source_file, sample_id] pairs or a training run\'s '
+                        'val_chains.json; overrides --split and suppresses the '
+                        'contamination warning')
     p.add_argument("--dump-split", default=None, help="write the evaluated chain ids here")
     p.add_argument("--batch-size", type=int, default=32, help="fragments per encoder forward")
     p.add_argument("--limit-chains", type=int, default=0, help="0 = no limit (smoke tests)")
@@ -234,7 +236,11 @@ def main() -> None:
           f"from {data_path} ({time.time() - t0:.1f}s)")
 
     if args.holdout_json:
-        keep = {tuple(map(str, x)) for x in json.loads(Path(args.holdout_json).read_text())}
+        # Either a bare list of pairs, or the val_chains.json a training run writes
+        # (a dict with the split metadata around a "val_chains" list).
+        blob = json.loads(Path(args.holdout_json).read_text())
+        pairs = blob["val_chains"] if isinstance(blob, dict) else blob
+        keep = {tuple(map(str, x)) for x in pairs}
         missing = keep - set(chains)
         if missing:
             print(f"[warn] {len(missing)} held-out chain ids are not in the data file")
