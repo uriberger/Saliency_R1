@@ -78,6 +78,21 @@ RESP_CHARS = 400
 SAMPLES_SUBDIR = "samples"
 
 
+def shorten(names):
+    """Drop the prefix every run name shares, so the table shows what differs.
+
+    These names are 90 characters of which the first 58 are the same cold-start
+    model on every run, and a column truncated from the left is a column of
+    identical strings.
+    """
+    names = list(names)
+    if len(names) < 2:
+        return {n: n for n in names}
+    prefix = os.path.commonprefix(names)
+    prefix = prefix[: prefix.rfind("_") + 1] if "_" in prefix else prefix
+    return {n: (n[len(prefix):] or n) if n.startswith(prefix) else n for n in names}
+
+
 # ---------------------------------------------------------------- reading rows
 
 def fingerprint(row):
@@ -521,11 +536,12 @@ def do_index(args):
         if dest.exists():
             stored.append(dest)
 
-    print(f"{'run':58s} {'kind':9s} {'steps':>6s} {'harvested':>10s}  profile")
+    labels = shorten([run for run, kind in by_run if kind == "curve"])
+    print(f"{'run':50s} {'kind':9s} {'steps':>6s} {'harvested':>10s}  profile")
     for (run, kind), entries in sorted(by_run.items()):
         harvested = sum(1 for _, ok, _ in entries if ok)
         shown = ", ".join(sorted({profile_name(n) for _, _, n in entries}))
-        print(f"{run[:58]:58s} {kind:9s} {len(entries):6d} {harvested:10d}  {shown}")
+        print(f"{labels.get(run, run)[:50]:50s} {kind:9s} {len(entries):6d} {harvested:10d}  {shown}")
 
     # Item-key health, measured on what is actually stored rather than assumed.
     print("")
@@ -720,22 +736,18 @@ def do_compare(args):
                                 ("B broke what A got right", (1.0, 0.0))):
             print(f"\n{direction}:")
             shown = 0
-            for task, x, y in pairs:
-                if (x, y) != want or shown >= args.flips:
-                    continue
-                key = (task, [k for k in left if k[0] == task][0][1])
-                shown += 1
-            # Re-walk with keys so the record can be printed, not just the scores.
-            shown = 0
             for key in sorted(set(left) & set(right)):
-                if key[0] not in tasks:
+                if key[0] not in tasks or shown >= args.flips:
                     continue
                 a_row, b_row = left[key], right[key]
-                if (a_row["score"], b_row["score"]) != want or shown >= args.flips:
+                if (a_row["score"], b_row["score"]) != want:
                     continue
                 shown += 1
-                print(f"  [{key[0]} #{key[1]}] target={a_row['target'][:40]!r} "
-                      f"A={a_row['pred'][:30]!r} B={b_row['pred'][:30]!r}")
+                print(f"  [{key[0]} #{key[1]}] target={a_row['target'][:40]!r}")
+                print(f"      A={a_row['pred'][:60]!r}")
+                print(f"      B={b_row['pred'][:60]!r}")
+            if not shown:
+                print("  none")
 
 
 def main():

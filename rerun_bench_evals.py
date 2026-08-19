@@ -46,7 +46,8 @@ from benchmarks import (DEFAULT_SUITE_N, SUITES, base_task, estimate_minutes,  #
                         plan_units, profile_dir, profile_name, task_sample_n)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bench_samples import resolve_results, results_index, step_files  # noqa: E402
+from bench_samples import (resolve_results, results_index, shorten,  # noqa: E402
+                           step_files)
 
 # Usable minutes in a one-hour allocation, after run_bench_eval.sh's SAFETY_MARGIN
 # for container staging and teardown. Only used to turn minutes into a job count
@@ -287,21 +288,6 @@ def dispatch(args, entries, sample_n):
         print("  " + " ".join(cmd))
         return False
     return subprocess.run(cmd).returncode == 0
-
-
-def shorten(names):
-    """Drop the prefix every run name shares, so the table shows what differs.
-
-    These names are 90 characters of which the first 58 are the same cold-start
-    model on every run, and a column truncated from the left is a column of
-    identical strings.
-    """
-    names = list(names)
-    if len(names) < 2:
-        return {n: n for n in names}
-    prefix = os.path.commonprefix(names)
-    prefix = prefix[: prefix.rfind("_") + 1] if "_" in prefix else prefix
-    return {n: (n[len(prefix):] or n) if n.startswith(prefix) else n for n in names}
 
 
 def report(entries, sample_n, bank, args, carried=frozenset()):
