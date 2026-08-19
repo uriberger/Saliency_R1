@@ -74,9 +74,26 @@ symmetric (+0.12 / +0.35 / +0.13 at -1/0/+1) where Qwen3-VL's is asymmetric
 frequency indices 1 and 2 (0.786 / 0.618 rad per position); Qwen2.5's chunked
 layout puts them at 16 and 40 (0.032 / 0.000178).
 
-**Effect size is small: positional share 0.0087**, i.e. under 1% of the variance in
-a token's image-attention profile, stable across 32- and 256-case runs. The march
-is statistically overwhelming and behaviourally tiny. Quote both together.
+**Effect size, aggregate: positional share 0.0087** — under 1% of the variance in a
+token's image-attention profile, stable across 32- and 256-case runs.
+
+**But that aggregate is a mean over a very heavy tail, and quoting it alone
+understates the effect by orders of magnitude.** Per head, the share of a single
+token's profile explained by position is:
+
+| median | p75 | p90 | p99 | max | mean |
+|---|---|---|---|---|---|
+| 0.013% | 0.20% | 2.0% | 18.4% | **51.2%** (L12 H2) | 1.02% |
+
+So a tenth of all heads have over 2% of their profile driven by position and one in
+a hundred has over 18%. "Under 1%" describes no head in particular: the typical head
+is 75x below it and the top head is 50x above. Detectability (69% of heads show the
+direction) and magnitude are different questions and neither implies the other.
+
+A free consistency check, and a better argument than any single %@pred: going from
+32 to 256 cases leaves `power(h8)` essentially unchanged (3.66e-2 -> 3.57e-2) while
+the `perm8` floor falls 5.7x for 8x the tokens. That is a fixed signal sitting on
+noise that averages away as 1/n.
 
 Layer profile (fraction of heads marching, `h8`): 0.88–1.00 through L0–L14, collapse
 at L15/16 (0.16/0.09), L20 (0.00), L27 (0.00), L29 (0.03), back to 1.00 at L35.
@@ -134,7 +151,29 @@ because its offset is identical for every patch and cannot reshape anything; `hw
 | `fix` | 0.51 | 0.50 | 0.50 | 0.50 | 0.50 | 0.49 | 0.50 | 0.50 | 0.49 | 0.49 | 0.49 |
 
 Three clean cycles on the predicted period. The column bucketing oscillates on *its*
-own period instead (minima ~5 and ~15, maxima 0, 10, 20). Four predictions, four hits.
+own period instead (minima ~5 and ~15, maxima 0, 10, 20). Four predictions, four
+hits — **on this readout.**
+
+**The other readout, the one billed above as "the prediction", only half-fired, and
+the number belongs here rather than in the report alone.** Recovering the imposed
+gap as a fitted shift gives `hw`/`full` **52% of gaps** against a 14% floor on the
+row clock, and **14% — exactly the floor — on the column clock**. Every miss is in
+the same direction: the fit returns 0 wherever the predicted shift is small (gaps 1,
+2, 6, 7, 9, 10 …).
+
+There is a mechanical reason, and it is trap 2 wearing a new hat. E1 compares bucket
+*b* at gap N with bucket *b* at gap 0 — **the same tokens** — so the bucket's
+content residual is identical on both sides and contributes a term that peaks at
+shift 0. E0 does not have this problem: it compares bucket *k+1* with bucket *k*,
+which are different tokens. The same term is why the similarity floor is +0.20
+rather than the −1.00 a pure translating sinusoid would give; read literally, about
+40% of the bucket residual is the marching component and 60% is content that did not
+cancel. Fixing it would need a shift test that does not put the same tokens on both
+sides.
+
+The similarity oscillation is untouched by this and remains the strong result. But
+"the prediction is a sawtooth, with nothing fitted" should not be quoted without the
+52%.
 
 **Behaviour — negative.** Fraction of greedy tokens that change:
 
@@ -207,17 +246,126 @@ like it had.
 patches. Unlike E1's flip count, this task can see it — which is partly a lesson
 about the task, not only about the effect.
 
-**But it is small and it has the wrong shape.** At a realistic reasoning length the
-whole effect is 0.63 patches, about 20 px on a 768 px canvas, under 3% of image
-height; growth is roughly logarithmic in the gap. And it is **monotone, with no
-wrap** — the striped drift's hallmark is that it returns at one period, and this
-does not. More than half is reproduced by `t` alone, which provably cannot reshape
-the profile (E1 measured it flat at 0.99). So the measurable behavioural shift is
-mostly the general "the image is further away" effect, with a spatial-axis
-component of similar size, and is **not** the marching stripes E0 characterised.
+**It is small**: at a realistic reasoning length the whole effect is 0.63 patches,
+about 20 px on a 768 px canvas, under 3% of image height, growing roughly
+logarithmically in the gap. So attention moves 1-2 patches and judgement moves a
+fifth of that. `fix` is noisy here (wandering, no trend) because it is far
+off-distribution; do not read it.
 
-So: attention moves 1-2 patches, judgement moves a fifth of that. `fix` is noisy
-here (wandering, no trend) because it is far off-distribution; do not read it.
+**Retracted: "it is monotone with no wrap, so it is not the stripes."** That
+argument was wrong and it is corrected here rather than deleted, because it is an
+easy one to make twice. The overlay has no period to return at. Only the *fastest*
+H channel repeats every 8; the next repeats every 16.48, and at a gap of 8 it sits
+at 0.486 of a cycle — very nearly antiphase, close to the worst possible gap, not
+restored. H and W do not share a period either (7.9956 against 10.1747, ratio
+1.2725), so the joint phase never repeats at all.
+
+E1's wrap is a property of the *analysis*, not of the physics: phase-bucketing on
+the h8 clock isolates the one component that does repeat. A behavioural readout
+sees the sum of the whole ladder, which does not. Asking E2 and E3 to dip at 8, 16
+and 24 was asking for a signature the mechanism never predicted.
+
+What survives, and it is the stronger statement anyway, is the **dissociation of
+magnitudes**: a gap of 4 translates the attention overlay by exactly 4 patches — a
+sixth of the image — and moves the perceived midline by 0.03. The `hw` arm's
+contribution is real (0.36 patches at gap 256, 4.5x the arithmetic floor) and
+should not have been discounted for having "the wrong shape".
+
+## E3 — growing the distance with real tokens
+
+E1 and E2 both reached in and rewrote position ids. E3 asks the same question the
+way it actually happens: the same filler placed **before** the image (condition A,
+positionally inert for the image-to-question distance) or **after** it (B, which
+grows that distance by exactly the filler length, asserted from the model's own
+`get_rope_index` — A held at 56 for all 25 lengths, B grew to 80).
+
+**The control invalidated the design, which is the result.** Condition A moved the
+perceived midline **0.65 patches** on its own. So B−A is not positional and its
+−0.93 must not be read as such: it is 4x what E2 measures for the same distance
+while changing nothing but ids.
+
+Two reasons A is not inert, and the second is the bigger one. The filler's meaning
+acts on the judgement differently depending on where it sits; and in B the filler
+ends up ~576 tokens (the whole image block) *closer to the answer* than in A, so
+its content has far more influence there. **Content moves this judgement several
+times harder than the distance those words create**, which retroactively justifies
+the artificial-looking position-id intervention: the natural version is confounded
+by a larger effect. No curve dips at 8/16/24 — see the retraction above for why
+that was never the right thing to look for.
+
+## E4 — freeze the cross-modal position, and find the best place to freeze it
+
+The intervention: give each post-image token **two position identities** — its real
+one when attending to text, and a frozen one (`h = w = s + d0`, the same for every
+token) when attending to image patches. The overlay then stops moving.
+
+This is not E1's `fix`. `fix` pinned the tail's h/w in the position ids, which also
+flattened tail-to-tail spatial offsets and cost +168% NLL — nearly all of it damage
+to *text-to-text* attention, nothing to do with the image. Restricting the frozen
+identity to image columns cannot be expressed through `position_ids` at all
+(offsets are differences of per-token values, so "change tail↔image but not
+tail↔tail" has no solution), so `rope_phase_e4.py` patches attention instead. Both
+self-checks are bitwise exact: the hand-written attention reproduces the library's
+kernel, and the frozen path reproduces the real one when handed identical phases.
+
+`d0` is a free parameter — *every* value removes the drift, so correctness does not
+pick one. It is chosen on **error against ground truth**, never on how little it
+disturbs the model: that criterion is minimised by doing nothing at all, so
+surprise-at-own-text is kept as a rejection filter (`guard`) and never as the
+objective.
+
+Two stimulus families with exact ground truth: E2's square, and 120 real images
+from `set_c` (train split; gqa, openimages, textcap, v7w, docvqa, textvqa,
+infographicsvqa) with their annotated boxes, scaled and **translated** on a grey
+canvas so the box centre sits a controlled number of patches off the midline.
+Offsets are whole patches — a sub-patch shift re-aligns content to the patch grid
+and changes the features, which showed up in the pilot as a 7.5-logit sawtooth on a
+docvqa page.
+
+### Result (2026-08-19, Qwen3-VL-8B)
+
+| | synthetic square | real images (63 usable of 120) |
+|---|---|---|
+| drift, gap 0 → 512 | **−0.778 ± 0.074** | **−0.356 ± 0.056** |
+| best frozen arm's residual | −0.484 | −0.209 ± 0.035 |
+| **share of the drift removed** | **38%** | **41%** |
+
+- **The drift's behavioural cost on real images, measured for the first time:
+  −0.356 ± 0.056 patches** over a 512-token answer. It had only ever been measured
+  on a coloured square.
+- **Best `d0` is 24 = `max(gh, gw)`** — the principled default, the distance of the
+  first token after the image, the value that makes the intervention an exact no-op
+  at the start of an answer. Best on synthetic; statistically tied with everything
+  in 24..47 on real images.
+- **The off-distribution controls behaved as predicted.** `d0` = 0 and 12 put the
+  query's row counter *inside* the image's own rows, where no text token ever sits.
+  They are the worst arms on both families and cost the most NLL.
+- **No periodicity in `d0`** — the error varies smoothly, as the incommensurate
+  channel ladder above requires.
+- **It removes only ~40% of the length-induced error, consistently.** The remaining
+  60% is the t axis — image-vs-text mass, "visual fading" — which this intervention
+  deliberately leaves alone because it provably cannot reshape the profile. That
+  matches E2, where `t` alone reproduced over half the effect.
+- **It is nearly free**: under 1% NLL and 1.1–1.5% token flips against E1's measured
+  bf16 floor of 1.2%.
+
+**One result that does not replicate, and should not be quoted without this.** On
+the synthetic square, freezing at 24 also nearly eliminates the *standing* bias at
+gap 0 (−0.675 → −0.069, a 90% cut). On real images it does not (+0.179 → +0.391,
+slightly worse). That gain is a property of the synthetic stimulus. On real data the
+honest claim is that freezing buys the ~40% of the length effect and nothing more.
+
+**Superseded: "this cannot be patched at inference, it would have to be trained
+for."** That was inferred from `fix`'s +168% NLL, which measured a different lesion.
+The surgical version costs under 1%. Circle-RoPE and DIPE still have the better
+argument for doing it in training — they get the whole effect rather than 40% — but
+the inference-time patch is cheap and works.
+
+**Read the median, not the mean.** The crossing is intercept over slope, and a
+shallow slope sends it to infinity: 11% of real stimuli land beyond ±5 patches, and
+one of them moves a mean of 111 by half a patch. The mean put the real-image drift
+at +0.05 ± 0.68 — no effect, useless error bar — where the median put it at −0.37.
+The mean was measuring its own tail.
 
 ## Controls
 
@@ -264,6 +412,9 @@ comes back when nothing is planted.
 | `test_rope_phase_e1_cpu.py` | CPU tests of the E1 arms and the shift recovery (13) |
 | `rope_phase_e2.py` | E2 pointing probe: perceived-midline shift |
 | `test_rope_phase_e2_cpu.py` | CPU tests of the stimulus and crossing estimator (6) |
+| `rope_phase_e3.py` | E3 filler-position probe; `--stage check` validates the tokenizer end |
+| `rope_phase_e4.py` | E4 the frozen cross-modal query, and the `d0` sweep |
+| `test_rope_phase_e4_cpu.py` | CPU tests of the intervention, the splice and resume (11) |
 | `submit_rope_phase_job.sh` | single-GPU batch submission (what produced `results/`) |
 | `launch_rope_phase.sh` | 8-way fan-out on a held interactive node (untested) |
 | `results/` | reports from the runs above |
@@ -276,5 +427,17 @@ fading. Circle-RoPE and DIPE both incidentally remove this drift, since they sto
 text tokens' spatial coordinates from advancing, but neither states the invariance
 as their motivation. The *shape drift* measured here appears unclaimed.
 
-E1 (below) measured what the drift costs: it reshapes the attention profile
-enormously and does not change the model's output.
+**What is measured, end to end.** E0 found the march and E1 confirmed it causally.
+E2 put its behavioural cost at 0.63 patches on a purpose-built task; E3 showed the
+natural-tokens version of that question is confounded by content; E4 measured the
+cost on real annotated images (0.36 patches over a 512-token answer) and showed it
+can be removed at inference for under 1% NLL -- but only ~40% of it, the rest being
+the fading channel.
+
+**Not done.** The 60% that fading contributes is untouched and it is the larger
+half. Whether any of this shows up in generated text has not been tested: every
+behavioural number here comes from reading two answer-token logits, never from a
+completion the model actually wrote. Dense OCR and counting are still untested at
+length. And the per-head causal test is open: a handful of heads carry 33-51% of the
+drift while the median carries 0.01%, so an intervention restricted to those heads
+would be far gentler than one applied to all 1152.
