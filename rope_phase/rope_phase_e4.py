@@ -178,9 +178,18 @@ def _frozen_forward(self, hidden_states, position_embeddings, attention_mask=Non
         # post-image tokens, so for every other query row q_frozen == q_real and
         # writing the image columns back is a no-op there.
         q_frozen, _ = ctl.apply_rope(q, k, ctl.cos_f, ctl.sin_f)
+        # Score every column and then keep the image ones, rather than scoring the
+        # image columns alone.  Mathematically the same, numerically not: a matmul
+        # over 576 columns reduces in a different order than one over 700, so in
+        # bf16 the two disagree in the last bits and 36 layers amplify it -- the
+        # null check read 0.5 on a logit scale of 32 instead of the zero a no-op
+        # owes you.  Matching the shape makes the frozen path bitwise identical to
+        # the real one whenever the two phases agree, which is what makes the check
+        # a proof rather than an argument.  Costs one extra matmul.
+        frozen_scores = torch.matmul(q_frozen, kk.transpose(2, 3)) * self.scaling
         img = ctl.img_cols
-        scores[:, :, :, img] = torch.matmul(
-            q_frozen, kk[:, :, img, :].transpose(2, 3)) * self.scaling
+        scores[:, :, :, img] = frozen_scores[:, :, :, img]
+        del frozen_scores
 
     mask = _resolve_mask(attention_mask, self, scores.shape[2], scores.shape[3],
                          scores.dtype, scores.device)
@@ -332,7 +341,26 @@ def fit_zero(offsets, ev):
 # different questions and must not be stitched together -- the same discipline E0's
 # report applies to its shards.
 RESUME_KEYS = ("family", "offsets", "d0s", "gaps", "arms", "image_side", "square_px",
-               "target_h", "base_model", "dataset", "gh", "gw", "colours", "rows")
+               "target_h", "base_model", "dataset", "gh", "gw", "colours", "rows",
+               "code_fingerprint")
+
+
+def code_fingerprint() -> str:
+    """A hash of the files that decide what a number in the table means.
+
+    Resume stitches a later run's rows onto an earlier run's, so the two must have
+    been produced by the same code.  Sweep parameters alone do not catch that: the
+    bf16 reduction order inside the frozen branch changed once already, which moved
+    every value slightly while leaving every parameter identical.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    for name in ("rope_phase_e4.py", "rope_phase_e2.py", "rope_phase_e1.py",
+                 "rope_phase_probe.py"):
+        p = Path(__file__).resolve().parent / name
+        h.update(p.read_bytes() if p.exists() else name.encode())
+    return h.hexdigest()[:16]
 
 
 def _load_partial(out_path, meta, shape):
@@ -500,9 +528,17 @@ def run(args, device, pilot: bool):
     print(f"[e4] null self-check: logit scale {checks['logit_scale']:.1f} | "
           f"eager vs stock {checks['eager_vs_stock']:.4f} | "
           f"frozen vs real {checks['frozen_vs_real']:.4f}", flush=True)
-    if checks["frozen_vs_real"] > 0.05 * checks["logit_scale"]:
-        raise SystemExit("the frozen path does not reproduce the real one when given "
-                         "identical positions; the splice is wrong")
+    # Both numbers owe you an exact zero: the hand-written attention is the library's
+    # own arithmetic in the same order, and the frozen branch is scored with the same
+    # matmul shape, so identical positions must give identical bits.  Anything else
+    # means a shape or an index moved, and the tolerance is deliberately far tighter
+    # than "small compared to the effect".
+    for name in ("eager_vs_stock", "frozen_vs_real"):
+        if checks[name] > 0.005 * checks["logit_scale"]:
+            raise SystemExit(
+                f"{name} is {checks[name]:.4f} against a logit scale of "
+                f"{checks['logit_scale']:.1f}; this path is supposed to be bitwise "
+                f"identical, so something is indexing or reducing differently")
 
     grid = probe_case["image_grid_thw"][0].tolist()
     merge = int(model.config.vision_config.spatial_merge_size)
@@ -537,7 +573,8 @@ def run(args, device, pilot: bool):
                 "gh": gh, "gw": gw, "natural_d0": max(gh, gw),
                 "image_side": args.image_side, "square_px": args.square_px,
                 "target_h": args.target_h, "base_model": args.base_model,
-                "dataset": args.dataset, "checks": checks, **extra}
+                "dataset": args.dataset, "checks": checks,
+                "code_fingerprint": code_fingerprint(), **extra}
         _sweep(model, ids, ctl, rotary, cases, offs, d0s, gaps, device, name,
                out_path=out_dir / f"scan_{name}.npz", meta=meta)
         print(f"[e4] wrote {out_dir / f'scan_{name}.npz'}", flush=True)

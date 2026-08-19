@@ -284,7 +284,8 @@ def test_resume_keeps_finished_stimuli_and_redoes_nothing_else():
     meta = {"family": "real", "offsets": [-1.0, 0.0, 1.0], "d0s": [24],
             "gaps": [0, 512], "arms": ["none", "frozen:24"], "image_side": 768,
             "square_px": 64, "target_h": 512, "base_model": "m", "dataset": "d",
-            "gh": 24, "gw": 24, "rows": [{"row_index": i} for i in range(5)]}
+            "gh": 24, "gw": 24, "code_fingerprint": "abc123",
+            "rows": [{"row_index": i} for i in range(5)]}
     ev = np.full(shape, np.nan)
     ev[:3] = 1.0
     with tempfile.TemporaryDirectory() as td:
@@ -303,7 +304,8 @@ def test_resume_keeps_finished_stimuli_and_redoes_nothing_else():
         # a different sweep must be refused, not silently stitched together
         for key, bad in (("d0s", [25]), ("gaps", [0, 256]), ("dataset", "other"),
                          ("offsets", [-2.0, 0.0, 2.0]),
-                         ("rows", [{"row_index": i} for i in range(5, 10)])):
+                         ("rows", [{"row_index": i} for i in range(5, 10)]),
+                         ("code_fingerprint", "deadbeef")):
             try:
                 E4._load_partial(p, {**meta, key: bad}, shape)
             except SystemExit:
