@@ -334,9 +334,12 @@ docvqa page.
   −0.356 ± 0.056 patches** over a 512-token answer. It had only ever been measured
   on a coloured square.
 - **Best `d0` is 24 = `max(gh, gw)`** — the principled default, the distance of the
-  first token after the image, the value that makes the intervention an exact no-op
-  at the start of an answer. Best on synthetic; statistically tied with everything
-  in 24..47 on real images.
+  first token after the image. Best on synthetic; statistically tied with everything
+  in 24..47 on real images. (It was described here as "an exact no-op at the start of
+  an answer". That is wrong: it is a no-op at the first token after the *image*,
+  which is the start of the *question*. By the first generated token `d` is already
+  24 + the question length, so the intervention is fully active before the model
+  writes anything — see E5.)
 - **The off-distribution controls behaved as predicted.** `d0` = 0 and 12 put the
   query's row counter *inside* the image's own rows, where no text token ever sits.
   They are the worst arms on both families and cost the most NLL.
@@ -355,17 +358,69 @@ gap 0 (−0.675 → −0.069, a 90% cut). On real images it does not (+0.179 →
 slightly worse). That gain is a property of the synthetic stimulus. On real data the
 honest claim is that freezing buys the ~40% of the length effect and nothing more.
 
-**Superseded: "this cannot be patched at inference, it would have to be trained
-for."** That was inferred from `fix`'s +168% NLL, which measured a different lesion.
-The surgical version costs under 1%. Circle-RoPE and DIPE still have the better
-argument for doing it in training — they get the whole effect rather than 40% — but
-the inference-time patch is cheap and works.
+**"This cannot be patched at inference" — retracted, then reinstated by E5.** The
++168% figure did measure a different lesion, and the surgical version really does
+cost under 1% NLL *teacher-forced*. But E5 let the model generate under it and the
+output collapses. The original conclusion stands; only the reasoning behind it was
+wrong. Circle-RoPE and DIPE, which do this in training, are the right shape of
+answer.
 
 **Read the median, not the mean.** The crossing is intercept over slope, and a
 shallow slope sends it to infinity: 11% of real stimuli land beyond ±5 patches, and
 one of them moves a mean of 111 by half a patch. The mean put the real-image drift
 at +0.05 ± 0.68 — no effect, useless error bar — where the median put it at −0.37.
 The mean was measuring its own tail.
+
+## E5 — the same intervention, live during generation
+
+Everything above is read off two answer-token logits at one position. E5 is the
+first thing here to look at text the model wrote. It wraps the text rotary module
+so the frozen phase is rebuilt every decode step, and decides which rows to freeze
+from the ids themselves (a token is in the tail exactly when its t index exceeds the
+image anchor), which cannot drift out of step with a KV cache the way an index can.
+
+The arm that makes the experiment is **`null`**: a constant added to every position
+id, a mathematical no-op that still perturbs bf16. Greedy decoding forks on a single
+flipped token, so without it "the completions changed" means nothing.
+
+### Result (2026-08-19, 60 cases from set_c, greedy, cap 320 tokens)
+
+| arm | differs from `none` | 1st diff (median) | hit the cap | mean length | exact match |
+|---|---|---|---|---|---|
+| `null:1000` (no-op floor) | 68% | token 41 | 0% | 128 | 72% |
+| **`frozen:24`** | 100% | token 0 | **73%** | 241 | **50%** (36% of those that finished) |
+| `frozen:0` | 100% | token 0 | 32% | 112 | 15% |
+| `none` | — | — | 0% | 126 | 72% |
+
+**The intervention wrecks generation.** Not by changing what the model perceives —
+by collapsing the decoder into degenerate repetition. **53% of `frozen:24`
+completions repeat some word more than ten times, against 0% of baseline** (mean
+max-repetition 41.4 vs 3.4); 73% never terminate; one degenerates into emitting
+`<tool_call>`.
+
+```
+Q: Who is wearing a cap?
+  none      : ... the person wearing a cap is the one in the maroon shirt.
+  frozen:24 : ... on in the person in the person in the person in the person ...
+```
+
+**The lesson is about evaluation, and it is the important part.** E4's guard
+teacher-forced the untouched model's own completion and measured +1.4% NLL and ~3%
+token flips — negligible, no arm rejected. The *same* intervention destroys free
+generation. A per-token perturbation that is invisible under teacher forcing
+compounds over hundreds of autoregressive steps into a different regime. **Teacher-
+forced NLL is not a safety check for anything that will be sampled from**, and this
+directory used it as one.
+
+`null` earned its place: 68% of completions differ from baseline under a
+mathematically exact no-op, at identical accuracy and length. Chaos alone rewrites
+most of the text.
+
+**The reference-NLL column in the report is broken and should not be quoted.** It
+teacher-forces the bare reference answer straight after the assistant tag, where the
+system prompt demands `<think>` first, so it sits at perplexity ~3.6e5 for every arm
+and measures off-distribution-ness rather than correctness. Use the match rate and
+the termination rate.
 
 ## Controls
 
@@ -415,6 +470,8 @@ comes back when nothing is planted.
 | `rope_phase_e3.py` | E3 filler-position probe; `--stage check` validates the tokenizer end |
 | `rope_phase_e4.py` | E4 the frozen cross-modal query, and the `d0` sweep |
 | `test_rope_phase_e4_cpu.py` | CPU tests of the intervention, the splice and resume (11) |
+| `rope_phase_e5.py` | E5 the same freeze live during generation |
+| `test_rope_phase_e5_cpu.py` | CPU tests of the decode-time tail rule and readouts (7) |
 | `submit_rope_phase_job.sh` | single-GPU batch submission (what produced `results/`) |
 | `launch_rope_phase.sh` | 8-way fan-out on a held interactive node (untested) |
 | `results/` | reports from the runs above |
@@ -435,9 +492,9 @@ can be removed at inference for under 1% NLL -- but only ~40% of it, the rest be
 the fading channel.
 
 **Not done.** The 60% that fading contributes is untouched and it is the larger
-half. Whether any of this shows up in generated text has not been tested: every
-behavioural number here comes from reading two answer-token logits, never from a
-completion the model actually wrote. Dense OCR and counting are still untested at
-length. And the per-head causal test is open: a handful of heads carry 33-51% of the
+half. E5 answered the generation question and the answer was no -- the patch cannot
+be applied at inference, so getting any of this into a model means training with a
+positional scheme that does not have the defect. Dense OCR and counting are still
+untested at length. And the per-head causal test is open: a handful of heads carry 33-51% of the
 drift while the median carries 0.01%, so an intervention restricted to those heads
 would be far gentler than one applied to all 1152.

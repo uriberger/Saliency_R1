@@ -1,0 +1,54 @@
+==============================================================================
+E5 -- the frozen cross-modal position, live during generation
+==============================================================================
+model   : /home/uberger/scratch/research/saliency_r1/outputs/bench_baselines/_models/Qwen3-VL-8B-Instruct
+data    : /lustre/fs1/portfolios/nvr/projects/nvr_israel_rlop/users/uberger/research/saliency_r1/cold_data/grpo_sets/set_c
+cases   : 60, greedy, max 320 new tokens
+
+`null` adds a constant to every position id and is a mathematical no-op, so
+whatever it moves is the floor: greedy decoding forks on a single bf16-flipped
+token.  An arm that does not clearly beat `null` has not been shown to do
+anything at all.
+
+--- DID THE TEXT CHANGE?
+             arm   differs   1st diff   median     len   d(len)
+            none        0%        nan      nan   125.8     +0.0
+       null:1000       68%       51.3     41.0   128.3     +2.5
+       frozen:24      100%        1.1      0.0   240.7   +115.0
+        frozen:0      100%        0.7      0.0   111.7    -14.1
+    'differs' = share of prompts whose completion is not identical to `none`.
+    '1st diff' = mean token index of the first difference; the intervention is
+    an exact no-op at d = d0 and grows with distance, so it should sit LATER
+    than the floor's.  Equal to `null` on every column = nothing demonstrated.
+
+--- REFERENCE-ANSWER NLL, paired per prompt (lower is better)
+             arm      NLL    vs none      +-   better
+            none   12.797    +0.0000  0.0000       0%
+       null:1000   12.750    -0.0473  0.0193      72%
+       frozen:24   12.911    +0.1141  0.2624      45%
+        frozen:0   14.363    +1.5661  0.3853      27%
+
+--- EXACT MATCH on the 40 prompts whose reference is 1-2 words
+             arm    match
+            none      72%
+       null:1000      72%
+       frozen:24      50%
+        frozen:0      15%
+
+--- THE DECIDING TEST: does the effect grow with completion length?
+    The drift accumulates with distance, so a real benefit must be bigger for
+    long completions.  Flat in length falsifies the attribution however good
+    the average looks.
+    split at the median completion length, 108 tokens
+             arm   short dNLL    long dNLL   long-short
+            none      +0.0000      +0.0000      +0.0000
+       null:1000      -0.0530      -0.0416      +0.0115
+       frozen:24      +0.0071      +0.2210      +0.2139
+        frozen:0      +1.5234      +1.6088      +0.0854
+
+READING IT
+  Three outcomes.  If every arm sits on `null`, the intervention does not
+  reach generated text and the 0.36 patches E4 measured stay locked inside a
+  logit comparison.  If `frozen` beats `null` on divergence but not on NLL, it
+  changes the text without improving it.  If it beats `null` on NLL AND the
+  gain grows with length, the mechanism reaches the output.
