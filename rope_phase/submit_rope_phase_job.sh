@@ -68,8 +68,11 @@ EXTRA_ARGS="$*"
 
 # E0/E1 read images from a dataset; E2/E3 build their own stimuli and need none.
 # Keyed off the script declaring it rather than a list of names to keep extending.
+# Match the VALUE, not just the name: E4 declares SELF_CONTAINED_STIMULI = False
+# because one of its two stimulus families is real images, and a name-only grep
+# would have read that as "needs nothing" and dropped the guard.
 NEEDS_DATASET=1
-grep -q "SELF_CONTAINED_STIMULI" "$HERE/$SCRIPT" 2>/dev/null && NEEDS_DATASET=0
+grep -qE "^SELF_CONTAINED_STIMULI[[:space:]]*=[[:space:]]*True" "$HERE/$SCRIPT" 2>/dev/null && NEEDS_DATASET=0
 [[ $NEEDS_DATASET -eq 0 || -n "$DATASET" || "$EXTRA_ARGS" == *--dataset* ]] || {
     echo "ERROR: $SCRIPT reads a dataset -- set ROPE_PHASE_DATASET or pass --dataset" >&2
     exit 2; }

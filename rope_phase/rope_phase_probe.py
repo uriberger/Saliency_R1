@@ -145,8 +145,19 @@ def load_samples(dataset_path: str, n: int, seed: int):
         raise SystemExit(f"dataset not found: {dataset_path} (pass --dataset)")
     rng = np.random.default_rng(seed)
     idx = sorted(rng.choice(np.arange(len(ds)), size=min(n, len(ds)), replace=False).tolist())
-    return [{"row_index": int(i), "question": ds[int(i)]["problem"], "image": ds[int(i)]["image"]}
-            for i in idx]
+    # `problem` and `image` are all E0/E1 need, but a probe that scores against
+    # annotations needs the annotations too, so any of these that the dataset
+    # happens to carry come along.  Additive: nothing that used the old three keys
+    # sees a difference.
+    extra = [c for c in ("bbox", "solution", "dataset", "split", "question_id")
+             if c in ds.column_names]
+    out = []
+    for i in idx:
+        row = ds[int(i)]
+        rec = {"row_index": int(i), "question": row["problem"], "image": row["image"]}
+        rec.update({c: row[c] for c in extra})
+        out.append(rec)
+    return out
 
 
 def load_model(base_path: str, adapter: str | None, device: str, attn_impl: str = "sdpa"):
