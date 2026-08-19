@@ -155,7 +155,14 @@ def do_collect(args):
             "and a step file mixing two sizes puts two different measurements on one curve.\n  "
             + "\n  ".join(problems))
 
-    suite_n = as_suite_n(observed or wanted)
+    # The profile comes from what was ASKED FOR, not from what happened to arrive.
+    # The difference matters in exactly one situation, and it is a destructive one:
+    # if every natural unit fails and only the carried-over non-natural results are
+    # in hand, the observed sizes are all 100 -- so inferring the profile would
+    # file a partial 300-document result as a 100-document one, on top of the real
+    # 100-document result that is already there. `observed` is what validates;
+    # `wanted` is what decides where this goes.
+    suite_n = as_suite_n(wanted if args.sample_n else observed)
     uneven = {s: v for s, v in suite_n.items() if isinstance(v, tuple)}
     # Not an error: a per-task override (`--task-n mmstar=200`, which is how the
     # one benchmark too expensive to triple is kept inside a one-hour job) is a
@@ -332,6 +339,25 @@ def do_publish_baseline(args):
     print(f"  run:     {url}")
 
 
+def do_carried_from(directory):
+    """{unit tag: profile} for the banked units in this directory that were reused.
+
+    Printed as JSON for run_bench_eval.sh to hand back to --collect. It lives here
+    rather than as a shell heredoc because the marker format is this file's
+    business, and a JSON writer spelled in bash is a JSON writer that will one day
+    emit something unparseable when a path contains a quote.
+    """
+    out = {}
+    for path in sorted(glob.glob(os.path.join(directory, "*.json"))):
+        try:
+            marker = json.load(open(path))
+        except Exception:
+            continue
+        if marker.get("carried_from"):
+            out[Path(path).stem] = marker["carried_from"]
+    print(json.dumps(out, sort_keys=True))
+
+
 def do_plan(args):
     """Print the banking units a job should attempt, largest first, as TSV.
 
@@ -356,6 +382,8 @@ def main():
     p.add_argument("--bank", choices=("suite", "task"), default="suite",
                    help="the unit a job banks progress in (--plan)")
     p.add_argument("--num-gpus", type=int, default=1, help="allocation size, for the estimate (--plan)")
+    p.add_argument("--carried-from", metavar="DIR",
+                   help="print {unit: profile} for the reused banked units in DIR")
     p.add_argument("--backfill", action="store_true", help="push recorded steps into a WandB run")
     p.add_argument("--publish-baseline", action="store_true",
                    help="publish this dir's step-0 score as a flat-line WandB run")
@@ -379,6 +407,9 @@ def main():
                    help="{suite: source} for suites reused from another profile (--collect)")
     args = p.parse_args()
 
+    if args.carried_from:
+        do_carried_from(args.carried_from)
+        return
     if args.plan:
         do_plan(args)
         return

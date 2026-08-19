@@ -395,9 +395,23 @@ if $DRY_RUN; then
     echo "[dry-run] wall clock left: $(minutes_left) min (+$MERGE_MINUTES to merge a checkpoint)"
     echo "[dry-run] merged models go to $MERGE_ROOT, kept across jobs while a step is"
     echo "[dry-run] unfinished and deleted once its step-<N>.json is written"
+    # Each unit is put through the same validation the job itself would apply, not
+    # merely checked for a file: a marker can exist and still be rejected because
+    # it names a sample size this job is not asking for, or points at a results
+    # file that has been cleaned up. "A marker is present" and "this unit will be
+    # skipped" are different statements, and only the second one is useful.
     for s in $(pending_steps); do
-        banked=$(ls "$PARTIAL_DIR/step-$s" 2>/dev/null | sed 's/\.json$//' | tr '\n' ' ')
-        echo "[dry-run] step $s: units already banked: ${banked:-none}"
+        STEP="$s"
+        reusable=""; owed=""
+        for i in "${!UNIT_TAG[@]}"; do
+            if banked_unit "$PARTIAL_DIR/step-$s/${UNIT_TAG[$i]}.json" "${UNIT_TASKS[$i]}" >/dev/null 2>&1
+            then reusable+="${UNIT_TAG[$i]} "
+            else owed+="${UNIT_TAG[$i]}(${UNIT_MINUTES[$i]}m) "
+            fi
+        done
+        echo "[dry-run] step $s"
+        echo "[dry-run]   reusable: ${reusable:-none}"
+        echo "[dry-run]   to run:   ${owed:-none}"
     done
     exit 0
 fi
@@ -510,8 +524,13 @@ while true; do
             echo "[step $STEP] WARNING: ${#FAILED[@]} unit(s) FAILED (${FAILED[*]}) -- recording a" >&2
             echo "            step file without them; those benchmarks will be absent from the curve" >&2
         fi
+        # Which units were reused from another profile rather than generated here.
+        # Read before the markers are deleted, and passed on so the step file says
+        # so: a carried-over benchmark is a repeated measurement, not a new one,
+        # and the only honest thing to do with a repeated measurement is record it.
+        CARRIED=$(python "$SCRIPT_DIR/bench_eval.py" --carried-from "$PARTIAL_DIR/step-$STEP")
         python "$SCRIPT_DIR/bench_eval.py" --collect --run-dir "$RUN_DIR" --step "$STEP" \
-            --sample-n "$SAMPLE_N_JSON" --results "${RESULTS[@]}"
+            --sample-n "$SAMPLE_N_JSON" --carried "$CARRIED" --results "${RESULTS[@]}"
         # Per-item rows, stored beside the step file. Failure here is reported and
         # not fatal: the aggregate is the result that took the GPU hours, and the
         # harvest can be redone at any time from the same files with --retro.
