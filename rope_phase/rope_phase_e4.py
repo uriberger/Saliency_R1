@@ -415,6 +415,11 @@ def _families(args, processor, model, device):
         out.append(("synthetic", cases, offs, {"colours": colours}))
     if "real" in want:
         offs = [float(x) for x in args.offsets_real.split(",")]
+        if any(abs(o - round(o)) > 1e-9 for o in offs):
+            raise SystemExit(
+                f"real offsets must be whole patches, got {offs}: a sub-patch shift "
+                f"re-aligns content to the patch grid and changes the features, "
+                f"which shows up as a sawtooth in the evidence curve")
         rows = usable_real_rows(args.dataset, args.n_real, args.seed, args.image_side,
                                 patch_px, args.target_h, max(abs(o) for o in offs),
                                 args.max_box_h, args.max_box_w, args.max_words, args.pool)
@@ -685,19 +690,55 @@ def report(args):
             P(f"    {arm:>12s}" + "".join(f"{c[0]:>+12.3f} +-{c[1]:<5.3f}" for c in cells))
         P("")
         gl = len(gaps) - 1
+        # Every arm is measured on the SAME stimulus, so the per-stimulus content
+        # prior -- which is most of the spread above -- cancels in the difference.
+        # That makes arm-to-arm comparisons far better powered than the absolute
+        # level, and it is how to tell a real difference from a coincidence.
+        P("    PAIRED SHIFT vs the untouched model at gap "
+          f"{gaps[0]}, same stimulus, same offsets.")
+        P("    " + " " * 12 + "".join(f"{'gap ' + str(g):>19s}" for g in gaps))
+        paired = {}
+        for ai, arm in enumerate(arms):
+            cells = []
+            for gi in range(len(gaps)):
+                d = mid[ok, ai, gi] - mid[ok, 0, 0]
+                d = d[np.isfinite(d)]
+                cells.append((float(d.mean()) if len(d) else float("nan"),
+                              float(d.std(ddof=1) / len(d) ** 0.5) if len(d) > 1
+                              else float("nan")))
+            paired[arm] = cells
+            P(f"    {arm:>12s}" + "".join(f"{c[0]:>+12.3f} +-{c[1]:<5.3f}" for c in cells))
+        P("")
         short, long_ = rows_out[0][1][0][0], rows_out[0][1][gl][0]
+        P(f"    the drift, measured paired: {paired['none'][gl][0]:+.3f} "
+          f"+-{paired['none'][gl][1]:.3f} patches from gap {gaps[0]} to {gaps[gl]}")
         P(f"    REFERENCE  untouched, short answer (gap {gaps[0]}) : {short:+.3f}")
         P(f"    REFERENCE  untouched, long answer  (gap {gaps[gl]}) : {long_:+.3f}"
           f"   <- the drift adds {abs(long_) - abs(short):+.3f} patches of error")
         ranked = sorted((abs(c[gl][0]), a, c[gl]) for a, c in rows_out[1:]
                         if np.isfinite(c[gl][0]))
         P("")
-        P(f"    BEST PRETEND LOCATIONS at gap {gaps[gl]}, by absolute error:")
+        P(f"    BEST PRETEND LOCATIONS at gap {gaps[gl]}, by absolute error against")
+        P("    ground truth.  `paired` is the same arm's shift from the untouched")
+        P("    short-answer model, which is the precisely measured quantity.")
         for err, arm, cell in ranked[:8]:
-            P(f"      {arm:>12s}  {cell[0]:>+7.3f} +-{cell[1]:.3f}   |error| {err:.3f}")
+            pc = paired[arm][gl]
+            P(f"      {arm:>12s}  {cell[0]:>+7.3f} +-{cell[1]:.3f}   |error| {err:.3f}"
+              f"   paired {pc[0]:>+7.3f} +-{pc[1]:.3f}")
         P("    WORST:")
         for err, arm, cell in ranked[-3:]:
-            P(f"      {arm:>12s}  {cell[0]:>+7.3f} +-{cell[1]:.3f}   |error| {err:.3f}")
+            pc = paired[arm][gl]
+            P(f"      {arm:>12s}  {cell[0]:>+7.3f} +-{cell[1]:.3f}   |error| {err:.3f}"
+              f"   paired {pc[0]:>+7.3f} +-{pc[1]:.3f}")
+        if m["family"] == "real":
+            P("")
+            P("    CAVEAT for real images: the absolute error is dominated by the model's")
+            P("    content prior about where a thing belongs -- a horse low, a sombrero")
+            P("    high -- which spread the pilot's crossings over ~2.9 patches.  That is")
+            P("    a real error against ground truth and it is fair to count it, but it is")
+            P("    not positional, no frozen phase should be expected to fix it, and it is")
+            P("    why the paired column is the one that resolves arm from arm.  The")
+            P("    square has no such prior, which is why E2 was synthetic.")
         P("")
         P("    FLATNESS CHECK -- a frozen arm should barely move with the gap, since its")
         P("    image attention no longer knows the distance.  What is left is the t axis,")
@@ -761,10 +802,20 @@ def main():
     # Pass these as --offsets-real=-1.5,... : argparse reads a space-separated value
     # beginning with a minus sign as another flag.
     ap.add_argument("--offsets-synth", default="-3,-2,-1.5,-1,-0.5,0,0.5,1")
-    ap.add_argument("--offsets-real", default="-1.5,-1,-0.5,0,0.5,1,1.5")
+    # WHOLE patches only.  A sub-patch translation re-aligns content to the patch
+    # grid, which changes the features and not just the position: in the pilot one
+    # docvqa page read +5.59 at half-patch offsets and -1.88 at whole-patch ones, a
+    # 7.5-logit sawtooth with nothing to do with where the box was.  A whole-patch
+    # shift maps patch k onto patch k+n exactly and cannot alias.  The square is
+    # insensitive to this, so the synthetic sweep keeps E2's fractional offsets.
+    ap.add_argument("--offsets-real", default="-2,-1,0,1,2")
     ap.add_argument("--colours", default="red,blue,green,yellow")
-    ap.add_argument("--n-real", type=int, default=20)
-    ap.add_argument("--pool", type=int, default=1500)
+    # The pilot put the between-stimulus spread of the crossing at 2.9 patches --
+    # that is the model's content prior about where a horse or a sombrero lives, not
+    # measurement noise -- so the ABSOLUTE level needs many stimuli to pin down.
+    # Arm-to-arm differences are paired on the same stimulus and are far cheaper.
+    ap.add_argument("--n-real", type=int, default=120)
+    ap.add_argument("--pool", type=int, default=2500)
     ap.add_argument("--target-h", type=int, default=512)
     ap.add_argument("--max-box-h", type=float, default=0.35)
     ap.add_argument("--max-box-w", type=float, default=0.6)
