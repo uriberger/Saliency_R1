@@ -31,17 +31,32 @@ ACCOUNT=nvr_israel_rlop
 PARTITION=${PARTITION:-$(sr1_pick_partition batch_singlenode batch_long batch)}
 
 RUN_DIR=""
-# One GPU per eval job. The mini suites are 100 docs per benchmark, so this is a
-# small job, and a single-GPU allocation gets scheduled while a 4-GPU one is still
-# queued behind the 8-GPU training run it is supposed to be tracking. The trade is
-# wall clock, which run_bench_eval.sh's --min-minutes guard scales with this number.
+# One GPU per eval job: a single-GPU allocation gets scheduled while a 4-GPU one
+# is still queued behind the 8-GPU training run it is supposed to be tracking. The
+# trade is wall clock, which run_bench_eval.sh's guard scales with this number --
+# and at 300 documents per natural benchmark it is what forces per-task banking,
+# since no allocation this size can hold a whole suite.
 NUM_GPUS=1
 EVERY=100
 SAMPLE_N=""
-NATURAL_N=""
-NONNATURAL_N=""
+# 300 documents per natural benchmark, 100 per non-natural one. This is the size
+# the during-training curve is measured at, because 100 could not resolve what the
+# runs actually differ by: se on a difference between two checkpoints was 0.028
+# against effects of 0.02-0.035, and even paired over items it is 0.016 -- still
+# wider than the best run's advantage over the model it started from. 300 takes
+# the paired figure to ~0.009.
+#
+# It costs about 3.6 single-GPU hours per checkpoint against 1.6 at n=100, i.e.
+# ~4 one-hour jobs instead of ~2. If training outruns that, raise --every rather
+# than lowering this: a sparser curve of numbers that mean something beats a dense
+# curve of noise. Pass --natural-n 100 for the old behaviour.
+NATURAL_N=300
+NONNATURAL_N=100
 declare -a TASK_N=()
-BANK=suite
+# Sized to the allocation rather than fixed: at 300 documents a suite no longer
+# fits an hour, and a job that cannot finish its own unit banks nothing and is
+# resubmitted forever. See plan_units() in eval_mini/benchmarks.py.
+BANK=auto
 STEPS_FILTER=""
 INTERVAL=60
 # Ask for one hour, not the partition's 4h maximum. batch_singlenode caps jobs at

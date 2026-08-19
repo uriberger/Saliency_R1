@@ -25,9 +25,12 @@
 #
 # What a unit is depends on --bank:
 #
-#   --bank suite   (default)  natural / mme-realworld / non-natural, three units
-#                             of 14-40 min at 100 documents per benchmark
-#   --bank task               one unit per benchmark, thirteen of 6-66 min
+#   --bank auto    (default)  suite while the suites fit the allocation, task
+#                             once they do not -- derived from the measured cost
+#                             and the job's own wall clock, so the pair
+#                             (sample size, granularity) cannot be set wrong
+#   --bank suite              natural / mme-realworld / non-natural, three units
+#   --bank task               one unit per benchmark, thirteen of them
 #
 # Suite banking is right at 100 documents and wrong above it: the natural suite
 # at 300 is ~105 minutes and can never finish inside a one-hour allocation, so it
@@ -79,7 +82,7 @@ SAMPLE_N=""
 NATURAL_N=""
 NONNATURAL_N=""
 declare -a TASK_N=()
-BANK=suite
+BANK=auto
 # Explicit list of steps to evaluate. Overrides the `% EVERY` rule, which is what
 # lets rerun_bench_evals.sh ask for exactly the checkpoints that already have a
 # result rather than every checkpoint on disk.
@@ -121,6 +124,10 @@ done
 # The merge is a file copy, not GPU work, so it costs the same at any allocation
 # size. Only charged against the clock when there is no merged model to reuse.
 MERGE_MINUTES=10
+# The countdown starts when this script does, which is a minute or two after the
+# allocation did -- the wrapper has to stage a container first. SAFETY_MARGIN
+# covers that gap plus teardown, so the estimate stays on the pessimistic side.
+SAFETY_MARGIN=5
 
 [[ -n "$RUN_DIR" ]] || { echo "error: --run-dir is required" >&2; exit 2; }
 [[ -d "$RUN_DIR" ]] || { echo "error: no such run dir: $RUN_DIR" >&2; exit 2; }
@@ -194,13 +201,36 @@ mkdir -p "$PROFILE_DIR" "$PARTIAL_DIR"
 # tag <TAB> tasks <TAB> minutes <TAB> extra args, largest first. The cost table
 # and the knowledge that mme-realworld needs its own resolution both live in
 # eval_mini/benchmarks.py, next to the benchmark table they describe.
-declare -a UNIT_TAG=() UNIT_TASKS=() UNIT_MINUTES=() UNIT_EXTRA=()
+#
+# WINDOW is the usable wall clock of this allocation, and it decides two things:
+# which granularity `--bank auto` picks, and (below) the ceiling on what any one
+# unit is allowed to ask for.
+WINDOW=0
+(( JOB_MINUTES > 0 )) && WINDOW=$(( JOB_MINUTES - SAFETY_MARGIN ))
+
+declare -a UNIT_TAG=() UNIT_TASKS=() UNIT_MINUTES=() UNIT_EXTRA=() CLAMPED=()
 while IFS=$'\t' read -r tag tasks minutes extra; do
     [[ -n "$tag" ]] || continue
+    need=${MIN_MINUTES:-$minutes}
+    # A unit budgeted more than the ENTIRE allocation can never satisfy the guard
+    # below, so the guard would decline to start it on every job, forever: the
+    # checkpoint would never complete, the dispatcher would resubmit, and nothing
+    # would say why. mmstar at 300 documents is exactly this -- 66 minutes
+    # budgeted against a 55 minute window, though its median is ~50.
+    #
+    # So the requirement is capped at the window. The unit is then attempted at
+    # the start of a fresh job, where it has the whole allocation, and either
+    # finishes or is killed at the wall clock and retried. That wastes a job when
+    # it loses, which is worth it against a checkpoint that never finishes; the
+    # way to stop paying it is to shrink the unit (--task-n mmstar=200).
+    if (( WINDOW > 0 && need > WINDOW )); then
+        CLAMPED+=("$tag(${need}min)")
+        need=$WINDOW
+    fi
     UNIT_TAG+=("$tag"); UNIT_TASKS+=("$tasks")
-    UNIT_MINUTES+=("${MIN_MINUTES:-$minutes}"); UNIT_EXTRA+=("$extra")
+    UNIT_MINUTES+=("$need"); UNIT_EXTRA+=("$extra")
 done < <(python "$SCRIPT_DIR/bench_eval.py" --plan --bank "$BANK" \
-             --sample-n "$SAMPLE_N_JSON" --num-gpus "$NUM_GPUS")
+             --sample-n "$SAMPLE_N_JSON" --num-gpus "$NUM_GPUS" --window "$WINDOW")
 (( ${#UNIT_TAG[@]} > 0 )) || { echo "error: could not plan the units" >&2; exit 1; }
 
 # ---------- banking a finished unit ----------
@@ -299,10 +329,6 @@ pending_steps() {
 # what let earlier jobs run head-first into the wall clock and TIMEOUT rather than
 # stopping at a unit boundary.
 #
-# The countdown starts when this script does, which is a minute or two after the
-# allocation did -- the wrapper has to stage a container first. SAFETY_MARGIN
-# covers that gap plus teardown, so the estimate stays on the pessimistic side.
-SAFETY_MARGIN=5
 minutes_left() {
     local left
     if (( JOB_MINUTES > 0 )); then
@@ -383,11 +409,16 @@ echo "Run dir:    $RUN_DIR"
 echo "Pending:    $(pending_steps | tr '\n' ' ')"
 echo "GPUs:       $NUM_GPUS   cadence: $([[ -n "$STEPS_FILTER" ]] && echo "steps $STEPS_FILTER" || echo "every $EVERY steps")"
 echo "Profile:    $PROFILE   ->  $PROFILE_DIR"
-echo "Banking:    per $BANK, ${#UNIT_TAG[@]} unit(s), largest first"
+echo "Banking:    per $BANK -> ${#UNIT_TAG[@]} unit(s), largest first$( (( WINDOW > 0 )) && echo ", ${WINDOW}min usable")"
 for i in "${!UNIT_TAG[@]}"; do
     printf '  %-14s %3s min  %s\n' "${UNIT_TAG[$i]}" "${UNIT_MINUTES[$i]}" "${UNIT_TASKS[$i]}"
 done
 echo "Banked:     $PARTIAL_DIR"
+if (( ${#CLAMPED[@]} > 0 )); then
+    echo "WARNING:    ${CLAMPED[*]} budgeted above the ${WINDOW}min window -- attempted at the"
+    echo "            start of a job, and lost to the wall clock when it overruns. Shrink it"
+    echo "            with --task-n <benchmark>=<n> to stop paying for the retries."
+fi
 echo "=========================================================================="
 
 if $DRY_RUN; then

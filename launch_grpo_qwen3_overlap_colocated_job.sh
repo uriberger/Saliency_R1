@@ -138,6 +138,7 @@
 #   NATURAL_ONLY=true            (same as --natural-only; --no-natural-only to force off)
 #   SAVE_STEPS=10   CKPT_KEEP_EVERY=100
 #   EVAL_STEPS=100   VAL_SETS_DIR=<dir>   AUTO_BENCH=true   BENCH_GPUS=1
+#   BENCH_NATURAL_N=300   BENCH_NONNATURAL_N=100
 #   DINO_PORT=8100   VLLM_PORT=8000   VLLM_MAX_MODEL_LEN=4096
 #   VLLM_GPU_MEM     (default 0.90, or 0.85 with --share-sidecar-gpu)
 #   SHARE_SIDECAR_GPU=true   (same as --share-sidecar-gpu; --no-share-sidecar-gpu to force off)
@@ -199,12 +200,21 @@ VAL_SETS_DIR=${VAL_SETS_DIR:-$REPO/cold_data/grpo_sets}
 # submits a $BENCH_GPUS-GPU job whenever a kept checkpoint is waiting to be scored.
 # It holds no GPU itself. --no-auto-bench turns it off.
 #
-# One GPU, not four: a mini suite is 100 docs per benchmark, so the job is small
-# enough to fit in a single-GPU allocation, which schedules far sooner than a
-# 4-GPU one next to an 8-GPU training run. It takes proportionally longer in
-# wall clock, which run_bench_eval.sh accounts for in its --min-minutes guard.
+# One GPU, not four: a single-GPU allocation schedules far sooner than a 4-GPU one
+# next to an 8-GPU training run. It takes proportionally longer in wall clock,
+# which run_bench_eval.sh accounts for in its own guard.
+#
+# BENCH_NATURAL_N is the documents per natural benchmark, and 300 is not free:
+# roughly 3.6 single-GPU hours per checkpoint against 1.6 at 100, i.e. ~4 one-hour
+# jobs instead of ~2. It buys the only thing that makes the curve worth reading --
+# se on a difference between two checkpoints falls from 0.016 (paired at 100) to
+# ~0.009, against effects of 0.02-0.035. If the dispatcher cannot keep up with
+# training, raise CKPT_KEEP_EVERY rather than lowering this: a sparser curve of
+# numbers that mean something beats a dense curve of noise.
 AUTO_BENCH=${AUTO_BENCH:-true}
 BENCH_GPUS=${BENCH_GPUS:-1}
+BENCH_NATURAL_N=${BENCH_NATURAL_N:-300}
+BENCH_NONNATURAL_N=${BENCH_NONNATURAL_N:-100}
 EXTRA_ARGS=""
 DIRECT=false
 
@@ -576,7 +586,7 @@ echo "Metric:           $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " ma
 echo "Overlap rows:     $([ "$NATURAL_ONLY" = true ] && echo 'natural images only (non-natural: format+accuracy+judge)' || echo 'all rows')"
 echo "Validation:       $([ -n "$VAL_SETS_DIR" ] && echo "accuracy only, step 0 then every $EVAL_STEPS steps, from $VAL_SETS_DIR" || echo 'off')"
 echo "Checkpoints:      save every $SAVE_STEPS, keep every $CKPT_KEEP_EVERY"
-echo "Benchmarks:       $([ "$AUTO_BENCH" = true ] && echo "dispatcher auto-started (${BENCH_GPUS}-GPU jobs)" || echo 'off (see --auto-bench)')"
+echo "Benchmarks:       $([ "$AUTO_BENCH" = true ] && echo "dispatcher auto-started (${BENCH_GPUS}-GPU jobs), ${BENCH_NATURAL_N} natural / ${BENCH_NONNATURAL_N} non-natural docs per benchmark" || echo 'off (see --auto-bench)')"
 echo "Batch:            per_device=$PER_DEVICE_BATCH num_generations=$NUM_GENERATIONS grad_accum=$GRAD_ACCUM  (gen_batch=$(( PER_DEVICE_BATCH * TRAIN_N * GRAD_ACCUM )))"
 echo "LoRA targets:     ${LORA_TARGETS//,/ }"
 echo "T5 step clf:      $OVERLAP_STEPS_DEVICE  ckpt=$OVERLAP_STEPS_CKPT"
@@ -905,7 +915,8 @@ if [[ "$AUTO_BENCH" == true ]]; then
     echo "$MODEL" > "$OUTPUT_DIR/bench_eval/base_model.txt"
     echo "[bench] starting the benchmark dispatcher for $OUTPUT_DIR"
     bash "$REPO/watch_bench_evals.sh" --run-dir "$OUTPUT_DIR" --num-gpus "$BENCH_GPUS" \
-        --every "$CKPT_KEEP_EVERY" > "$LOG_DIR/bench_watcher.log" 2>&1 &
+        --every "$CKPT_KEEP_EVERY" --natural-n "$BENCH_NATURAL_N" \
+        --nonnatural-n "$BENCH_NONNATURAL_N" > "$LOG_DIR/bench_watcher.log" 2>&1 &
     BENCH_WATCHER_PID=$!
     sleep 5
     if kill -0 "$BENCH_WATCHER_PID" 2>/dev/null; then
@@ -921,7 +932,8 @@ if [[ "$AUTO_BENCH" == true ]]; then
         echo "        node (it needs no GPUs):" >&2
         echo "" >&2
         echo "          bash $REPO/watch_bench_evals.sh --run-dir $OUTPUT_DIR \\" >&2
-        echo "               --num-gpus $BENCH_GPUS --every $CKPT_KEEP_EVERY" >&2
+        echo "               --num-gpus $BENCH_GPUS --every $CKPT_KEEP_EVERY \\" >&2
+        echo "               --natural-n $BENCH_NATURAL_N --nonnatural-n $BENCH_NONNATURAL_N" >&2
         echo "==========================================================================" >&2
     fi
 fi

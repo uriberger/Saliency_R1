@@ -369,7 +369,7 @@ def do_plan(args):
     from benchmarks import plan_units
 
     sample_n = json.loads(args.sample_n) if args.sample_n else None
-    for tag, tasks, extra, minutes in plan_units(args.bank, sample_n, args.num_gpus):
+    for tag, tasks, extra, minutes in plan_units(args.bank, sample_n, args.num_gpus, args.window):
         print(f"{tag}\t{','.join(tasks)}\t{minutes:.0f}\t{extra}")
 
 
@@ -379,8 +379,10 @@ def main():
     p.add_argument("--collect", action="store_true", help="reduce lmms-eval output to one step file")
     p.add_argument("--plan", action="store_true",
                    help="print the banking units and their minute estimates as TSV")
-    p.add_argument("--bank", choices=("suite", "task"), default="suite",
-                   help="the unit a job banks progress in (--plan)")
+    p.add_argument("--bank", choices=("auto", "suite", "task"), default="auto",
+                   help="the unit a job banks progress in; auto sizes it to --window (--plan)")
+    p.add_argument("--window", type=int, default=0,
+                   help="usable minutes in the allocation, for --bank auto (--plan)")
     p.add_argument("--num-gpus", type=int, default=1, help="allocation size, for the estimate (--plan)")
     p.add_argument("--carried-from", metavar="DIR",
                    help="print {unit: profile} for the reused banked units in DIR")

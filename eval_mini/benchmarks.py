@@ -331,7 +331,7 @@ def estimate_minutes(tasks, sample_n=None, num_gpus=1, load=True):
 MMERW_ARGS = "--max-pixels 3211264"
 
 
-def plan_units(bank="suite", sample_n=None, num_gpus=1):
+def plan_units(bank="auto", sample_n=None, num_gpus=1, window=0):
     """The list of things a job can finish and bank, largest first.
 
     A unit is one lmms-eval invocation whose results are recorded the moment it
@@ -347,18 +347,35 @@ def plan_units(bank="suite", sample_n=None, num_gpus=1):
     the first that does not) then puts the expensive units in the jobs that can
     hold them and fills the rest with the cheap ones.
 
+    `bank="auto"` (the default) picks suite when the suites fit the job's window
+    and task when they do not. That is not a convenience: the two settings are
+    coupled to the sample size, and getting the pair wrong is silent and fatal.
+    A job asked for 300 documents with suite banking would budget 115 minutes for
+    the natural suite, never satisfy its own guard in a one-hour allocation, bank
+    nothing, and be resubmitted forever -- a checkpoint that never finishes and
+    never says why. Deriving it from the measured cost removes the possibility.
+
     Returns [(tag, [tasks], extra_args, minutes)].
     """
     natural = [t for t in suite_tasks("natural") if base_task(t) != "mmerealworld"]
-    if bank == "suite":
-        groups = [("natural", natural, ""),
-                  ("mmerw", ["mmerealworld_mini"], MMERW_ARGS),
-                  ("nonnatural", suite_tasks("nonnatural"), "")]
+    by_suite = [("natural", natural, ""),
+                ("mmerw", ["mmerealworld_mini"], MMERW_ARGS),
+                ("nonnatural", suite_tasks("nonnatural"), "")]
+    by_task = [(base_task(t), [t], MMERW_ARGS if base_task(t) == "mmerealworld" else "")
+               for t in suite_tasks("natural") + suite_tasks("nonnatural")]
+
+    if bank == "auto":
+        groups = by_suite
+        if window and any(estimate_minutes(tasks, sample_n, num_gpus) > window
+                          for _tag, tasks, _extra in by_suite):
+            groups = by_task
+    elif bank == "suite":
+        groups = by_suite
     elif bank == "task":
-        groups = [(base_task(t), [t], MMERW_ARGS if base_task(t) == "mmerealworld" else "")
-                  for t in suite_tasks("natural") + suite_tasks("nonnatural")]
+        groups = by_task
     else:
-        raise SystemExit(f"unknown banking unit: {bank!r} (suite | task)")
+        raise SystemExit(f"unknown banking unit: {bank!r} (auto | suite | task)")
+
     units = [(tag, tasks, extra, estimate_minutes(tasks, sample_n, num_gpus))
              for tag, tasks, extra in groups]
     return sorted(units, key=lambda u: -u[3])

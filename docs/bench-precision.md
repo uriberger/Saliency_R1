@@ -187,32 +187,63 @@ and killed at the wall clock banks nothing and is repeated from scratch, while a
 unit not started costs only a resubmission.
 
 **The natural suite at 300 cannot finish in a one-hour job**, so it would be
-started, killed and repeated forever. The banking unit is therefore selectable:
+started, killed and repeated forever. The banking unit is therefore derived from
+the cost and the job's own wall clock rather than set by hand:
 
 ```
---bank suite   (default)  3 units    right at n=100
---bank task               13 units   required above it, costs 4 extra model loads (~6 min)
+--bank auto   (default)  suite while the suites fit, task once they do not
+--bank suite             3 units    right at n=100, and at n=300 on 8 GPUs
+--bank task              13 units   required at n=300 on 1 GPU, costs 4 extra loads (~6 min)
 ```
+
+`auto` exists because the pair (sample size, granularity) is coupled, and setting
+it wrong is silent and fatal — a job that cannot finish its own unit banks
+nothing, writes no step file, and is resubmitted forever with nothing in the log
+to say why.
 
 Units are attempted largest-first, and one that does not fit the remaining clock
 is **skipped so the next is tried**, rather than ending the job — so the merge is
 paid once and the small units still fill the tail of a window.
 
+**One unit is over even at task granularity: mmstar at 300 is budgeted 66 min
+against a 55 min window.** A guard that took that literally would decline to start
+it on every job — the same forever-loop. So a unit's requirement is capped at the
+whole window: it is attempted at the start of a fresh job, where it has the full
+allocation, and either finishes (median ~50 min) or is killed and retried. The
+banner warns when this is happening. `--task-n mmstar=200` (44 min) stops paying
+for the retries, at the cost of a benchmark measured on fewer documents than its
+neighbours.
+
 ---
 
-## The one decision left
+## Where 300 is now the default
 
-**mmstar at n=300 is budgeted 66 minutes against a 55-minute usable window.** Its
-median is ~50 min, so it will usually finish and sometimes be killed and repeated,
-costing perhaps a quarter of a job per checkpoint. The alternative is
-`--task-n mmstar=200`, which fits (44 min) and still doubles its sample; the cost
-is that `bench/natural/mean` then averages benchmarks with different item counts,
-which is exactly why `--compare` pools items instead.
+Every path that scores a checkpoint is at **natural = 300, non-natural = 100**:
 
-`rerun_bench_evals.py` prints this warning with the numbers every time. It is left
-as a choice because it changes what gets measured.
+| | default | cost per checkpoint |
+|---|---|---|
+| during training (`watch_bench_evals.sh`, and the colocated launcher through it) | 300/100, `--bank auto` → per task | ~3.6 GPU-h, ~4 one-hour jobs |
+| named checkpoints (`run_bench_eval_steps.sh`, 8 GPUs) | 300/100, per suite | ~28 min |
+| the historical sweep (`rerun_bench_evals.py`) | 300/100, per task | ~2.9 GPU-h |
 
-**And how much history to re-score.** The full sweep is 537 single-GPU hours,
+`--natural-n 100` restores the old size anywhere; `BENCH_NATURAL_N=100` does it
+for a training launch.
+
+At 100 the during-training eval was ~1.6 GPU-h per checkpoint, so this is roughly
+2.2× the eval load, and the dispatcher runs one job at a time. **If training
+produces checkpoints faster than ~4 hours apart, the curve will fall behind.** The
+fix is `CKPT_KEEP_EVERY` (the dispatcher's `--every`), not a smaller sample: a
+sparser curve of numbers that mean something beats a dense curve of noise.
+
+One thing to know before pointing this at a run that already has history: the
+dispatcher drains oldest-first, and at the new profile *every* existing checkpoint
+counts as unscored. A run mid-training would go back to step 0 and never catch up.
+Use `rerun_bench_evals.py --every 500` for the history and let the dispatcher take
+new checkpoints.
+
+## The decision left
+
+**How much history to re-score.** The full sweep is 537 single-GPU hours,
 ~590 one-hour jobs:
 
 ```

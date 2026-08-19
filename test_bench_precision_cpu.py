@@ -265,6 +265,28 @@ def test_units_and_cost():
     task = plan_units("task", DEFAULT_SUITE_N)
     check("task banking gives one unit per benchmark", len(task), 13)
 
+    # `auto` couples the granularity to the sample size, because getting that pair
+    # wrong is silent and fatal: 300 documents with suite banking budgets 115 min
+    # for the natural suite, never satisfies the guard in a one-hour job, banks
+    # nothing, and is resubmitted forever.
+    n300 = {"natural": 300, "nonnatural": 100}
+    check("auto stays per-suite at n=100 on 1 GPU",
+          len(plan_units("auto", DEFAULT_SUITE_N, num_gpus=1, window=55)), 3)
+    check("auto switches to per-task at n=300 on 1 GPU",
+          len(plan_units("auto", n300, num_gpus=1, window=55)), 13)
+    check("auto stays per-suite at n=300 on 8 GPUs, where a suite still fits",
+          len(plan_units("auto", n300, num_gpus=8, window=55)), 3)
+    check("auto with no window stated cannot size anything, so it keeps suites",
+          len(plan_units("auto", n300, num_gpus=1, window=0)), 3)
+
+    # And the reason run_bench_eval.sh caps a unit's requirement at the window:
+    # this one is over it even after switching to tasks, so a guard that took the
+    # estimate literally would decline to start it on every job, forever.
+    largest = plan_units("auto", n300, num_gpus=1, window=55)[0]
+    check_true(f"the largest n=300 unit still exceeds a 55min window ({largest[0]}, "
+               f"{largest[3]:.0f}min) -- hence the clamp in run_bench_eval.sh",
+               largest[3] > 55, f"{largest[0]} {largest[3]:.1f}")
+
     # The estimator is checked against what was actually measured on 1 GPU: the
     # natural suite's median is 29.8 min and its p90 is 39.6, and the guard is
     # meant to sit at the p90 -- a unit started and killed banks nothing.
