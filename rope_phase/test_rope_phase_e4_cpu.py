@@ -19,6 +19,7 @@ come back bit-identical.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -269,6 +270,48 @@ def test_fit_zero_recovers_a_planted_midline():
     # a flat curve has no midline to report, and the slope says so
     z, slope = E4.fit_zero(offs, np.zeros_like(offs))
     assert np.isnan(z) and abs(slope) < 1e-9
+
+
+def _write_partial(tmp, meta, ev, done):
+    np.savez(tmp, ev=ev, __meta__=np.frombuffer(
+        json.dumps({**meta, "done": done}).encode(), dtype=np.uint8))
+
+
+def test_resume_keeps_finished_stimuli_and_redoes_nothing_else():
+    import tempfile
+
+    shape = (5, 3, 2, 2)
+    meta = {"family": "real", "offsets": [-1.0, 0.0, 1.0], "d0s": [24],
+            "gaps": [0, 512], "arms": ["none", "frozen:24"], "image_side": 768,
+            "square_px": 64, "target_h": 512, "base_model": "m", "dataset": "d",
+            "gh": 24, "gw": 24, "rows": [{"row_index": i} for i in range(5)]}
+    ev = np.full(shape, np.nan)
+    ev[:3] = 1.0
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "scan_real.npz"
+        _write_partial(p, meta, ev, 3)
+        got, done = E4._load_partial(p, meta, shape)
+        assert done == 3 and np.all(got[:3] == 1.0) and np.isnan(got[3]).all()
+
+        # a counter left ahead of the data by a kill mid-write must not be believed
+        ev2 = np.full(shape, np.nan)
+        ev2[:2] = 1.0
+        _write_partial(p, meta, ev2, 4)
+        _, done2 = E4._load_partial(p, meta, shape)
+        assert done2 == 2, (done2, "trusted a count the data does not back up")
+
+        # a different sweep must be refused, not silently stitched together
+        for key, bad in (("d0s", [25]), ("gaps", [0, 256]), ("dataset", "other"),
+                         ("offsets", [-2.0, 0.0, 2.0]),
+                         ("rows", [{"row_index": i} for i in range(5, 10)])):
+            try:
+                E4._load_partial(p, {**meta, key: bad}, shape)
+            except SystemExit:
+                continue
+            raise AssertionError(f"a sweep differing on {key} was accepted")
+
+        # and a fresh directory simply starts at zero
+        assert E4._load_partial(Path(td) / "absent.npz", meta, shape) == (None, 0)
 
 
 def test_arm_labels_and_d0_parsing():

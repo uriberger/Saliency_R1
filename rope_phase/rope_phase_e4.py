@@ -328,6 +328,43 @@ def fit_zero(offsets, ev):
 
 
 # ---------------------------------------------------------------------------
+# Keys that define the sweep.  If any of them differs, two files are answers to
+# different questions and must not be stitched together -- the same discipline E0's
+# report applies to its shards.
+RESUME_KEYS = ("family", "offsets", "d0s", "gaps", "arms", "image_side", "square_px",
+               "target_h", "base_model", "dataset", "gh", "gw", "colours", "rows")
+
+
+def _load_partial(out_path, meta, shape):
+    """Stimuli already done by an earlier run of the SAME sweep.
+
+    The stimulus list is deterministic -- a fixed seed, a fixed filter, taken in
+    order -- so stimulus i is the same picture in every run of one sweep, and the
+    finished rows can simply be kept.  Anything that would change what stimulus i
+    IS appears in RESUME_KEYS and refuses the merge instead.
+    """
+    if out_path is None or not out_path.exists():
+        return None, 0
+    z = np.load(out_path, allow_pickle=False)
+    old = json.loads(bytes(z["__meta__"]).decode())
+    diff = [k for k in RESUME_KEYS if old.get(k) != meta.get(k)]
+    if diff:
+        raise SystemExit(
+            f"{out_path.name} was written by a different sweep (differs on {diff}). "
+            f"Use a fresh --out-dir; stitching two sweeps together would report a "
+            f"table whose rows came from different experiments.")
+    ev_old = z["ev"]
+    if tuple(ev_old.shape) != tuple(shape):
+        raise SystemExit(f"{out_path.name} has shape {ev_old.shape}, this sweep needs "
+                         f"{tuple(shape)}; use a fresh --out-dir")
+    done = int(old.get("done", 0))
+    # Trust the counter only as far as the data backs it up: a run killed mid-write
+    # could leave the count ahead of the values.
+    while done > 0 and not np.all(np.isfinite(ev_old[done - 1])):
+        done -= 1
+    return ev_old, done
+
+
 @torch.no_grad()
 def _sweep(model, ids, ctl, rotary, cases, offsets, d0s, gaps, device, label,
            out_path=None, meta=None):
@@ -335,9 +372,18 @@ def _sweep(model, ids, ctl, rotary, cases, offsets, d0s, gaps, device, label,
     image_token_id = int(getattr(model.config, "image_token_id", None) or RP.IMAGE_TOKEN_ID)
     dummy = torch.zeros(1, 1, 1, dtype=next(model.parameters()).dtype, device=device)
     inner = model.model if hasattr(model, "model") else model
-    ev = np.full((len(cases), len(offsets), 1 + len(d0s), len(gaps)), np.nan)
+    shape = (len(cases), len(offsets), 1 + len(d0s), len(gaps))
+    ev_old, start = _load_partial(out_path, meta, shape)
+    ev = np.full(shape, np.nan) if ev_old is None else ev_old.copy()
+    if start:
+        print(f"[e4] {label}: resuming, {start}/{len(cases)} stimuli already done",
+              flush=True)
+        if start >= len(cases):
+            return ev
     t0 = time.time()
     for si, mk in enumerate(cases):
+        if si < start:
+            continue
         for oi, off in enumerate(offsets):
             case = mk(off)
             input_ids = case["input_ids"]
@@ -360,8 +406,11 @@ def _sweep(model, ids, ctl, rotary, cases, offsets, d0s, gaps, device, label,
                         model(**case, position_ids=pos, use_cache=False).logits, ids)
                     ctl.disarm()
         el = time.time() - t0
+        # Rate over what THIS run has done, not over the resumed count, or a resumed
+        # job reports an ETA based on work it never did.
+        rate = el / max(si + 1 - start, 1)
         print(f"[e4] {label}: {si + 1}/{len(cases)} stimuli, {el / 60:.1f} min elapsed, "
-              f"~{el * len(cases) / (si + 1) / 60:.1f} min total", flush=True)
+              f"~{rate * (len(cases) - si - 1) / 60:.1f} min left", flush=True)
         # Written after every stimulus: a job killed at the wall clock should not
         # cost the whole sweep, which is what E0's all-or-nothing shard write did.
         if out_path is not None:
