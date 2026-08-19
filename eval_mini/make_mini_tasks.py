@@ -22,17 +22,26 @@ lmms-eval resolves `include` against an absolute path and resolves `!function`
 against the *including* file's directory, so this works from a --include_path dir
 without touching the lmms-eval clone at all.
 
-Usage:
-    python eval_mini/make_mini_tasks.py --out-dir <dir> [--lmms-eval-dir DIR] [--n 100]
+Sample sizes are per suite, and may be overridden per task:
+
+    python eval_mini/make_mini_tasks.py --out-dir <dir> [--lmms-eval-dir DIR]
+        [--n 100 | --natural-n 300 --nonnatural-n 100] [--task-n mmstar=200]
+
+`--n` sets both suites and is what every existing caller passes. The split exists
+because the two suites are not equally worth resampling or equally cheap: the
+effects being chased are on the natural benchmarks, and the non-natural suite
+generates 4x the tokens per document.
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchmarks import BENCHMARKS, MINI_SUFFIX, SUITES, suite_tasks  # noqa: E402
+from benchmarks import (BENCHMARKS, DEFAULT_SUITE_N, MINI_SUFFIX, SUITES,  # noqa: E402
+                        base_task, profile_name, suite_tasks, task_sample_n)
 
 SAMPLER = '''"""Seeded subsample, applied by every mini task config.
 
@@ -41,22 +50,35 @@ against each other, which only means anything if every checkpoint is scored on t
 same documents. `datasets.shuffle` with an explicit seed is a deterministic
 permutation, so the sample is reproducible across processes, machines and reruns.
 
+It is also a permutation that does not depend on how many rows are then taken, so
+`select(range(100))` is a PREFIX of `select(range(300))`: raising the sample size
+adds documents and moves none. That is what lets an old 100-item result stay valid
+for the items it covers, and lets a 100-item run be compared with a 300-item one
+over their shared 100.
+
+The sizes are per task rather than one global, because `process_docs` is handed
+only the dataset -- no task name, no config -- so a single module-level SAMPLE_N
+could not differ between the suites. One sampler function is emitted per distinct
+size instead, and each task's yaml names the one it wants.
+
 Splits smaller than the sample size are returned whole rather than padded.
 """
 
 import random
 
-SAMPLE_N = {n}
+# What was generated, for the record. Nothing reads it at eval time; it is here so
+# that a config directory found on disk says what it samples.
+SAMPLE_N = {sample_n}
 SAMPLE_SEED = {seed}
 
 
-def take(dataset):
-    if len(dataset) <= SAMPLE_N:
+def _take(dataset, n):
+    if len(dataset) <= n:
         return dataset
-    return dataset.shuffle(seed=SAMPLE_SEED).select(range(SAMPLE_N))
+    return dataset.shuffle(seed=SAMPLE_SEED).select(range(n))
 
 
-def take_groups(dataset, key, stratify=None):
+def _take_groups(dataset, n, key, stratify=None):
     """Subsample whole groups of rows that share `dataset[key]`.
 
     Some benchmarks do not score a row on its own. MME scores an image from the
@@ -66,7 +88,7 @@ def take_groups(dataset, key, stratify=None):
     has generated, so one broken task discards all of them).
 
     Groups are drawn, not rows, so the sample is always whole. The count is still
-    measured in rows -- SAMPLE_N=100 over pairs means 50 images -- so a grouped
+    measured in rows -- n=100 over pairs means 50 images -- so a grouped
     benchmark costs the same as an ungrouped one rather than 2x.
 
     With `stratify`, groups are taken round-robin over that column instead of in
@@ -79,12 +101,17 @@ def take_groups(dataset, key, stratify=None):
     Selection order comes from `random.Random(SAMPLE_SEED)` over the group keys,
     not `datasets.shuffle`: the same groups must be chosen whatever order the rows
     arrive in. Row indices are restored to dataset order at the end so the result
-    reads like a contiguous subset.
+    reads like a contiguous subset -- which also means that unlike the ungrouped
+    sampler above, this one RENUMBERS its rows when n changes. The groups chosen
+    at n=100 are still a subset of those chosen at n=300 (MME's groups are all the
+    same size, so the greedy fill takes a strict prefix), but their positions
+    move, so a 100-vs-300 comparison of MME has to join on document content.
+    bench_samples.py stores an `item` digest for exactly that.
     """
     groups = {{}}
     for index, value in enumerate(dataset[key]):
         groups.setdefault(value, []).append(index)
-    if len(dataset) <= SAMPLE_N or len(groups) <= 1:
+    if len(dataset) <= n or len(groups) <= 1:
         return dataset
 
     rng = random.Random(SAMPLE_SEED)
@@ -112,7 +139,7 @@ def take_groups(dataset, key, stratify=None):
 
     chosen = []
     for value in order:
-        if len(chosen) + len(groups[value]) > SAMPLE_N:
+        if len(chosen) + len(groups[value]) > n:
             continue
         chosen.extend(groups[value])
     # Every group is larger than the budget: keep the smallest whole one rather
@@ -122,14 +149,23 @@ def take_groups(dataset, key, stratify=None):
     return dataset.select(sorted(chosen))
 '''
 
-# Each grouped benchmark gets its own wrapper appended to minisample.py: lmms-eval
-# resolves `!function` to a bare name and hands it only the dataset, so the column
-# names cannot travel through the yaml. Keyed by task, not by column, so two
-# benchmarks grouping on the same column name cannot collide.
+# One wrapper per distinct sample size. lmms-eval resolves `!function` to a bare
+# name and hands it only the dataset, so the size cannot travel through the yaml
+# either as an argument or as a global the config sets -- it has to be closed over
+# here, and the yaml picks the function it wants by name.
+PLAIN_SAMPLER = '''
+
+def take_{n}(dataset):
+    return _take(dataset, {n})
+'''
+
+# Each grouped benchmark gets its own wrapper for the same reason, plus one more:
+# the column names cannot travel through the yaml. Keyed by task, not by column,
+# so two benchmarks grouping on the same column name cannot collide.
 GROUP_SAMPLER = '''
 
 def take_for_{task}(dataset):
-    return take_groups(dataset, "{key}", {stratify})
+    return _take_groups(dataset, {n}, "{key}", {stratify})
 '''
 
 CONFIG = """# Generated by eval_mini/make_mini_tasks.py -- do not edit by hand.
@@ -206,20 +242,52 @@ def local_data_config(task, spec, split):
                                     split=split, path=path)
 
 
+def parse_task_n(values):
+    """`--task-n mmstar=200` pairs, into {task: n}."""
+    out = {}
+    for value in values or []:
+        task, sep, n = value.partition("=")
+        if not sep or not n.isdigit():
+            raise SystemExit(f"--task-n wants TASK=N, got {value!r}")
+        out[task.strip()] = int(n)
+    return out
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out-dir", help="where to write the generated configs")
     p.add_argument("--lmms-eval-dir", default=os.environ.get("LMMS_EVAL_DIR", ""),
                    help="lmms-eval clone (default $LMMS_EVAL_DIR)")
-    p.add_argument("--n", type=int, default=100, help="samples per benchmark (default 100)")
+    p.add_argument("--n", type=int, help="samples per benchmark in BOTH suites")
+    p.add_argument("--natural-n", type=int, help="samples per natural benchmark (default 100)")
+    p.add_argument("--nonnatural-n", type=int, help="samples per non-natural benchmark (default 100)")
+    p.add_argument("--task-n", action="append", metavar="TASK=N",
+                   help="override one benchmark's size, e.g. --task-n mmstar=200")
     p.add_argument("--seed", type=int, default=1234, help="subsample seed (default 1234)")
     p.add_argument("--print-tasks", choices=sorted(SUITES),
                    help="print the comma-separated mini task names for one suite and exit")
+    p.add_argument("--print-sample-n", action="store_true",
+                   help="print the resolved {task: n} as JSON and exit")
     args = p.parse_args()
 
     if args.print_tasks:
         print(",".join(suite_tasks(args.print_tasks)))
+        return
+
+    # --n is the old spelling and still means "both suites", so every existing
+    # caller keeps working; the per-suite flags win over it where both are given.
+    suite_n = dict(DEFAULT_SUITE_N)
+    if args.n is not None:
+        suite_n = {suite: args.n for suite in SUITES}
+    if args.natural_n is not None:
+        suite_n["natural"] = args.natural_n
+    if args.nonnatural_n is not None:
+        suite_n["nonnatural"] = args.nonnatural_n
+    sample_n = task_sample_n(suite_n, parse_task_n(args.task_n))
+
+    if args.print_sample_n:
+        print(json.dumps(sample_n, sort_keys=True))
         return
 
     if not args.out_dir:
@@ -232,12 +300,22 @@ def main():
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    sampler = SAMPLER.format(n=args.n, seed=args.seed)
+
+    sampler = SAMPLER.format(sample_n=repr(sample_n), seed=args.seed)
+    for n in sorted({n for task, n in sample_n.items()
+                     if not BENCHMARKS[base_task(task)].get("group_by")}):
+        sampler += PLAIN_SAMPLER.format(n=n)
     for task, spec in BENCHMARKS.items():
         if spec.get("group_by"):
-            sampler += GROUP_SAMPLER.format(task=task, key=spec["group_by"],
+            sampler += GROUP_SAMPLER.format(task=task, n=sample_n[f"{task}{MINI_SUFFIX}"],
+                                            key=spec["group_by"],
                                             stratify=repr(spec.get("stratify_by")))
     (out_dir / "minisample.py").write_text(sampler)
+    # Written beside the configs so that everything downstream -- the runner's
+    # banking markers, the step file, the per-item harvest -- reads the sizes that
+    # were actually generated instead of re-deriving them from flags that may have
+    # been passed differently. One job, one answer.
+    (out_dir / "sample_n.json").write_text(json.dumps(sample_n, indent=1, sort_keys=True))
 
     written = 0
     for task, spec in BENCHMARKS.items():
@@ -255,14 +333,20 @@ def main():
         extra = ""
         if spec.get("local_data"):
             extra = local_data_config(task, spec, parent_split(task, parent))
+        sampler_name = (f"take_for_{task}" if spec.get("group_by")
+                        else f"take_{sample_n[f'{task}{MINI_SUFFIX}']}")
         (out_dir / f"{task}{MINI_SUFFIX}.yaml").write_text(
             CONFIG.format(task=task, parent=parent, suffix=MINI_SUFFIX, extra=extra,
-                          sampler=f"take_for_{task}" if spec.get("group_by") else "take")
+                          sampler=sampler_name)
         )
         written += 1
 
+    sizes = ", ".join(f"{suite}={suite_n[suite]}" for suite in SUITES)
     print(f"wrote {written} mini task configs + minisample.py to {out_dir}", file=sys.stderr)
-    print(f"  {args.n} samples per benchmark, seed {args.seed}", file=sys.stderr)
+    print(f"  {sizes}, seed {args.seed}   (profile {profile_name(suite_n)})", file=sys.stderr)
+    for task, n in sorted(sample_n.items()):
+        if n != suite_n[BENCHMARKS[base_task(task)]["suite"]]:
+            print(f"  override: {task} = {n}", file=sys.stderr)
 
 
 if __name__ == "__main__":

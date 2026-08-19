@@ -11,23 +11,40 @@
 # For each pending checkpoint:
 #   1. merge the LoRA adapter into the base model (a checkpoint is 116 MB of
 #      adapter; lmms-eval needs a standalone model)
-#   2. run the natural suite, then MME-RealWorld at its test-time resolution,
-#      then the non-natural suite
+#   2. run each banking unit that fits in the remaining wall clock
 #   3. reduce the results to bench_eval/step-<N>.json, which the trainer picks up
-#      and logs to WandB
+#      and logs to WandB, and store the per-item rows beside it
 #   4. delete the merged model -- 16 GB each, and /lustre is not roomy
 #
-# Progress is banked per suite, not per checkpoint. A job that runs out of wall
-# clock after two of the three suites records what those two produced under
-# bench_eval/partial/step-<N>/ and leaves the merged model in place; the next job
-# reuses both and picks up at the third. That is what makes a one-hour allocation
-# useful: the unit of work it has to finish is a suite (~15-25 min on 1 GPU), not
-# a whole checkpoint (50-86 min) plus the merge.
+# Progress is banked per UNIT, not per checkpoint. A job that runs out of wall
+# clock after two of three units records what those produced under
+# bench_eval/[<profile>/]partial/step-<N>/ and leaves the merged model in place;
+# the next job reuses both and picks up at the units still owed. That is what
+# makes a one-hour allocation useful: the unit of work it has to finish is a
+# suite or a task, not a whole checkpoint plus the merge.
 #
-# What is NOT banked is a partial step-<N>.json. It is written only once all three
-# suites are in hand, because a half-measured checkpoint on the benchmark curve is
+# What a unit is depends on --bank:
+#
+#   --bank suite   (default)  natural / mme-realworld / non-natural, three units
+#                             of 14-40 min at 100 documents per benchmark
+#   --bank task               one unit per benchmark, thirteen of 6-66 min
+#
+# Suite banking is right at 100 documents and wrong above it: the natural suite
+# at 300 is ~105 minutes and can never finish inside a one-hour allocation, so it
+# would be started, killed and repeated forever, banking nothing. Task banking
+# costs four extra model loads (~6 min) and makes every unit finishable. The
+# minute figures come from eval_mini/benchmarks.py, measured over the 295
+# results.json this has already produced -- not guessed.
+#
+# Units are attempted largest-first, and a unit that does not fit the remaining
+# clock is SKIPPED rather than ending the job: the smaller ones behind it usually
+# still fit, and the merge is only paid once. The job stops when nothing left
+# fits.
+#
+# What is NOT banked is a partial step-<N>.json. It is written only once every
+# unit is in hand, because a half-measured checkpoint on the benchmark curve is
 # indistinguishable from a real one. The merged model is deleted at that same
-# moment -- it exists only to serve the suites still owed for that checkpoint.
+# moment -- it exists only to serve the units still owed for that checkpoint.
 #
 # Everything runs through vlm_reasoning's launch_lmms_eval_job.sh --direct, so a
 # mini benchmark is evaluated with exactly the recipe the full test suite uses
@@ -36,6 +53,8 @@
 #
 # Usage:
 #   bash run_bench_eval.sh --run-dir CKPT_DIR [--num-gpus 1] [--every 100]
+#                          [--natural-n 300] [--nonnatural-n 100]
+#                          [--task-n mmstar=200] [--bank task] [--steps 100,200]
 #
 # Environment:
 #   OPENAI_API_KEY / NVIDIA_API_KEY   needed by mathvista's llm_as_judge metric
@@ -43,6 +62,7 @@
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)
+export SCRIPT_DIR
 REPO=${REPO:-/home/uberger/scratch/research/saliency_r1}
 VLM_REASONING=${VLM_REASONING:-/home/uberger/scratch/research/vlm_reasoning}
 LMMS_EVAL_DIR=${LMMS_EVAL_DIR:-/home/uberger/scratch/research/lmms-eval}
@@ -51,10 +71,23 @@ CONDA_SH=/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh
 RUN_DIR=""
 NUM_GPUS=1
 EVERY=100
-SAMPLE_N=100
-# Below this much wall-clock left, start no further suite. Left empty here and
-# filled in after parsing, because the figure depends on how many GPUs this job
-# got -- see below. 0 disables the guard entirely.
+# Sample sizes. --sample-n is the old spelling and sets both suites; the per-suite
+# flags exist because the effects being chased are on the natural benchmarks and
+# the non-natural suite generates 4x the tokens per document, so raising both
+# would spend most of the extra GPU time where it buys nothing.
+SAMPLE_N=""
+NATURAL_N=""
+NONNATURAL_N=""
+declare -a TASK_N=()
+BANK=suite
+# Explicit list of steps to evaluate. Overrides the `% EVERY` rule, which is what
+# lets rerun_bench_evals.sh ask for exactly the checkpoints that already have a
+# result rather than every checkpoint on disk.
+STEPS_FILTER=""
+HARVEST=true
+# Below this much wall-clock left, start no further unit. Left empty here and
+# filled in per unit from the measured cost table -- see the plan below. Setting
+# it pins every unit to one flat figure instead; 0 disables the guard entirely.
 MIN_MINUTES=""
 MAX_CHECKPOINTS=0   # 0 = drain everything that is pending
 # Total wall clock this job was given, in minutes. Set by the dispatcher, because
@@ -70,25 +103,21 @@ while [[ $# -gt 0 ]]; do
         --num-gpus)        NUM_GPUS="$2";        shift 2 ;;
         --every)           EVERY="$2";           shift 2 ;;
         --sample-n)        SAMPLE_N="$2";        shift 2 ;;
+        --natural-n)       NATURAL_N="$2";       shift 2 ;;
+        --nonnatural-n)    NONNATURAL_N="$2";    shift 2 ;;
+        --task-n)          TASK_N+=("$2");       shift 2 ;;
+        --bank)            BANK="$2";            shift 2 ;;
+        --steps)           STEPS_FILTER="$2";    shift 2 ;;
+        --no-harvest)      HARVEST=false;        shift ;;
         --min-minutes)     MIN_MINUTES="$2";     shift 2 ;;
         --job-minutes)     JOB_MINUTES="$2";     shift 2 ;;
         --max-checkpoints) MAX_CHECKPOINTS="$2"; shift 2 ;;
         --dry-run)         DRY_RUN=true;         shift ;;
-        -h|--help)         sed -n '2,30p' "$0"; exit 0 ;;
+        -h|--help)         sed -n '2,60p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
-# The guard sizes ONE SUITE, because a suite is what gets banked. Measured on 1 GPU
-# (gaps between consecutive step-*.json in a draining job): 50-86 min per checkpoint,
-# of which ~10 is the merge, leaving ~15-25 for each of the three suites. The
-# generation part shrinks with the allocation; loading the model into each worker
-# does not, hence the fixed term.
-#
-# Getting this wrong in the optimistic direction is still the expensive failure --
-# a suite started and killed at the wall clock banks nothing and is redone from
-# scratch -- but it now costs one suite rather than a whole checkpoint.
-SUITE_MINUTES=${MIN_MINUTES:-$(( 5 + 25 / NUM_GPUS ))}
 # The merge is a file copy, not GPU work, so it costs the same at any allocation
 # size. Only charged against the clock when there is no merged model to reuse.
 MERGE_MINUTES=10
@@ -116,64 +145,121 @@ export HF_HUB_OFFLINE=1
 BENCH_DIR="$RUN_DIR/bench_eval"
 TASK_DIR="$BENCH_DIR/tasks"
 MERGE_ROOT="${BENCH_MERGE_ROOT:-$REPO/checkpoint/_bench_eval}"
-# Where a finished suite is recorded so a later job can skip it. One directory per
-# step, deleted the moment that step's step-<N>.json is written.
-PARTIAL_DIR="$BENCH_DIR/partial"
-mkdir -p "$BENCH_DIR" "$MERGE_ROOT" "$PARTIAL_DIR"
-
-# ---------- banking a finished suite ----------
-# A suite is banked by recording WHERE lmms-eval put its results, not by copying
-# them. The sample size is recorded alongside because --sample-n changes what the
-# mini task contains but does not change lmms-eval's output directory: without
-# this, results produced at n=100 would be silently reused for a job asking for
-# n=500 and the curve would mix two different benchmarks.
-bank_suite() {
-    local marker="$1" results="$2"
-    mkdir -p "$(dirname "$marker")"
-    printf '{"sample_n": %s, "results": "%s"}\n' "$SAMPLE_N" "$results" > "$marker"
-}
-
-# Echo the banked results path if it is still usable, else fail. "Usable" has to
-# be checked, not assumed: the referenced file may have been cleaned up, and a
-# results.json from a run killed mid-write parses as truncated garbage.
-banked_suite() {
-    local marker="$1"
-    [[ -f "$marker" ]] || return 1
-    python - "$marker" "$SAMPLE_N" <<'PY' || return 1
-import json, os, sys
-try:
-    marker = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(1)
-if str(marker.get("sample_n")) != sys.argv[2]:
-    sys.exit(1)
-path = marker.get("results", "")
-if not os.path.isfile(path):
-    sys.exit(1)
-try:
-    if not json.load(open(path)).get("results"):
-        sys.exit(1)
-except Exception:
-    sys.exit(1)
-print(path)
-PY
-}
+mkdir -p "$BENCH_DIR" "$MERGE_ROOT"
 
 # ---------- mini task configs ----------
 # Regenerated every job rather than committed: they carry the absolute path of the
 # lmms-eval clone, and a stale path would silently evaluate the wrong task file.
 source "$CONDA_SH"
 set +u; conda activate lmms_eval; set -u
-python "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" \
-    --out-dir "$TASK_DIR" --lmms-eval-dir "$LMMS_EVAL_DIR" --n "$SAMPLE_N" || exit 1
 
-NATURAL_TASKS=$(python "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" --print-tasks natural)
-NONNATURAL_TASKS=$(python "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" --print-tasks nonnatural)
-# MME-RealWorld's images are ~36MP and the wrapper default downsamples them ~22x,
-# which makes the model over-abstain. The test suite runs it at 3.2M pixels; a
-# combined invocation cannot, so it gets its own.
-NATURAL_TASKS=${NATURAL_TASKS//mmerealworld_mini,/}
-NATURAL_TASKS=${NATURAL_TASKS//,mmerealworld_mini/}
+declare -a GEN_ARGS=()
+[[ -n "$SAMPLE_N" ]]     && GEN_ARGS+=(--n "$SAMPLE_N")
+[[ -n "$NATURAL_N" ]]    && GEN_ARGS+=(--natural-n "$NATURAL_N")
+[[ -n "$NONNATURAL_N" ]] && GEN_ARGS+=(--nonnatural-n "$NONNATURAL_N")
+for t in ${TASK_N[@]+"${TASK_N[@]}"}; do GEN_ARGS+=(--task-n "$t"); done
+
+python "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" \
+    --out-dir "$TASK_DIR" --lmms-eval-dir "$LMMS_EVAL_DIR" \
+    ${GEN_ARGS[@]+"${GEN_ARGS[@]}"} || exit 1
+
+# The generated configs are the authority on what this job samples. Reading the
+# sizes back out of sample_n.json rather than re-deriving them from the flags
+# means the banking markers, the step file and the per-item store cannot disagree
+# with what was actually generated.
+SAMPLE_N_JSON=$(cat "$TASK_DIR/sample_n.json")
+
+# Where results for this sample profile live. The 100/100 default keeps the flat
+# layout every existing reader (including the trainer's callback) expects; any
+# other profile gets a subdirectory, so the two can never be read as one curve.
+PROFILE_DIR=$(python - "$BENCH_DIR" "$SAMPLE_N_JSON" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.path.join(os.environ["SCRIPT_DIR"], "eval_mini"))
+from benchmarks import profile_dir, profile_name
+print(profile_dir(sys.argv[1], json.loads(sys.argv[2])))
+print(profile_name(json.loads(sys.argv[2])))
+PY
+) || exit 1
+PROFILE=$(sed -n 2p <<< "$PROFILE_DIR")
+PROFILE_DIR=$(sed -n 1p <<< "$PROFILE_DIR")
+
+# Where a finished unit is recorded so a later job can skip it. One directory per
+# step, deleted the moment that step's step-<N>.json is written. Under the profile
+# directory, so units banked at one sample size are not offered to a job asking
+# for another.
+PARTIAL_DIR="$PROFILE_DIR/partial"
+mkdir -p "$PROFILE_DIR" "$PARTIAL_DIR"
+
+# ---------- the banking units ----------
+# tag <TAB> tasks <TAB> minutes <TAB> extra args, largest first. The cost table
+# and the knowledge that mme-realworld needs its own resolution both live in
+# eval_mini/benchmarks.py, next to the benchmark table they describe.
+declare -a UNIT_TAG=() UNIT_TASKS=() UNIT_MINUTES=() UNIT_EXTRA=()
+while IFS=$'\t' read -r tag tasks minutes extra; do
+    [[ -n "$tag" ]] || continue
+    UNIT_TAG+=("$tag"); UNIT_TASKS+=("$tasks")
+    UNIT_MINUTES+=("${MIN_MINUTES:-$minutes}"); UNIT_EXTRA+=("$extra")
+done < <(python "$SCRIPT_DIR/bench_eval.py" --plan --bank "$BANK" \
+             --sample-n "$SAMPLE_N_JSON" --num-gpus "$NUM_GPUS")
+(( ${#UNIT_TAG[@]} > 0 )) || { echo "error: could not plan the units" >&2; exit 1; }
+
+# ---------- banking a finished unit ----------
+# A unit is banked by recording WHERE lmms-eval put its results, not by copying
+# them. The per-task sample sizes are recorded alongside because they change what
+# the mini task contains without changing lmms-eval's output directory: without
+# this, results produced at n=100 would be silently reused for a job asking for
+# n=300 and the curve would mix two different benchmarks.
+#
+# rerun_bench_evals.sh writes markers in this same format to carry a suite over
+# from an earlier profile instead of re-generating it, so the shape is a contract,
+# not an implementation detail: {"sample_n": {task: n}, "results": path}, with an
+# optional "carried_from" naming the profile it came from.
+bank_unit() {
+    local marker="$1" tasks="$2" results="$3"
+    mkdir -p "$(dirname "$marker")"
+    python - "$marker" "$tasks" "$results" "$SAMPLE_N_JSON" <<'PY'
+import json, sys
+marker, tasks, results, sizes = sys.argv[1:5]
+sizes = json.loads(sizes)
+json.dump({"sample_n": {t: sizes[t] for t in tasks.split(",") if t in sizes},
+           "results": results}, open(marker, "w"))
+PY
+}
+
+# Echo the banked results path if it is still usable, else fail. "Usable" has to
+# be checked, not assumed: the referenced file may have been cleaned up, a
+# results.json from a run killed mid-write parses as truncated garbage, and a
+# marker left by an earlier job may describe a different sample size.
+banked_unit() {
+    local marker="$1" tasks="$2"
+    [[ -f "$marker" ]] || return 1
+    python - "$marker" "$tasks" "$SAMPLE_N_JSON" <<'PY' || return 1
+import json, os, sys
+marker, tasks, sizes = sys.argv[1:4]
+sizes = json.loads(sizes)
+try:
+    banked = json.load(open(marker))
+except Exception:
+    sys.exit(1)
+have = banked.get("sample_n") or {}
+for task in tasks.split(","):
+    if task in sizes and have.get(task) != sizes[task]:
+        sys.exit(1)
+path = banked.get("results", "")
+if not os.path.isfile(path):
+    sys.exit(1)
+try:
+    results = json.load(open(path)).get("results") or {}
+except Exception:
+    sys.exit(1)
+# The file has to contain THESE tasks, not merely be a valid results.json: a
+# marker pointing at a neighbouring unit's output would otherwise be accepted and
+# the benchmark it claims to cover would be silently absent from the step file.
+if not all(task in results for task in tasks.split(",")):
+    sys.exit(1)
+print(path)
+PY
+}
 
 # ---------- what still needs evaluating ----------
 # Step 0 is the model the run started from, recorded by the launcher. It is already
@@ -181,17 +267,22 @@ NATURAL_TASKS=${NATURAL_TASKS//,mmerealworld_mini/}
 # delete afterwards.
 BASE_MODEL_FILE="$BENCH_DIR/base_model.txt"
 
+wanted_step() {
+    [[ -z "$STEPS_FILTER" ]] && { (( $1 % EVERY == 0 )); return; }
+    [[ ",$STEPS_FILTER," == *",$1,"* ]]
+}
+
 pending_steps() {
     local d step
-    if [[ -f "$BASE_MODEL_FILE" && ! -f "$BENCH_DIR/step-0.json" ]]; then
+    if [[ -f "$BASE_MODEL_FILE" && ! -f "$PROFILE_DIR/step-0.json" ]] && wanted_step 0; then
         echo 0
     fi
     for d in "$RUN_DIR"/checkpoint-*; do
         [[ -d "$d" ]] || continue
         step=${d##*checkpoint-}
         [[ "$step" =~ ^[0-9]+$ ]] || continue
-        (( step % EVERY == 0 )) || continue
-        [[ -f "$BENCH_DIR/step-$step.json" ]] && continue
+        wanted_step "$step" || continue
+        [[ -f "$PROFILE_DIR/step-$step.json" ]] && continue
         # Both files, not just the config: a checkpoint being written right now
         # would otherwise be picked up and merged from a partial adapter.
         [[ -f "$d/adapter_config.json" && -s "$d/adapter_model.safetensors" ]] || continue
@@ -206,7 +297,7 @@ pending_steps() {
 # container that does not mount /cm/shared, so the slurm client is absent and the
 # query silently returns nothing. Believing the 99999 fallback in that situation is
 # what let earlier jobs run head-first into the wall clock and TIMEOUT rather than
-# stopping at a suite boundary.
+# stopping at a unit boundary.
 #
 # The countdown starts when this script does, which is a minute or two after the
 # allocation did -- the wrapper has to stage a container first. SAFETY_MARGIN
@@ -239,29 +330,34 @@ print(int(days) * 1440 + h * 60 + m + s // 60)
 PY
 }
 
-# ---------- evaluate one suite ----------
+# ---------- evaluate one unit ----------
 # Echoes the results.json lmms-eval produced, or nothing if the run failed. Each
-# suite gets its own --tag so its results land in their own directory: attributing
-# a suite by "the newest file in a shared directory" would quietly mislabel
-# everything the first time a suite failed and left the previous one newest.
+# unit gets its own --tag so its results land in their own directory: attributing
+# a unit by "the newest file in a shared directory" would quietly mislabel
+# everything the first time one failed and left the previous one newest.
 # Exit status is three-valued, because "no results" and "no time" have to be told
-# apart by the caller: 0 results echoed, 1 the suite failed, 2 out of wall clock
-# (nothing attempted, nothing lost).
-run_suite() {
-    local model="$1" tasks="$2" tag="$3"; shift 3
+# apart by the caller: 0 results echoed, 1 the unit failed, 2 not enough wall
+# clock for this one (nothing attempted, nothing lost).
+run_unit() {
+    local model="$1" tag="$2" tasks="$3" need="$4"; shift 4
     local marker="$PARTIAL_DIR/step-$STEP/$tag.json"
     local banked
-    if banked=$(banked_suite "$marker"); then
-        echo "[step $STEP] $tag: reusing the suite banked by an earlier job" >&2
+    if banked=$(banked_unit "$marker" "$tasks"); then
+        echo "[step $STEP] $tag: reusing the results banked by an earlier job" >&2
         printf '%s\n' "$banked"
         return 0
     fi
 
     local left; left=$(minutes_left)
-    if (( SUITE_MINUTES > 0 && left < SUITE_MINUTES )); then
-        echo "[step $STEP] $tag: ${left}min of wall clock left, a suite needs $SUITE_MINUTES -- stopping here" >&2
+    if (( need > 0 && left < need )); then
+        echo "[step $STEP] $tag: ${left}min left, this unit needs ${need} -- skipping it" >&2
         return 2
     fi
+
+    # An explicit marker for report_bench_evals.sh. The tag also appears inside
+    # lmms-eval's output paths, which is why the report cannot simply grep for it:
+    # the model directory name contains the tag of whichever job merged it.
+    echo "[step $STEP] unit $tag: starting ($tasks), ${left}min left, budgeted $need" >&2
 
     local -a common=(--model "$model" --tasks "$tasks" --max-new-tokens 4096
                      --num-gpus "$NUM_GPUS" --direct --r1-mode --tag "r1_$tag" "$@")
@@ -275,7 +371,7 @@ run_suite() {
     local results
     results=$(ls -t "$out_dir"/*/*_results.json 2>/dev/null | head -1)
     [[ -n "$results" ]] || return 1
-    bank_suite "$marker" "$results"
+    bank_unit "$marker" "$tasks" "$results"
     printf '%s\n' "$results"
 }
 
@@ -285,20 +381,23 @@ done_count=0
 echo "=========================================================================="
 echo "Run dir:    $RUN_DIR"
 echo "Pending:    $(pending_steps | tr '\n' ' ')"
-echo "GPUs:       $NUM_GPUS   sample: $SAMPLE_N/benchmark   cadence: every $EVERY steps   need ${SUITE_MINUTES}min/suite"
-echo "Natural:    $NATURAL_TASKS + mmerealworld_mini (at 3.2M pixels, as on test)"
-echo "Non-nat:    $NONNATURAL_TASKS"
+echo "GPUs:       $NUM_GPUS   cadence: $([[ -n "$STEPS_FILTER" ]] && echo "steps $STEPS_FILTER" || echo "every $EVERY steps")"
+echo "Profile:    $PROFILE   ->  $PROFILE_DIR"
+echo "Banking:    per $BANK, ${#UNIT_TAG[@]} unit(s), largest first"
+for i in "${!UNIT_TAG[@]}"; do
+    printf '  %-14s %3s min  %s\n' "${UNIT_TAG[$i]}" "${UNIT_MINUTES[$i]}" "${UNIT_TASKS[$i]}"
+done
 echo "Banked:     $PARTIAL_DIR"
 echo "=========================================================================="
 
 if $DRY_RUN; then
     echo "[dry-run] would evaluate, in order: $(pending_steps | tr '\n' ' ')"
-    echo "[dry-run] wall clock left: $(minutes_left) min (need $SUITE_MINUTES per suite, +$MERGE_MINUTES to merge)"
+    echo "[dry-run] wall clock left: $(minutes_left) min (+$MERGE_MINUTES to merge a checkpoint)"
     echo "[dry-run] merged models go to $MERGE_ROOT, kept across jobs while a step is"
     echo "[dry-run] unfinished and deleted once its step-<N>.json is written"
     for s in $(pending_steps); do
         banked=$(ls "$PARTIAL_DIR/step-$s" 2>/dev/null | sed 's/\.json$//' | tr '\n' ' ')
-        echo "[dry-run] step $s: suites already banked: ${banked:-none}"
+        echo "[dry-run] step $s: units already banked: ${banked:-none}"
     done
     exit 0
 fi
@@ -310,15 +409,18 @@ while true; do
         break
     fi
     LEFT=$(minutes_left)
-    # What entering this checkpoint costs before anything can be banked: one suite,
-    # plus the merge if no earlier job already paid for it.
+    # What entering this checkpoint costs before anything can be banked: the
+    # cheapest unit still owed, plus the merge if no earlier job already paid for
+    # it. Cheapest, not first: units are attempted largest-first but a job with
+    # only 20 minutes left can still bank a small one, and refusing to enter the
+    # checkpoint at all would waste that.
     MERGED="$MERGE_ROOT/${RUN_NAME}_cp${STEP}_merged"
     MERGE_DONE="$MERGED.complete"
-    NEED=$SUITE_MINUTES
+    NEED=${UNIT_MINUTES[$(( ${#UNIT_MINUTES[@]} - 1 ))]}
     if (( STEP != 0 )) && [[ ! -f "$MERGE_DONE" ]]; then
         NEED=$(( NEED + MERGE_MINUTES ))
     fi
-    if (( SUITE_MINUTES > 0 && LEFT < NEED )); then
+    if (( NEED > 0 && LEFT < NEED )); then
         echo "[drain] only ${LEFT}min of wall clock left (need $NEED to bank anything) -- exiting; the dispatcher will resubmit"
         break
     fi
@@ -377,41 +479,54 @@ while true; do
     echo "--------------------------------------------------------------------------"
 
     set +u; conda activate lmms_eval; set -u
-    # Each suite is attempted only if the clock allows, and banked the moment it
-    # succeeds. Status 2 means the clock ran out: stop the whole job rather than
-    # move on, since the remaining suites have no more time than this one did.
-    NAT_RESULTS=""; MMERW_RESULTS=""; NONNAT_RESULTS=""; OUT_OF_TIME=false
-    NAT_RESULTS=$(run_suite "$MERGED" "$NATURAL_TASKS" natural)
-    (( $? == 2 )) && OUT_OF_TIME=true
-    if ! $OUT_OF_TIME; then
-        MMERW_RESULTS=$(run_suite "$MERGED" "mmerealworld_mini" mmerw --max-pixels 3211264)
-        (( $? == 2 )) && OUT_OF_TIME=true
-    fi
-    if ! $OUT_OF_TIME; then
-        NONNAT_RESULTS=$(run_suite "$MERGED" "$NONNATURAL_TASKS" nonnatural)
-        (( $? == 2 )) && OUT_OF_TIME=true
-    fi
+    # Each unit is attempted only if the clock allows, and banked the moment it
+    # succeeds. A unit that does not fit is skipped and the next one tried: they
+    # are ordered largest-first, so what is left behind is usually the one costly
+    # unit and the cheap ones can still be banked with the time remaining.
+    declare -a RESULTS=() OWED=() FAILED=()
+    for i in "${!UNIT_TAG[@]}"; do
+        # Read into a temp so the exit status is the function's, not the assignment's.
+        unit_out=$(run_unit "$MERGED" "${UNIT_TAG[$i]}" "${UNIT_TASKS[$i]}" \
+                            "${UNIT_MINUTES[$i]}" ${UNIT_EXTRA[$i]})
+        case $? in
+            0) RESULTS+=("$unit_out") ;;
+            2) OWED+=("${UNIT_TAG[$i]}") ;;
+            *) FAILED+=("${UNIT_TAG[$i]}") ;;
+        esac
+    done
 
-    if $OUT_OF_TIME; then
-        # Deliberately no step file and no cleanup: the suites already finished are
+    if (( ${#OWED[@]} > 0 )); then
+        # Deliberately no step file and no cleanup: the units already finished are
         # banked in $PARTIAL_DIR/step-$STEP and the merged model is left in place,
-        # so the next job resumes at the first suite still owed instead of redoing
-        # the merge and everything before it.
-        echo "[drain] out of wall clock part-way through step $STEP -- finished suites are banked,"
-        echo "        the merge is kept, and the dispatcher will resubmit to finish it"
+        # so the next job resumes at the units still owed instead of redoing the
+        # merge and everything before it.
+        echo "[drain] out of wall clock part-way through step $STEP -- still owed: ${OWED[*]}"
+        echo "        finished units are banked, the merge is kept, and the dispatcher will resubmit"
         break
     fi
 
-    if [[ -n "$NAT_RESULTS$MMERW_RESULTS$NONNAT_RESULTS" ]]; then
+    if (( ${#RESULTS[@]} > 0 )); then
+        if (( ${#FAILED[@]} > 0 )); then
+            echo "[step $STEP] WARNING: ${#FAILED[@]} unit(s) FAILED (${FAILED[*]}) -- recording a" >&2
+            echo "            step file without them; those benchmarks will be absent from the curve" >&2
+        fi
         python "$SCRIPT_DIR/bench_eval.py" --collect --run-dir "$RUN_DIR" --step "$STEP" \
-            --results $NAT_RESULTS $MMERW_RESULTS $NONNAT_RESULTS
+            --sample-n "$SAMPLE_N_JSON" --results "${RESULTS[@]}"
+        # Per-item rows, stored beside the step file. Failure here is reported and
+        # not fatal: the aggregate is the result that took the GPU hours, and the
+        # harvest can be redone at any time from the same files with --retro.
+        if $HARVEST; then
+            python "$SCRIPT_DIR/bench_samples.py" --harvest --run-dir "$RUN_DIR" \
+                --step "$STEP" --sample-n "$SAMPLE_N_JSON" --results "${RESULTS[@]}" \
+                || echo "[step $STEP] per-item harvest failed -- rerun bench_samples.py --retro" >&2
+        fi
         done_count=$((done_count + 1))
         # The checkpoint is measured, so everything that existed to serve it goes:
-        # the banked suites have been folded into step-$STEP.json, and the merged
+        # the banked units have been folded into step-$STEP.json, and the merged
         # model has nothing left to be evaluated against.
         rm -rf "$PARTIAL_DIR/step-$STEP"
     else
-        echo "[step $STEP] every suite failed -- not recording a result" >&2
+        echo "[step $STEP] every unit failed -- not recording a result" >&2
     fi
 
     if $MERGED_IS_TEMPORARY; then
@@ -420,4 +535,4 @@ while true; do
 done
 
 echo ""
-echo "Evaluated $done_count checkpoint(s); results in $BENCH_DIR"
+echo "Evaluated $done_count checkpoint(s); results in $PROFILE_DIR"

@@ -37,7 +37,12 @@ RUN_DIR=""
 # wall clock, which run_bench_eval.sh's --min-minutes guard scales with this number.
 NUM_GPUS=1
 EVERY=100
-SAMPLE_N=100
+SAMPLE_N=""
+NATURAL_N=""
+NONNATURAL_N=""
+declare -a TASK_N=()
+BANK=suite
+STEPS_FILTER=""
 INTERVAL=60
 # Ask for one hour, not the partition's 4h maximum. batch_singlenode caps jobs at
 # 04:00:00, so a 4h request only ever backfills into a 4h hole -- the rarest window
@@ -53,6 +58,17 @@ while [[ $# -gt 0 ]]; do
         --num-gpus)  NUM_GPUS="$2";  shift 2 ;;
         --every)     EVERY="$2";     shift 2 ;;
         --sample-n)  SAMPLE_N="$2";  shift 2 ;;
+        # Sample sizes per suite, and the banking unit. See run_bench_eval.sh:
+        # above 100 documents per benchmark a suite no longer fits a one-hour
+        # allocation, so --natural-n 300 needs --bank task to be finishable.
+        --natural-n)    NATURAL_N="$2";    shift 2 ;;
+        --nonnatural-n) NONNATURAL_N="$2"; shift 2 ;;
+        --task-n)       TASK_N+=("$2");    shift 2 ;;
+        --bank)         BANK="$2";         shift 2 ;;
+        # Evaluate exactly these steps instead of every EVERY-th checkpoint. This
+        # is how rerun_bench_evals.py asks for the checkpoints that already have a
+        # result at another sample size, rather than everything on disk.
+        --steps)        STEPS_FILTER="$2"; shift 2 ;;
         --interval)  INTERVAL="$2";  shift 2 ;;
         --duration)  DURATION="$2";  shift 2 ;;
         --partition) PARTITION="$2"; shift 2 ;;
@@ -73,17 +89,49 @@ done
 RUN_DIR=$(cd "$RUN_DIR" && pwd -P)
 
 RUN_NAME=$(basename "$RUN_DIR")
+BENCH_DIR="$RUN_DIR/bench_eval"
+LOG_ROOT="$REPO/outputs/logs"
+
+# Which sample profile this dispatcher is filling in, and hence which directory
+# counts as "already scored". Resolved here, once, by the same code the job will
+# use, so the dispatcher and the job cannot disagree about what is pending.
+read -r PROFILE PROFILE_DIR < <(python - "$SCRIPT_DIR" "$BENCH_DIR" \
+        "${SAMPLE_N:-}" "${NATURAL_N:-}" "${NONNATURAL_N:-}" \
+        ${TASK_N[@]+"${TASK_N[@]}"} <<'PY'
+import json, os, sys
+script_dir, bench_dir, both, natural, nonnatural = sys.argv[1:6]
+sys.path.insert(0, os.path.join(script_dir, "eval_mini"))
+from benchmarks import DEFAULT_SUITE_N, SUITES, profile_dir, profile_name, task_sample_n
+
+suite_n = dict(DEFAULT_SUITE_N)
+if both:
+    suite_n = {s: int(both) for s in SUITES}
+if natural:
+    suite_n["natural"] = int(natural)
+if nonnatural:
+    suite_n["nonnatural"] = int(nonnatural)
+overrides = dict(pair.split("=", 1) for pair in sys.argv[6:])
+sizes = task_sample_n(suite_n, overrides)
+print(profile_name(sizes), profile_dir(bench_dir, sizes))
+PY
+) || { echo "error: could not resolve the sample profile" >&2; exit 2; }
+
 # submit_job rewrites the name it is given -- it appends a _<date>-<time> stamp and
 # replaces dots with underscores (a run named ...wov0.11... comes back as
 # ...wov0_11..._20260802-144252). An exact `squeue -n` match would therefore never
 # fire, and this loop would submit a fresh job every poll, forever. So the check
 # looks for a token that no such rewriting can touch: letters and digits only,
 # derived from the run directory, hence unique per run.
-JOB_TOKEN="bencheval$(printf '%s' "$RUN_DIR" | md5sum | cut -c1-8)"
+#
+# The profile is part of the identity for anything but the default, so a
+# re-scoring sweep at n=300 and the live n=100 dispatcher for the same run each
+# see only their own job instead of blocking each other. The default profile
+# hashes the bare path, unchanged, so tokens already in the queue still match.
+TOKEN_INPUT="$RUN_DIR"
+[[ "$PROFILE" != "n100_100" ]] && TOKEN_INPUT="$RUN_DIR@$PROFILE"
+JOB_TOKEN="bencheval$(printf '%s' "$TOKEN_INPUT" | md5sum | cut -c1-8)"
 JOB_NAME="${JOB_TOKEN}_${RUN_NAME}"
-BENCH_DIR="$RUN_DIR/bench_eval"
-LOG_ROOT="$REPO/outputs/logs"
-mkdir -p "$BENCH_DIR" "$LOG_ROOT"
+mkdir -p "$BENCH_DIR" "$PROFILE_DIR" "$LOG_ROOT"
 
 # ---------- how to submit ----------
 # Two backends, because submit_job does not work everywhere:
@@ -150,21 +198,26 @@ fi
 CPUS_PER_GPU=${CPUS_PER_GPU:-28}
 MEM_PER_GPU_GB=${MEM_PER_GPU_GB:-229}
 
+wanted_step() {
+    [[ -z "$STEPS_FILTER" ]] && { (( $1 % EVERY == 0 )); return; }
+    [[ ",$STEPS_FILTER," == *",$1,"* ]]
+}
+
 pending_steps() {
     local d step
     # Step 0 is the model the run started from, recorded by the launcher as
     # bench_eval/base_model.txt. It has to appear here too: this is what decides
     # whether a job is submitted at all, so a baseline the job would happily score
     # would otherwise never get one.
-    if [[ -f "$BENCH_DIR/base_model.txt" && ! -f "$BENCH_DIR/step-0.json" ]]; then
+    if [[ -f "$BENCH_DIR/base_model.txt" && ! -f "$PROFILE_DIR/step-0.json" ]] && wanted_step 0; then
         echo 0
     fi
     for d in "$RUN_DIR"/checkpoint-*; do
         [[ -d "$d" ]] || continue
         step=${d##*checkpoint-}
         [[ "$step" =~ ^[0-9]+$ ]] || continue
-        (( step % EVERY == 0 )) || continue
-        [[ -f "$BENCH_DIR/step-$step.json" ]] && continue
+        wanted_step "$step" || continue
+        [[ -f "$PROFILE_DIR/step-$step.json" ]] && continue
         [[ -f "$d/adapter_config.json" && -s "$d/adapter_model.safetensors" ]] || continue
         echo "$step"
     done | sort -n
@@ -204,8 +257,15 @@ BENCH_JUDGE_KEY=${OPENAI_API_KEY:-${NVIDIA_API_KEY:-}}
 # /cm/shared, so squeue is not on PATH there and run_bench_eval.sh's fallback would
 # have it believe it has unlimited time -- it would start a suite it cannot finish
 # and be killed part-way. We know the budget here, so we simply tell it.
+SIZE_ARGS=""
+[[ -n "$SAMPLE_N" ]]     && SIZE_ARGS+=" --sample-n $SAMPLE_N"
+[[ -n "$NATURAL_N" ]]    && SIZE_ARGS+=" --natural-n $NATURAL_N"
+[[ -n "$NONNATURAL_N" ]] && SIZE_ARGS+=" --nonnatural-n $NONNATURAL_N"
+for t in ${TASK_N[@]+"${TASK_N[@]}"}; do SIZE_ARGS+=" --task-n $t"; done
+[[ -n "$STEPS_FILTER" ]] && SIZE_ARGS+=" --steps $STEPS_FILTER"
+
 INNER_CMD="bash $SCRIPT_DIR/run_bench_eval.sh \
-        --run-dir $RUN_DIR --num-gpus $NUM_GPUS --every $EVERY --sample-n $SAMPLE_N \
+        --run-dir $RUN_DIR --num-gpus $NUM_GPUS --every $EVERY --bank $BANK$SIZE_ARGS \
         --job-minutes $(( DURATION * 60 ))"
 
 submit_eval_job() {
@@ -251,8 +311,9 @@ echo "Watching:   $RUN_DIR"
 echo "Job name:   $JOB_NAME   ($NUM_GPUS GPUs, ${DURATION}h, $PARTITION)"
 echo "Submitting: $BACKEND   (from $(hostname))"
 echo "Benchmarks: $(python "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" --print-tasks natural | tr ',' ' ' | wc -w) natural + $(python "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" --print-tasks nonnatural | tr ',' ' ' | wc -w) non-natural, all self-scoring (no API key needed)"
-echo "Cadence:    every $EVERY steps, $SAMPLE_N samples/benchmark"
-echo "Results:    $BENCH_DIR/step-<N>.json"
+echo "Cadence:    $([[ -n "$STEPS_FILTER" ]] && echo "steps $STEPS_FILTER" || echo "every $EVERY steps")"
+echo "Profile:    $PROFILE   (banking per $BANK)"
+echo "Results:    $PROFILE_DIR/step-<N>.json"
 echo "Poll:       every ${INTERVAL}s   $($ONCE && echo '(--once: one pass)' || echo '(Ctrl-C to stop)')"
 echo "=========================================================================="
 

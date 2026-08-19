@@ -14,7 +14,7 @@
 #
 # Everything else comes from the job's log and the run's bench_eval/ directory:
 #   [step N]                     the checkpoint being worked on
-#   r1_<suite>                   which of the three suites is running
+#   [step N] unit <tag>          which banking unit is running (suite or task)
 #   bench_eval/partial/step-N/   the suites already banked for it
 #   Model Responding: X/Y        progress inside the current suite
 set -uo pipefail
@@ -43,35 +43,60 @@ done
 # Hash the physical path, as the dispatcher does (it resolves RUN_DIR with
 # `pwd -P` first): /home/uberger/scratch/research/saliency_r1 is a symlink to the
 # /lustre spelling, and the two hash differently.
-declare -A RUN_OF_TOKEN=()
+#
+# A dispatcher filling in a non-default sample profile hashes "<path>@<profile>"
+# instead, so that a re-scoring sweep at n=300 and the live n=100 watcher for the
+# same run do not see each other's jobs. Both spellings are registered here, for
+# every profile directory that exists, and the profile is remembered so this can
+# say WHICH sample size a job is producing -- a report that silently conflated
+# them would be the same mistake as a plot that did.
+declare -A RUN_OF_TOKEN=() PROFILE_OF_TOKEN=()
 build_token_map() {
-    local d real token
+    local d real token p profile
     for d in "$CKPT_ROOT"/*/; do
         [[ -d "$d" ]] || continue
         real=$(cd "$d" && pwd -P) || continue
         token=$(printf '%s' "$real" | md5sum | cut -c1-8)
         RUN_OF_TOKEN[$token]="$real"
+        PROFILE_OF_TOKEN[$token]="n100_100"
+        for p in "$real"/bench_eval/n*_*/; do
+            [[ -d "$p" ]] || continue
+            profile=$(basename "$p")
+            token=$(printf '%s@%s' "$real" "$profile" | md5sum | cut -c1-8)
+            RUN_OF_TOKEN[$token]="$real"
+            PROFILE_OF_TOKEN[$token]="$profile"
+        done
     done
+}
+
+# The directory one profile's results live in. The 100/100 default is the flat
+# bench_eval/, which is where every result written before sample sizes were a
+# thing still is.
+profile_dir_of() {
+    local run_dir="$1" profile="${2:-n100_100}"
+    [[ "$profile" == "n100_100" ]] && { echo "$run_dir/bench_eval"; return; }
+    echo "$run_dir/bench_eval/$profile"
 }
 
 # ---------- what a run still owes ----------
 scored_steps() {
-    local bench="$1/bench_eval" f
-    for f in "$bench"/step-*.json; do
+    local dir="$1" f
+    for f in "$dir"/step-*.json; do
         [[ -f "$f" ]] || continue
         f=${f##*/step-}; echo "${f%.json}"
     done | sort -n
 }
 
 pending_steps() {
-    local run_dir="$1" bench="$1/bench_eval" d step
-    [[ -f "$bench/base_model.txt" && ! -f "$bench/step-0.json" ]] && echo 0
+    local run_dir="$1" dir; dir=$(profile_dir_of "$1" "${2:-n100_100}")
+    local d step
+    [[ -f "$run_dir/bench_eval/base_model.txt" && ! -f "$dir/step-0.json" ]] && echo 0
     for d in "$run_dir"/checkpoint-*; do
         [[ -d "$d" ]] || continue
         step=${d##*checkpoint-}
         [[ "$step" =~ ^[0-9]+$ ]] || continue
         (( step % EVERY == 0 )) || continue
-        [[ -f "$bench/step-$step.json" ]] && continue
+        [[ -f "$dir/step-$step.json" ]] && continue
         [[ -f "$d/adapter_config.json" && -s "$d/adapter_model.safetensors" ]] || continue
         echo "$step"
     done | sort -n
@@ -88,6 +113,7 @@ report_one() {
     local token=""
     [[ "$name" =~ ^bencheval([0-9a-f]{8}) ]] && token="${BASH_REMATCH[1]}"
     local run_dir="${RUN_OF_TOKEN[$token]:-}"
+    local profile="${PROFILE_OF_TOKEN[$token]:-n100_100}"
     local log; log=$(log_for_job "$jobid")
     # Fall back to the log if the token matches no checkpoint directory -- which
     # happens for a run that has since been renamed or moved away.
@@ -98,6 +124,7 @@ report_one() {
 
     echo "job $jobid  [$state]  ${elapsed} elapsed, ${left} left  ${node:-$reason}"
     echo "  run:      ${run_name:-<unknown: token $token>}"
+    echo "  sample:   $profile   (natural/non-natural documents per benchmark)"
 
     if [[ -z "$log" ]]; then
         echo "  step:     not started yet (no log; queued as ${reason:-pending})"
@@ -106,8 +133,14 @@ report_one() {
         # baseline banner) prints one as soon as a checkpoint is entered, so this
         # never lags behind what is actually being evaluated.
         local step; step=$(grep -aoE '^\[step [0-9]+\]' "$log" | tail -1 | tr -dc '0-9')
-        local suite; suite=$(grep -aoE 'r1_(natural|mmerw|nonnatural)' "$log" | tail -1)
-        suite=${suite#r1_}
+        # The job announces each unit as it starts one. Grepping for the tag
+        # itself would not work: it also appears inside lmms-eval's output paths,
+        # where the model directory carries the tag of whichever job merged it.
+        # Fall back to the old three-suite pattern for logs written before that
+        # marker existed.
+        local suite; suite=$(grep -aoE '^\[step [0-9]+\] unit [a-z0-9_]+' "$log" | tail -1)
+        suite=${suite##*unit }
+        [[ -n "$suite" ]] || { suite=$(grep -aoE 'r1_(natural|mmerw|nonnatural)' "$log" | tail -1); suite=${suite#r1_}; }
         # Progress is written with carriage returns, so the whole bar is one
         # "line"; splitting on \r is what makes the last update visible. Only the
         # tail of the log is scanned -- these files reach tens of MB.
@@ -119,7 +152,7 @@ report_one() {
             echo "  step:     starting up (merging/loading, nothing scored yet)"
         else
             local banked=""
-            [[ -n "$run_dir" ]] && banked=$(ls "$run_dir/bench_eval/partial/step-$step" 2>/dev/null |
+            [[ -n "$run_dir" ]] && banked=$(ls "$(profile_dir_of "$run_dir" "$profile")/partial/step-$step" 2>/dev/null |
                                             sed 's/\.json$//' | tr '\n' ' ')
             echo "  step:     $step   suite: ${suite:-<not started>}   banked: ${banked:-none}"
             [[ -n "$prog" ]] && echo "  progress: $prog"
@@ -131,8 +164,8 @@ report_one() {
 
     if [[ -n "$run_dir" ]]; then
         local done_steps pending
-        done_steps=$(scored_steps "$run_dir" | tr '\n' ' ')
-        pending=$(pending_steps "$run_dir" | tr '\n' ' ')
+        done_steps=$(scored_steps "$(profile_dir_of "$run_dir" "$profile")" | tr '\n' ' ')
+        pending=$(pending_steps "$run_dir" "$profile" | tr '\n' ' ')
         echo "  scored:   ${done_steps:-none}"
         echo "  pending:  ${pending:-none}"
     fi
@@ -143,17 +176,20 @@ report_one() {
 # running for them, or one is and it is in its cooldown -- both worth seeing,
 # since a run silently going unevaluated looks exactly like one that is up to date.
 report_idle_runs() {
-    local d run_dir pending header=false
+    local d p run_dir pending profile header=false
     for d in "$CKPT_ROOT"/*/; do
         [[ -d "$d/bench_eval" ]] || continue
         run_dir=$(cd "$d" && pwd -P)
-        # ${a[@]+...} rather than a bare "${a[@]}": under `set -u` an empty array
-        # is an unbound expansion on older bash, i.e. exactly the no-jobs case.
-        printf '%s\n' ${IN_FLIGHT[@]+"${IN_FLIGHT[@]}"} | grep -qxF "$run_dir" && continue
-        pending=$(pending_steps "$run_dir" | tr '\n' ' ')
-        [[ -n "$pending" ]] || continue
-        $header || { echo "Pending, nothing in flight:"; header=true; }
-        printf '  %-70s %s\n' "$(basename "$run_dir")" "[$pending]"
+        for p in n100_100 $(cd "$run_dir/bench_eval" 2>/dev/null && ls -d n*_*/ 2>/dev/null | tr -d /); do
+            profile="$p"
+            # ${a[@]+...} rather than a bare "${a[@]}": under `set -u` an empty array
+            # is an unbound expansion on older bash, i.e. exactly the no-jobs case.
+            printf '%s\n' ${IN_FLIGHT[@]+"${IN_FLIGHT[@]}"} | grep -qxF "$run_dir@$profile" && continue
+            pending=$(pending_steps "$run_dir" "$profile" | tr '\n' ' ')
+            [[ -n "$pending" ]] || continue
+            $header || { echo "Pending, nothing in flight:"; header=true; }
+            printf '  %-58s %-10s %s\n' "$(basename "$run_dir")" "$profile" "[$pending]"
+        done
     done
     $header && echo ""
 }
@@ -169,7 +205,8 @@ report() {
         [[ "$name" == bencheval* ]] || continue
         found=true
         [[ "$name" =~ ^bencheval([0-9a-f]{8}) ]] && token="${BASH_REMATCH[1]}" || token=""
-        [[ -n "${RUN_OF_TOKEN[$token]:-}" ]] && IN_FLIGHT+=("${RUN_OF_TOKEN[$token]}")
+        [[ -n "${RUN_OF_TOKEN[$token]:-}" ]] && \
+            IN_FLIGHT+=("${RUN_OF_TOKEN[$token]}@${PROFILE_OF_TOKEN[$token]:-n100_100}")
         report_one "$jobid" "$name" "$state" "$elapsed" "$left" "$node" "$reason"
     done < <(squeue -u "$USER" -h -o '%i|%j|%T|%M|%L|%N|%R' 2>/dev/null)
     $found || echo "no eval jobs queued or running"$'\n'
