@@ -33,30 +33,39 @@ python bench_samples.py --compare grpo-no-saliency overlap-8k --suite natural
 python bench_samples.py --compare A B --flips 10     # which documents changed
 ```
 
-se on a difference is now **0.0153 against 0.028 unpaired** — the whole gain the
-plan hoped n=300 would buy, at the sample size already on disk. Discordance is
-7–10%, better than the 15% assumed. The table above, redone paired against
-`grpo-no-saliency` over the 400 natural items (2026-08-19):
+se on a difference is now **0.015–0.017 against 0.028 unpaired** — the whole gain
+the plan hoped n=300 would buy, at the sample size already on disk. Discordance is
+7–11%, better than the 15% assumed.
+
+The table above, redone paired over the 400 natural items, against
+**`sft-coldstart`** — the model all three overlap runs actually start from
+(2026-08-19):
 
 ```
 model                pooled item acc     diff              95% CI    disc   McNemar p
-sft-coldstart                 0.7225  +0.0050  [-0.0225, +0.0325]    8.5%      0.8642
-grpo-no-saliency              0.7175        —                   —       —           —
-saliency-r1                   0.7375  +0.0200  [-0.0075, +0.0475]    7.5%      0.2005
-overlap-8k                    0.7475  +0.0300  [+0.0000, +0.0600]    9.5%      0.0730
-auroc w0.11 @3990             0.7500  +0.0325  [+0.0025, +0.0625]    9.8%      0.0533
+sft-coldstart                 0.7225        —                   —       —           —
+grpo-no-saliency              0.7175  -0.0050  [-0.0325, +0.0225]    8.5%      0.8642
+saliency-r1                   0.7375  +0.0150  [-0.0175, +0.0475]   10.5%      0.4408
+overlap-8k                    0.7475  +0.0250  [-0.0075, +0.0575]   11.5%      0.1839
+auroc w0.11 @3990             0.7500  +0.0275  [-0.0050, +0.0600]   10.8%      0.1263
 ```
 
-**The best model's advantage over `grpo-no-saliency` now has a CI that excludes
-zero**, where unpaired it was 1.2σ. It is marginal, not established — but it is
-the first time the ordering in that table has been more than a ranking of noise,
-and it cost no GPU time.
+**Nothing here is significant.** Halving the standard error was not enough: the
+best run's advantage over the model it started from is +0.0275 with a CI that
+still contains zero. That is the honest reading, and it makes the case for n=300
+stronger rather than weaker — at 300 the same effect would have a half-width of
+~0.019 and would separate.
 
-Note `sft-coldstart` at +0.005: whatever the trained runs are gaining, they are
-not gaining it over the cold-start model, which is the comparison
-`grpo-no-saliency` was supposed to isolate. Worth its own look.
+The reference matters, and it is easy to get wrong. Against `grpo-no-saliency` the
+same data gives `overlap-8k +0.0300 [+0.0000, +0.0600] p=0.073` and
+`auroc w0.11 +0.0325 [+0.0025, +0.0625] p=0.053` — a CI that excludes zero. But
+`grpo-no-saliency` is GRPO from **vanilla Qwen3-VL-8B-Instruct**, not from the
+cold start (check `bench_eval/base_model.txt`), so that comparison carries the
+cold-start SFT as well as the reward, and the trap is already written down in
+[next-reward-experiments.md](next-reward-experiments.md). It is quoted here only
+because the difference between the two tables is the whole finding.
 
-(The accuracies here differ slightly from `bench/natural/mean` — 0.7475 against
+(These accuracies differ slightly from `bench/natural/mean` — 0.7475 against
 0.7504 for overlap-8k — because this pools items and weights each equally, while
 the curve averages four benchmark means, and because pope contributes per-item
 accuracy here against corpus F1 there. `--compare` prints both.)

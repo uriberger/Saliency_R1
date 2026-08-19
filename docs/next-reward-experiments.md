@@ -187,14 +187,21 @@ easy to find a story afterwards.
 
 ## Traps
 
-- **The benchmark cannot resolve this yet.** se on a difference in bench/natural/mean is
-  ≈ 0.028 at the current 5 tasks × 100 items, and the effects are 0.02–0.035. Two
-  identical configs already gave 0.750 and 0.737. See
-  [next-bench-precision.md](next-bench-precision.md); ideally that work lands first, and
-  in any case do not report a ranking of these four runs without a stated uncertainty.
+- **The benchmark still cannot resolve this.** se on a difference in
+  bench/natural/mean was ≈ 0.028 at 5 tasks × 100 items, against effects of
+  0.02–0.035. Pairing over items now halves it — use
+  `python bench_samples.py --compare A B --suite natural`, which needs no GPU and
+  is already harvested for every existing result. Even so, against `sft-coldstart`
+  the best run to date is +0.0275 with a 95% CI of [-0.0050, +0.0600]: not
+  significant. Raising the natural benchmarks to 300 is built and costed; see
+  [bench-precision.md](bench-precision.md). Do not report a ranking of these four
+  runs without a stated uncertainty.
 - **Do not compare against `baseline/grpo-no-saliency`.** It starts from vanilla
   Qwen3-VL-8B-Instruct, not from `coldstart_..._merged` (check
   `bench_eval/base_model.txt`). The correct control is Uri's `--w-overlap 0` run.
+  This is not hypothetical: against `grpo-no-saliency` the same paired data puts
+  `auroc w0.11` at +0.0325 [+0.0025, +0.0625], a CI that excludes zero, and
+  against `sft-coldstart` it does not.
 - Match the reference run's adapter: `--lora-targets q_proj,v_proj`. The launcher's
   current default is `q_proj,k_proj,v_proj`, which is a different experiment and adds
   `_loraqkv` to the name.
