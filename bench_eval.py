@@ -297,8 +297,15 @@ def do_publish_baseline(args):
     # The sample size is part of the identity of a baseline, not a detail of it: a
     # 100-item line and a 300-item line of the same model are two different
     # estimates and must not overwrite one another, nor share a legend entry.
+    #
+    # Which is why the DISPLAY NAME carries it too, not just the run id. The id
+    # keeps them apart in the API; the name is what a panel legend shows, and two
+    # reference lines both labelled `baseline/overlap-8k` differing only in an
+    # invisible sample size is precisely the confusion all of this exists to
+    # prevent.
     suffix = "" if wanted == DEFAULT_SUITE_N else f"-{profile_name(wanted)}"
     run_id = f"bench-baseline-{slug(args.name)}{suffix}"
+    run_name = f"baseline/{args.name}" + ("" if not suffix else f"@{profile_name(wanted)}")
     # Anything other than a clean "no such run" aborts rather than being read as
     # "does not exist": a transient API error would otherwise send this down the
     # create path and append a second pair of points to a run that already has one.
@@ -318,9 +325,10 @@ def do_publish_baseline(args):
         existing.delete()
 
     run = wandb.init(
-        id=run_id, name=f"baseline/{args.name}", project=project, entity=entity,
+        id=run_id, name=run_name, project=project, entity=entity,
         job_type="bench_baseline", group="bench_baselines", resume="allow",
-        config={"baseline": args.name, "baseline_model": model, "bench_step_span": args.span},
+        config={"baseline": args.name, "baseline_model": model, "bench_step_span": args.span,
+                "sample_profile": profile_name(wanted), "sample_n": wanted},
     )
     run.define_metric(f"{prefix}/step")
     run.define_metric(f"{prefix}/*", step_metric=f"{prefix}/step")
@@ -331,7 +339,7 @@ def do_publish_baseline(args):
     url = run.url or f"{entity}/{project}/{run_id} (offline)"
     run.finish()
 
-    print(f"published baseline '{args.name}' ({len(metrics)} scalars) spanning "
+    print(f"published baseline '{run_name}' ({len(metrics)} scalars) spanning "
           f"{prefix}/step 0..{args.span}")
     print(f"  model:   {model}")
     print(f"  profile: {profile_name(wanted)} "

@@ -47,6 +47,17 @@ SPAN_RUN=grpo-coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged-overlap__wo
 
 NUM_GPUS=8
 
+# 300 documents per natural benchmark, 100 per non-natural one -- the same profile
+# every other scoring path now uses. A baseline scored at a different size from the
+# curve it is drawn under is not a reference line, it is a second measurement of a
+# different thing, so this has to match.
+NATURAL_N=${NATURAL_N:-300}
+NONNATURAL_N=${NONNATURAL_N:-100}
+declare -a TASK_N=()
+BANK=${BANK:-auto}
+# Restrict to some of BASELINES, by label. Repeatable.
+declare -a ONLY=()
+
 SCRIPT_DIR=$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)
 REPO=${REPO:-/home/uberger/scratch/research/saliency_r1}
 CONDA_SH=/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh
@@ -72,24 +83,63 @@ while [[ $# -gt 0 ]]; do
         # refusing. Deletes the old run; its URL stops resolving.
         --overwrite)    OVERWRITE="--overwrite"; shift ;;
         --num-gpus)     NUM_GPUS="$2"; shift 2 ;;
+        --natural-n)    NATURAL_N="$2";    shift 2 ;;
+        --nonnatural-n) NONNATURAL_N="$2"; shift 2 ;;
+        --task-n)       TASK_N+=("$2");    shift 2 ;;
+        --bank)         BANK="$2";         shift 2 ;;
+        # Score/publish only these labels, rather than all of BASELINES.
+        --only)         ONLY+=("$2");      shift 2 ;;
         -h|--help)      sed -n '2,31p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
+# ---------- which sample profile ----------
+# Resolved by the same code the eval job uses, so this script and the job cannot
+# disagree about where a result belongs or which WandB keys it becomes.
+PY_BIN=$(command -v python || command -v python3) || \
+    { echo "error: no python on PATH" >&2; exit 2; }
+declare -a SIZE_ARGS=(--natural-n "$NATURAL_N" --nonnatural-n "$NONNATURAL_N")
+for t in ${TASK_N[@]+"${TASK_N[@]}"}; do SIZE_ARGS+=(--task-n "$t"); done
+SAMPLE_N_JSON=$("$PY_BIN" "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" \
+    "${SIZE_ARGS[@]}" --print-sample-n) || \
+    { echo "error: could not resolve the sample sizes" >&2; exit 2; }
+read -r PROFILE PROFILE_SUBDIR < <("$PY_BIN" - "$SCRIPT_DIR" "$SAMPLE_N_JSON" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.path.join(sys.argv[1], "eval_mini"))
+from benchmarks import profile_dir, profile_name
+sizes = json.loads(sys.argv[2])
+print(profile_name(sizes), os.path.relpath(profile_dir("x", sizes), "x"))
+PY
+) || { echo "error: could not resolve the sample profile" >&2; exit 2; }
+
+profile_dir_of() {
+    [[ "$PROFILE_SUBDIR" == "." ]] && { echo "$1/bench_eval"; return; }
+    echo "$1/bench_eval/$PROFILE_SUBDIR"
+}
+
 # ---------- how far the lines should reach ----------
-SPAN_DIR="$REPO/checkpoint/$SPAN_RUN/bench_eval"
-[[ -d "$SPAN_DIR" ]] || { echo "error: no bench_eval under $SPAN_DIR" >&2; exit 2; }
+# Read from the span run's curve AT THIS PROFILE where it has one, since that is
+# the axis these lines will be drawn against. A profile with no curve yet falls
+# back to the 100-document one: the span only sets the x-extent of a horizontal
+# line, so borrowing it is cosmetic, not a mixing of measurements.
+SPAN_DIR=$(profile_dir_of "$REPO/checkpoint/$SPAN_RUN")
 SPAN=$(ls "$SPAN_DIR"/step-*.json 2>/dev/null | sed 's|.*/step-||; s|\.json$||' | sort -n | tail -1)
+if [[ -z "$SPAN" ]]; then
+    SPAN_DIR="$REPO/checkpoint/$SPAN_RUN/bench_eval"
+    SPAN=$(ls "$SPAN_DIR"/step-*.json 2>/dev/null | sed 's|.*/step-||; s|\.json$||' | sort -n | tail -1)
+    [[ -n "$SPAN" ]] && echo "note: $SPAN_RUN has no $PROFILE curve yet; spanning to its 100-document one (x-extent only)" >&2
+fi
 [[ -n "$SPAN" ]] || { echo "error: $SPAN_RUN has no scored checkpoints to span" >&2; exit 2; }
 
 mkdir -p "$ROOT/_models"
 
 echo "=========================================================================="
-echo "Baselines: ${#BASELINES[@]}"
-echo "Span:      bench/step 0..$SPAN   (from $SPAN_RUN)"
+echo "Baselines: $( (( ${#ONLY[@]} > 0 )) && echo "${#ONLY[@]} of ${#BASELINES[@]}   (${ONLY[*]})" || echo "${#BASELINES[@]}")"
+echo "Sample:    $PROFILE   (natural=$NATURAL_N, non-natural=$NONNATURAL_N per benchmark)"
+echo "Span:      0..$SPAN   (from $SPAN_RUN)"
 echo "GPUs:      $NUM_GPUS   (serial, one baseline at a time)"
-echo "Results:   $ROOT/<label>/bench_eval/step-0.json"
+echo "Results:   $(profile_dir_of "$ROOT/<label>")/step-0.json"
 $SCORE   || echo "Mode:      --publish-only, nothing will be evaluated"
 $PUBLISH || echo "Mode:      --no-publish, nothing will be sent to WandB"
 $DRY_RUN && echo "Mode:      --dry-run"
@@ -103,6 +153,14 @@ declare -a DONE=() SKIPPED=() FAILED=()
 for ENTRY in "${BASELINES[@]}"; do
     LABEL=${ENTRY%%|*}
     MODEL=${ENTRY#*|}
+    # --only, when given, is the whole list. Matched exactly rather than as a
+    # substring: the labels are short and a loose match on "saliency-r1" would
+    # also take "grpo-no-saliency".
+    if (( ${#ONLY[@]} > 0 )); then
+        keep=false
+        for want in "${ONLY[@]}"; do [[ "$want" == "$LABEL" ]] && keep=true; done
+        $keep || continue
+    fi
     echo ""
     echo "--------------------------------------------------------------------------"
     echo "Baseline: $LABEL"
@@ -139,7 +197,7 @@ print(snapshot_download(sys.argv[1]))" "$MODEL" 2>/dev/null)
     echo "  model:  $MODEL"
 
     SHADOW="$ROOT/$LABEL"
-    RESULT="$SHADOW/bench_eval/step-0.json"
+    RESULT="$(profile_dir_of "$SHADOW")/step-0.json"
 
     if $SCORE; then
         if [[ -f "$RESULT" ]] && ! $FORCE; then
@@ -154,7 +212,7 @@ print(snapshot_download(sys.argv[1]))" "$MODEL" 2>/dev/null)
             $FORCE && rm -f "$RESULT"
 
             bash "$SCRIPT_DIR/run_bench_eval.sh" --run-dir "$SHADOW" \
-                --num-gpus "$NUM_GPUS" --min-minutes 0
+                --num-gpus "$NUM_GPUS" --min-minutes 0 --bank "$BANK" "${SIZE_ARGS[@]}"
 
             # run_bench_eval.sh reports a suite that failed and moves on, so its exit
             # status does not say whether this model was scored. The step file does.
@@ -169,7 +227,7 @@ print(snapshot_download(sys.argv[1]))" "$MODEL" 2>/dev/null)
 
     if $PUBLISH; then
         if $DRY_RUN; then
-            echo "  would publish as WandB run baseline/$LABEL, bench/step 0..$SPAN"
+            echo "  would publish as WandB run baseline/$LABEL@$PROFILE, keys bench_$PROFILE/*, step 0..$SPAN"
         elif [[ ! -f "$RESULT" ]]; then
             echo "  nothing to publish: no $RESULT" >&2
             FAILED+=("$LABEL (no result to publish)")
@@ -177,7 +235,8 @@ print(snapshot_download(sys.argv[1]))" "$MODEL" 2>/dev/null)
         else
             source "$CONDA_SH"; set +u; conda activate lmms_eval; set -u
             if ! python "$SCRIPT_DIR/bench_eval.py" --publish-baseline \
-                    --run-dir "$SHADOW" --name "$LABEL" --span "$SPAN" $OVERWRITE; then
+                    --run-dir "$SHADOW" --name "$LABEL" --span "$SPAN" \
+                    --sample-n "$SAMPLE_N_JSON" $OVERWRITE; then
                 FAILED+=("$LABEL (publish)")
                 continue
             fi
