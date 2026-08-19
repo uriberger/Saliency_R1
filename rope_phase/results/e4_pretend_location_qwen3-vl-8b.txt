@@ -1,0 +1,259 @@
+==============================================================================
+E4 -- which pretend location is best?
+==============================================================================
+
+--- family: real   (63/120 stimuli with a usable slope)
+    26% of crossings fall outside the swept offsets -2.0..+2.0 and are extrapolated from the fit
+    model /home/uberger/scratch/research/saliency_r1/outputs/bench_baselines/_models/Qwen3-VL-8B-Instruct
+    grid 24x24 patches; natural d0 = 24; offsets [np.float64(-2.0), np.float64(-1.0), np.float64(0.0), np.float64(1.0), np.float64(2.0)]
+    sources: [('gqa', 36), ('openimages', 18), ('textcap', 16), ('v7w', 15), ('docvqa', 15), ('textvqa', 13), ('infographicsvqa', 6), ('flickr30k', 1)]
+    self-check: eager vs stock 0.0000, frozen vs real 0.0000, logit scale 32.0
+
+    PERCEIVED MIDLINE in patches, MEDIAN over stimuli.  Ground truth is 0.000:
+    the sign says which way the model is wrong and |value| is the error.  +- is
+    a bootstrap standard error, so a difference smaller than it is not one.
+    Median, not mean: the crossing is a ratio and its tail eats a mean alive.
+                              gap 0            gap 512
+            none      +0.179 +-0.262      -0.042 +-0.280
+        frozen:0      -0.206 +-0.219      -0.506 +-0.188
+       frozen:12      +0.139 +-0.216      -0.249 +-0.193
+       frozen:24      +0.391 +-0.234      +0.018 +-0.229
+       frozen:25      +0.359 +-0.235      -0.045 +-0.221
+       frozen:26      +0.333 +-0.233      -0.113 +-0.200
+       frozen:27      +0.325 +-0.232      -0.189 +-0.198
+       frozen:28      +0.268 +-0.235      -0.213 +-0.192
+       frozen:29      +0.290 +-0.235      -0.212 +-0.204
+       frozen:30      +0.284 +-0.243      -0.199 +-0.224
+       frozen:31      +0.295 +-0.248      -0.151 +-0.225
+       frozen:32      +0.290 +-0.232      -0.115 +-0.224
+       frozen:33      +0.261 +-0.235      -0.144 +-0.225
+       frozen:34      +0.230 +-0.237      -0.145 +-0.218
+       frozen:35      +0.183 +-0.224      -0.167 +-0.232
+       frozen:36      +0.124 +-0.227      -0.145 +-0.242
+       frozen:37      +0.121 +-0.249      -0.113 +-0.250
+       frozen:38      +0.182 +-0.253      -0.090 +-0.252
+       frozen:39      +0.237 +-0.260      -0.052 +-0.266
+       frozen:40      +0.234 +-0.261      -0.053 +-0.254
+       frozen:41      +0.283 +-0.257      -0.073 +-0.242
+       frozen:42      +0.248 +-0.244      -0.023 +-0.234
+       frozen:43      +0.224 +-0.237      -0.052 +-0.225
+       frozen:44      +0.231 +-0.220      -0.000 +-0.228
+       frozen:45      +0.229 +-0.220      +0.006 +-0.234
+       frozen:46      +0.254 +-0.224      -0.026 +-0.228
+       frozen:47      +0.249 +-0.220      -0.085 +-0.232
+       frozen:64      +0.203 +-0.257      -0.080 +-0.239
+       frozen:96      +0.132 +-0.207      -0.133 +-0.213
+      frozen:112      +0.281 +-0.229      -0.111 +-0.208
+
+    PAIRED SHIFT vs the untouched model at gap 0, same stimulus, same offsets.
+                              gap 0            gap 512
+            none      +0.000 +-0.000      -0.356 +-0.056
+        frozen:0      -0.463 +-0.072      -0.731 +-0.090
+       frozen:12      +0.074 +-0.051      -0.428 +-0.067
+       frozen:24      +0.098 +-0.030      -0.276 +-0.040
+       frozen:25      +0.115 +-0.042      -0.300 +-0.036
+       frozen:26      +0.082 +-0.027      -0.347 +-0.035
+       frozen:27      +0.027 +-0.028      -0.367 +-0.043
+       frozen:28      +0.012 +-0.047      -0.391 +-0.047
+       frozen:29      +0.015 +-0.036      -0.367 +-0.046
+       frozen:30      +0.042 +-0.033      -0.329 +-0.063
+       frozen:31      +0.077 +-0.023      -0.274 +-0.064
+       frozen:32      +0.121 +-0.032      -0.254 +-0.070
+       frozen:33      +0.093 +-0.019      -0.268 +-0.053
+       frozen:34      +0.068 +-0.023      -0.290 +-0.050
+       frozen:35      +0.018 +-0.021      -0.335 +-0.038
+       frozen:36      +0.008 +-0.015      -0.390 +-0.027
+       frozen:37      +0.009 +-0.017      -0.365 +-0.035
+       frozen:38      +0.022 +-0.018      -0.321 +-0.037
+       frozen:39      +0.058 +-0.022      -0.279 +-0.045
+       frozen:40      +0.076 +-0.022      -0.243 +-0.043
+       frozen:41      +0.100 +-0.017      -0.218 +-0.054
+       frozen:42      +0.108 +-0.021      -0.209 +-0.035
+       frozen:43      +0.089 +-0.021      -0.232 +-0.036
+       frozen:44      +0.070 +-0.031      -0.253 +-0.025
+       frozen:45      +0.045 +-0.041      -0.252 +-0.034
+       frozen:46      +0.053 +-0.030      -0.284 +-0.025
+       frozen:47      +0.043 +-0.026      -0.300 +-0.045
+       frozen:64      +0.076 +-0.028      -0.283 +-0.044
+       frozen:96      -0.022 +-0.033      -0.352 +-0.054
+      frozen:112      +0.106 +-0.037      -0.251 +-0.058
+
+    the drift, measured paired: -0.356 +-0.056 patches from gap 0 to 512
+    REFERENCE  untouched, short answer (gap 0) : +0.179
+    REFERENCE  untouched, long answer  (gap 512) : -0.042   <- the drift adds -0.137 patches of error
+
+    BEST PRETEND LOCATIONS at gap 512, by absolute error against
+    ground truth.  `paired` is the same arm's shift from the untouched
+    short-answer model, which is the precisely measured quantity.
+         frozen:44   -0.000 +-0.228   |error| 0.000   paired  -0.253 +-0.025
+         frozen:45   +0.006 +-0.234   |error| 0.006   paired  -0.252 +-0.034
+         frozen:24   +0.018 +-0.229   |error| 0.018   paired  -0.276 +-0.040
+         frozen:42   -0.023 +-0.234   |error| 0.023   paired  -0.209 +-0.035
+         frozen:46   -0.026 +-0.228   |error| 0.026   paired  -0.284 +-0.025
+         frozen:25   -0.045 +-0.221   |error| 0.045   paired  -0.300 +-0.036
+         frozen:39   -0.052 +-0.266   |error| 0.052   paired  -0.279 +-0.045
+         frozen:43   -0.052 +-0.225   |error| 0.052   paired  -0.232 +-0.036
+    WORST:
+         frozen:28   -0.213 +-0.192   |error| 0.213   paired  -0.391 +-0.047
+         frozen:12   -0.249 +-0.193   |error| 0.249   paired  -0.428 +-0.067
+          frozen:0   -0.506 +-0.188   |error| 0.506   paired  -0.731 +-0.090
+
+    CAVEAT for real images: the absolute error is dominated by the model's
+    content prior about where a thing belongs -- a horse low, a sombrero
+    high -- which spread the pilot's crossings over ~2.9 patches.  That is
+    a real error against ground truth and it is fair to count it, but it is
+    not positional, no frozen phase should be expected to fix it, and it is
+    why the paired column is the one that resolves arm from arm.  The
+    square has no such prior, which is why E2 was synthetic.
+
+    FLATNESS CHECK -- a frozen arm should barely move with the gap, since its
+    image attention no longer knows the distance.  What is left is the t axis,
+    which changes mass and cannot reshape the profile.
+              none  gap 0: +0.179  gap 512: -0.042
+         frozen:24  gap 0: +0.391  gap 512: +0.018
+
+--- family: synthetic   (4/4 stimuli with a usable slope)
+    0% of crossings fall outside the swept offsets -3.0..+1.0 and are extrapolated from the fit
+    model /home/uberger/scratch/research/saliency_r1/outputs/bench_baselines/_models/Qwen3-VL-8B-Instruct
+    grid 24x24 patches; natural d0 = 24; offsets [np.float64(-3.0), np.float64(-2.0), np.float64(-1.5), np.float64(-1.0), np.float64(-0.5), np.float64(0.0), np.float64(0.5), np.float64(1.0)]
+    self-check: eager vs stock 0.0000, frozen vs real 0.0000, logit scale 32.0
+
+    PERCEIVED MIDLINE in patches, MEDIAN over stimuli.  Ground truth is 0.000:
+    the sign says which way the model is wrong and |value| is the error.  +- is
+    a bootstrap standard error, so a difference smaller than it is not one.
+    Median, not mean: the crossing is a ratio and its tail eats a mean alive.
+                              gap 0            gap 512
+            none      -0.675 +-0.056      -1.372 +-0.099
+        frozen:0      -0.799 +-0.060      -1.151 +-0.062
+       frozen:12      -0.487 +-0.069      -0.964 +-0.062
+       frozen:24      -0.055 +-0.018      -0.553 +-0.056
+       frozen:25      -0.044 +-0.038      -0.592 +-0.059
+       frozen:26      -0.109 +-0.033      -0.593 +-0.053
+       frozen:27      -0.193 +-0.036      -0.587 +-0.058
+       frozen:28      -0.316 +-0.044      -0.561 +-0.017
+       frozen:29      -0.344 +-0.040      -0.576 +-0.021
+       frozen:30      -0.413 +-0.044      -0.596 +-0.025
+       frozen:31      -0.450 +-0.068      -0.593 +-0.026
+       frozen:32      -0.449 +-0.053      -0.592 +-0.036
+       frozen:33      -0.505 +-0.059      -0.580 +-0.058
+       frozen:34      -0.527 +-0.067      -0.609 +-0.069
+       frozen:35      -0.548 +-0.066      -0.617 +-0.078
+       frozen:36      -0.607 +-0.059      -0.656 +-0.074
+       frozen:37      -0.632 +-0.072      -0.681 +-0.071
+       frozen:38      -0.664 +-0.057      -0.742 +-0.062
+       frozen:39      -0.707 +-0.053      -0.768 +-0.074
+       frozen:40      -0.711 +-0.063      -0.811 +-0.070
+       frozen:41      -0.732 +-0.067      -0.836 +-0.065
+       frozen:42      -0.734 +-0.063      -0.835 +-0.064
+       frozen:43      -0.741 +-0.056      -0.853 +-0.078
+       frozen:44      -0.775 +-0.064      -0.873 +-0.072
+       frozen:45      -0.775 +-0.045      -0.899 +-0.073
+       frozen:46      -0.783 +-0.062      -0.947 +-0.062
+       frozen:47      -0.784 +-0.051      -0.953 +-0.053
+       frozen:64      -0.842 +-0.060      -0.973 +-0.078
+       frozen:96      -0.856 +-0.055      -1.031 +-0.061
+      frozen:112      -0.877 +-0.061      -1.105 +-0.077
+
+    PAIRED SHIFT vs the untouched model at gap 0, same stimulus, same offsets.
+                              gap 0            gap 512
+            none      +0.000 +-0.000      -0.778 +-0.074
+        frozen:0      -0.077 +-0.031      -0.526 +-0.035
+       frozen:12      +0.188 +-0.018      -0.337 +-0.033
+       frozen:24      +0.593 +-0.046      +0.156 +-0.059
+       frozen:25      +0.607 +-0.029      +0.135 +-0.056
+       frozen:26      +0.550 +-0.039      +0.135 +-0.045
+       frozen:27      +0.495 +-0.039      +0.153 +-0.045
+       frozen:28      +0.400 +-0.054      +0.114 +-0.041
+       frozen:29      +0.355 +-0.047      +0.095 +-0.051
+       frozen:30      +0.302 +-0.050      +0.064 +-0.041
+       frozen:31      +0.230 +-0.056      +0.063 +-0.040
+       frozen:32      +0.234 +-0.039      +0.057 +-0.037
+       frozen:33      +0.158 +-0.031      +0.067 +-0.058
+       frozen:34      +0.114 +-0.027      +0.084 +-0.073
+       frozen:35      +0.094 +-0.021      +0.032 +-0.076
+       frozen:36      +0.049 +-0.018      +0.012 +-0.076
+       frozen:37      +0.026 +-0.019      -0.043 +-0.068
+       frozen:38      -0.007 +-0.013      -0.072 +-0.065
+       frozen:39      -0.048 +-0.010      -0.113 +-0.072
+       frozen:40      -0.049 +-0.017      -0.188 +-0.060
+       frozen:41      -0.057 +-0.014      -0.227 +-0.046
+       frozen:42      -0.059 +-0.011      -0.242 +-0.051
+       frozen:43      -0.084 +-0.013      -0.248 +-0.053
+       frozen:44      -0.100 +-0.015      -0.257 +-0.044
+       frozen:45      -0.105 +-0.011      -0.282 +-0.050
+       frozen:46      -0.113 +-0.009      -0.328 +-0.036
+       frozen:47      -0.117 +-0.005      -0.341 +-0.035
+       frozen:64      -0.159 +-0.018      -0.351 +-0.047
+       frozen:96      -0.198 +-0.018      -0.427 +-0.041
+      frozen:112      -0.213 +-0.013      -0.486 +-0.048
+
+    the drift, measured paired: -0.778 +-0.074 patches from gap 0 to 512
+    REFERENCE  untouched, short answer (gap 0) : -0.675
+    REFERENCE  untouched, long answer  (gap 512) : -1.372   <- the drift adds +0.697 patches of error
+
+    BEST PRETEND LOCATIONS at gap 512, by absolute error against
+    ground truth.  `paired` is the same arm's shift from the untouched
+    short-answer model, which is the precisely measured quantity.
+         frozen:24   -0.553 +-0.056   |error| 0.553   paired  +0.156 +-0.059
+         frozen:28   -0.561 +-0.017   |error| 0.561   paired  +0.114 +-0.041
+         frozen:29   -0.576 +-0.021   |error| 0.576   paired  +0.095 +-0.051
+         frozen:33   -0.580 +-0.058   |error| 0.580   paired  +0.067 +-0.058
+         frozen:27   -0.587 +-0.058   |error| 0.587   paired  +0.153 +-0.045
+         frozen:32   -0.592 +-0.036   |error| 0.592   paired  +0.057 +-0.037
+         frozen:25   -0.592 +-0.059   |error| 0.592   paired  +0.135 +-0.056
+         frozen:31   -0.593 +-0.026   |error| 0.593   paired  +0.063 +-0.040
+    WORST:
+         frozen:96   -1.031 +-0.061   |error| 1.031   paired  -0.427 +-0.041
+        frozen:112   -1.105 +-0.077   |error| 1.105   paired  -0.486 +-0.048
+          frozen:0   -1.151 +-0.062   |error| 1.151   paired  -0.526 +-0.035
+
+    FLATNESS CHECK -- a frozen arm should barely move with the gap, since its
+    image attention no longer knows the distance.  What is left is the t axis,
+    which changes mass and cannot reshape the profile.
+              none  gap 0: -0.675  gap 512: -1.372
+         frozen:24  gap 0: -0.055  gap 512: -0.553
+
+--- GUARD: damage to ordinary language modelling (rejection filter only)
+    8 cases, teacher-forced on the untouched model's own text.
+    NOT how the winner is chosen: the arm that changes nothing wins here by
+    construction.  It is here to reject arms that break the model.
+             arm      NLL   vs none   flips %
+            none    0.361     +0.0%      0.0
+        frozen:0    0.374     +3.5%      4.7
+       frozen:12    0.375     +3.7%      4.7
+       frozen:24    0.366     +1.4%      3.1
+       frozen:25    0.363     +0.5%      2.9
+       frozen:26    0.360     -0.3%      2.1
+       frozen:27    0.364     +0.8%      1.8
+       frozen:28    0.361     -0.1%      2.0
+       frozen:29    0.364     +0.6%      1.8
+       frozen:30    0.364     +0.6%      1.7
+       frozen:31    0.362     +0.2%      2.2
+       frozen:32    0.365     +0.9%      2.0
+       frozen:33    0.364     +0.7%      1.7
+       frozen:34    0.361     -0.2%      1.8
+       frozen:35    0.363     +0.5%      1.8
+       frozen:36    0.363     +0.5%      1.2
+       frozen:37    0.364     +0.6%      1.5
+       frozen:38    0.364     +0.7%      1.7
+       frozen:39    0.363     +0.5%      1.5
+       frozen:40    0.362     +0.3%      1.3
+       frozen:41    0.367     +1.4%      1.1
+       frozen:42    0.364     +0.8%      1.6
+       frozen:43    0.361     -0.1%      1.6
+       frozen:44    0.363     +0.5%      1.4
+       frozen:45    0.363     +0.5%      1.1
+       frozen:46    0.362     +0.2%      1.3
+       frozen:47    0.364     +0.8%      1.3
+       frozen:64    0.363     +0.6%      2.1
+       frozen:96    0.359     -0.6%      2.2
+      frozen:112    0.364     +0.6%      2.3
+
+READING IT
+  The question is which frozen distance leaves the smallest error against ground
+  truth on a long answer -- not which one disturbs the model least.  Three things
+  can happen.  If every frozen arm sits at the untouched model's long-answer
+  error, the intervention does nothing.  If they sit at its short-answer error,
+  the fix works and buys back exactly what the drift cost.  If one sits BELOW the
+  short-answer error, part of the model's standing spatial bias was the overlay
+  all along, and freezing it is worth more than merely removing the drift.

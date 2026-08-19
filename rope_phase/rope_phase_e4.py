@@ -225,6 +225,27 @@ def arm_labels(d0s):
     return ["none"] + [f"frozen:{d}" for d in d0s]
 
 
+def centre(v, n_boot: int = 2000, seed: int = 0):
+    """Median and its bootstrap standard error.
+
+    NOT the mean.  The crossing is intercept over slope, and a ratio whose
+    denominator can be near zero is heavy-tailed: on real images 11% of stimuli
+    land beyond +-5 patches and one of them can move a mean of 111 by half a patch.
+    Measured, the mean put the drift at +0.05 +- 0.68 -- no effect, enormous error
+    bar -- where the median put it at -0.37 and a slope-filtered mean at -0.46
+    +- 0.09.  The mean was not measuring the model, it was measuring its own tail.
+    """
+    v = np.asarray(v, float)
+    v = v[np.isfinite(v)]
+    if len(v) == 0:
+        return float("nan"), float("nan")
+    if len(v) == 1:
+        return float(v[0]), float("nan")
+    rng = np.random.default_rng(seed)
+    boot = np.median(rng.choice(v, size=(n_boot, len(v)), replace=True), axis=1)
+    return float(np.median(v)), float(boot.std(ddof=1))
+
+
 # ---------------------------------------------------------------------------
 # stimuli
 # ---------------------------------------------------------------------------
@@ -759,19 +780,14 @@ def report(args):
             P("    too few usable stimuli to report")
             continue
         P("")
-        P("    PERCEIVED MIDLINE in patches.  Ground truth is 0.000: the sign says which")
-        P("    way the model is wrong and |value| is the error.  +- is the standard error")
-        P("    over stimuli, so a difference smaller than that is not a difference.")
+        P("    PERCEIVED MIDLINE in patches, MEDIAN over stimuli.  Ground truth is 0.000:")
+        P("    the sign says which way the model is wrong and |value| is the error.  +- is")
+        P("    a bootstrap standard error, so a difference smaller than it is not one.")
+        P("    Median, not mean: the crossing is a ratio and its tail eats a mean alive.")
         P("    " + " " * 12 + "".join(f"{'gap ' + str(g):>19s}" for g in gaps))
         rows_out = []
         for ai, arm in enumerate(arms):
-            cells = []
-            for gi in range(len(gaps)):
-                v = mid[ok, ai, gi]
-                v = v[np.isfinite(v)]
-                cells.append((float(v.mean()) if len(v) else float("nan"),
-                              float(v.std(ddof=1) / len(v) ** 0.5) if len(v) > 1
-                              else float("nan")))
+            cells = [centre(mid[ok, ai, gi]) for gi in range(len(gaps))]
             rows_out.append((arm, cells))
             P(f"    {arm:>12s}" + "".join(f"{c[0]:>+12.3f} +-{c[1]:<5.3f}" for c in cells))
         P("")
@@ -785,13 +801,7 @@ def report(args):
         P("    " + " " * 12 + "".join(f"{'gap ' + str(g):>19s}" for g in gaps))
         paired = {}
         for ai, arm in enumerate(arms):
-            cells = []
-            for gi in range(len(gaps)):
-                d = mid[ok, ai, gi] - mid[ok, 0, 0]
-                d = d[np.isfinite(d)]
-                cells.append((float(d.mean()) if len(d) else float("nan"),
-                              float(d.std(ddof=1) / len(d) ** 0.5) if len(d) > 1
-                              else float("nan")))
+            cells = [centre(mid[ok, ai, gi] - mid[ok, 0, 0]) for gi in range(len(gaps))]
             paired[arm] = cells
             P(f"    {arm:>12s}" + "".join(f"{c[0]:>+12.3f} +-{c[1]:<5.3f}" for c in cells))
         P("")
@@ -909,7 +919,10 @@ def main():
     # ("The children are of African ethnicity."), which do not name a thing that can
     # be in the top half of a picture.
     ap.add_argument("--max-words", type=int, default=4)
-    ap.add_argument("--min-slope", type=float, default=0.5)
+    # Steep enough that the crossing is interpolated rather than extrapolated off the
+    # end of a nearly flat line.  At 0.5, 11% of real stimuli land beyond +-5 patches
+    # and the mean over 111 of them is meaningless; at 1.5, none do.
+    ap.add_argument("--min-slope", type=float, default=1.5)
     ap.add_argument("--n-guard", type=int, default=8)
     ap.add_argument("--max-new-tokens", type=int, default=192)
     ap.add_argument("--min-tokens", type=int, default=48)
