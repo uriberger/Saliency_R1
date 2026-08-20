@@ -107,10 +107,31 @@
 #                      -> is it grounding, or any same-shaped signal?
 #   --placebo random   a stable hash of the completion text -> U(0,1). w 0.013.
 #                      -> pure within-group variance, no direction at all.
-#   --placebo length   -n_completion_tokens/1000. w 0.031.
+#   --placebo length   (max_completion_length - n_completion_tokens)/1000. w 0.031.
 #                      -> is the overlap reward a brevity reward in disguise? Within a
 #                         group, brevity is the largest thing it is associated with
 #                         (r -0.042 / -0.105 / -0.035 across the three trained runs).
+#
+# The constant in `length` is not decoration. The doc specifies -n/1000, and a constant
+# offset cancels in the GRPO advantage -- but NOT in the reward fold that trl_repo is
+# currently running: it predates commit 8489767 and still uses `.nansum(dim=1)`, which
+# reads an UNSCORED reward as 0. Under -n/1000 every scored completion is negative, so 0
+# would be the BEST possible length score and "produce no groundable observe step" would
+# become the winning move on the auxiliary dimension -- in the one experiment that exists
+# to measure direction. Anchored at the completion cap the score is in [0, cap/1000] and
+# an unscored completion reads as the longest possible one, which is the same kind of
+# penalty an unscored mean_in already takes. Under the merged trainer the two are
+# identical. See "WHICH TRAINER IS RUNNING" below.
+#
+# WHICH TRAINER IS RUNNING. As of 2026-08-20 trl_repo/ is deliberately behind main on
+# trl/grpo_trainer_qwen3.py: main imputes each group's mean for an unscored reward
+# (8489767), trl_repo still folds with nansum, and that was not shipped because it
+# changes the GRPO advantage for every run. The four reference runs were trained under
+# nansum. --placebo needs no trainer change to work -- only the two new logging lines
+# (rewards/*/within_group_std and placebo/*) live there -- so the placebos can be run
+# under either fold. Decide which one deliberately: matching the reference means nansum,
+# and nansum means ~2-4% of completions (the ungroundable ones) are scored 0 on the
+# auxiliary dimension rather than left neutral.
 #
 # Read against `overlap mean_in w0.4` and against the accuracy-only control
 # (--w-overlap 0), NOT against baseline/grpo-no-saliency, which starts from vanilla

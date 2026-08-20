@@ -107,9 +107,24 @@ _CFG = {
     "seed": 0,
     # Keep the translated union inside the grid (see the module docstring).
     "inframe": True,
-    # --placebo length: score = -n_completion_tokens / length_scale. Linear on purpose --
-    # the calibration multiplies the weight by a ratio of standard deviations, and a
-    # non-linear map would make that ratio depend on where the length distribution sits.
+    # --placebo length: score = (length_anchor - n_completion_tokens) / length_scale.
+    # Linear on purpose -- the calibration multiplies the weight by a ratio of standard
+    # deviations, and a non-linear map would make that ratio depend on where the length
+    # distribution sits.
+    #
+    # The doc specifies -n/1000; the anchor is a constant added to it, which is invisible
+    # to GRPO (the advantage subtracts the group mean) and NOT invisible to one thing:
+    # the trainer that is currently installed in trl_repo/ predates commit 8489767 and
+    # still folds the rewards with `.nansum(dim=1)`, i.e. it reads an UNSCORED reward as
+    # 0. Under -n/1000 every scored completion is negative, so 0 would be the highest
+    # possible length score and "have no groundable observe step" would become the best
+    # move on the auxiliary dimension -- the opposite of the intended direction, in the
+    # one experiment that exists to measure direction. With the anchor at the completion
+    # cap the score is in [0, cap/1000] and an unscored completion reads as the LONGEST
+    # possible one, which is the same kind of penalty an unscored mean_in takes (0 sits
+    # ~4 within-group sd below its 0.04 level). Under the merged trainer both forms are
+    # exactly equivalent. Set from --max_completion_length by grpo_vlm_qwen3.py.
+    "length_anchor": 1024.0,
     "length_scale": 1000.0,
 }
 
@@ -200,13 +215,14 @@ def uniform01(text: str, seed: int = 0) -> float:
     return _blake_u64("placebo-random", str(seed), text) / 2.0**64
 
 
-def length_score(n_tokens: int, scale: float = 1000.0) -> float:
+def length_score(n_tokens: int, scale: float = 1000.0, anchor: float = 1024.0) -> float:
     """--placebo length: monotone DECREASING in the completion's token count.
 
     `n_tokens` is the same count the trainer logs as train/completions/mean_length: the
-    completion token ids up to and including the first EOS.
+    completion token ids up to and including the first EOS. `anchor` only shifts the
+    scale -- see _CFG["length_anchor"] for why it is not zero.
     """
-    return -float(n_tokens) / float(scale)
+    return (float(anchor) - float(n_tokens)) / float(scale)
 
 
 def roll_mask(mask: np.ndarray, prompt: str, step_text: str, seed: int = 0,
@@ -285,7 +301,8 @@ def think_placebo_reward(
                 "--placebo length needs the per-completion token ids (the trainer passes "
                 "them as completion_ids), but none reached the reward function."
             )
-        const = [length_score(len(ids), _CFG["length_scale"]) for ids in completion_ids]
+        const = [length_score(len(ids), _CFG["length_scale"], _CFG["length_anchor"])
+                 for ids in completion_ids]
 
     prompts = prompts if prompts is not None else [""] * n
 
@@ -344,9 +361,9 @@ def think_placebo_reward(
             rewards.append(None)  # zero scorable observe steps -> mask (neutral)
             continue
         # The format gate is multiplicative and kept identical to the overlap reward's,
-        # because parity is the point. Note it is unreachable in training: the trainer
-        # builds no observe-step maps for a format-invalid completion, so such a row
-        # arrives with no steps and is masked above. If that ever changes, revisit it for
-        # `length` -- a 0 there is the HIGHEST possible length score, not the lowest.
+        # because parity is the point. It is unreachable in training -- the trainer builds
+        # no observe-step maps for a format-invalid completion, so such a row arrives with
+        # no steps and is masked above -- and `length_anchor` is what keeps the gated 0
+        # from being the BEST score if it ever becomes reachable.
         rewards.append(float(np.mean(vals)) * (1.0 if valid_list[c] else 0.0))
     return rewards

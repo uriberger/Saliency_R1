@@ -73,12 +73,23 @@ def _map(peak_rc, peak=3.0, gh=6, gw=6, floor=0.05):
 # ---------------------------------------------------------------------------
 # Test 1: the three placebo values, in isolation
 # ---------------------------------------------------------------------------
-# length: monotone decreasing, linear, and exactly -n/1000 as specified.
-assert plc.length_score(0) == 0.0
-assert plc.length_score(250) == -0.25
-assert plc.length_score(1000) == -1.0
+# length: linear, monotone decreasing, and -n/1000 up to the constant `anchor`. The
+# anchor keeps every scored completion NON-NEGATIVE, so that under the pre-8489767
+# `nansum` fold that trl_repo still runs -- where an unscored reward reads as 0 -- an
+# unscored completion looks like the LONGEST possible one rather than the shortest.
+assert plc.length_score(0, anchor=0.0) == 0.0
+assert plc.length_score(250, anchor=0.0) == -0.25
 assert plc.length_score(300) < plc.length_score(299), "length must be DECREASING in tokens"
-print("[T1a] length = -n_tokens/1000, monotone decreasing")
+# affine: the anchor shifts every score by the same amount, so within-group spread (and
+# hence the calibrated weight, and hence the GRPO advantage) is untouched.
+_diffs = {plc.length_score(n, anchor=a) - plc.length_score(n)
+          for n in (10, 300, 900) for a in (0.0, 1024.0)}
+assert len(_diffs) == 2, _diffs
+assert plc.length_score(1024, anchor=1024.0) == 0.0        # the cap is the floor
+assert plc.length_score(0, anchor=1024.0) == 1.024
+assert plc.length_score(200, anchor=1024.0) > 0, "a scored completion must beat unscored-as-0"
+print("[T1a] length = (anchor - n_tokens)/1000: decreasing, affine in the anchor, "
+      "non-negative up to the completion cap")
 
 # random: in [0,1), deterministic, different for different text, uniform-ish.
 u = [plc.uniform01(f"completion number {i}") for i in range(20000)]
@@ -274,13 +285,14 @@ orw._dino_boxes = _fake_dino
 # ---------------------------------------------------------------------------
 # Test 4: the placebo VALUES are what they claim, on a scored batch
 # ---------------------------------------------------------------------------
-plc.configure(kind="length")
+plc.configure(kind="length", length_anchor=1024.0)
 r_len = plc.think_placebo_reward(**_kw)
 # completions 0 and 3 are the scored ones; ids are 50 + 30*i tokens long
-assert r_len[0] == -0.050 and abs(r_len[3] - -0.140) < 1e-12, r_len
+assert abs(r_len[0] - 0.974) < 1e-12 and abs(r_len[3] - 0.884) < 1e-12, r_len
 assert r_len[3] < r_len[0], "the longer completion must score lower"
+assert all(v > 0 for v in r_len if v is not None), "must stay above the unscored-as-0 read"
 print(f"[T4a] length: {[None if v is None else round(v, 3) for v in r_len]} "
-      f"(-n_tokens/1000, per completion)")
+      f"((1024 - n_tokens)/1000, per completion)")
 
 plc.configure(kind="random")
 r_rand = plc.think_placebo_reward(**_kw)

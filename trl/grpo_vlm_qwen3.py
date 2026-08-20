@@ -611,8 +611,13 @@ if __name__ == "__main__":
             from trl.rewards.placebo_rewards import configure as configure_placebo
             from trl.rewards.placebo_rewards import think_placebo_reward
 
+            # length_anchor is the completion cap, so --placebo length stays in
+            # [0, cap/1000]: an unscored completion must not read as the BEST possible
+            # length under the pre-8489767 `nansum` fold that trl_repo still runs. It
+            # cancels in the advantage either way -- see placebo_rewards._CFG.
             configure_placebo(kind=script_args.placebo, seed=script_args.rollnull_seed,
-                              inframe=script_args.rollnull_inframe)
+                              inframe=script_args.rollnull_inframe,
+                              length_anchor=float(training_args.max_completion_length))
             reward_funcs = [think_format_reward, think_placebo_reward, accuracy_reward, openai_reward]
         else:
             reward_funcs = [think_format_reward, think_overlap_reward, accuracy_reward, openai_reward]

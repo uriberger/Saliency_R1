@@ -286,6 +286,35 @@ Plus `placebo/roll_toroidal_frac`, `placebo/roll_dist`, `placebo/union_frac` whe
 `--placebo roll` is on; `roll_toroidal_frac` is the one to read, because it says the
 control wrapped across the image border and stopped having the union's shape.
 
+### Which trainer fold you run under — decide this deliberately
+
+`trl_repo/` is deliberately behind `main` on `trl/grpo_trainer_qwen3.py`: `main` imputes
+each group's mean for an unscored reward (commit 8489767), `trl_repo` still folds with
+`.nansum(dim=1)`, which reads an unscored reward as **0**. The four reference runs were
+trained under `nansum`.
+
+`--placebo` needs no trainer change to work — only the two new logging lines live there —
+so the placebos can run under either fold, and the choice is an experimental one:
+
+- **`nansum` (what runs today)** matches the reference exactly, and scores the ~2–4% of
+  completions with no gradeable observe step as 0 on the auxiliary dimension rather than
+  leaving them neutral. For `mean_in` (level 0.04, `sd_within` 0.0098) that 0 is a ~4σ
+  penalty. It is why `--placebo length` is anchored at the completion cap rather than
+  written as `-n/1000`: under the latter, 0 would be the *highest* possible length score,
+  so "produce no groundable observe step" would become the best move on the very
+  dimension this experiment is measuring. The anchor is a constant, invisible to the
+  advantage, and makes the unscored read a floor instead of a ceiling.
+- **`impute` (main)** is the correct semantics, and makes the placebo runs differ from
+  the reference in one more way than direction — unless the reference is re-run too.
+
+Shipping `--placebo` to `trl_repo/` does **not** require the full `patch_trl_qwen3.sh`
+(which is all-or-nothing and would carry 8489767 with it). Four files suffice:
+`trl/rewards/placebo_rewards.py`, `trl/rewards/__init__.py`, `trl/scripts/utils.py` →
+`trl_repo/trl/...`, and `trl/grpo_vlm_qwen3.py` →
+`trl_repo/examples/scripts/grpo_vlm_qwen3.py`. Adding
+`trl/grpo_trainer_qwen3.py` is what buys the new logging *and* the `impute` fold — one
+decision, not two.
+
 ### Four GPUs
 
 `--placebo` still needs DINO, but DINO peaks at 1.6 GB, so it fits on vLLM's GPU:
