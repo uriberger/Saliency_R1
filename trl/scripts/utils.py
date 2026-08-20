@@ -421,6 +421,29 @@ class ScriptArguments:
             "If unset, DINO runs locally on each training process's device."
         },
     )
+    placebo: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "reward_variant='ours': REPLACE the attention-overlap reward with a "
+            "control that has its within-group spread but not its grounding, to find out "
+            "whether the reward's DIRECTION matters at all. 'roll' = the configured "
+            "--overlap_metric on the same map, scored against the step's own box union "
+            "MOVED to a deterministic wrong place (same area, same shape); 'random' = a "
+            "stable hash of the completion text -> U(0,1), pure variance with no "
+            "direction; 'length' = -n_completion_tokens/1000, i.e. the brevity reward the "
+            "overlap term is suspected of being in disguise (within a group it correlates "
+            "-0.04 to -0.11 with completion length and ~0.00 with accuracy). Each takes "
+            "the overlap reward's slot in reward_funcs, so --reward_weights is unchanged, "
+            "and each must be given the weight that matches mean_in w0.4's WITHIN-GROUP "
+            "sd -- the launcher resolves it. Every placebo returns unscored on exactly "
+            "the completions the real reward would leave unscored (it runs the same "
+            "segmentation, the same Grounding-DINO call and the same metric, and uses the "
+            "real score only as a gate), so the comparison has one variable and not two. "
+            "Not available with --overlap_metric logratio. See "
+            "docs/next-reward-experiments.md and trl/rewards/placebo_rewards.py.",
+            "choices": ["roll", "random", "length"],
+        },
+    )
     overlap_natural_only: bool = field(
         default=False,
         metadata={

@@ -2829,6 +2829,29 @@ class GRPOTrainer(Trainer):
             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
             std_rewards = nanstd(rewards_per_func[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
+        # WITHIN-GROUP std of each reward term. The /std above is across all rollouts in
+        # the batch, and that is NOT the quantity that reaches the gradient: the advantage
+        # is `reward - group_mean`, so a term's spread ACROSS prompts cancels and only its
+        # spread WITHIN one prompt's generation group survives. Two reward terms with the
+        # same /std can therefore apply very different pressure at the same weight, which
+        # is exactly what the auxiliary weights (w 0.4 / 0.11 / 0.033 / 0.020) are set from
+        # -- and until now the number they are set from could only be measured offline
+        # from a probe run or reconstructed from the wandb completions table.
+        #
+        # Group-mean-centre, then pool: sqrt( sum_g sum_i (x_gi - mean_g)^2 / sum_g (n_g - 1) ),
+        # over the completions the func actually scored (NaN = not applied, and a group
+        # with fewer than 2 scored completions contributes nothing). No new collective --
+        # rewards_per_func is already gathered, so every rank computes the same number.
+        _rpf = rewards_per_func.view(-1, self.num_generations, rewards_per_func.size(1))
+        _n_scored = (~torch.isnan(_rpf)).sum(dim=1)                       # [groups, funcs]
+        _dev2 = (_rpf - torch.nanmean(_rpf, dim=1, keepdim=True)) ** 2    # NaN where unscored
+        _ss = torch.nansum(_dev2, dim=1).sum(dim=0)                       # [funcs]
+        _dof = (_n_scored - 1).clamp(min=0).sum(dim=0)                    # [funcs]
+        for i, reward_func_name in enumerate(self.reward_func_names):
+            if _dof[i] > 0:
+                self._metrics[mode][f"rewards/{reward_func_name}/within_group_std"].append(
+                    (_ss[i] / _dof[i]).sqrt().item()
+                )
         if self.overlap_natural_only:
             # Share of rollouts the overlap reward was actually scored on. The
             # rewards/think_overlap_reward/mean above is a nanmean, so it already
@@ -2857,6 +2880,24 @@ class GRPOTrainer(Trainer):
                 _g = _g[~torch.isnan(_g)]
                 if _g.numel():
                     self._metrics[mode][f"{_pfx}/roll_{_k}"].append(_g.mean().item())
+        if self.reward_variant == "ours":
+            # --placebo by-products. `roll_toroidal_frac` is the one to read: it says the
+            # union's bounding box already filled the grid, so the control wrapped across
+            # the image border and no longer has the union's SHAPE -- which is the only
+            # property that makes `roll` a control rather than a second copy of `random`.
+            # All NaN for --placebo random|length (no roll), and drained only when a
+            # placebo is installed, which is a rank-uniform CLI decision -- so the number
+            # of collectives below is the same on every rank, which is what matters.
+            from trl.rewards.placebo_rewards import is_active as _placebo_active
+            from trl.rewards.placebo_rewards import pop_diagnostics as pop_placebo_diagnostics
+
+            if _placebo_active():
+                for _k, _v in pop_placebo_diagnostics().items():
+                    _t = torch.tensor([_v], dtype=torch.float32, device=device)
+                    _g = gather(_t)
+                    _g = _g[~torch.isnan(_g)]
+                    if _g.numel():
+                        self._metrics[mode][f"placebo/{_k}"].append(_g.mean().item())
         if self.reward_variant == "grad":
             # The roll-null closes box size and confidence; it does not close the centre
             # hack (`ecc` rising, and correlating with the score), the reward going hollow

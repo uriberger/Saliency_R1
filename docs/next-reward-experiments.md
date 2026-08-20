@@ -82,8 +82,15 @@ Readout, against `overlap mean_in w0.4` and against the accuracy-only control
 | `length` ≈ mean_in, `random` does not | the overlap reward is a brevity reward in disguise — the current best guess |
 | mean_in beats all three | grounding contributes something specific, and every null measured so far was looking in the wrong place |
 
-`length` is the cheapest of the three — no DINO, no attention re-forward — so it runs at
-roughly accuracy-only speed. Implement it first.
+~~`length` is the cheapest of the three — no DINO, no attention re-forward — so it runs at
+roughly accuracy-only speed.~~ **Wrong, and it contradicts the parity rule two sections
+down.** Whether a completion has a gradeable observe step is a question only Grounding-DINO
+can answer, so `length` pays the full grounding cost — 16.6 s of a 40.5 s optimizer step,
+against 1.0 s for the attention re-forward. The re-forward is kept as well (2.5% of the
+step is not worth a second path through the ZeRO-3 trainer), so a placebo run is the same
+computation as its reference in everything except the reward's value. `length` is still
+the one to run first, but because its calibration is the most stable of the three
+(w 0.031 on both measured corpora), not because it is cheap.
 
 ---
 
@@ -147,8 +154,13 @@ a fixture.
 ### Calibration — match within-group sd, not sample sd
 
 Effective pressure is `w × sd_within_group(reward)`, because GRPO centres within the
-group before anything else. The existing `overlap_metric_spread.py` reports **sd per
-sample**, which is the wrong quantity and is how the incumbent weights were set.
+group before anything else. ~~The existing `overlap_metric_spread.py` reports **sd per
+sample**, which is the wrong quantity and is how the incumbent weights were set.~~
+**Half wrong.** Its `sd/sample` column is already a within-group quantity — the MEAN over
+prompts of each prompt's own sd — so the incumbent weights are not measuring the wrong
+thing. What it was missing is the POOLED version, and the two differ by only a few percent
+at n=8 (`E[s] < sqrt(E[s²])`), which is well inside the ±25% those weights already carry.
+The column that really is the wrong one, `sd all`, was never used for a weight.
 
 1. Extend `overlap_metric_spread.py` to also report **within-group sd** (group-mean-
    centre, then pool). `launch_overlap_probe.sh` already generates 8 generations per
@@ -207,3 +219,84 @@ easy to find a story afterwards.
   `_loraqkv` to the name.
 - `/lustre/fs1` project quota for `nvr_israel_rlop` has been hitting 100T/100T. Check
   `df -h /home/uberger/scratch` before starting anything that writes checkpoints.
+
+---
+
+## As built — 2026-08-20
+
+Implemented, CPU-tested, **not run**. Branch `feat/placebo-rewards`.
+
+### Flags
+
+```bash
+bash launch_grpo_qwen3_overlap_colocated_job.sh --placebo length --lora-targets q_proj,v_proj
+```
+
+`--placebo roll|random|length` replaces `think_overlap_reward` with
+`think_placebo_reward` in the same `reward_funcs` slot, so `--reward_weights` is
+unchanged. It requires the attention map and refuses `--overlap-metric logratio` (the
+roll-null is already scored against rolled unions, and its scorer draws randomness, so
+using it as the parity gate would consume its own draw). The run name gains
+`_placebo<kind>`, so a placebo can never share a checkpoint directory or a wandb run with
+a real one.
+
+### Resolved weights, and where they came from
+
+`w = 0.4 × sd_within(mean_in) / sd_within(placebo)`, with `sd_within` the pooled
+within-group sd. Measured on the cold-start policy this experiment starts from,
+temperature 1, 8 generations, with `overlap_metric_spread.py` — which computes the three
+placebo rows by importing `trl/rewards/placebo_rewards.py` itself, so the number a run is
+launched with comes from the function the run will use.
+
+| placebo | set_a 40×8 (315 compl) | val_natural 30×8 (231 compl) | launcher default |
+|---|---|---|---|
+| `roll` | — (that probe kept no maps) | 0.320 | **0.32** |
+| `random` | 0.013 | 0.010 | **0.013** |
+| `length` | 0.031 | 0.031 | **0.031** |
+
+`sd_within(mean_in)` is 0.0098 on set_a and 0.0071 on val_natural, and that difference is
+where almost all of the spread in the table comes from — `random` is analytic given it
+(U(0,1) has sd 0.2887; measured 0.2917 and 0.2930, which also says the hash is uniform).
+`roll` has one cold-start measurement; the trained checkpoint `mean_in_v2_cp_1700` on
+set_a puts it at 0.52, so read 0.32 as bracketed by [0.32, 0.52]. It sits near the
+reference's own 0.4 for a structural reason: it is the same metric on the same map with an
+equal-area mask, and only the mask's location differs. To re-measure on the corpus you
+actually train on:
+
+```bash
+bash launch_overlap_probe.sh --n-samples 40 --no-judge \
+    --out-dir outputs/overlap_probe/placebo_spread --dataset <dataset>
+python overlap_metric_spread.py outputs/overlap_probe/placebo_spread
+```
+
+### Scored-vs-unscored parity
+
+Not imitated — taken. `think_placebo_reward` runs the identical pipeline (the same
+`--overlap_natural_only` gate, the same batched Grounding-DINO call, the same
+`_union_mask`, then the real configured metric via `overlap_rewards._step_score`) and uses
+the real score **only as a boolean**. `test_placebo_reward_cpu.py` pins the two unscored
+sets equal on a hand-built fixture covering every way the real reward can decline to score
+a completion, and on 300 randomised batches × 3 metrics × 3 placebos.
+
+### New logging
+
+`train/rewards/<func>/within_group_std` — the quantity the calibration targets, for every
+reward term, live. It is not a new collective: `rewards_per_func` is already gathered.
+Plus `placebo/roll_toroidal_frac`, `placebo/roll_dist`, `placebo/union_frac` when
+`--placebo roll` is on; `roll_toroidal_frac` is the one to read, because it says the
+control wrapped across the image border and stopped having the union's shape.
+
+### Four GPUs
+
+`--placebo` still needs DINO, but DINO peaks at 1.6 GB, so it fits on vLLM's GPU:
+
+```bash
+bash launch_grpo_qwen3_overlap_colocated_job.sh --placebo length \
+    --num-gpus 4 --share-sidecar-gpu --grad-accum 16 --lora-targets q_proj,v_proj
+```
+
+`--grad-accum 16` is load-bearing. The generation batch is
+`per_device × train_procs × grad_accum`, so 3 training procs at grad_accum 8 put 24
+sequences (3 prompts × 8 generations) behind each optimizer step instead of 48 — half the
+prompts per step, and a different meaning for the LR schedule, against an 8-GPU reference.
+16 restores 48. The banner prints `gen_batch`; check it reads 48.

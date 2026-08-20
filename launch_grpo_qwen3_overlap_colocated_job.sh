@@ -90,6 +90,57 @@
 # paper's, chosen for downstream language quality at a fixed budget, not for attention
 # placement. Changing this invalidates --resume from an existing adapter checkpoint.
 #
+# PLACEBO CONTROLS -- does the reward's DIRECTION matter at all?
+#
+#   bash launch_grpo_qwen3_overlap_colocated_job.sh --placebo length --lora-targets q_proj,v_proj
+#
+# Measured 2026-08-18/19: the overlap reward does not identify the correct completion
+# within a group (r with accuracy_reward -0.019 +- 0.051 at mean_in w0.4) and does not
+# move the training objective -- but it takes train/frac_reward_zero_std from 0.547 to
+# 0.000, and the benchmark moves. "It keeps the gradient alive" says why SOMETHING
+# happens; it does not say which way the policy is pushed. These three replace the
+# overlap reward with a control that has its tie-breaking strength and none of its
+# grounding, each weighted to mean_in w0.4's WITHIN-GROUP sd so only direction varies:
+#
+#   --placebo roll     the same metric, the same map, the step's own box union MOVED to a
+#                      deterministic wrong place. Same area, same shape. w 0.32.
+#                      -> is it grounding, or any same-shaped signal?
+#   --placebo random   a stable hash of the completion text -> U(0,1). w 0.013.
+#                      -> pure within-group variance, no direction at all.
+#   --placebo length   -n_completion_tokens/1000. w 0.031.
+#                      -> is the overlap reward a brevity reward in disguise? Within a
+#                         group, brevity is the largest thing it is associated with
+#                         (r -0.042 / -0.105 / -0.035 across the three trained runs).
+#
+# Read against `overlap mean_in w0.4` and against the accuracy-only control
+# (--w-overlap 0), NOT against baseline/grpo-no-saliency, which starts from vanilla
+# Qwen3-VL-8B rather than the cold-start merge. All three ~= mean_in means direction is
+# irrelevant; `length` ~= mean_in but `random` not means it is a brevity reward; mean_in
+# beating all three means grounding contributes something specific.
+#
+# EVERY PLACEBO IS UNSCORED ON EXACTLY THE COMPLETIONS mean_in WOULD LEAVE UNSCORED.
+# That is not imitated, it is taken: the run does the same segmentation, the same batched
+# Grounding-DINO call and the same metric, and uses the real score only as a gate. So a
+# placebo run is NOT cheap -- DINO is 16.6 s of a 40.5 s optimizer step and the parity
+# rule needs all of it. The attention re-forward (1.0 s) is kept too, so a placebo run is
+# the same computation as its reference in everything but the reward's value.
+#
+# --placebo appends _placebo<kind> to the run name, so it can never share a checkpoint
+# directory or a wandb run with a real one. It requires the attention map and refuses
+# --overlap-metric logratio (the roll-null is already a rolled control).
+#
+# On four GPUs. --placebo still needs DINO, but DINO peaks at 1.6 GB, so put it on vLLM's
+# GPU and keep the other three for training:
+#
+#   bash launch_grpo_qwen3_overlap_colocated_job.sh --placebo length \
+#       --num-gpus 4 --share-sidecar-gpu --grad-accum 16 --lora-targets q_proj,v_proj
+#
+# --grad-accum 16 is not optional if the run is to be compared step-for-step with an
+# 8-GPU one: the generation batch is per_device x train_procs x grad_accum, so 3 procs at
+# grad_accum 8 would put 24 sequences (3 prompts x 8 generations) behind each optimizer
+# step instead of 48, halving the prompts per step and changing the LR schedule's meaning.
+# 16 restores 48. The banner prints gen_batch -- check it reads 48.
+#
 # MIXED CORPORA -- restrict the overlap reward to photographs:
 #
 #   bash launch_grpo_qwen3_overlap_colocated_job.sh --dataset_name cold_data/grpo_sets/set_b --natural-only
@@ -264,6 +315,10 @@ MASS_FLOOR_TAU=""        # unset -> off for mean_in, 0.0022 for auroc (see below
 # overlap term is worse than none. Only meaningful on a mixed corpus with a `natural`
 # column (cold_data/grpo_sets/set_b); OFF by default so existing runs are unchanged.
 NATURAL_ONLY=${NATURAL_ONLY:-false}
+# --placebo roll|random|length: REPLACE the overlap reward with a control that has its
+# within-group spread but none of its grounding, to find out whether its DIRECTION
+# matters. Empty = off (the real reward). See the PLACEBO block in the header.
+PLACEBO=${PLACEBO:-}
 
 # ---------- sidecar defaults ----------
 DINO_PORT=${DINO_PORT:-8100}
@@ -326,6 +381,7 @@ while [[ $# -gt 0 ]]; do
         --rollnull-clip)          ROLLNULL_CLIP="$2";           shift 2 ;;
         --rollnull-seed)          ROLLNULL_SEED="$2";           shift 2 ;;
         --mass-floor-tau)         MASS_FLOOR_TAU="$2";          shift 2 ;;
+        --placebo)                PLACEBO="$2";                 shift 2 ;;
         --natural-only)           NATURAL_ONLY=true;            shift ;;
         --no-natural-only)        NATURAL_ONLY=false;           shift ;;
         --eval-steps)             EVAL_STEPS="$2";              shift 2 ;;
@@ -386,6 +442,31 @@ if [[ "$OVERLAP_METRIC" == "mean_in" && "$REWARD_VARIANT" != "ours" ]]; then
     echo "         over the map's mean and has no such hole. Continuing." >&2
 fi
 
+# ---------- --placebo: the three direction controls ----------
+if [[ -n "$PLACEBO" ]]; then
+    case "$PLACEBO" in
+        roll|random|length) ;;
+        *) echo "ERROR: --placebo must be roll|random|length (got '$PLACEBO')" >&2; exit 1 ;;
+    esac
+    # The placebos are controls FOR THE ATTENTION-OVERLAP REWARD and inherit its
+    # scored/unscored set. Against another map they would be compared to a reference
+    # that was never run.
+    if [[ "$REWARD_VARIANT" != "ours" ]]; then
+        echo "ERROR: --placebo $PLACEBO needs the attention map (--saliency-method attention);" >&2
+        echo "       got --saliency-method $REWARD_VARIANT." >&2
+        exit 1
+    fi
+    # The roll-null is ALREADY scored against rolled copies of the union, so --placebo
+    # roll would be a control of a control; and its scorer draws random placements, so
+    # using it as the scored/unscored parity gate would consume that draw and
+    # double-count the diagnostics. trl/rewards/placebo_rewards.configure() refuses it too.
+    if [[ "$OVERLAP_METRIC" == "logratio" ]]; then
+        echo "ERROR: --placebo does not work with --overlap-metric logratio. Use mean_in" >&2
+        echo "       (the reference the placebos are controls for), mean_in_v2 or auroc." >&2
+        exit 1
+    fi
+fi
+
 
 if [ "$SHARE_SIDECAR_GPU" = true ]; then MIN_GPUS=2; else MIN_GPUS=3; fi
 if (( NUM_GPUS < MIN_GPUS )); then
@@ -439,6 +520,50 @@ fi
 # the floor OFF. If you pass --mass-floor-tau anyway, drop the weight to ~0.024.
 if [[ "$OVERLAP_METRIC" == "mean_in_v2" && "$REWARD_VARIANT" == "ours" ]]; then
     [[ -z "${W_OVERLAP_SET:-}" ]] && W_OVERLAP=0.033
+fi
+
+# --placebo carries its OWN weight, and it overrides the metric's: the point of the
+# experiment is that all four runs apply the same tie-breaking PRESSURE and differ only
+# in direction, so the weight is set from the placebo's spread, not the metric's.
+#
+#   w_placebo = 0.4 x sd_within(mean_in) / sd_within(placebo)
+#
+# sd_within is the pooled WITHIN-GROUP sd -- the advantage subtracts the group mean, so
+# a term's spread across prompts never reaches the gradient. Measured with
+# `python overlap_metric_spread.py <probe_merged.json>`, which now prints it next to the
+# per-sample column the incumbent weights came from, and computes these three rows by
+# importing trl/rewards/placebo_rewards.py itself.
+#
+#   MEASURED on the cold-start policy this run starts from, temperature 1, 8 generations
+#   (2026-08-20). w at w_ref=0.4:
+#
+#     placebo   set_a 40x8 (315 compl)   val_natural 30x8 (231 compl)   default
+#     roll      -- (probe kept no maps)  0.320                          0.32
+#     random    0.013                    0.010                          0.013
+#     length    0.031                    0.031                          0.031
+#
+#   `length` is the stable one: 0.031 on both corpora. `random` is analytic up to the
+#   reference -- U(0,1) has sd 0.2887 and the measured 0.2917/0.2930 confirm the hash is
+#   uniform -- so its whole spread is sd_within(mean_in)'s, which is 0.0098 on set_a
+#   against 0.0071 on val_natural. `roll` has only the one cold-start measurement; the
+#   trained checkpoint mean_in_v2_cp_1700 on set_a puts it at 0.52 instead, so read 0.32
+#   as bracketed by [0.32, 0.52]. It sits near the reference's own 0.4 for a structural
+#   reason: it is the SAME metric on the SAME map with an equal-area mask, so only the
+#   mask's location differs. To re-measure on the corpus you are actually training on:
+#
+#     bash launch_overlap_probe.sh --n-samples 40 --no-judge \
+#         --out-dir outputs/overlap_probe/placebo_spread --dataset <your dataset>
+#     python overlap_metric_spread.py outputs/overlap_probe/placebo_spread
+#
+#   (the probe must keep its maps -- the default -- or the `roll` row cannot be built).
+#
+# An explicit --w-overlap always wins, as it does for every other metric.
+if [[ -n "$PLACEBO" && -z "${W_OVERLAP_SET:-}" ]]; then
+    case "$PLACEBO" in
+        roll)   W_OVERLAP=0.32 ;;
+        random) W_OVERLAP=0.013 ;;
+        length) W_OVERLAP=0.031 ;;
+    esac
 fi
 
 # --grad replaces the attention map with the PIXEL GRADIENT of each observe step's own
@@ -553,6 +678,10 @@ if [[ "$OVERLAP_METRIC" == "logratio" ]]; then
     SUFFIX="${SUFFIX}_rn${ROLLNULL_OFFSETS}_clip${ROLLNULL_CLIP}"
 fi
 fi
+# A placebo run is NOT the reward its metric names, so it must not share a checkpoint
+# directory or a wandb run name with a real one. The weight already differs, but relying
+# on that would break the moment someone passes --w-overlap explicitly.
+[[ -n "$PLACEBO" ]] && SUFFIX="${SUFFIX}_placebo${PLACEBO}"
 [[ -n "$MASS_FLOOR_TAU" ]] && SUFFIX="${SUFFIX}_mf${MASS_FLOOR_TAU}"
 [[ -n "$MAX_UNION_AREA" ]] && SUFFIX="${SUFFIX}_mu${MAX_UNION_AREA}"
 [[ "$MAX_BOX_AREA" == "0" ]] && SUFFIX="${SUFFIX}_nobox"
@@ -583,6 +712,17 @@ echo "Generation:       vLLM server  127.0.0.1:$VLLM_PORT  gpu_mem=$VLLM_GPU_MEM
 echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_box_area=$([[ "$MAX_BOX_AREA" == "0" ]] && echo 'off (no per-box cap)' || echo "$MAX_BOX_AREA") max_union_area=$([[ -n "$MAX_UNION_AREA" ]] && echo "$MAX_UNION_AREA" || echo 'off')"
 echo "Overlap reward:   layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
 echo "Metric:           $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " mass_floor_tau=$MASS_FLOOR_TAU" || echo " (no mass floor)")"
+if [[ -n "$PLACEBO" ]]; then
+    case "$PLACEBO" in
+        roll)   _PLACEBO_WHAT="the same metric on the step's own box union MOVED (same area, same shape, wrong place)" ;;
+        random) _PLACEBO_WHAT="a stable hash of the completion text -> U(0,1): variance with no direction" ;;
+        length) _PLACEBO_WHAT="-n_completion_tokens/1000: the brevity reward, made explicit" ;;
+    esac
+    echo "PLACEBO:          $PLACEBO -- $_PLACEBO_WHAT"
+    echo "                  w=$W_OVERLAP$([[ -n "${W_OVERLAP_SET:-}" ]] && echo ' (explicit --w-overlap)' || echo " (= 0.4 x sd_within(mean_in)/sd_within($PLACEBO), measured on the cold-start policy)")"
+    echo "                  scored on exactly the completions $OVERLAP_METRIC would score: same"
+    echo "                  segmentation, same Grounding-DINO call, same union, real metric used as the gate."
+fi
 echo "Overlap rows:     $([ "$NATURAL_ONLY" = true ] && echo 'natural images only (non-natural: format+accuracy+judge)' || echo 'all rows')"
 echo "Validation:       $([ -n "$VAL_SETS_DIR" ] && echo "accuracy only, step 0 then every $EVAL_STEPS steps, from $VAL_SETS_DIR" || echo 'off')"
 echo "Checkpoints:      save every $SAVE_STEPS, keep every $CKPT_KEEP_EVERY"
@@ -658,6 +798,7 @@ if ! $DIRECT; then
                 ${MAX_UNION_AREA:+--max-union-area $MAX_UNION_AREA} \
                 --overlap-metric $OVERLAP_METRIC \
                 ${MASS_FLOOR_TAU:+--mass-floor-tau $MASS_FLOOR_TAU} \
+                ${PLACEBO:+--placebo $PLACEBO} \
                 --dino-port $DINO_PORT \
                 --vllm-port $VLLM_PORT \
                 --vllm-gpu-mem $VLLM_GPU_MEM \
@@ -852,6 +993,11 @@ MASS_FLOOR_FLAG=""
 MAX_UNION_FLAG=""
 [[ -n "$MAX_UNION_AREA" ]] && MAX_UNION_FLAG="--max_union_area $MAX_UNION_AREA"
 
+# Omitted when off, so the dataclass default (None = the real overlap reward) applies and
+# every existing run's command line is reproduced byte for byte.
+PLACEBO_FLAG=""
+[[ -n "$PLACEBO" ]] && PLACEBO_FLAG="--placebo $PLACEBO"
+
 # Omitted when off, so the dataclass default (False) applies and the command line of an
 # existing run is reproduced byte for byte.
 NATURAL_ONLY_FLAG=""
@@ -972,6 +1118,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     $MAX_UNION_FLAG \
     --overlap_metric "$OVERLAP_METRIC" \
     $MASS_FLOOR_FLAG \
+    $PLACEBO_FLAG \
     $NATURAL_ONLY_FLAG \
     $EVAL_FLAGS \
     --dino_api_base "http://127.0.0.1:$DINO_PORT" \

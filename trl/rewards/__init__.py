@@ -23,6 +23,7 @@ _import_structure = {
     "format_rewards": ["think_format_reward"],
     "saliency_rewards": ["think_saliency_reward"],
     "overlap_rewards": ["think_overlap_reward"],
+    "placebo_rewards": ["think_placebo_reward"],
     "openai_rewards": ["openai_reward"],
     "answer_format_rewards": ["answer_format_reward"]
 }
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
     from .format_rewards import think_format_reward
     from .saliency_rewards import think_saliency_reward
     from .overlap_rewards import think_overlap_reward
+    from .placebo_rewards import think_placebo_reward
     from .openai_rewards import openai_reward
     from .answer_format_rewards import answer_format_reward
 

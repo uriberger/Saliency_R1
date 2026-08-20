@@ -108,6 +108,14 @@ cp "$REPO/trl/glimpse_maps.py"            "$TRL_REPO/trl/trainer/glimpse_maps.py
 cp "$REPO/trl/rewards/glimpse_rewards.py" "$TRL_REPO/trl/rewards/glimpse_rewards.py"
 echo "  copied GLIMPSE-reward files (glimpse_maps, glimpse_rewards)"
 
+# ── 2e. placebo controls (--placebo roll|random|length) ─────────────────────
+# placebo_rewards.py does `from . import overlap_rewards` and `from . import roll_null`
+# -- it takes the scored/unscored decision from the real reward rather than reproducing
+# it -- so it lands beside both in trl/rewards/. No map module: it scores the attention
+# map the trainer already builds.
+cp "$REPO/trl/rewards/placebo_rewards.py" "$TRL_REPO/trl/rewards/placebo_rewards.py"
+echo "  copied placebo-control file (placebo_rewards)"
+
 # ── 3a. trl/trainer/__init__.py ─────────────────────────────────────────────
 TINIT="$TRL_REPO/trl/trainer/__init__.py"
 [ -f "$TINIT" ] || { echo "MISSING: $TINIT"; exit 1; }

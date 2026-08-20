@@ -571,6 +571,17 @@ if __name__ == "__main__":
     if script_args.overlap_metric is None:
         script_args.overlap_metric = {"grad": "logratio", "glimpse": "mean_in_v2"}.get(
             script_args.reward_variant, "mean_in")
+    # --placebo's whole contract is "unscored on exactly the completions the ATTENTION
+    # overlap reward leaves unscored", and that set is defined by think_overlap_reward.
+    # Silently applying it to another map would compare against a reference that was
+    # never run.
+    if script_args.placebo and script_args.reward_variant != "ours":
+        raise SystemExit(
+            f"--placebo {script_args.placebo} needs --saliency_method attention "
+            f"(--reward_variant ours); got reward_variant='{script_args.reward_variant}'. "
+            "The placebos are controls for the attention-overlap reward and inherit its "
+            "scored/unscored set, which is the one thing that must not differ."
+        )
 
     if script_args.reward_variant == "ours":
         from trl.rewards.overlap_rewards import configure as configure_overlap
@@ -589,7 +600,22 @@ if __name__ == "__main__":
             dino_api_base=script_args.dino_api_base,
             natural_only=script_args.overlap_natural_only,
         )
-        reward_funcs = [think_format_reward, think_overlap_reward, accuracy_reward, openai_reward]
+        if script_args.placebo:
+            # --placebo takes the overlap reward's SLOT, so --reward_weights lines up
+            # unchanged and the run differs from its reference in the reward's value and
+            # nothing else. It still runs the whole overlap pipeline -- segmentation,
+            # Grounding-DINO, the configured metric -- because the metric's score is what
+            # decides which completions are scored at all, and that set has to match the
+            # reference exactly or the comparison has two variables. Configured AFTER
+            # configure_overlap: it reads the resolved metric back out to refuse logratio.
+            from trl.rewards.placebo_rewards import configure as configure_placebo
+            from trl.rewards.placebo_rewards import think_placebo_reward
+
+            configure_placebo(kind=script_args.placebo, seed=script_args.rollnull_seed,
+                              inframe=script_args.rollnull_inframe)
+            reward_funcs = [think_format_reward, think_placebo_reward, accuracy_reward, openai_reward]
+        else:
+            reward_funcs = [think_format_reward, think_overlap_reward, accuracy_reward, openai_reward]
     elif script_args.reward_variant == "grad":
         # Same slot in reward_funcs as the overlap reward, so --reward_weights lines up
         # unchanged. The DINO-side knobs live in overlap_rewards._CFG -- grad_rewards
