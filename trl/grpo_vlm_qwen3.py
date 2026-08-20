@@ -290,12 +290,37 @@ class BenchmarkResultsCallback(TrainerCallback):
     the checkpoint it describes, and WandB's global step cannot go backwards.
     Anything still unfinished when training exits is appended afterwards by
     `bench_eval.py --backfill`.
+
+    Results are also scanned one directory deeper, because the eval job files them
+    by SAMPLE PROFILE: 100 documents per benchmark keeps the flat
+    `bench_eval/step-<N>.json`, and anything else -- 300 on the natural half is now
+    the default -- goes to `bench_eval/n300_100/`. A non-recursive glob therefore
+    saw nothing at all, and a run whose every checkpoint was scored logged no
+    benchmark curve and said nothing about why.
+
+    Each profile keeps its own key namespace (`bench/*`, `bench_n300_100/*`) so
+    that no panel can put two sample sizes on one line. The namespace is derived
+    from the directory name, which IS the profile name -- see profile_dir() and
+    wandb_prefix() in eval_mini/benchmarks.py, whose spelling this has to match.
+    It is duplicated here rather than imported because this runs inside the
+    training process, where an import error would be a crash in a callback that is
+    only supposed to draw a curve.
     """
 
     def __init__(self, bench_dir):
         self.bench_dir = bench_dir
         self.logged = set()
-        self._axis_declared = False
+        self._axes_declared = set()
+
+    def _step_files(self):
+        """Every step file under bench_dir, flat and one level of profile deep."""
+        return sorted(glob.glob(os.path.join(self.bench_dir, "step-*.json")) +
+                      glob.glob(os.path.join(self.bench_dir, "n*_*", "step-*.json")))
+
+    def _prefix(self, path):
+        """The WandB key namespace a step file belongs in, from its directory."""
+        parent = os.path.basename(os.path.dirname(path))
+        return "bench" if parent == os.path.basename(self.bench_dir) else f"bench_{parent}"
 
     def _wandb_run(self):
         try:
@@ -311,7 +336,7 @@ class BenchmarkResultsCallback(TrainerCallback):
         if run is None:
             return
 
-        for path in sorted(glob.glob(os.path.join(self.bench_dir, "step-*.json"))):
+        for path in self._step_files():
             if path in self.logged:
                 continue
             try:
@@ -323,13 +348,19 @@ class BenchmarkResultsCallback(TrainerCallback):
                 self.logged.add(path)
                 continue
 
-            if not self._axis_declared:
-                run.define_metric("bench/step")
-                run.define_metric("bench/*", step_metric="bench/step")
-                self._axis_declared = True
-            run.log({**metrics, "bench/step": step})
+            # bench_eval.py writes the keys under `bench/`; re-namespace them to
+            # this file's profile so two sample sizes cannot land on one curve.
+            prefix = self._prefix(path)
+            if prefix != "bench":
+                metrics = {f"{prefix}/{k.split('/', 1)[1]}": v for k, v in metrics.items()}
+            if prefix not in self._axes_declared:
+                run.define_metric(f"{prefix}/step")
+                run.define_metric(f"{prefix}/*", step_metric=f"{prefix}/step")
+                self._axes_declared.add(prefix)
+            run.log({**metrics, f"{prefix}/step": step})
             self.logged.add(path)
-            print(f"[bench] logged checkpoint {step} ({len(metrics)} scalars) to WandB")
+            print(f"[bench] logged checkpoint {step} ({len(metrics)} scalars) "
+                  f"to WandB as {prefix}/*")
 
 
 if __name__ == "__main__":

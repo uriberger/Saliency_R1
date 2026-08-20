@@ -303,10 +303,57 @@ def test_units_and_cost():
                tripled > 55, f"{tripled:.1f}")
 
 
+def test_trainer_callback_sees_every_profile():
+    """The live WandB logger must find results filed under a profile subdirectory.
+
+    This is a regression test for a real outage: the callback globbed
+    `bench_eval/step-*.json` non-recursively while the eval job had started filing
+    300-document results under `bench_eval/n300_100/`, so a run whose checkpoints
+    were all being scored logged no benchmark curve at all and said nothing about
+    why. The class is exercised by source rather than imported, because importing
+    the trainer needs torch.
+    """
+    print("the trainer's benchmark callback")
+    source = (HERE / "trl" / "grpo_vlm_qwen3.py").read_text()
+    start = source.index("class BenchmarkResultsCallback")
+    body = source[start:source.index("\n\n\n", start)].replace("(TrainerCallback)", "(object)")
+    namespace = {"glob": __import__("glob"), "os": os, "json": json}
+    exec(body, namespace)
+    callback_cls = namespace["BenchmarkResultsCallback"]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        bench = Path(tmp) / "bench_eval"
+        (bench / "n300_100").mkdir(parents=True)
+        (bench / "step-100.json").write_text(json.dumps(
+            {"step": 100, "metrics": {"bench/natural/mean": 0.71}}))
+        (bench / "n300_100" / "step-100.json").write_text(json.dumps(
+            {"step": 100, "metrics": {"bench/natural/mean": 0.73},
+             "sample_n": {"natural": 300, "nonnatural": 100}}))
+        # Not a step file, and not a profile directory: neither may be picked up.
+        (bench / "partial").mkdir()
+        (bench / "partial" / "step-100.json").write_text("{}")
+
+        callback = callback_cls(str(bench))
+        found = callback._step_files()
+        check("both profiles are found", len(found), 2)
+        check("the banked-units directory is not mistaken for a profile",
+              [f for f in found if "partial" in f], [])
+        check("the flat layout keeps the bench/ namespace",
+              callback._prefix(str(bench / "step-100.json")), "bench")
+        check("a profile directory gets its own namespace",
+              callback._prefix(str(bench / "n300_100" / "step-100.json")), "bench_n300_100")
+        # The namespace must agree with what bench_eval.py --backfill would use,
+        # or a curve would be split across two key names.
+        check("and it agrees with wandb_prefix()",
+              callback._prefix(str(bench / "n300_100" / "step-100.json")),
+              wandb_prefix({"natural": 300, "nonnatural": 100}))
+
+
 def main():
     for test in (test_profiles, test_refuses_to_mix, test_partial_collect_cannot_clobber,
                  test_item_scores, test_fingerprint, test_join_refuses_mismatched_items,
-                 test_harvest_round_trip, test_units_and_cost):
+                 test_harvest_round_trip, test_units_and_cost,
+                 test_trainer_callback_sees_every_profile):
         test()
     print(f"\n{PASSED} passed, {FAILED} failed")
     return 1 if FAILED else 0
