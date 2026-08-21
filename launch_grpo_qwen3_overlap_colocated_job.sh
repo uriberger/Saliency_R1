@@ -308,6 +308,11 @@ MAX_UNION_AREA=""        # unset -> off. Per-STEP cap on the union of the kept b
                          # the measured median union is already 56% of it.
 REWARD_VARIANT=ours      # ours (attention overlap) | grad (roll-null pixel gradient)
                          # | glimpse (GLIMPSE grounding; 55-59x grad, read the warning)
+                         # NOTE: this default is what a relaunch that forgets
+                         # --saliency-method silently falls back to. The resume gate
+                         # below exists because that fallback is invisible otherwise.
+ALLOW_MAP_CHANGE=false   # --allow-map-change: resume a checkpoint with a DIFFERENT
+                         # saliency map than the one it was trained with. Off by default.
 GRAD_TARGET=clogit       # clogit (default) | logit | logprob -- see trl/grad_maps.py
 GRAD_NULL_OFFSETS=16
 GRAD_LOGRATIO_CLIP=1.0
@@ -387,6 +392,7 @@ while [[ $# -gt 0 ]]; do
         --max-union-area)         MAX_UNION_AREA="$2";          shift 2 ;;
         --overlap-metric)         OVERLAP_METRIC="$2";          shift 2 ;;
         --saliency-method)        SALIENCY_METHOD="$2";         shift 2 ;;
+        --allow-map-change)       ALLOW_MAP_CHANGE=true;        shift 1 ;;
         --grad)                   REWARD_VARIANT=grad;          shift 1 ;;
         --grad-target)            GRAD_TARGET="$2";             shift 2 ;;
         --grad-null-offsets)      GRAD_NULL_OFFSETS="$2";       shift 2 ;;
@@ -439,6 +445,14 @@ case "${SALIENCY_METHOD:-}" in
     glimpse)   REWARD_VARIANT=glimpse ;;
     "")        ;;
     *) echo "ERROR: --saliency-method must be attention|grad|glimpse (got '$SALIENCY_METHOD')" >&2; exit 1 ;;
+esac
+# The resolved method, spelled the way the flag spells it. The SLURM path re-invokes this
+# script with --direct and has to hand the map back explicitly: REWARD_VARIANT is an
+# internal variable and does not survive a new process.
+case "$REWARD_VARIANT" in
+    grad)    SALIENCY_METHOD_R=grad ;;
+    glimpse) SALIENCY_METHOD_R=glimpse ;;
+    *)       SALIENCY_METHOD_R=attention ;;
 esac
 # One metric flag now serves three maps that had three different historical defaults, so
 # an unset metric resolves per map -- otherwise a bare --grad would silently stop using
@@ -724,6 +738,73 @@ RUN_NAME="grpo-${MODEL_SLUG}-${REWARD_SLUG}${SUFFIX}"
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$REPO/checkpoint/${RUN_NAME}"
 mkdir -p "$OUTPUT_DIR"
 
+# ---------- resume gate: the checkpoint remembers the map, the command line must too ----
+# --saliency-method is not sticky. Nothing in a checkpoint sets it, so every relaunch --
+# a new allocation, an autoresume chunk, a repeat typed from memory -- has to carry it
+# again. Leave it off and REWARD_VARIANT falls back to its default `ours`:
+# think_overlap_reward takes the same reward_funcs slot at the same --reward_weights
+# position, training continues from the checkpoint on a DIFFERENT reward at a weight
+# calibrated for another map, the run name does not change, and nothing says so. That is
+# how grad runs wov0.017 and wov0.027 spent their last hundreds of steps on the attention
+# map, in the same WandB run (WANDB_RESUME=allow), visible only as train/rewards/
+# think_grad_reward/mean going flat while think_overlap_reward/mean started.
+# A checkpoint does record which reward ran, indirectly: trainer_state.json's log_history
+# carries the reward's own key, rewards/<function name>/mean, which GRPOTrainer builds
+# from the function's __name__. Read it back out and refuse a launch that disagrees.
+_ckpt_reward_fn() {   # the last saliency reward function a checkpoint logged, if any
+    local st="$1/trainer_state.json"
+    [[ -f "$st" ]] || return 0
+    # think_format_reward is in every variant and says nothing about the map. Ordering is
+    # log_history's, which is chronological, so the last hit is the most recent step.
+    grep -o '"rewards/think_[a-z]*_reward/mean"' "$st" 2>/dev/null \
+        | grep -v think_format_reward | tail -1 | tr -d '"' | sed 's|rewards/||; s|/mean||' || true
+}
+# What THIS command line would put in that slot. A --reward_variant passed through as an
+# extra arg lands AFTER the launcher's own copy on the python command line and therefore
+# wins, so read it back rather than judging a run by a flag it overrides.
+_EFFECTIVE_VARIANT="$REWARD_VARIANT"
+[[ "$EXTRA_ARGS" =~ --reward_variant[[:space:]]+([a-z]+) ]] && _EFFECTIVE_VARIANT="${BASH_REMATCH[1]}"
+case "$_EFFECTIVE_VARIANT" in
+    grad)    WANT_REWARD_FN=think_grad_reward;    _MAP_SHOWN=grad ;;
+    glimpse) WANT_REWARD_FN=think_glimpse_reward; _MAP_SHOWN=glimpse ;;
+    ours)    WANT_REWARD_FN=$([[ -n "$PLACEBO" ]] && echo think_placebo_reward || echo think_overlap_reward)
+             _MAP_SHOWN=attention ;;
+    # 'none' and anything else: no saliency slot, so nothing to check and nothing to name.
+    *)       WANT_REWARD_FN="";                   _MAP_SHOWN="$_EFFECTIVE_VARIANT" ;;
+esac
+_GATE_CKPT=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoint-||' | sort -n | tail -1 || true)
+if [[ -n "$_GATE_CKPT" && -n "$WANT_REWARD_FN" ]]; then
+    HAVE_REWARD_FN=$(_ckpt_reward_fn "$OUTPUT_DIR/checkpoint-$_GATE_CKPT")
+    # An empty read is "cannot tell" (a pre-overlap checkpoint, a --reward_variant none
+    # run, a trainer_state.json that never logged a saliency reward), not "disagrees".
+    if [[ -n "$HAVE_REWARD_FN" && "$HAVE_REWARD_FN" != "$WANT_REWARD_FN" ]]; then
+        if [[ "$ALLOW_MAP_CHANGE" == true ]]; then
+            echo "WARNING: resuming checkpoint-$_GATE_CKPT ($HAVE_REWARD_FN) as $WANT_REWARD_FN." >&2
+            echo "         --allow-map-change given, continuing. The run's curve now has two" >&2
+            echo "         rewards in it and its name states only one." >&2
+        else
+            echo "ERROR: this launch would resume a checkpoint trained with a DIFFERENT reward." >&2
+            echo "  output dir:  $OUTPUT_DIR" >&2
+            echo "  resuming:    checkpoint-$_GATE_CKPT, whose last logged saliency reward is" >&2
+            echo "               $HAVE_REWARD_FN" >&2
+            echo "  this launch: $WANT_REWARD_FN (--saliency-method $_MAP_SHOWN$([[ -n "$PLACEBO" ]] && echo " --placebo $PLACEBO"))" >&2
+            echo "" >&2
+            echo "  Nothing in a checkpoint sets --saliency-method, so a relaunch that omits it" >&2
+            echo "  falls back to the attention map and keeps training, silently, at a weight" >&2
+            echo "  chosen for another one. If this is a relaunch, add the flag it is missing:" >&2
+            case "$HAVE_REWARD_FN" in
+                think_grad_reward)    echo "      --saliency-method grad" >&2 ;;
+                think_glimpse_reward) echo "      --saliency-method glimpse" >&2 ;;
+                think_placebo_reward) echo "      --saliency-method attention --placebo <roll|random|length>" >&2 ;;
+                *)                    echo "      --saliency-method attention" >&2 ;;
+            esac
+            echo "  If the map change is deliberate, pass --allow-map-change (and expect one" >&2
+            echo "  curve with two rewards in it), or point --output-dir at a new directory." >&2
+            exit 1
+        fi
+    fi
+fi
+
 REWARD_WEIGHTS="1.0 ${W_OVERLAP} 1.0 1.0"
 
 echo "=========================================================================="
@@ -731,6 +812,7 @@ echo "Model:            $MODEL"
 echo "GPUs (total $NUM_GPUS):  DINO=cuda:$DINO_GPU  vLLM=cuda:$VLLM_GPU  train=cuda:[$TRAIN_GPUS] ($TRAIN_N procs)$([ "$SHARE_SIDECAR_GPU" = true ] && echo '  [sidecars SHARED on cuda:0]')"
 echo "Generation:       vLLM server  127.0.0.1:$VLLM_PORT  gpu_mem=$VLLM_GPU_MEM  max_len=$VLLM_MAX_MODEL_LEN"
 echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_box_area=$([[ "$MAX_BOX_AREA" == "0" ]] && echo 'off (no per-box cap)' || echo "$MAX_BOX_AREA") max_union_area=$([[ -n "$MAX_UNION_AREA" ]] && echo "$MAX_UNION_AREA" || echo 'off')"
+echo "Saliency map:     $_MAP_SHOWN -> ${WANT_REWARD_FN:-(no saliency reward)}$([[ -n "${_GATE_CKPT:-}" ]] && echo "   (resuming checkpoint-$_GATE_CKPT)")"
 echo "Overlap reward:   layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
 echo "Metric:           $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " mass_floor_tau=$MASS_FLOOR_TAU" || echo " (no mass floor)")"
 if [[ -n "$PLACEBO" ]]; then
@@ -820,6 +902,21 @@ if ! $DIRECT; then
                 --overlap-metric $OVERLAP_METRIC \
                 ${MASS_FLOOR_TAU:+--mass-floor-tau $MASS_FLOOR_TAU} \
                 ${PLACEBO:+--placebo $PLACEBO} \
+                --saliency-method $SALIENCY_METHOD_R \
+                --grad-target $GRAD_TARGET \
+                --grad-null-offsets $GRAD_NULL_OFFSETS \
+                --grad-logratio-clip $GRAD_LOGRATIO_CLIP \
+                --glimpse-target $GLIMPSE_TARGET \
+                --glimpse-layer-frac $GLIMPSE_LAYER_FRAC \
+                --glimpse-token-cap $GLIMPSE_TOKEN_CAP \
+                --glimpse-depth-temp $GLIMPSE_DEPTH_TEMP \
+                --glimpse-temp $GLIMPSE_TEMP \
+                --glimpse-token-weight $GLIMPSE_TOKEN_WEIGHT \
+                --rollnull-offsets $ROLLNULL_OFFSETS \
+                --rollnull-clip $ROLLNULL_CLIP \
+                --rollnull-seed $ROLLNULL_SEED \
+                $([ "$NATURAL_ONLY" = true ] && echo --natural-only) \
+                $([ "$ALLOW_MAP_CHANGE" = true ] && echo --allow-map-change) \
                 --dino-port $DINO_PORT \
                 --vllm-port $VLLM_PORT \
                 --vllm-gpu-mem $VLLM_GPU_MEM \
