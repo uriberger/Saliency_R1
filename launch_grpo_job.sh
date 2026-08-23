@@ -24,7 +24,7 @@ sr1_find_submit_job || { echo "ERROR: submit_job not found under the cluster-int
 
 # ---------- cluster / project constants ----------
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-$(sr1_pick_partition batch_singlenode batch_long batch)}
+PARTITION=${PARTITION:-$(sr1_pick_partition)}
 DURATION=${DURATION:-4}
 REPO=/home/uberger/scratch/research/saliency_r1
 CONDA_SH=/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh

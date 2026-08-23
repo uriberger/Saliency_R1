@@ -28,7 +28,7 @@ REPO=${REPO:-/home/uberger/scratch/research/saliency_r1}
 source "$SCRIPT_DIR/cluster_env.sh"
 
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-$(sr1_pick_partition batch_singlenode batch_long batch)}
+PARTITION=${PARTITION:-$(sr1_pick_partition)}
 
 RUN_DIR=""
 # One GPU per eval job: a single-GPU allocation gets scheduled while a 4-GPU one

@@ -36,23 +36,43 @@ find_submit_job() {
     return 1
 }
 
-# First named partition that actually exists here, else the cluster default: a
-# partition name that does not exist is not a clean failure, the job just never runs.
+# Comma-separated list of the named partitions that actually exist here, else the cluster
+# default: a partition name that does not exist is not a clean failure, the job just never
+# runs, and pinning ONE name queues behind whatever that pool happens to be -- which can be
+# orders of magnitude smaller than the partition next to it. SLURM takes whichever of them
+# can start the job soonest, so the order here is only a tie-break.
+#
+# Backfill partitions are dropped when mixed with non-backfill ones because SLURM refuses
+# that combination outright. Partitions whose QoS caps running jobs per user are kept out
+# of the list below for a subtler reason: being at that cap parks the WHOLE job across
+# every partition it names, not just the capped one -- see sr1__drop_user_capped in
+# ../cluster_env.sh. Reach those with an explicit PARTITION=.
 pick_partition() {
-    local avail want default
+    local avail want default list= kept= dropped= p
     avail=$(sinfo -h -o '%P' 2>/dev/null | tr -d '*' | sort -u)
     [ -z "$avail" ] && { echo "${1:-batch}"; return 0; }
     for want in "$@"; do
-        printf '%s\n' "$avail" | grep -qx -- "$want" && { echo "$want"; return 0; }
+        printf '%s\n' "$avail" | grep -qx -- "$want" && list="${list:+$list }$want"
     done
-    default=$(sinfo -h -o '%P' 2>/dev/null | grep -m1 '\*' | tr -d '*')
-    echo "${default:-$(printf '%s\n' "$avail" | head -1)}"
+    if [ -z "$list" ]; then
+        default=$(sinfo -h -o '%P' 2>/dev/null | grep -m1 '\*' | tr -d '*')
+        echo "${default:-$(printf '%s\n' "$avail" | head -1)}"
+        return 0
+    fi
+    case "$list" in *backfill*)
+        for p in $list; do
+            case "$p" in backfill*) dropped="${dropped:+$dropped }$p" ;;
+                         *)         kept="${kept:+$kept }$p" ;; esac
+        done
+        [ -n "$kept" ] && list="$kept" ;;   # backfill-only is a legal submission
+    esac
+    printf '%s\n' "$list" | tr ' ' ','
 }
 
 find_submit_job || { echo "ERROR: submit_job not found; run rope_phase_probe.py directly." >&2; exit 1; }
 
 ACCOUNT=${ACCOUNT:-nvr_israel_rlop}
-PARTITION=${PARTITION:-$(pick_partition batch_singlenode batch_long batch)}
+PARTITION=${PARTITION:-$(pick_partition polar4 polar3 polar batch_singlenode batch_long batch)}
 DURATION=${DURATION:-2}
 CONDA_SH=${CONDA_SH:-/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh}
 CONDA_ENV=${CONDA_ENV:-saliency_r1_qwen3_vllm}   # needs transformers with qwen*_vl + peft
