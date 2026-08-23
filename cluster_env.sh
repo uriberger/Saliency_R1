@@ -20,14 +20,33 @@
 # wins -- these only supply the default.
 
 # The preference list used when sr1_pick_partition is called with no arguments. Every
-# launcher in this repo submits ONE node with 8 GPUs, so every name here must be able to
-# hold that shape. Ordered biggest-pool-first, but the order is only a tie-break: SLURM
+# launcher in this repo submits ONE node with 8 GPUs for 4h, so every name here must be able
+# to hold that shape. Ordered least-contended-first, but the order is only a tie-break: SLURM
 # considers all of them and takes whichever can start the job soonest.
 #
-# Why this is a list and not one name: the partitions differ by orders of magnitude in size,
-# and the small ones are shared with the interactive pool. Pinning a single name is what left
-# 8-GPU jobs queued for a day behind a pool far smaller than the ones next to it.
-SR1_DEFAULT_PARTITIONS=${SR1_DEFAULT_PARTITIONS:-"polar4 polar3 polar batch_singlenode batch_long batch"}
+# Why this is a list and not one name: pinning a single name is what left 8-GPU jobs queued
+# for a day behind a pool the scheduler had no reason to prefer. The clusters get there by
+# different routes, and the list has to cover both:
+#
+#   * polar -- the pools differ by orders of magnitude in SIZE, and the small ones are
+#     shared with the interactive pool.
+#   * oci-nrt-cs-001 -- size says nothing, because every GPU partition is backed by the SAME
+#     554 nodes. What differs is QUEUE DEPTH. batch_block1 is Default=YES and so collects
+#     nearly every job on the cluster (~880 pending); batch_singlenode is the same hardware
+#     with ~3. Measured with `sbatch --test-only`, that was a 13.5-hour difference in
+#     predicted start for one identical 8-GPU job. Both are listed and both earn their
+#     place: batch_singlenode is usually empty, and batch_block1 is PriorityTier=20 against
+#     batch_singlenode's 10, so it wins outright whenever it does have room.
+#
+# Names NOT added for oci-nrt-cs-001, so nobody re-derives this: batch_short (MaxTime=2h,
+# under the 4h these jobs ask for), interactive (its QoS caps a user at 16 GPUs, and two
+# interactive shells already spend exactly that -- see sr1__drop_user_capped for why a
+# per-user cap parks the whole job), backfill (PreemptMode=CANCEL at PriorityTier=1, so a
+# 4h training job is killed rather than requeued), and admin / batch_large / sniff-gpu-nodes
+# (AllowAccounts excludes us). batch_long is likewise closed to this account here, but it
+# stays for oci-hsg-cs-001; alongside a partition that does work it is simply ignored,
+# because this cluster sets EnforcePartLimits=ANY.
+SR1_DEFAULT_PARTITIONS=${SR1_DEFAULT_PARTITIONS:-"polar4 polar3 polar batch_singlenode batch_block1 batch_long batch"}
 
 # sr1_pick_partition [<preferred> ...]
 # Echo a comma-separated list of the named partitions that actually exist here, in the
