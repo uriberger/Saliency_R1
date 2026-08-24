@@ -39,7 +39,10 @@ ACCOUNT="${SLURM_ACCOUNT:-}"
 DAYS=14           # how far back to look at YOUR jobs
 ALLHOURS=24       # how far back to look at EVERYONE's jobs (cluster-wide waits)
 GPUS="8,4,1"
-HOURS="4"
+# Both lengths the launchers use, because on this cluster the length is what decides which
+# partitions answer at all: batch_short caps at MaxTime=2h, so it is instant at 1h and a
+# flat REFUSED at 4h. Probing only 4h would hide the fastest pool here entirely.
+HOURS="1,4"
 USERNAME="${USER:-$(id -un)}"
 
 while [[ $# -gt 0 ]]; do
@@ -145,11 +148,13 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-sec 2 "TIME LIMITS -- which GPU partitions can hold a ${HOURS%%,*}h job at all"
+sec 2 "TIME LIMITS -- which GPU partitions can hold a ${HOURS//,/h or }h job at all"
 for p in $GPU_PARTS; do
     printf '  %-22s %s\n' "$p" "$(sinfo -h -p "$p" -o '%l' 2>/dev/null | head -1)"
 done
 echo "  A run needing 20h+ needs a long partition, or requeue-on-timeout plus checkpoints."
+echo "  Read this against [4]: a shorter chunk does not just backfill better, it can add a"
+echo "  whole partition -- and the ones with the tightest limits are often the emptiest."
 
 # ---------------------------------------------------------------------------
 sec 3 "QUEUE -- the backlog you would be joining, per partition and GPU count"
@@ -317,10 +322,10 @@ sacctmgr -nP show assoc where user="$USERNAME" format=Account,Partition,GrpTRES,
 sec 7 "SUMMARY -- paste this block back to compare clusters"
 printf ' cluster=%s  user=%s  at=%s\n' "${CLUSTER:-?}" "$USERNAME" "$(date -Is)"
 printf ' node size: %s\n' "$(sinfo -h -N -o '%G' 2>/dev/null | sed 's/(.*//' | grep 'gpu:' | sort | uniq -c | tr '\n' ' ')"
-echo " fastest predicted start, ${HOURS%%,*}h job (from [4]):"
+echo " fastest predicted start, any probed shape (from [4]):"
 if [[ -n "$PROBE_ROWS" ]]; then
     printf '%s' "$PROBE_ROWS" | sort -n | head -6 \
-        | awk -F'|' "$AWKLIB"'{ printf "   %-22s %2s GPUs  %s\n", $2, $3, human($1) }'
+        | awk -F'|' "$AWKLIB"'{ printf "   %-22s %2s GPUs  %2sh  %s\n", $2, $3, $4, human($1) }'
 else
     echo "   no partition would accept any of the probed shapes"
 fi

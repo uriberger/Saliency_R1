@@ -35,8 +35,10 @@ fi
 
 source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/cluster_env.sh"
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-$(sr1_pick_partition)}   # single-node (localhost sidecars); override for faster queue
 DURATION=${DURATION:-1}
+# DURATION first: it decides which partitions are eligible. At 1h this picks up batch_short
+# on its own -- the "faster queue" the usage note above used to ask for by hand.
+PARTITION=${PARTITION:-$(SR1_JOB_HOURS=$DURATION sr1_pick_partition)}   # single-node (localhost sidecars)
 NUM_GPUS=${NUM_GPUS:-8}
 REPO=/home/uberger/scratch/research/saliency_r1
 CONDA_ENV=${CONDA_ENV:-saliency_r1_qwen3_vllm}

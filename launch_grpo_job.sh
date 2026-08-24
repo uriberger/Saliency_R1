@@ -24,8 +24,10 @@ sr1_find_submit_job || { echo "ERROR: submit_job not found under the cluster-int
 
 # ---------- cluster / project constants ----------
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-$(sr1_pick_partition)}
 DURATION=${DURATION:-4}
+# DURATION first: it decides which partitions are eligible. A 4h request gives up
+# batch_short (MaxTime=2h); DURATION=1 gains it. See SR1_JOB_HOURS in cluster_env.sh.
+PARTITION=${PARTITION:-$(SR1_JOB_HOURS=$DURATION sr1_pick_partition)}
 REPO=/home/uberger/scratch/research/saliency_r1
 CONDA_SH=/home/uberger/scratch/miniconda3/etc/profile.d/conda.sh
 CONDA_ENV=saliency_r1

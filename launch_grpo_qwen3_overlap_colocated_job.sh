@@ -206,7 +206,8 @@
 #                `python bench_eval.py --backfill --run-dir DIR --wandb-run-id ID`.
 #
 # Environment overrides:
-#   PARTITION=batch_singlenode   DURATION=1 (hours; see the note at the default)
+#   PARTITION=batch_short        DURATION=1 (hours; see the note at the default -- the
+#                                length decides which partitions are eligible)
 #   NATURAL_ONLY=true            (same as --natural-only; --no-natural-only to force off)
 #   SAVE_STEPS=10   CKPT_KEEP_EVERY=100
 #   EVAL_STEPS=100   VAL_SETS_DIR=<dir>   AUTO_BENCH=true   BENCH_GPUS=1
@@ -232,14 +233,26 @@ HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 # ---------- SLURM defaults ----------
 source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/cluster_env.sh"
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-$(sr1_pick_partition)}
-# 1 hour. Every partition this submits to caps at MaxTime=4:00:00, so a 4h request is
-# the one length that can ONLY start on a fully idle node -- backfill needs a hole at
-# least as long as the job, and a 4h hole exists only when something ran to the wall.
+# Resolved after argument parsing, not here: the set of partitions that can hold this job
+# depends on DURATION, and --duration is not known yet. See RESOLVED_PARTITION below.
+PARTITION=${PARTITION:-}
+# 1 hour. The long-lived pools here cap at MaxTime=4:00:00, so a 4h request is the one
+# length that can ONLY start on a fully idle node -- backfill needs a hole at least as
+# long as the job, and a 4h hole exists only when something ran to the wall.
 # Dropping to 2h was meant to fit the 2-4h gaps that open constantly, and it did not
 # help: with polar4/polar3/polar at zero idle nodes the 2h requests still sat at
 # Reason=Priority with StartTime=Unknown. 1h is the shortest useful chunk and fits the
 # largest set of backfill windows, so it is what to try when 2h will not start.
+#
+# On oci-nrt-cs-001 it does something better than fit a gap: at 1h (or 2h) the job also
+# becomes eligible for batch_short, whose MaxTime=2h put it out of reach at 4h. That is the
+# highest-priority GPU partition open to this account (PriorityTier=40 against
+# batch_block1's 20), it preempts the backfill pool rather than queueing behind it, and
+# `sbatch --test-only` puts a 1h 8-GPU job there inside a minute against ~6.7 h on
+# batch_block1. It is one more pool the scheduler can start us in, not a replacement --
+# see the measured numbers in cluster_env.sh. sr1_pick_partition adds and removes it from
+# DURATION automatically (SR1_JOB_HOURS), so raising DURATION back to 4 silently gives it
+# up again. That is the real cost of a long chunk here now.
 #
 # What it costs: warm-up is ~6 min (DINO 30s, vLLM 75s, ~3 min to the first step) against
 # ~50s/step, so overhead per allocation goes from ~3% at 4h to ~7% at 2h to ~10% here --
@@ -249,8 +262,9 @@ PARTITION=${PARTITION:-$(sr1_pick_partition)}
 # often. Watch that SAVE_STEPS still lands a checkpoint comfortably inside 62 steps --
 # anything after the last save is redone on requeue.
 #
-# Raise it with DURATION=2 or 4 when the pool is idle enough that a longer hole is
-# plausible -- longer chunks are strictly cheaper once you can actually get one.
+# Raise it with DURATION=2 when the pool is idle enough that a longer hole is plausible --
+# 2h is the longest chunk that keeps batch_short, so it is the one to try first. DURATION=4
+# only pays off once the 4h pools themselves are idle.
 DURATION=${DURATION:-1}
 
 # ---------- training defaults ----------
@@ -453,6 +467,13 @@ while [[ $# -gt 0 ]]; do
         *)                        EXTRA_ARGS="$EXTRA_ARGS $1";  shift ;;
     esac
 done
+
+# ---------- partition, resolved once DURATION is final ----------
+# Deliberately after the argument loop: which partitions can hold this job depends on how
+# long it asks for. batch_short (MaxTime=2h) is in the list at DURATION=1 or 2 and out of
+# it at 4, and resolving next to the defaults would have decided that against the built-in
+# 1 rather than against a --duration on the command line.
+PARTITION=${PARTITION:-$(SR1_JOB_HOURS=$DURATION sr1_pick_partition)}
 
 # ---------- saliency method and metric, resolved once ----------
 # --saliency-method is the flag; --grad / --glimpse are kept as shorthand and

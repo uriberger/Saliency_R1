@@ -90,7 +90,11 @@ HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 # ---------- SLURM defaults ----------
 source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/cluster_env.sh"
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-$(sr1_pick_partition)}
+# Resolved after argument parsing (below the loop): eligibility depends on DURATION.
+PARTITION=${PARTITION:-}
+# 4h here, unlike the colocated launcher, which dropped to 1h to fit backfill windows --
+# see the note at its DURATION. A 4h request gives up batch_short (MaxTime=2h); if this
+# one starts sitting at Reason=Priority too, DURATION=1 is the first thing to try.
 DURATION=${DURATION:-4}
 
 # ---------- training defaults ----------
@@ -166,6 +170,10 @@ while [[ $# -gt 0 ]]; do
         *)                        EXTRA_ARGS="$EXTRA_ARGS $1";  shift ;;
     esac
 done
+
+# After the argument loop, because which partitions can hold the job depends on how long
+# it asks for -- batch_short is in the list at DURATION<=2 and out of it at 4.
+PARTITION=${PARTITION:-$(SR1_JOB_HOURS=$DURATION sr1_pick_partition)}
 
 REFORWARD_SALIENCY=True
 

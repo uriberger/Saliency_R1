@@ -28,7 +28,9 @@ REPO=${REPO:-/home/uberger/scratch/research/saliency_r1}
 source "$SCRIPT_DIR/cluster_env.sh"
 
 ACCOUNT=nvr_israel_rlop
-PARTITION=${PARTITION:-$(sr1_pick_partition)}
+# Resolved after argument parsing, not here: eligibility depends on DURATION, and
+# --duration is not known yet. See the RESOLVED PARTITION block below the argument loop.
+PARTITION=${PARTITION:-}
 
 RUN_DIR=""
 # One GPU per eval job: a single-GPU allocation gets scheduled while a 4-GPU one
@@ -63,6 +65,12 @@ INTERVAL=60
 # 04:00:00, so a 4h request only ever backfills into a 4h hole -- the rarest window
 # there is, which is why these evals sat in (Priority) behind 55 jobs instead of
 # slipping into the gaps between them. An hour fits almost anywhere.
+#
+# It also buys a partition: at 1h these jobs are eligible for batch_short (MaxTime=2h,
+# PriorityTier=40 -- the highest open to this account), which a 4h request cannot use at
+# all. sr1_pick_partition works that out from DURATION, so raising this above 2 gives
+# batch_short up. Single-GPU evals are the shape that benefits most: over 24h batch_short
+# started 1472 of them at a 6-minute median.
 DURATION=1
 ONCE=false
 DRY_RUN=false
@@ -93,6 +101,10 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+# RESOLVED PARTITION -- after the argument loop, because which partitions can hold these
+# jobs depends on the length they ask for (batch_short is in at 1-2h and out at 4h).
+PARTITION=${PARTITION:-$(SR1_JOB_HOURS=$DURATION sr1_pick_partition)}
 
 [[ -n "$RUN_DIR" ]] || { echo "error: --run-dir is required" >&2; exit 2; }
 [[ -d "$RUN_DIR" ]] || { echo "error: no such run dir: $RUN_DIR" >&2; exit 2; }
