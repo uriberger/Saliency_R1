@@ -51,10 +51,10 @@ the reference weights already carry. On an ATTENTION run there is no trap: all f
 `logratio` included, are the same map and the table is paired as designed.
 
 W_GLIMPSE, the same arithmetic, and the one thing that is EASIER here. `--map glimpse`
-records `mean_in_v2_raw` and `auroc_raw` on every grounded step like every other run, so a
-single glimpse probe run calibrates BOTH reward variants on identical maps, masks and
-completions -- the two rows are paired against each other even though neither is paired
-against the incumbent. Take `sd_per_sample` for the variant being trained and compute
+records all four `*_raw` metrics on every grounded step like every other run, so a single
+glimpse probe run calibrates every variant on identical maps, masks and completions -- the
+rows are paired against each other even though none is paired against the incumbent. Take
+`sd_per_sample` for the variant being trained and compute
 
     w_glimpse = 0.4 * 0.0086 / sd_variant
 
@@ -72,6 +72,15 @@ Read `union_frac`/`box_area_frac` in the same report while you are there: mean_i
 ceiling is n_patches/n_in, so its spread is partly a spread of union AREAS, and a w set
 from it is paying for that too. auroc has no such term, which is the main practical
 argument for the auroc variant over the mean_in_v2 one.
+
+THIS SCRIPT'S TABLE IS ALWAYS THE UNCAPPED ONE. It has no `--max-union-area`, so every row
+is computed over every grounded step -- while the glimpse runs on record train with
+`--max-union-area 0.5`, which skips the 61% of steps whose union covers more than half the
+image and moves each weight by up to 1.5x (measured 2026-08-24; the four uncapped/capped
+w on set_a are mean_in 0.13/0.088, mean_in_v2 0.024/0.013, auroc 0.071/0.060, logratio
+0.032/0.020). To get the capped column, filter the steps in `probe_merged.json` by
+`box_area_frac` -- that field IS the union fraction `--max-union-area` gates on -- and
+rerun `summarise`'s arithmetic over what survives.
 
 The per-completion reward is reconstructed the way think_overlap_reward builds it:
 mean over the completion's grounded observe steps, times the format gate, None when

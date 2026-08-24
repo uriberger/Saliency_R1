@@ -30,19 +30,38 @@ steps, times the format gate; no grounded step -> None (masked, neutral in the G
 advantage), exactly as in overlap_rewards and grad_rewards. `w_glimpse` is applied by the
 trainer via --reward_weights, not here.
 
-W_GLIMPSE, measured. set_a, base cold-start policy, 40 samples x 8 generations, 1077
-grounded steps over 308 completions (2026-08-12, `overlap_probe.py --map glimpse` ->
-`overlap_metric_spread.py`):
+W_GLIMPSE, measured. set_a, base cold-start policy, 40 samples x 8 generations, 1099
+grounded steps over 307 completions, default knobs and no union cap (2026-08-24,
+`overlap_probe.py --map glimpse` -> `overlap_metric_spread.py`):
 
-    metric        level     sd/sample    w_glimpse    steps above chance
-    mean_in_v2    1.2122       0.1696        0.020            71.4%
-    auroc         0.5596       0.0542        0.063            69.0%
+    metric        level     sd/sample    w_glimpse    w if --max_union_area 0.5
+    mean_in      0.1426        0.0268         0.13                        0.088
+    mean_in_v2   1.1910        0.1407        0.024                        0.013
+    auroc        0.5523        0.0485        0.071                        0.060
+    logratio     0.0998        0.1071        0.032                        0.020
 
 `w = 0.4 * 0.0086 / sd`, anchored on the ATTENTION map's per-sample spread -- the same
 arithmetic w_grad uses and with the same caveat, that this one comparison cannot be
-paired. Do NOT take the incumbent 0.033: that is mean_in_v2 on the ATTENTION map. Both
-levels reproduce the 3,471-step screen (1.275 and 0.5673) on an independent draw, which
-is the main reason to trust the sd next to them.
+paired. Do NOT take the incumbent 0.033: that is mean_in_v2 on the ATTENTION map.
+
+THE UNION CAP IS THE FORK, not a rounding difference. `--max_union_area 0.5` skips 61% of
+the grounded steps (median union area is 0.569) and 32% of the completions, and every
+weight above moves by up to 1.5x. Take the last column when the run passes the cap, which
+every glimpse run on record does.
+
+The 0.020 / 0.063 those runs were launched with come from an earlier draw (2026-08-12,
+1077 steps / 308 completions): 13-20% under the uncapped numbers here, inside the +-25% a
+cross-map anchor carries, and close to the CAPPED auroc weight the runs actually needed.
+Both levels reproduce across the two draws (1.2122 / 1.1910 and 0.5596 / 0.5523), which is
+the main reason to trust the sd next to them.
+
+`mean_in` is a third variant this module will score -- `_step_score` falls through to it --
+and it is now weighted, but it is still not recommended: it divides by the map's own PEAK,
+so flattening the map raises it, and the launcher warns on the combination. On this map it
+is at least not perverse -- its per-completion level sits above the roll placebo's (0.1409
+vs 0.1232), and the same run's `logratio` clears its own roll-null (0.0998 against a chance
+of 0, 72.3% of steps above it). But its within-group spread is within 5% of that placebo's
+(0.0297 vs 0.0283), so the variation the advantage sees is the size of a control's.
 
 READ THIS BEFORE TRAINING ON IT. A 3,471-step / 1,157-completion screen of this exact map
 (`outputs/flow_corr/glimpse_screen/glimpse/report.txt`) found:

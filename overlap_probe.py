@@ -648,9 +648,11 @@ def glimpse_step_maps(model, processor, prompt_inputs, prompt_len, comp_ids, ste
 
     Same [{"map", "text", "tok_a", "tok_b"}] contract as the other two producers, so the
     scoring, the HTML and every aggregate below are shared. This is the run that sets
-    `w_glimpse`: `score_steps` records `mean_in_v2_raw` AND `auroc_raw` on every grounded
-    step, so ONE probe run calibrates both variants on identical maps and masks -- a
-    paired comparison, which two separate runs could not give.
+    `w_glimpse`: `score_steps` records ALL FOUR `*_raw` metrics on every grounded step, so
+    ONE probe run calibrates every variant on identical maps and masks -- a paired
+    comparison, which separate runs could not give. The 2026-08-24 run did exactly that
+    (result 7 in docs/probe-results.md); the weights it produced are in
+    trl/rewards/glimpse_rewards.py, and they depend on `--max-union-area`.
     """
     case = teacher_forced_case(prompt_inputs, comp_ids, device)
     ids = case["input_ids"]

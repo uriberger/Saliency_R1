@@ -85,8 +85,11 @@ question-level GT bboxes.
    wired as a new reward variant, with CLI flags in `trl/scripts/utils.py` and the
    launcher, and the new files added to `patch_trl_qwen3.sh`'s `cp` list.
 3. `test_glimpse_reward_cpu.py` mirroring `test_grad_reward_cpu.py` — no model, no GPU.
-4. A weight calibration for `w_glimpse` the way `w_grad` was derived
-   (`overlap_metric_spread.py:23-26` documents the arithmetic).
+4. ~~A weight calibration for `w_glimpse` the way `w_grad` was derived
+   (`overlap_metric_spread.py:23-26` documents the arithmetic).~~ **Done** — `mean_in_v2`
+   and `auroc` 2026-08-12, all four metrics plus the `--max-union-area` column 2026-08-24.
+   Numbers in `trl/rewards/glimpse_rewards.py`'s docstring and the launcher's refusal
+   message; the run is result 7 in [probe-results.md](probe-results.md).
 
 ## Repo rules that will bite you
 

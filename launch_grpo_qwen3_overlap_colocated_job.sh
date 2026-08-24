@@ -677,28 +677,42 @@ if [[ "$REWARD_VARIANT" == "grad" ]]; then
     [[ -n "$MASS_FLOOR_TAU" ]] && { echo "ERROR: --mass-floor-tau does not apply to --grad." >&2; exit 1; }
 fi
 
-# GLIMPSE needs the same explicit --w-overlap, for the same reason -- neither metric's
-# spread is known on this corpus, and mean_in_v2's incumbent 0.033 was calibrated on the
+# GLIMPSE needs the same explicit --w-overlap. The four spreads ARE measured now (the
+# table below), but the weight still cannot be defaulted: it depends on --max-union-area,
+# which changes it by up to 1.5x, and mean_in_v2's incumbent 0.033 was calibrated on the
 # ATTENTION map, not this one. It also gets a cost warning the other two do not need.
 if [[ "$REWARD_VARIANT" == "glimpse" ]]; then
     if [[ -z "${W_OVERLAP_SET:-}" ]]; then
         echo "ERROR: --glimpse needs an explicit --w-overlap." >&2
         echo "  The incumbent's 0.033 was calibrated on the ATTENTION map and does not" >&2
-        echo "  transfer. MEASURED on set_a (base cold-start, 40 samples x 8 gens," >&2
-        echo "  1077 grounded steps / 308 completions, 2026-08-12):" >&2
+        echo "  transfer. MEASURED on set_a (base cold-start, 40 samples x 8 gens, default" >&2
+        echo "  glimpse knobs, 1099 grounded steps / 307 completions, 2026-08-24):" >&2
         echo "" >&2
-        echo "      metric        level    sd/sample    w_glimpse" >&2
-        echo "      mean_in_v2    1.2122      0.1696        0.020" >&2
-        echo "      auroc         0.5596      0.0542        0.063" >&2
+        echo "      metric        level    sd/sample    w_glimpse    w with --max-union-area 0.5" >&2
+        echo "      mean_in      0.1426       0.0268        0.13                          0.088" >&2
+        echo "      mean_in_v2   1.1910       0.1407       0.024                          0.013" >&2
+        echo "      auroc        0.5523       0.0485       0.071                          0.060" >&2
+        echo "      logratio     0.0998       0.1071       0.032                          0.020" >&2
         echo "" >&2
+        echo "  THE UNION CAP IS THE FORK, not a rounding difference: --max-union-area 0.5" >&2
+        echo "  skips 61% of grounded steps (median union area 0.569) and 32% of the" >&2
+        echo "  completions, which moves every weight by up to 1.5x. Take the last column" >&2
+        echo "  if this run passes the cap, the w_glimpse column if it does not." >&2
         echo "  w = 0.4 x 0.0086 / sd, anchored on the ATTENTION map's spread -- do NOT" >&2
-        echo "  read the mean_in column of that report, which is mean_in on GLIMPSE maps" >&2
-        echo "  and was never trained with (the pairing trap in overlap_metric_spread.py)." >&2
-        echo "  So: --w-overlap 0.020 for mean_in_v2, 0.063 for auroc." >&2
-        echo "  To re-measure on another corpus:" >&2
-        echo "    python overlap_probe.py --map glimpse --n-samples 40 --trained-adapter none \\" >&2
-        echo "        --out-dir outputs/overlap_probe/glimpse_spread --dataset <set>" >&2
+        echo "  read the mean_in column of that report, which self-anchors to 0.4 on a" >&2
+        echo "  glimpse run (the pairing trap in overlap_metric_spread.py)." >&2
+        echo "  An earlier draw (2026-08-12, 1077 steps / 308 completions) gave 0.020 and" >&2
+        echo "  0.063 for the uncapped mean_in_v2 / auroc; every glimpse run on record was" >&2
+        echo "  launched with those, 13-20% under this draw and inside the +-25% the" >&2
+        echo "  cross-map anchor carries. Both levels reproduce, so neither needs changing." >&2
+        echo "  To re-measure on another corpus (8 GPUs, ~30 min at these knobs):" >&2
+        echo "    bash launch_overlap_probe.sh --n-samples 40 --gpus 8 --no-judge \\" >&2
+        echo "        --out-dir outputs/overlap_probe/glimpse_spread \\" >&2
+        echo "        --map glimpse --trained-adapter none --dataset <set>" >&2
         echo "    python overlap_metric_spread.py outputs/overlap_probe/glimpse_spread/probe_merged.json" >&2
+        echo "  That report is always the UNCAPPED one -- it has no --max-union-area flag." >&2
+        echo "  For the capped column, filter the steps by box_area_frac in probe_merged.json," >&2
+        echo "  which is exactly the union fraction --max-union-area gates on." >&2
         exit 1
     fi
     # Same refusal as --grad, same reason: the mass floor gates on the fraction of an

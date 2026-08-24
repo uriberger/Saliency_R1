@@ -9,7 +9,9 @@ Read 1 and 2 together. The first is a *layer-level* null; the second shows why t
 null does not license the conclusion the plan drew from it. 3 replaces the direct
 attention map with three indirect ones and is the first place a signal survives
 correction. 6 scores a fourth, GLIMPSE, and is the first map here that is grounded at
-all — which turns out not to be the good news it sounds like.
+all — which turns out not to be the good news it sounds like. 7 is the only one that is
+not a screen: it sets the `w_overlap` a GLIMPSE run needs, on its own draw of completions
+rather than the shared 1,157 cases.
 
 ---
 
@@ -616,6 +618,67 @@ so the true |r| is if anything slightly larger.
 grounding measurement in this line of work; it makes GLIMPSE the right map for
 diagnostic use — per-step LOC, `ov_share` — even though it is the wrong thing to hand a
 policy to maximise.
+
+---
+
+## 7. GLIMPSE reward weights (2026-08-24) — all four spreads, and the union cap that moves them
+
+`overlap_probe.py --map glimpse --trained-adapter none` on set_a, base cold-start, 40
+samples × 8 generations → **1,099 grounded steps / 307 completions**, at the reward's
+default knobs (`layer_frac 1.0`, no token cap) and with no union cap. SLURM job 32822918,
+8 GPUs, **28 min**. Output in `outputs/overlap_probe/glimpse_spread`, maps stored.
+
+Run to fill one hole: `mean_in` on the GLIMPSE map had never been weighted, so
+`--saliency-method glimpse --overlap-metric mean_in` could not be launched at all. Because
+`score_steps` records all four `*_raw` metrics on every grounded step whatever the map, the
+same run re-derives the other three on identical maps, masks and completions.
+
+### The weights
+
+`w = 0.4 × 0.0086 / sd_per_sample`, anchored on the ATTENTION map's `mean_in` spread — the
+one comparison that cannot be paired, so every number here inherits ±25%.
+
+| metric | level | sd/sample | sd_within | w | w with `--max-union-area 0.5` |
+|---|---|---|---|---|---|
+| `mean_in` | 0.1426 | 0.0268 | 0.0297 | **0.13** | **0.088** |
+| `mean_in_v2` | 1.1910 | 0.1407 | 0.1698 | 0.024 | 0.013 |
+| `auroc` | 0.5523 | 0.0485 | 0.0512 | 0.071 | 0.060 |
+| `logratio` | 0.0998 | 0.1071 | 0.1230 | 0.032 | 0.020 |
+
+Both anchors agree on the new cell — 0.128 from `sd/sample` against 0.0086, 0.132 from
+`sd_within` against 0.0098 — the same convergence the `grad`/`auroc` calibration showed.
+
+**The two cells already on record reproduce.** This draw levels `mean_in_v2` at 1.1910
+against 2026-08-12's 1.2122 and `auroc` at 0.5523 against 0.5596, on 1,099 steps against
+1,077. Their re-derived weights come out at 0.024 and 0.071 against the 0.020 and 0.063 the
+runs were launched with — 13–20% high, inside the ±25%, so nothing in flight needs
+changing. That agreement is the reason to trust the `mean_in` row beside them.
+
+### The union cap is the fork
+
+`--max-union-area 0.5` is not a refinement of those numbers, it is a different column.
+Median union area is 0.569, so the cap skips **61% of the grounded steps** and 32% of the
+completions, leaving 428 steps / 210 completions — and the spread of what survives moves
+every weight by up to 1.5×. Every glimpse run on record passes the cap while every weight
+on record was measured without it. For `auroc` the mismatch happens to land well (0.063
+launched against 0.060 measured under the cap); nothing guarantees that for the next
+metric, and for `mean_in` it is the difference between 0.13 and 0.088.
+
+`overlap_metric_spread.py` has no `--max-union-area`, so its table is always the uncapped
+one. `box_area_frac` on each step record in `probe_merged.json` is exactly the union
+fraction the cap gates on, which is what the capped column above was recomputed from.
+
+### `mean_in` is weighted now, and still not recommended
+
+It divides by the map's own peak, so a policy that merely flattens the map scores higher —
+the mechanism behind the `wov0.4` hack, and the launcher warns on the combination. What
+this run adds is that on this map it is at least not perverse: `mean_in` levels at 0.1409
+per completion against the roll placebo's 0.1232, and `logratio` clears its own roll-null
+(0.0998 against a chance of 0, 72.3% of steps above it). The GLIMPSE map does put more mass
+in the union a step names than in a rolled equal-area control. But `mean_in`'s within-group
+spread is within 5% of that placebo's (0.0297 against 0.0283), so the variation GRPO's
+advantage actually sees is the size of a direction control's — which is the argument
+against training it, independently of the weight now existing.
 
 ---
 
