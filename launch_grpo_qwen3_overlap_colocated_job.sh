@@ -206,7 +206,7 @@
 #                `python bench_eval.py --backfill --run-dir DIR --wandb-run-id ID`.
 #
 # Environment overrides:
-#   PARTITION=batch_singlenode   DURATION=4 (hours)
+#   PARTITION=batch_singlenode   DURATION=2 (hours; see the note at the default)
 #   NATURAL_ONLY=true            (same as --natural-only; --no-natural-only to force off)
 #   SAVE_STEPS=10   CKPT_KEEP_EVERY=100
 #   EVAL_STEPS=100   VAL_SETS_DIR=<dir>   AUTO_BENCH=true   BENCH_GPUS=1
@@ -233,7 +233,22 @@ HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/cluster_env.sh"
 ACCOUNT=nvr_israel_rlop
 PARTITION=${PARTITION:-$(sr1_pick_partition)}
-DURATION=${DURATION:-4}
+# 2 hours, not 4, because every partition this submits to caps at MaxTime=4:00:00.
+# A 4h request is therefore the one length that can ONLY start on a fully idle node --
+# backfill needs a hole at least as long as the job, and a 4h hole exists only when
+# something ran to the wall. Nodes free up in 2-4h gaps constantly; a 2h job fits those
+# and a 4h job does not. With polar4/polar3/polar at zero idle nodes that is the whole
+# difference between starting and sitting at Reason=Priority with StartTime=Unknown.
+#
+# What it costs: warm-up is ~6 min (DINO 30s, vLLM 75s, ~3 min to the first step) against
+# ~50s/step, so overhead per allocation goes from ~3% to ~7% -- about 273 steps per chunk
+# down to ~132. It costs throughput, not progress: --autoresume_uninstrumented requeues
+# either way and the run picks up from the newest checkpoint (see RESUME_FLAG below), so
+# the only real loss is re-paying warm-up twice as often.
+#
+# Raise it with DURATION=4 when the pool is idle enough that a full-length hole is
+# plausible -- longer chunks are strictly cheaper once you can actually get one.
+DURATION=${DURATION:-2}
 
 # ---------- training defaults ----------
 MODEL="$REPO/checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged"
