@@ -69,13 +69,20 @@
 #
 # That asymmetry is fine because this is a UNION, not a choice: SLURM considers every name
 # in the list and starts the job wherever it can start soonest, so an extra eligible pool
-# is upside with no downside -- provided it cannot PARK the job, which is what
-# sr1__drop_user_capped checks and which batch_short passes (its QoS sets no MaxJobsPU).
+# is upside with no downside -- provided it cannot PARK the job.
 #
-# That QoS (4_nodes_per_user_20_nodes_max) does cap this user at 4 nodes / 32 GPUs there
-# and the whole partition at 20 nodes / 160 GPUs, with DenyOnLimit. One 8-GPU trainer plus
-# 1-GPU bench evals has plenty of headroom, but if ~24 evals ever run at once that cap is
-# the first thing to look at.
+# On the parking risk, and this is the one thing to check before trusting the above: this
+# cluster caps GPUS-per-user, not JOBS-per-user. MaxJobsPU is empty for every GPU QoS
+# here, so sr1__drop_user_capped -- which only reads MaxJobsPU -- has nothing to say about
+# batch_short either way. The live limit is its QoS 4_nodes_per_user_20_nodes_max:
+# MaxTRESPU=gres/gpu=32 (4 nodes) for this user, GrpTRES=gres/gpu=160 (20 nodes) for the
+# whole partition, DenyOnLimit. Sitting at a MaxTRESPU parks a multi-partition job exactly
+# the way MaxJobsPU does, just with Reason=QOSMaxGRESPerUser -- which is how `interactive`
+# (cap 16, and two 8-GPU shells already spend it) parks jobs today.
+#
+# 32 GPUs is far from what we spend there: one 8-GPU trainer plus 1-GPU bench evals. But
+# if the whole list ever parks with StartTime=Unknown and Reason=QOSMax*, this is the
+# limit to check first, and dropping batch_short is the fix.
 #
 # Names still NOT added for oci-nrt-cs-001, so nobody re-derives this: interactive (its QoS
 # caps a user at 16 GPUs, and two interactive shells already spend exactly that -- see
