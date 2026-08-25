@@ -269,7 +269,11 @@ read -r UNIT_MIN_MINUTES UNIT_SUM_MINUTES UNIT_COUNT < <(
 ) || { echo "error: could not plan the banking units" >&2; exit 2; }
 (( UNIT_COUNT > 0 )) || { echo "error: could not plan the banking units" >&2; exit 2; }
 CKPT_MINUTES=$(( UNIT_SUM_MINUTES + MERGE_MINUTES ))
-MIN_STEP_MINUTES=$(( UNIT_MIN_MINUTES + MERGE_MINUTES ))
+# The margin is in here because run_bench_eval.sh applies its own to whatever clock
+# it is handed. Without it this script would let a step in with exactly enough
+# time, the eval would subtract five minutes, decline to start anything and exit --
+# a whole invocation spent regenerating task configs and reading its own mind.
+MIN_STEP_MINUTES=$(( UNIT_MIN_MINUTES + MERGE_MINUTES + SAFETY_MARGIN ))
 
 # Minutes of this allocation still to come. Unlimited without --job-minutes, which
 # is the shell-in-an-salloc case: nothing here decides anything then.
@@ -303,6 +307,30 @@ if [[ -f "$CHAIN_STATE" ]]; then
     read -r PREV_PROGRESS NOPROGRESS < "$CHAIN_STATE"
     [[ "$PREV_PROGRESS" =~ ^[0-9]+$ ]] || PREV_PROGRESS=-1
     [[ "$NOPROGRESS"    =~ ^[0-9]+$ ]] || NOPROGRESS=0
+fi
+
+# Judged at STARTUP, on what the link before this one left behind, and not at the
+# end of this one. The difference matters: the exits that most need bounding are
+# the ones that never reach the end -- a missing conda env, a run directory that
+# is not there, an lmms-eval that dies on import. Those exit non-zero in seconds,
+# and with --autoresume_ignore_failure a non-zero exit is a request for another
+# job, so nothing downstream of them would ever run. Counted here, a link that
+# fails before it does anything still costs the chain one of its lives.
+if (( JOB_MINUTES > 0 )) && ! $DRY_RUN && ! $PUSH_ONLY; then
+    THIS_PROGRESS=$(progress_units)
+    if (( THIS_PROGRESS > PREV_PROGRESS )); then
+        NOPROGRESS=0
+    else
+        NOPROGRESS=$(( NOPROGRESS + 1 ))
+    fi
+    printf '%s %s\n' "$THIS_PROGRESS" "$NOPROGRESS" > "$CHAIN_STATE"
+    if (( NOPROGRESS > MAX_NOPROGRESS )); then
+        echo "STOPPING THE CHAIN: the last $NOPROGRESS jobs banked no step and no unit between" >&2
+        echo "them. Something is failing the same way every time -- read one of their logs" >&2
+        echo "before asking for more GPUs. Exiting 0 so nothing is requeued;" >&2
+        echo "launch_bench_eval_steps.sh clears $CHAIN_STATE and starts a fresh chain." >&2
+        exit 0
+    fi
 fi
 
 # ---------- which WandB run these results belong to ----------
@@ -404,9 +432,11 @@ fi
 read -r -a STEPS <<< "$STEPS_IN"
 if (( ${#STEPS[@]} == 0 )); then
     echo "nothing to do: every checkpoint in $RUN_DIR is already scored"
-    # The launcher reads this line to decide whether submitting a job is worth it.
-    # Keep the two in step: launch_bench_eval_steps.sh greps for "PLAN ".
-    $DRY_RUN && echo "PLAN steps=0 per_checkpoint_min=0 jobs_needed=0"
+    # The launcher reads this line to decide whether submitting a job is worth it,
+    # and where the chain counter lives. Keep the two in step: it is a contract
+    # between these two files and nothing else.
+    $DRY_RUN && echo "PLAN steps=0 per_checkpoint_min=0 jobs_needed=0 chain_state=$CHAIN_STATE"
+    (( JOB_MINUTES > 0 )) && rm -f "$CHAIN_STATE"
     exit 0
 fi
 
@@ -423,7 +453,7 @@ echo "Steps:    ${#STEPS[@]} ($STEPS_SOURCE$([[ "$STEPS_SOURCE" == detected ]] &
 echo "GPUs:     $NUM_GPUS   (serial, one checkpoint at a time)"
 echo "Sample:   $PROFILE   (natural=$NATURAL_N, non-natural=$NONNATURAL_N per benchmark)"
 echo "Banking:  per $BANK -> $UNIT_COUNT unit(s), the cheapest ${UNIT_MIN_MINUTES}min"
-echo "Cost:     ~${CKPT_MINUTES}min per checkpoint (${UNIT_SUM_MINUTES} of units + ${MERGE_MINUTES} to merge), on $NUM_GPUS GPUs"
+echo "Cost:     ~${CKPT_MINUTES}min per checkpoint (${UNIT_SUM_MINUTES} of units + ${MERGE_MINUTES} to merge), on $NUM_GPUS GPU$( (( NUM_GPUS == 1 )) || echo s)"
 if (( JOB_MINUTES > 0 )); then
     echo "Clock:    ${JOB_MINUTES}min allocation, ${WINDOW}min of it usable"
     echo "          this list needs ~$JOBS_NEEDED of them; progress is banked per unit, so a job"
@@ -477,8 +507,10 @@ push_to_wandb() {
     rm -rf "$staging"
 }
 
-# The simulated clock --dry-run spends; the real one is minutes_left().
-DRY_LEFT=$WINDOW
+# The simulated clock --dry-run spends; the real one is minutes_left(). The whole
+# allocation, not WINDOW: the margin is already inside MIN_STEP_MINUTES, and
+# charging it twice would show a job stopping a checkpoint before it really does.
+DRY_LEFT=$JOB_MINUTES
 
 # Steps this allocation will not reach, once the clock says so. Filled by the loop
 # below and reported at the end; what the chain actually runs on is the on-disk
@@ -562,13 +594,19 @@ for STEP in "${STEPS[@]}"; do
     LEFT=$(minutes_left)
     if (( JOB_MINUTES > 0 && LEFT < MIN_STEP_MINUTES )); then
         echo "  ${LEFT}min of this allocation left, and the cheapest thing that could be banked"
-        echo "  here needs ${MIN_STEP_MINUTES} (merge $MERGE_MINUTES + unit $UNIT_MIN_MINUTES) -- stopping, the next job takes it"
+        echo "  here needs ${MIN_STEP_MINUTES} (merge $MERGE_MINUTES + unit $UNIT_MIN_MINUTES + margin $SAFETY_MARGIN) -- stopping, the next job takes it"
         defer_rest "$STEP"
         break
     fi
 
     mkdir -p "$SHADOW"
     ln -sfn "$CKPT" "$SHADOW/checkpoint-$STEP"
+
+    # --force means measure it again, and the shadow is reused between jobs, so it
+    # may still hold the step file from the last time. run_bench_eval.sh would find
+    # it, conclude nothing is pending, and the copy below would report that old
+    # number as a fresh measurement.
+    $FORCE && rm -f "$(profile_dir_of "$SHADOW")/step-$STEP.json"
 
     # Two different clocks, and run_bench_eval.sh needs both: --job-minutes is what
     # is left NOW, which decides whether a unit may be started, and --alloc-minutes
@@ -644,7 +682,7 @@ fi
 # Outside an allocation this is a single run and the old contract holds: non-zero
 # means something went wrong.
 if (( JOB_MINUTES == 0 )) || $DRY_RUN || $PUSH_ONLY; then
-    $DRY_RUN && echo "PLAN steps=${#STEPS[@]} per_checkpoint_min=$CKPT_MINUTES jobs_needed=$JOBS_NEEDED"
+    $DRY_RUN && echo "PLAN steps=${#STEPS[@]} per_checkpoint_min=$CKPT_MINUTES jobs_needed=$JOBS_NEEDED chain_state=$CHAIN_STATE"
     echo "=========================================================================="
     (( ${#FAILED[@]} + ${#UNPUSHED[@]} == 0 ))
     exit $?
@@ -660,24 +698,6 @@ if (( ${#REMAINING[@]} == 0 )); then
     echo "The list is complete -- exiting 0, which ends the chain."
     echo "=========================================================================="
     rm -f "$CHAIN_STATE"
-    exit 0
-fi
-
-# Did this link earn anything? Only then is asking for another one honest.
-NOW_PROGRESS=$(progress_units)
-if (( NOW_PROGRESS > PREV_PROGRESS )); then
-    NOPROGRESS=0
-else
-    NOPROGRESS=$(( NOPROGRESS + 1 ))
-fi
-printf '%s %s\n' "$NOW_PROGRESS" "$NOPROGRESS" > "$CHAIN_STATE"
-
-if (( NOPROGRESS >= MAX_NOPROGRESS )); then
-    echo "STOPPING THE CHAIN: $NOPROGRESS jobs in a row banked no step and no unit, and" >&2
-    echo "${#REMAINING[@]} step(s) are still owed. Something is failing the same way every time --" >&2
-    echo "read the unit output above before asking for more GPUs. Exiting 0 so nothing is" >&2
-    echo "requeued; launch_bench_eval_steps.sh clears $CHAIN_STATE and starts a fresh chain." >&2
-    echo "=========================================================================="
     exit 0
 fi
 
