@@ -58,6 +58,7 @@
 #   bash run_bench_eval.sh --run-dir CKPT_DIR [--num-gpus 1] [--every 100]
 #                          [--natural-n 300] [--nonnatural-n 100]
 #                          [--task-n mmstar=200] [--bank task] [--steps 100,200]
+#                          [--job-minutes 60] [--alloc-minutes 60]
 #
 # Environment:
 #   OPENAI_API_KEY / NVIDIA_API_KEY   needed by mathvista's llm_as_judge metric
@@ -96,6 +97,21 @@ MAX_CHECKPOINTS=0   # 0 = drain everything that is pending
 # Total wall clock this job was given, in minutes. Set by the dispatcher, because
 # asking Slurm does not work from inside submit_job's container -- see minutes_left.
 JOB_MINUTES=0
+# The whole allocation, when --job-minutes is only what is LEFT of it -- which is
+# the case when a caller invokes this script several times inside one job (see
+# run_bench_eval_steps.sh, one invocation per checkpoint). Two different questions
+# are being answered by these two numbers and conflating them is expensive:
+#
+#   --job-minutes    "may I start this unit?"       -> shrinks as the job runs
+#   --alloc-minutes  "what size are the units?"     -> fixed for the whole job
+#
+# The plan has to be fixed, because a banked unit is keyed by its tag. If the
+# granularity were re-derived from the time remaining, an invocation late in a job
+# would flip `--bank auto` from suite to task, look for markers named mme/mmstar/...
+# instead of the natural.json an earlier invocation banked, and redo work that was
+# already paid for. Left unset it is --job-minutes, i.e. the single-invocation
+# dispatcher's behaviour, unchanged.
+ALLOC_MINUTES=0
 DRY_RUN=false
 # When the script started, which is what --job-minutes is measured from.
 START_EPOCH=$(date +%s)
@@ -114,6 +130,7 @@ while [[ $# -gt 0 ]]; do
         --no-harvest)      HARVEST=false;        shift ;;
         --min-minutes)     MIN_MINUTES="$2";     shift 2 ;;
         --job-minutes)     JOB_MINUTES="$2";     shift 2 ;;
+        --alloc-minutes)   ALLOC_MINUTES="$2";   shift 2 ;;
         --max-checkpoints) MAX_CHECKPOINTS="$2"; shift 2 ;;
         --dry-run)         DRY_RUN=true;         shift ;;
         -h|--help)         sed -n '2,60p' "$0"; exit 0 ;;
@@ -204,9 +221,13 @@ mkdir -p "$PROFILE_DIR" "$PARTIAL_DIR"
 #
 # WINDOW is the usable wall clock of this allocation, and it decides two things:
 # which granularity `--bank auto` picks, and (below) the ceiling on what any one
-# unit is allowed to ask for.
+# unit is allowed to ask for. Both are properties of the ALLOCATION, not of the
+# time left in it, which is why --alloc-minutes wins here and --job-minutes is
+# only consulted when there is no separate figure for the allocation.
+PLAN_MINUTES=$JOB_MINUTES
+(( ALLOC_MINUTES > 0 )) && PLAN_MINUTES=$ALLOC_MINUTES
 WINDOW=0
-(( JOB_MINUTES > 0 )) && WINDOW=$(( JOB_MINUTES - SAFETY_MARGIN ))
+(( PLAN_MINUTES > 0 )) && WINDOW=$(( PLAN_MINUTES - SAFETY_MARGIN ))
 
 declare -a UNIT_TAG=() UNIT_TASKS=() UNIT_MINUTES=() UNIT_EXTRA=() CLAMPED=()
 while IFS=$'\t' read -r tag tasks minutes extra; do
@@ -414,6 +435,8 @@ for i in "${!UNIT_TAG[@]}"; do
     printf '  %-14s %3s min  %s\n' "${UNIT_TAG[$i]}" "${UNIT_MINUTES[$i]}" "${UNIT_TASKS[$i]}"
 done
 echo "Banked:     $PARTIAL_DIR"
+(( JOB_MINUTES > 0 )) && \
+    echo "Clock:      $(minutes_left)min left$( (( ALLOC_MINUTES > 0 )) && echo " of a ${ALLOC_MINUTES}min allocation")"
 if (( ${#CLAMPED[@]} > 0 )); then
     echo "WARNING:    ${CLAMPED[*]} budgeted above the ${WINDOW}min window -- attempted at the"
     echo "            start of a job, and lost to the wall clock when it overruns. Shrink it"
