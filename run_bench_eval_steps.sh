@@ -460,7 +460,7 @@ if (( JOB_MINUTES > 0 )); then
     echo "          killed at the wall clock loses only the unit it was in the middle of"
     echo "          exit $EXIT_MORE = steps still owed (run another), exit 0 = the list is done"
     (( NOPROGRESS > 0 )) && \
-        echo "          WARNING: the $NOPROGRESS link(s) before this one banked nothing ($MAX_NOPROGRESS stops the chain)"
+        echo "          WARNING: the last $NOPROGRESS job(s) banked nothing; $(( MAX_NOPROGRESS + 1 - NOPROGRESS )) more like that stops the chain"
 else
     echo "Clock:    unlimited (no --job-minutes) -- run to the end of the list or be killed part-way"
 fi
