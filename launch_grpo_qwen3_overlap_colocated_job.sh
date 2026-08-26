@@ -174,7 +174,8 @@
 #
 # WATCHING A RUN INSTEAD OF ONLY AUTOPSYING IT
 #
-# Two independent monitors, both landing in the same WandB run:
+# Two independent evaluations, both landing in the same WandB run -- one during
+# training, one only after it:
 #
 #   validation   At step 0 and every --eval-steps (100) steps, val_natural and
 #                val_nonnatural are scored on ANSWER ACCURACY ONLY -- 256 held-out
@@ -189,29 +190,29 @@
 #                measured 21.6 min per set -- ~90% of training throughput at a
 #                100-step cadence, which is what made the cheap path necessary.
 #
-#   benchmarks   13 of the test benchmarks -- all but the three that need an LLM
-#                judge to score (see eval_mini/benchmarks.py) -- cut to 100 docs
-#                and split into a natural and a non-natural suite, run on every kept
-#                checkpoint by a separate 1-GPU job. watch_bench_evals.sh starts
-#                with the run, holds no GPUs itself, and submits a job only when a
-#                checkpoint is waiting and none is already in flight. It submits
-#                with sbatch here on the compute node, because the submit_job
-#                wrapper resolves the cluster from $HOSTNAME and has no pool1-*
-#                entry. --no-auto-bench turns it off; to run it by hand later:
+#   benchmarks   NOT run during training. This launcher used to start
+#                watch_bench_evals.sh alongside the run and let it submit a 1-GPU
+#                eval job per kept checkpoint; it no longer starts anything. The
+#                test suites are scored after the fact, on the checkpoints that
+#                are worth scoring, by running the dispatcher by hand:
 #
 #                  bash watch_bench_evals.sh --run-dir <output-dir>
 #
-#                Results reach WandB under bench/* within one logging interval;
-#                anything finishing after training exits is appended with
+#                It backfills whatever has piled up -- its state is entirely on
+#                disk (a checkpoint is done once bench_eval/step-<N>.json exists),
+#                so starting it late loses nothing. Results are appended to the
+#                training run's WandB history with
 #                `python bench_eval.py --backfill --run-dir DIR --wandb-run-id ID`.
+#
+#                --auto-bench / --no-auto-bench are still accepted and ignored, so
+#                the command lines of in-flight runs keep parsing across a requeue.
 #
 # Environment overrides:
 #   PARTITION=batch_short        DURATION=1 (hours; see the note at the default -- the
 #                                length decides which partitions are eligible)
 #   NATURAL_ONLY=true            (same as --natural-only; --no-natural-only to force off)
 #   SAVE_STEPS=10   CKPT_KEEP_EVERY=100
-#   EVAL_STEPS=100   VAL_SETS_DIR=<dir>   AUTO_BENCH=true   BENCH_GPUS=1
-#   BENCH_NATURAL_N=300   BENCH_NONNATURAL_N=100
+#   EVAL_STEPS=100   VAL_SETS_DIR=<dir>
 #   DINO_PORT=8100   VLLM_PORT=8000   VLLM_MAX_MODEL_LEN=4096
 #   VLLM_GPU_MEM     (default 0.90, or 0.85 with --share-sidecar-gpu)
 #   SHARE_SIDECAR_GPU=true   (same as --share-sidecar-gpu; --no-share-sidecar-gpu to force off)
@@ -300,22 +301,14 @@ CKPT_KEEP_EVERY=${CKPT_KEEP_EVERY:-100}
 # rather than memorization. Set VAL_SETS_DIR="" to turn validation off entirely.
 EVAL_STEPS=${EVAL_STEPS:-100}
 VAL_SETS_DIR=${VAL_SETS_DIR:-$REPO/cold_data/grpo_sets}
-# The benchmark-eval dispatcher (watch_bench_evals.sh) starts with the run and
-# submits a $BENCH_GPUS-GPU job whenever a kept checkpoint is waiting to be scored.
-# It holds no GPU itself. --no-auto-bench turns it off.
+# No benchmark eval runs during training: this launcher starts no dispatcher, and
+# there is no flag that makes it start one. Score checkpoints afterwards by running
+# watch_bench_evals.sh by hand -- see the printed hint at the end of startup.
 #
-# One GPU, not four: a single-GPU allocation schedules far sooner than a 4-GPU one
-# next to an 8-GPU training run. It takes proportionally longer in wall clock,
-# which run_bench_eval.sh accounts for in its own guard.
-#
-# BENCH_NATURAL_N is the documents per natural benchmark, and 300 is not free:
-# roughly 3.6 single-GPU hours per checkpoint against 1.6 at 100, i.e. ~4 one-hour
-# jobs instead of ~2. It buys the only thing that makes the curve worth reading --
-# se on a difference between two checkpoints falls from 0.016 (paired at 100) to
-# ~0.009, against effects of 0.02-0.035. If the dispatcher cannot keep up with
-# training, raise CKPT_KEEP_EVERY rather than lowering this: a sparser curve of
-# numbers that mean something beats a dense curve of noise.
-AUTO_BENCH=${AUTO_BENCH:-true}
+# The BENCH_* values below no longer drive anything here. They survive because
+# --bench-gpus is still on the command line of runs that are in flight (dropping
+# the flag would send it to the training script as an unknown argument), and
+# because the hint quotes them.
 BENCH_GPUS=${BENCH_GPUS:-1}
 BENCH_NATURAL_N=${BENCH_NATURAL_N:-300}
 BENCH_NONNATURAL_N=${BENCH_NONNATURAL_N:-100}
@@ -446,8 +439,11 @@ while [[ $# -gt 0 ]]; do
         --eval-steps)             EVAL_STEPS="$2";              shift 2 ;;
         --no-eval)                VAL_SETS_DIR="";              shift ;;
         --val-sets-dir)           VAL_SETS_DIR="$2";            shift 2 ;;
-        --auto-bench)             AUTO_BENCH=true;              shift ;;
-        --no-auto-bench)          AUTO_BENCH=false;             shift ;;
+        # Accepted and ignored. Benchmarks are never run during training now, but a
+        # run that was submitted before that change re-invokes this script with the
+        # flag on every requeue, and the catch-all below would forward it to the
+        # training script as an unknown argument.
+        --auto-bench|--no-auto-bench)                           shift ;;
         --bench-gpus)             BENCH_GPUS="$2";              shift 2 ;;
         --dino-port)              DINO_PORT="$2";               shift 2 ;;
         --vllm-port)              VLLM_PORT="$2";               shift 2 ;;
@@ -882,7 +878,7 @@ fi
 echo "Overlap rows:     $([ "$NATURAL_ONLY" = true ] && echo 'natural images only (non-natural: format+accuracy+judge)' || echo 'all rows')"
 echo "Validation:       $([ -n "$VAL_SETS_DIR" ] && echo "accuracy only, step 0 then every $EVAL_STEPS steps, from $VAL_SETS_DIR" || echo 'off')"
 echo "Checkpoints:      save every $SAVE_STEPS, keep every $CKPT_KEEP_EVERY"
-echo "Benchmarks:       $([ "$AUTO_BENCH" = true ] && echo "dispatcher auto-started (${BENCH_GPUS}-GPU jobs), ${BENCH_NATURAL_N} natural / ${BENCH_NONNATURAL_N} non-natural docs per benchmark" || echo 'off (see --auto-bench)')"
+echo "Benchmarks:       none during training (score afterwards with watch_bench_evals.sh)"
 echo "Batch:            per_device=$PER_DEVICE_BATCH num_generations=$NUM_GENERATIONS grad_accum=$GRAD_ACCUM  (gen_batch=$(( PER_DEVICE_BATCH * TRAIN_N * GRAD_ACCUM )))"
 echo "LoRA targets:     ${LORA_TARGETS//,/ }"
 echo "T5 step clf:      $OVERLAP_STEPS_DEVICE  ckpt=$OVERLAP_STEPS_CKPT"
@@ -979,7 +975,6 @@ if ! $DIRECT; then
                 --bench-gpus $BENCH_GPUS \
                 ${VAL_SETS_DIR:+--val-sets-dir $VAL_SETS_DIR} \
                 $([ -z "$VAL_SETS_DIR" ] && echo --no-eval) \
-                $([ "$AUTO_BENCH" = true ] && echo --auto-bench) \
                 $([ "$SHARE_SIDECAR_GPU" = true ] && echo --share-sidecar-gpu) \
                 $EXTRA_ARGS
         '"
@@ -1055,7 +1050,7 @@ VLLM_PID=""
 CLEANUP_PID=""
 cleanup() {
     echo "[cleanup] shutting down sidecars ..."
-    for pid in "$VLLM_PID" "$DINO_PID" "$CLEANUP_PID" "${BENCH_WATCHER_PID:-}"; do
+    for pid in "$VLLM_PID" "$DINO_PID" "$CLEANUP_PID"; do
         [ -n "$pid" ] || continue
         pkill -TERM -P "$pid" 2>/dev/null || true
         kill -TERM "$pid" 2>/dev/null || true
@@ -1214,46 +1209,20 @@ if [[ -n "$VAL_SETS_DIR" ]]; then
     EVAL_FLAGS="--val_sets_dir $VAL_SETS_DIR --val_eval_steps $EVAL_STEPS"
 fi
 
-# ---------- benchmark-eval dispatcher ----------
-# Submits a $BENCH_GPUS-GPU job whenever a kept checkpoint is waiting to be scored on
-# the mini test suites. It holds no GPU itself and runs alongside training, here on
-# the compute node -- watch_bench_evals.sh picks its own submission backend, falling
-# back from submit_job (which cannot resolve a pool1-* hostname) to sbatch (which
-# can). Deciding that there rather than here keeps one copy of the rule.
+# ---------- benchmark evals: none during training ----------
+# This used to start watch_bench_evals.sh, which then submitted a 1-GPU eval job per
+# kept checkpoint for the length of the run. Nothing is started here any more: no
+# test benchmark is scored while training is in flight, and no flag turns it back on.
 #
-# A dispatcher that died on startup looks exactly like one that found no work, so
-# confirm it is alive and print the manual command if it is not.
-BENCH_WATCHER_PID=""
-if [[ "$AUTO_BENCH" == true ]]; then
-    # Record what this run starts from, so the benchmark job can score it as step 0.
-    # Without a baseline the earliest benchmark point is step 100, and a curve with
-    # no origin cannot say whether training helped or hurt.
-    mkdir -p "$OUTPUT_DIR/bench_eval"
-    echo "$MODEL" > "$OUTPUT_DIR/bench_eval/base_model.txt"
-    echo "[bench] starting the benchmark dispatcher for $OUTPUT_DIR"
-    bash "$REPO/watch_bench_evals.sh" --run-dir "$OUTPUT_DIR" --num-gpus "$BENCH_GPUS" \
-        --every "$CKPT_KEEP_EVERY" --natural-n "$BENCH_NATURAL_N" \
-        --nonnatural-n "$BENCH_NONNATURAL_N" > "$LOG_DIR/bench_watcher.log" 2>&1 &
-    BENCH_WATCHER_PID=$!
-    sleep 5
-    if kill -0 "$BENCH_WATCHER_PID" 2>/dev/null; then
-        sed -n '/^Submitting:/p' "$LOG_DIR/bench_watcher.log" | sed 's/^/[bench] /'
-        echo "[bench] dispatcher running (pid $BENCH_WATCHER_PID), log: $LOG_DIR/bench_watcher.log"
-    else
-        BENCH_WATCHER_PID=""
-        echo "==========================================================================" >&2
-        echo "[bench] The dispatcher exited immediately. It said:" >&2
-        sed 's/^/        /' "$LOG_DIR/bench_watcher.log" >&2
-        echo "" >&2
-        echo "        Training continues. To collect benchmarks, run this on the login" >&2
-        echo "        node (it needs no GPUs):" >&2
-        echo "" >&2
-        echo "          bash $REPO/watch_bench_evals.sh --run-dir $OUTPUT_DIR \\" >&2
-        echo "               --num-gpus $BENCH_GPUS --every $CKPT_KEEP_EVERY \\" >&2
-        echo "               --natural-n $BENCH_NATURAL_N --nonnatural-n $BENCH_NONNATURAL_N" >&2
-        echo "==========================================================================" >&2
-    fi
-fi
+# The one thing still done is the part that cannot be reconstructed afterwards --
+# recording which model the run started from, so a later pass can score it as step 0.
+mkdir -p "$OUTPUT_DIR/bench_eval"
+echo "$MODEL" > "$OUTPUT_DIR/bench_eval/base_model.txt"
+echo "[bench] benchmarks are not run during training. To score this run's checkpoints"
+echo "[bench] afterwards (holds no GPU itself, backfills whatever has piled up):"
+echo "[bench]   bash $REPO/watch_bench_evals.sh --run-dir $OUTPUT_DIR \\"
+echo "[bench]        --num-gpus $BENCH_GPUS --every $CKPT_KEEP_EVERY \\"
+echo "[bench]        --natural-n $BENCH_NATURAL_N --nonnatural-n $BENCH_NONNATURAL_N"
 
 # ---------- 4. GRPO training on GPUs 2..N-1 ----------
 echo "[start] training on cuda:[$TRAIN_GPUS] ($TRAIN_N procs)"

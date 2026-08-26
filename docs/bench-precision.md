@@ -222,24 +222,24 @@ Every path that scores a checkpoint is at **natural = 300, non-natural = 100**:
 
 | | default | cost per checkpoint |
 |---|---|---|
-| during training (`watch_bench_evals.sh`, and the colocated launcher through it) | 300/100, `--bank auto` → per task | ~3.6 GPU-h, ~4 one-hour jobs |
+| a finished run (`watch_bench_evals.sh`, pointed at its output dir) | 300/100, `--bank auto` → per task | ~3.6 GPU-h, ~4 one-hour jobs |
 | named checkpoints (`run_bench_eval_steps.sh`, 8 GPUs) | 300/100, per suite | ~28 min |
 | the historical sweep (`rerun_bench_evals.py`) | 300/100, per task | ~2.9 GPU-h |
 
-`--natural-n 100` restores the old size anywhere; `BENCH_NATURAL_N=100` does it
-for a training launch.
+`--natural-n 100` restores the old size anywhere.
 
-At 100 the during-training eval was ~1.6 GPU-h per checkpoint, so this is roughly
-2.2× the eval load, and the dispatcher runs one job at a time. **If training
-produces checkpoints faster than ~4 hours apart, the curve will fall behind.** The
-fix is `CKPT_KEEP_EVERY` (the dispatcher's `--every`), not a smaller sample: a
-sparser curve of numbers that mean something beats a dense curve of noise.
+**Nothing runs during training.** The colocated launcher used to start the
+dispatcher alongside the run; it no longer starts anything, and no flag turns that
+back on. Benchmarks are scored afterwards, by pointing `watch_bench_evals.sh` at a
+run's output directory — its state is on disk (a checkpoint is done once
+`bench_eval/step-<N>.json` exists), so starting it after the fact loses nothing and
+it backfills the whole run.
 
-One thing to know before pointing this at a run that already has history: the
-dispatcher drains oldest-first, and at the new profile *every* existing checkpoint
-counts as unscored. A run mid-training would go back to step 0 and never catch up.
-Use `rerun_bench_evals.py --every 500` for the history and let the dispatcher take
-new checkpoints.
+That also removes the failure mode this section used to warn about. At 300 an eval
+is ~3.6 GPU-h per checkpoint against ~1.6 at 100, and the dispatcher runs one job
+at a time — alongside training, checkpoints arriving faster than ~4 hours apart
+left the curve permanently behind. Run after the fact and the only cost is wall
+clock you are not waiting on. Raise `--every` to score a sparser set of steps.
 
 ## The decision left
 

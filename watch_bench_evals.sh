@@ -173,8 +173,9 @@ mkdir -p "$BENCH_DIR" "$PROFILE_DIR" "$LOG_ROOT"
 #               to be inspected rather than the status.
 #
 #   sbatch      stock Slurm. Works from anywhere that reaches slurmctld, compute
-#               nodes included, which is what lets --auto-bench start this from
-#               inside a training job.
+#               nodes included -- which used to matter because the colocated
+#               launcher started this from inside a training job. It no longer
+#               does; this runs on a login node, after the run.
 CI_DIR=""
 if command -v submit_job >/dev/null 2>&1; then
     CI_DIR=$(dirname "$(command -v submit_job)")
