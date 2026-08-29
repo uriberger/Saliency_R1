@@ -27,6 +27,7 @@ Usage:
 Exit status is 0 unless a check could not be performed at all.
 """
 
+import glob
 import hashlib
 import importlib.metadata as md
 import os
@@ -43,18 +44,30 @@ PKGS = [
     "qwen-vl-utils", "pillow", "wandb",
 ]
 
-# Patched in place inside site-packages, so they carry no version of their own.
+# Patched in place inside site-packages, so they carry no version of their own. Paths are
+# relative to site-packages and hashed directly -- importing transformers just to learn
+# where it lives would make the cheapest check in this file depend on the slowest step.
 SITE_PATCHES = [
-    ("transformers", "integrations/sdpa_attention.py"),
-    ("vllm", "transformers_utils/tokenizer.py"),
-    ("vllm", "model_executor/models/qwen3_vl.py"),
+    "transformers/integrations/sdpa_attention.py",
+    "vllm/transformers_utils/tokenizer.py",
+    "vllm/model_executor/models/qwen3_vl.py",
 ]
+
+NO_IMPORTS = "--no-imports" in sys.argv
 
 WIDTH = 26
 
 
 def row(label, value):
-    print(f"{label:<{WIDTH}} {value}")
+    print(f"{label:<{WIDTH}} {value}", flush=True)  # flush: partial output survives a hang
+
+
+def site_packages():
+    """Locate site-packages from the interpreter prefix, without importing anything."""
+    for cand in glob.glob(os.path.join(sys.prefix, "lib", "python*", "site-packages")):
+        if os.path.isdir(cand):
+            return cand
+    return None
 
 
 def digest(path):
@@ -154,26 +167,6 @@ row("$ENV", sys.prefix)
 print("\n## interpreter")
 row("python", sys.version.split()[0])
 
-print("\n## packages")
-for p in PKGS:
-    try:
-        row(p, md.version(p))
-    except Exception:
-        row(p, "ABSENT")
-
-print("\n## torch build")
-try:
-    import torch
-    row("torch.version.cuda", torch.version.cuda)
-    row("torch.cuda.nccl", ".".join(map(str, torch.cuda.nccl.version())))
-except Exception as exc:
-    row("torch", f"ERROR {type(exc).__name__}: {exc}")
-
-print("\n## import origins")
-for name in ("trl", "transformers", "peft", "deepspeed"):
-    d = module_dir(name)
-    row(name, norm(d) if d else "ERROR (import failed)")
-
 def dirty(path):
     """Tracked-file edits, named; untracked files only counted.
 
@@ -237,9 +230,37 @@ else:
         row(mod, (d or "MISSING") + tag)
 
 print("\n## site-package patches")
-for pkg, rel in SITE_PATCHES:
-    base = module_dir(pkg)
-    if base is None:
-        row(f"{pkg}/{os.path.basename(rel)}", "ABSENT (import failed)")
-        continue
-    row(f"{pkg}/{os.path.basename(rel)}", digest(os.path.join(base, rel)) or "MISSING")
+sp = site_packages()
+if sp is None:
+    row("site-packages", f"NOT FOUND under {sys.prefix}")
+else:
+    for rel in SITE_PATCHES:
+        row(rel, digest(os.path.join(sp, rel)) or "MISSING")
+
+print("\n## packages")
+for p in PKGS:
+    try:
+        row(p, md.version(p))
+    except Exception:
+        row(p, "ABSENT")
+
+# Everything above reads files. Everything below imports them, which on a cold lustre
+# cache costs minutes and can stall outright on an HF library that reaches for the
+# network. Keep it last so a hang here still leaves you with every hash that decides
+# whether a checkpoint resumes, and let --no-imports skip it entirely.
+if NO_IMPORTS:
+    print("\n## torch build / import origins   SKIPPED (--no-imports)")
+    raise SystemExit(0)
+
+print("\n## torch build")
+try:
+    import torch
+    row("torch.version.cuda", torch.version.cuda)
+    row("torch.cuda.nccl", ".".join(map(str, torch.cuda.nccl.version())))
+except Exception as exc:
+    row("torch", f"ERROR {type(exc).__name__}: {exc}")
+
+print("\n## import origins   (slow: ~25s warm, minutes on a cold cache)")
+for name in ("trl", "transformers", "peft", "deepspeed"):
+    d = module_dir(name)
+    row(name, norm(d) if d else "ERROR (import failed)")
