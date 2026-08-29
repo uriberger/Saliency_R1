@@ -116,6 +116,18 @@ echo "  copied GLIMPSE-reward files (glimpse_maps, glimpse_rewards)"
 cp "$REPO/trl/rewards/placebo_rewards.py" "$TRL_REPO/trl/rewards/placebo_rewards.py"
 echo "  copied placebo-control file (placebo_rewards)"
 
+# ── 2f. ZeRO-3 generation hooks ─────────────────────────────────────────────
+# unwrap_model_for_generation() strips the ZeRO-3 fetch/partition hooks, yields, then
+# re-registers them. Upstream re-registers on the normal path only, so anything raised
+# inside the yielded block -- a vLLM timeout, an OOM, a reward that throws -- escapes
+# with the hooks still off and the policy keeps training with unsharded parameter
+# access. The corruption is silent: no error names this function, and the run continues.
+# The local copy wraps the yield in try/finally. It is a whole-file copy of an upstream
+# module rather than a sed, same as trl/scripts/utils.py, so the next TRL bump shows up
+# as a conflict here instead of being silently reverted.
+cp "$REPO/trl/models/utils.py"            "$TRL_REPO/trl/models/utils.py"
+echo "  copied ZeRO-3 generation-hook fix (models/utils)"
+
 # ── 3a. trl/trainer/__init__.py ─────────────────────────────────────────────
 TINIT="$TRL_REPO/trl/trainer/__init__.py"
 [ -f "$TINIT" ] || { echo "MISSING: $TINIT"; exit 1; }
