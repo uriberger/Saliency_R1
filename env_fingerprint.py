@@ -174,10 +174,35 @@ for name in ("trl", "transformers", "peft", "deepspeed"):
     d = module_dir(name)
     row(name, norm(d) if d else "ERROR (import failed)")
 
+def dirty(path):
+    """Tracked-file edits, named; untracked files only counted.
+
+    The repo root accumulates dozens of untracked run-output directories, and listing
+    them buries the one line that matters -- an edit to a tracked file that makes this
+    checkout differ from the other cluster's at the same HEAD. Untracked files cannot,
+    so a count is enough.
+    """
+    out = sh("git", "-C", path, "status", "--porcelain")
+    if out in ("(none)", "") or out.startswith("ERROR"):
+        return out or "(clean)"
+    tracked, untracked = [], 0
+    for line in out.splitlines():
+        if line.startswith("??"):
+            untracked += 1
+        else:
+            tracked.append(line.strip())
+    parts = []
+    if tracked:
+        parts.append(", ".join(tracked))
+    parts.append(f"+{untracked} untracked" if untracked else "0 untracked")
+    return " | ".join(parts) if tracked else parts[0]
+
+
 print("\n## git")
 row("repo HEAD", sh("git", "-C", REPO, "rev-parse", "--short", "HEAD"))
-row("repo dirty", sh("git", "-C", REPO, "status", "--porcelain").replace("\n", " | "))
+row("repo dirty", dirty(REPO))
 row("trl_repo HEAD", sh("git", "-C", TRL_REPO, "rev-parse", "--short", "HEAD"))
+row("trl_repo dirty", dirty(TRL_REPO))
 
 print("\n## patch set (patch_trl_qwen3.sh: trl_repo copy vs tracked source)")
 pairs = copied_pairs()
