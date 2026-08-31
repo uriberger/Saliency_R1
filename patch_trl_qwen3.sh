@@ -116,7 +116,25 @@ echo "  copied GLIMPSE-reward files (glimpse_maps, glimpse_rewards)"
 cp "$REPO/trl/rewards/placebo_rewards.py" "$TRL_REPO/trl/rewards/placebo_rewards.py"
 echo "  copied placebo-control file (placebo_rewards)"
 
-# ── 2f. ZeRO-3 generation hooks ─────────────────────────────────────────────
+# ── 2f. mask-free rewards (--maskfree flatness|mass) ────────────────────────
+# Same placement rule as 2e: maskfree_rewards.py does `from . import overlap_rewards`
+# (for the --overlap_natural_only gate and the optional --maskfree-parity path), so it
+# lands beside it in trl/rewards/. No map module and no DINO: it scores the attention map
+# the trainer already builds, and it takes the same reward_funcs slot as --placebo.
+#
+# THIS LINE IS LOAD-BEARING FOR EVERY `--reward_variant ours` RUN, not just --maskfree
+# ones. grpo_trainer_qwen3.py imports is_active/pop_diagnostics from this module at the
+# top of its `reward_variant == "ours"` metrics block, BEFORE the is_active() guard --
+# the same shape as the placebo block above. Omitting the copy is therefore not "the new
+# flag is unavailable", it is an ImportError on the first metrics log of a plain mean_in
+# run. It was omitted once (069bd32 added the module and not this line) and the failure
+# surfaced only on a second cluster, because the first had the file copied by hand.
+# test_import_layout_cpu.py now checks absolute `from trl.<mod> import` targets against
+# this script's copy list, so a repeat fails on CPU instead of mid-run.
+cp "$REPO/trl/rewards/maskfree_rewards.py" "$TRL_REPO/trl/rewards/maskfree_rewards.py"
+echo "  copied mask-free reward file (maskfree_rewards)"
+
+# ── 2g. ZeRO-3 generation hooks ─────────────────────────────────────────────
 # unwrap_model_for_generation() strips the ZeRO-3 fetch/partition hooks, yields, then
 # re-registers them. Upstream re-registers on the normal path only, so anything raised
 # inside the yielded block -- a vLLM timeout, an OOM, a reward that throws -- escapes

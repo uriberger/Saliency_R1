@@ -119,14 +119,89 @@ def test_relative_imports_survive_the_copy():
             )
 
 
+def absolute_trl_imports(src: Path) -> list[tuple[int, str, str]]:
+    """-> [(lineno, dotted module after `trl.`, the whole statement)].
+
+    `from trl.rewards.overlap_rewards import ...` resolves the same in both trees, which
+    is why it is the recommended form -- but only if the module it names is actually in
+    the tree that executes.
+    """
+    pat = re.compile(r"^\s*from\s+(trl\.[\w.]+)\s+import\b")
+    out = []
+    for i, line in enumerate(src.read_text().splitlines(), 1):
+        m = pat.match(line)
+        if m:
+            out.append((i, m.group(1), line.strip()))
+    return out
+
+
+def our_source_for(dotted: str) -> Path | None:
+    """The file in THIS repo that `trl.a.b` names, or None if the module is upstream's.
+
+    Upstream modules (trl.data_utils and friends) are already in trl_repo and are not
+    ours to copy; only the ones we maintain need a cp line.
+    """
+    rel = Path(*dotted.split(".")[1:])
+    for cand in (REPO / "trl" / rel.with_suffix(".py"), REPO / "trl" / rel / "__init__.py"):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def test_absolute_imports_are_copied():
+    """Every module we maintain and import absolutely must have a cp line.
+
+    The relative-import check above cannot see this class of bug: an absolute import is
+    spelled identically in both trees and resolves fine in `trl/`, so nothing fails until
+    the module is missing from `trl_repo/` at runtime. That is how 069bd32 shipped
+    `maskfree_rewards.py` without a cp line -- and because the trainer imports it at the
+    top of its `reward_variant == "ours"` metrics block, BEFORE the is_active() guard, the
+    consequence was an ImportError on the first metrics log of every attention-overlap
+    run, not just the --maskfree ones it was written for. It surfaced only on a second
+    cluster, because the first had the file copied in by hand.
+
+    Deliberately independent of trl_repo/: the invariant is a property of the patch
+    script, so this fails on a fresh clone too.
+    """
+    print("\n[layout] every `from trl.x` module we maintain has a cp line in the patch script")
+    pairs = copied_files()
+    sources = {p.resolve() for p, _ in pairs}
+    seen = set()
+    for src, _dst in pairs:
+        for lineno, dotted, stmt in absolute_trl_imports(src):
+            ours = our_source_for(dotted)
+            if ours is None:
+                continue                        # upstream module, already in trl_repo
+            key = (src, dotted)
+            if key in seen:
+                continue
+            seen.add(key)
+            ok = ours.resolve() in sources
+            check(
+                f"{src.relative_to(REPO)}:{lineno}  {dotted}",
+                ok,
+                # Only on failure: the remedy is noise next to 20 passing lines, and the
+                # relative-import check above already prints its context unconditionally
+                # because there the destination directory IS the information.
+                "" if ok else
+                f"-> add `cp \"$REPO/{ours.relative_to(REPO)}\" \"$TRL_REPO/...\"` "
+                f"to patch_trl_qwen3.sh  [{stmt}]",
+            )
+
+
 def main():
     test_relative_imports_survive_the_copy()
+    test_absolute_imports_are_copied()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         for f in FAIL:
             print(f"  FAILED: {f}")
-        print("\n  Use an absolute `from trl.rewards.<mod> import ...` instead -- it "
-              "resolves\n  in both trees, and grpo_vlm_qwen3.py already imports that way.")
+        print("\n  A `.x` failure: use an absolute `from trl.rewards.<mod> import ...` "
+              "instead --\n  it resolves in both trees, and grpo_vlm_qwen3.py already "
+              "imports that way.")
+        print("  A `trl.x` failure: the import is fine, the module is just never copied "
+              "into\n  trl_repo/. Add the cp line to patch_trl_qwen3.sh -- the line the "
+              "message names.")
         return 1
     return 0
 
