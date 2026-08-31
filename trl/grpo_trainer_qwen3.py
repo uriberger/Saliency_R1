@@ -2898,6 +2898,22 @@ class GRPOTrainer(Trainer):
                     _g = _g[~torch.isnan(_g)]
                     if _g.numel():
                         self._metrics[mode][f"placebo/{_k}"].append(_g.mean().item())
+
+            # --maskfree by-products. Both variants record BOTH `flatness` and `mass`, not
+            # just the one being scored: the hypothesis under test is that mean_in raised
+            # image mass through a flatness reward, so a --maskfree flatness run whose mass
+            # rises is the result, and it is invisible if only the scored quantity is
+            # logged. Same rank-uniform argument as the placebo block above.
+            from trl.rewards.maskfree_rewards import is_active as _maskfree_active
+            from trl.rewards.maskfree_rewards import pop_diagnostics as pop_maskfree_diagnostics
+
+            if _maskfree_active():
+                for _k, _v in pop_maskfree_diagnostics().items():
+                    _t = torch.tensor([_v], dtype=torch.float32, device=device)
+                    _g = gather(_t)
+                    _g = _g[~torch.isnan(_g)]
+                    if _g.numel():
+                        self._metrics[mode][f"maskfree/{_k}"].append(_g.mean().item())
         if self.reward_variant == "grad":
             # The roll-null closes box size and confidence; it does not close the centre
             # hack (`ecc` rising, and correlating with the score), the reward going hollow

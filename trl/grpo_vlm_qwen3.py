@@ -582,6 +582,24 @@ if __name__ == "__main__":
             "The placebos are controls for the attention-overlap reward and inherit its "
             "scored/unscored set, which is the one thing that must not differ."
         )
+    # --maskfree is a control on the same reference for the same reason, and its weights
+    # were measured on the ATTENTION map. `flatness` and `mass` are well defined on the
+    # gradient and GLIMPSE maps too, but those have different scales and would need their
+    # own calibration, so allowing them silently would apply an unknown multiple of the
+    # intended pressure. Lifting this is a one-line change plus one probe run.
+    if script_args.maskfree and script_args.reward_variant != "ours":
+        raise SystemExit(
+            f"--maskfree {script_args.maskfree} needs --saliency_method attention "
+            f"(--reward_variant ours); got reward_variant='{script_args.reward_variant}'. "
+            "The mask-free rewards are controls for the attention-overlap reward and "
+            "their weights were measured on that map."
+        )
+    # Both take the same slot in reward_funcs, so one of them would silently win.
+    if script_args.maskfree and script_args.placebo:
+        raise SystemExit(
+            f"--maskfree {script_args.maskfree} and --placebo {script_args.placebo} both "
+            "REPLACE the overlap reward in the same reward_funcs slot. Pick one."
+        )
 
     if script_args.reward_variant == "ours":
         from trl.rewards.overlap_rewards import configure as configure_overlap
@@ -619,6 +637,19 @@ if __name__ == "__main__":
                               inframe=script_args.rollnull_inframe,
                               length_anchor=float(training_args.max_completion_length))
             reward_funcs = [think_format_reward, think_placebo_reward, accuracy_reward, openai_reward]
+        elif script_args.maskfree:
+            # --maskfree takes the same slot, and unlike --placebo it does NOT run the
+            # grounding pipeline: no boxes, no union, no Grounding-DINO. configure_overlap
+            # above still ran because --overlap_natural_only lives in its config and the
+            # optional --maskfree-parity path borrows its helpers; with parity off (the
+            # default) none of the DINO knobs are ever read.
+            from trl.rewards.maskfree_rewards import configure as configure_maskfree
+            from trl.rewards.maskfree_rewards import think_maskfree_reward
+
+            configure_maskfree(kind=script_args.maskfree,
+                               parity=script_args.maskfree_parity,
+                               mass_anchor=script_args.maskfree_mass_anchor)
+            reward_funcs = [think_format_reward, think_maskfree_reward, accuracy_reward, openai_reward]
         else:
             reward_funcs = [think_format_reward, think_overlap_reward, accuracy_reward, openai_reward]
     elif script_args.reward_variant == "grad":

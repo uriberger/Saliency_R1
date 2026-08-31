@@ -329,3 +329,135 @@ bash launch_grpo_qwen3_overlap_colocated_job.sh --placebo length \
 sequences (3 prompts × 8 generations) behind each optimizer step instead of 48 — half the
 prompts per step, and a different meaning for the LR schedule, against an 8-GPU reference.
 16 restores 48. The banner prints `gen_batch`; check it reads 48.
+
+---
+
+# The mask-free rewards — 2026-08-31
+
+Implemented, CPU-tested, **not run**. Branch `feat/maskfree-rewards`.
+
+## Why, in one table
+
+`mean_in = mean_U(m) / max(m)`, and the denominator is over the *whole* map. Measured on
+the val_natural probe, on the quantity GRPO sees (per-completion reward, group mean
+removed):
+
+| mask fed to `mean_in` | all unions | union < 0.30 |
+|---|---|---|
+| the real DINO union | 1.000 | 1.000 |
+| in-frame roll (what `--placebo roll` did) | +0.538 | +0.449 |
+| **uniform toroidal roll (a genuine relocation)** | **+0.353** | **−0.015** |
+| random box of the same area, anywhere | +0.505 | +0.457 |
+| **`mean_all(m)/max(m)` — no mask at all** | **+0.690** | **+0.678** |
+
+Once the mask is genuinely relocated its score stops predicting the reward. The best
+single predictor of `mean_in` is a statistic that never sees a box. Corroboration from
+two directions: [sharpness-results.md](sharpness-results.md) finds *"DINO survives in 0
+of 4 families. SHARP in 2. MASS in 3"*, and the `mean_in`-trained 8k policy puts **2.3×**
+the cold start's attention mass on the image (0.00393 → 0.00893) with an 18% flatter map,
+while the `auroc`-trained one goes the other way (−8%) and is the run that damaged
+non-natural.
+
+Hypothesis: `mean_in` is an attention-flatness reward, flatness and image mass are
+coupled through the softmax, and image mass is the one map property with controlled
+evidence of predicting correctness. These two rewards are the experiment that can kill it.
+
+## Flags
+
+```bash
+bash launch_grpo_qwen3_overlap_colocated_job.sh --maskfree flatness --num-gpus 7
+bash launch_grpo_qwen3_overlap_colocated_job.sh --maskfree mass     --num-gpus 7
+```
+
+| flag | reward | isolates |
+|---|---|---|
+| `--maskfree flatness` | `mean(m)/max(m)` over the grid — `mean_in` with the union replaced by the image | shape only; **scale-invariant**, so it cannot be raised by attending to the image more |
+| `--maskfree mass` | `log(sum(m)) + anchor` — the softmax mass the step's think-tokens put on image patches | scale only; the variable `sharpness-results.md` says predicts correctness |
+
+The pair is deliberate: `flatness` is scale-invariant and `mass` is scale-only, so between
+them they span the two directions `mean_in` moved in. They correlate +0.38 within a group
+at the cold start, so they are not redundant either.
+
+Both take `think_overlap_reward`'s slot, so `--reward_weights` is unchanged. Attention map
+only (the weights were measured on it). Refuses to combine with `--placebo`.
+
+## Neither one calls Grounding-DINO
+
+That is the point, and it is enforced by not starting the server rather than by trusting
+the reward: with `--maskfree`, the launcher skips `serve_grounding_dino.py`, omits
+`--dino_api_base`, and gives vLLM GPU 0 with training on 1..N−1. `test_maskfree_reward_cpu.py`
+runs every case with `overlap_rewards._dino_boxes` replaced by a bomb.
+
+Cost removed: **16.6 s of a 40.5 s optimizer step**, plus a GPU. The layer-22 re-forward
+(1.0 s) and the T5 observe-step segmentation are *kept*, so the maps scored are the ones
+`think_overlap_reward` would have scored and this stays a control on the reference rather
+than a third experiment.
+
+**`--num-gpus 7` is load-bearing**, for the reason `--share-sidecar-gpu` needs
+`--grad-accum 16`: `gen_batch = per_device × train_procs × grad_accum`, and 8 GPUs with no
+DINO give 7 training procs and `gen_batch` 56 against the reference's 48. 7 GPUs give 6
+procs and 48. The banner prints `gen_batch` and warns when `train_procs != 6`.
+
+## The scored set — the one place this is not a single-variable change
+
+The overlap reward is unscored where DINO grounds nothing; without DINO that question
+cannot be asked, so a completion counts here when it has any observe step with a
+positive-maximum map. A superset in principle. Measured on val_natural:
+
+| | |
+|---|---|
+| observe steps with a map | 874 |
+| ... that DINO grounded | 859 (98.3%) |
+| completions the DINO reward scored | 231 / 240 (96.2%) |
+| completions scored **mask-free** | 231 / 240 (96.2%) — **+0** |
+
+Identical. `--maskfree-parity` re-imposes the DINO gate (value stays mask-free, only the
+gate changes) at the full DINO cost; off by default because the measurement says it buys
+nothing.
+
+## Weights
+
+`w = 0.4 × sd_within(mean_in) / sd_within(variant)`, from `overlap_metric_spread.py`,
+which now prints both rows by importing `trl/rewards/maskfree_rewards.py` itself:
+
+| variant | level | sd_within | w at w_ref=0.4 | launcher default |
+|---|---|---|---|---|
+| `mean_in` (reference) | 0.0388 | 0.0071 | 0.400 | — |
+| `flatness` | 0.0513 | 0.0064 | 0.447 | **0.45** |
+| `mass` | 12.1621 | 0.4586 | 0.006 | **0.006** |
+
+`flatness` landing next to `mean_in`'s own 0.4 is structural: it is the same statistic on
+a superset of the same patches. One-corpus caveat applies as everywhere else — read these
+as ±25%, the way `roll`'s 0.32 turned out to be bracketed by [0.32, 0.52].
+
+Two traps this cost a debugging pass each, both now closed in code:
+
+- **`mass` must not read `_decode_step_map`.** That decoder returns the map normalised to
+  its own peak, which is correct for every metric offered until now (all four are
+  scale-invariant) and wrong for the first one that is not: a peak-normalised map sums to
+  ~8, not to attention's ~0.004. The spread tool reads the probe's stored `image_mass`.
+- **The anchor has to clear the measured minimum.** `log(sum(m))` is negative, and a
+  `.nansum` fold reads an unscored reward as 0 — which would make "produce no gradeable
+  observe step" the best move. The first draft's anchor of 8.0 needed 8.87 and went
+  negative on the lowest ~1% of real steps. It is **18.0**, against min 1.40e-04 over
+  13,648 observe steps: four orders of magnitude of margin. The guarantee is empirical,
+  not structural.
+
+## What to log
+
+`maskfree/flatness`, `maskfree/mass`, `maskfree/peak`, `maskfree/mean`, `maskfree/n_steps`.
+**Both statistics are recorded under either kind**, on purpose: a `--maskfree flatness`
+run whose *mass* rises is the finding this experiment exists to produce, and it is
+invisible if only the scored quantity is logged.
+
+## Pre-registered predictions
+
+- Both keep `train/frac_reward_zero_std` ≈ 0.000, like every other continuous reward.
+- `flatness` raises `maskfree/mass` without being rewarded for it — the coupling claim.
+- If the mechanism is right, `flatness` ≈ `mean_in` on both benchmark suites, at ~60% of
+  the step time and one fewer GPU.
+- `mass` is the sharper test and the one that could go wrong loudly: it has an unbounded
+  degenerate direction (dump the whole softmax row on the image), which `flatness` does
+  not. Watch `maskfree/peak` and `train/entropy` for it.
+- If **neither** moves the benchmark, the union's area/shape mattered after all and the
+  flatness reading of `mean_in` is wrong.

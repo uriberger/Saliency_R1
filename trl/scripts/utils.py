@@ -444,6 +444,52 @@ class ScriptArguments:
             "choices": ["roll", "random", "length"],
         },
     )
+    maskfree: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "reward_variant='ours': REPLACE the attention-overlap reward with a "
+            "MASK-FREE one that needs no boxes and never calls Grounding-DINO. 'flatness' "
+            "= mean(m)/max(m) over the whole patch grid, i.e. mean_in with the union "
+            "replaced by the image -- scale-invariant, so it scores only the map's shape; "
+            "'mass' = log(sum(m)) + anchor, the probability mass the step's think-tokens "
+            "put on image patches. These test whether mean_in's benefit was ever about "
+            "grounding: on the val_natural probe, within-group, mean_all/max predicts the "
+            "real mean_in reward at r=+0.69 while a genuinely relocated union predicts it "
+            "at r=-0.015. Takes the overlap reward's slot in reward_funcs, so "
+            "--reward_weights is unchanged, and needs the weight that matches mean_in "
+            "w0.4's WITHIN-GROUP sd -- the launcher resolves it (flatness 0.45, mass "
+            "0.006). Segmentation and the layer-22 re-forward are kept, so the maps are "
+            "the ones think_overlap_reward would have scored. See "
+            "docs/next-reward-experiments.md and trl/rewards/maskfree_rewards.py.",
+            "choices": ["flatness", "mass"],
+        },
+    )
+    maskfree_parity: bool = field(
+        default=False,
+        metadata={
+            "help": "--maskfree: re-impose the overlap reward's scored/unscored set by "
+            "running the real Grounding-DINO pipeline and using its verdict only as a "
+            "boolean. Off by default: measured on val_natural the two sets are IDENTICAL "
+            "(231/240 completions either way), and turning it on costs the full grounding "
+            "call -- 16.6 s of a 40.5 s optimizer step -- which is the entire saving "
+            "--maskfree exists for. Turn it on only to verify that equality on a new "
+            "corpus."
+        },
+    )
+    maskfree_mass_anchor: float = field(
+        default=18.0,
+        metadata={
+            "help": "--maskfree mass: constant added to log(sum(m)). Invisible to GRPO "
+            "(the advantage subtracts the group mean); it exists so a scored completion "
+            "never reads negative, because a `.nansum` fold reads an UNSCORED reward as 0 "
+            "and that would make 'produce no gradeable observe step' the best move on the "
+            "auxiliary dimension. 18.0 against a measured minimum image mass of 1.4e-04 "
+            "(13,648 observe steps, val_natural), which needs 8.87 -- four orders of "
+            "magnitude of margin. The guarantee is empirical: no finite anchor makes a "
+            "log positive for an arbitrarily small mass, so on a much dimmer corpus read "
+            "maskfree/mass in the logs and raise this."
+        },
+    )
     overlap_natural_only: bool = field(
         default=False,
         metadata={

@@ -107,6 +107,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import math
 import importlib.util
 import json
 import sys
@@ -151,6 +152,78 @@ def _load_placebo_rewards():
     sys.modules["trl_spread.rewards.placebo_rewards"] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def _load_maskfree_rewards():
+    """Import trl/rewards/maskfree_rewards.py the same way, and for the same reason.
+
+    Safe to call after _load_placebo_rewards(): both register the same `trl_spread`
+    stub packages, and re-registering them is idempotent.
+    """
+    src = ROOT / "trl" / "rewards" / "maskfree_rewards.py"
+    if not src.exists():
+        return None
+    for name, path in (("trl_spread", src.parent.parent), ("trl_spread.rewards", src.parent)):
+        if name not in sys.modules:
+            m = types.ModuleType(name)
+            m.__path__ = [str(path)]
+            sys.modules[name] = m
+    spec = importlib.util.spec_from_file_location("trl_spread.rewards.maskfree_rewards", src)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["trl_spread.rewards.maskfree_rewards"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def maskfree_group_vals(samples, ref_key, kind, mfr):
+    """Per-group mask-free rewards, on exactly the completions `ref_key` scored.
+
+    NOT what the reward does at training time -- there it scores every completion with a
+    gradeable observe step, because without DINO the reference's gate cannot be evaluated.
+    Here the reference's set is imposed so the sd is measured on the SAME completions as
+    the mean_in row it is about to be divided by; a weight derived from a different set
+    would not be the ratio it claims to be. The two sets were measured identical on
+    val_natural anyway (231/240 either way) -- see maskfree_rewards.__doc__.
+
+    `mass` MUST NOT read `_decode_step_map`. That decoder returns the map normalised to
+    its own peak, which is exactly right for every metric offered until now -- mean_in
+    divides by the peak, mean_in_v2 is a ratio of two means of the same map, auroc is
+    rank-only, logratio is a log ratio -- and exactly wrong for the first metric that is
+    NOT scale-invariant: a peak-normalised map sums to ~8, not to the ~0.004 of real
+    attention mass, and its spread is the spread of a normalisation constant. The probe
+    stores the true total as `image_mass` (= smap.sum(), written on every step whether or
+    not maps were kept), so that is what is read here. `flatness` is scale-invariant and
+    can use the decoder safely.
+    """
+    group_vals = []
+    for s in samples:
+        vals = []
+        for c in s["completions"]:
+            steps = [st for st in c["observe_steps"]
+                     if st.get("grounded") and st.get(ref_key) is not None]
+            if not steps:
+                continue                       # masked by the reference -> masked here
+            gate = 1.0 if c["format_valid"] else 0.0
+            per_step = []
+            for st in steps:
+                if kind == "mass":
+                    total = st.get("image_mass")
+                    if total is None or not (total > 0):
+                        continue
+                    per_step.append(math.log(float(total)) + mfr._CFG["mass_anchor"])
+                    continue
+                m, _mask = _decode_step_map(st)
+                if m is None:
+                    continue
+                v = mfr.flatness(m)
+                if v is not None:
+                    per_step.append(v)
+            if not per_step:
+                continue
+            vals.append(float(np.mean(per_step)) * gate)
+        if vals:
+            group_vals.append(vals)
+    return group_vals
 
 
 def pooled_within_sd(group_vals):
@@ -315,6 +388,8 @@ def main():
     w_refs = [float(w) for w in args.reference_weights.split(",") if w.strip()]
 
     plc = None if args.no_placebo else _load_placebo_rewards()
+    # The mask-free rows need the stored maps for the same reason `placebo:roll` does.
+    mfr = None if args.no_placebo else _load_maskfree_rewards()
     ref_key = next((k for k, n in METRICS if n == args.reference), None)
 
     for model, m in payload["models"].items():
@@ -323,11 +398,11 @@ def main():
             print(f"\n=== {model}: no scored steps ===")
             continue
         print(f"\n=== {model} ===")
-        print(f"{'metric':<14} {'steps':>7} {'compl':>6} {'step mean':>10} {'reward mean':>12} "
+        print(f"{'metric':<18} {'steps':>7} {'compl':>6} {'step mean':>10} {'reward mean':>12} "
               f"{'sd_within':>10} {'sd/sample':>10} {'sd all':>8} {'>chance':>8}")
         for r in rows:
             ac = r.get("frac_steps_above_chance")
-            print(f"{r['name']:<14} {r['n_steps']:>7} {r['n_completions']:>6} "
+            print(f"{r['name']:<18} {r['n_steps']:>7} {r['n_completions']:>6} "
                   f"{r['step_mean']:>10.4f} {r['reward_mean']:>12.4f} "
                   f"{r['sd_within']:>10.4f} {r['sd_per_sample']:>10.4f} {r['reward_sd_all']:>8.4f} "
                   f"{'--' if ac is None else f'{ac:>8.3f}'}")
@@ -347,10 +422,25 @@ def main():
                 rows.append(row)
                 note = f"   [{dropped} completions the reference scored had no rollable step]" if dropped else ""
                 ac = row.get("frac_steps_above_chance")
-                print(f"{row['name']:<14} {'--':>7} {row['n_completions']:>6} "
+                print(f"{row['name']:<18} {'--':>7} {row['n_completions']:>6} "
                       f"{'--':>10} {row['reward_mean']:>12.4f} "
                       f"{row['sd_within']:>10.4f} {row['sd_per_sample']:>10.4f} "
                       f"{row['reward_sd_all']:>8.4f} {'--' if ac is None else f'{ac:>8.3f}'}{note}")
+
+        # --- the mask-free rewards (--maskfree flatness|mass), same completions --------
+        if mfr is not None and ref_key is not None:
+            for kind in mfr.KINDS:
+                row = _stats(f"maskfree:{kind}", maskfree_group_vals(m["samples"], ref_key, kind, mfr))
+                if row is None:
+                    print(f"maskfree:{kind:<5} -- not measurable here "
+                          f"(no stored maps: rerun the probe with --store-maps)")
+                    continue
+                rows.append(row)
+                ac = row.get("frac_steps_above_chance")
+                print(f"{row['name']:<18} {'--':>7} {row['n_completions']:>6} "
+                      f"{'--':>10} {row['reward_mean']:>12.4f} "
+                      f"{row['sd_within']:>10.4f} {row['sd_per_sample']:>10.4f} "
+                      f"{row['reward_sd_all']:>8.4f} {'--' if ac is None else f'{ac:>8.3f}'}")
 
         ref = next((r for r in rows if r["name"] == args.reference), None)
         if not ref:
@@ -360,14 +450,14 @@ def main():
                 continue
             print(f"\n  w that matches {args.reference}'s pressure, on {basis} "
                   f"(w_ref x {basis}_{args.reference}/{basis}_row):")
-            print("  " + f"{'metric':<14}" + "".join(f"{f'w_ref={w}':>14}" for w in w_refs)
+            print("  " + f"{'metric':<18}" + "".join(f"{f'w_ref={w}':>14}" for w in w_refs)
                   + f"{'sd ratio':>11}")
             for r in rows:
                 if not np.isfinite(r[basis]) or r[basis] <= 0:
                     continue
                 ratio = ref[basis] / r[basis]
                 cells = "".join(f"{w * ratio:>14.3f}" for w in w_refs)
-                print(f"  {r['name']:<14}{cells}{ratio:>11.3f}")
+                print(f"  {r['name']:<18}{cells}{ratio:>11.3f}")
         print("\n  sd_within is the one to weight from; sd/sample is what the incumbent "
               "weights were set from and is kept for continuity.")
 

@@ -370,6 +370,12 @@ NATURAL_ONLY=${NATURAL_ONLY:-false}
 # within-group spread but none of its grounding, to find out whether its DIRECTION
 # matters. Empty = off (the real reward). See the PLACEBO block in the header.
 PLACEBO=${PLACEBO:-}
+# --maskfree flatness|mass: REPLACE the overlap reward with one that needs NO BOXES, to
+# test whether mean_in's benefit was ever about grounding. Empty = off. This is the one
+# reward here that does not start Grounding-DINO at all -- see the MASKFREE block in the
+# header and the GPU layout below.
+MASKFREE=${MASKFREE:-}
+MASKFREE_PARITY=${MASKFREE_PARITY:-false}
 
 # ---------- sidecar defaults ----------
 DINO_PORT=${DINO_PORT:-8100}
@@ -434,6 +440,8 @@ while [[ $# -gt 0 ]]; do
         --rollnull-seed)          ROLLNULL_SEED="$2";           shift 2 ;;
         --mass-floor-tau)         MASS_FLOOR_TAU="$2";          shift 2 ;;
         --placebo)                PLACEBO="$2";                 shift 2 ;;
+        --maskfree)               MASKFREE="$2";                shift 2 ;;
+        --maskfree-parity)        MASKFREE_PARITY=true;         shift 1 ;;
         --natural-only)           NATURAL_ONLY=true;            shift ;;
         --no-natural-only)        NATURAL_ONLY=false;           shift ;;
         --eval-steps)             EVAL_STEPS="$2";              shift 2 ;;
@@ -512,6 +520,35 @@ if [[ "$OVERLAP_METRIC" == "mean_in" && "$REWARD_VARIANT" != "ours" ]]; then
     echo "         over the map's mean and has no such hole. Continuing." >&2
 fi
 
+# ---------- --maskfree: the two no-box rewards ----------
+# WANT_DINO is the single switch every later block reads. It is resolved here, before the
+# GPU layout, because "is there a DINO server" changes how many GPUs training gets.
+WANT_DINO=true
+if [[ -n "$MASKFREE" ]]; then
+    case "$MASKFREE" in
+        flatness|mass) ;;
+        *) echo "ERROR: --maskfree must be flatness|mass (got '$MASKFREE')" >&2; exit 1 ;;
+    esac
+    if [[ "$REWARD_VARIANT" != "ours" ]]; then
+        echo "ERROR: --maskfree $MASKFREE needs the attention map (--saliency-method attention);" >&2
+        echo "       got --saliency-method $REWARD_VARIANT. The weights below were measured" >&2
+        echo "       on that map; another map needs its own probe run first." >&2
+        exit 1
+    fi
+    if [[ -n "$PLACEBO" ]]; then
+        echo "ERROR: --maskfree $MASKFREE and --placebo $PLACEBO both REPLACE the overlap" >&2
+        echo "       reward in the same reward_funcs slot. Pick one." >&2
+        exit 1
+    fi
+    # THE POINT OF THE FLAG. No boxes are ever needed, so no server is started and the
+    # GPU it would have held goes to training. --maskfree-parity is the one path that
+    # still grounds (it re-imposes the reference's scored/unscored set as a boolean gate),
+    # and it needs the server back.
+    if [ "$MASKFREE_PARITY" != true ]; then
+        WANT_DINO=false
+    fi
+fi
+
 # ---------- --placebo: the three direction controls ----------
 if [[ -n "$PLACEBO" ]]; then
     case "$PLACEBO" in
@@ -538,9 +575,11 @@ if [[ -n "$PLACEBO" ]]; then
 fi
 
 
-if [ "$SHARE_SIDECAR_GPU" = true ]; then MIN_GPUS=2; else MIN_GPUS=3; fi
+if [ "$WANT_DINO" != true ] || [ "$SHARE_SIDECAR_GPU" = true ]; then MIN_GPUS=2; else MIN_GPUS=3; fi
 if (( NUM_GPUS < MIN_GPUS )); then
-    if [ "$SHARE_SIDECAR_GPU" = true ]; then
+    if [ "$WANT_DINO" != true ]; then
+        echo "ERROR: need >=2 GPUs with --maskfree (1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
+    elif [ "$SHARE_SIDECAR_GPU" = true ]; then
         echo "ERROR: need >=2 GPUs with --share-sidecar-gpu (1 shared DINO+vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
     else
         echo "ERROR: need >=3 GPUs (1 DINO + 1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
@@ -553,9 +592,22 @@ if (( NUM_GPUS > 8 )); then
 fi
 
 # Sidecar placement. Shared: both servers on GPU 0, training on 1..N-1. Separate (default):
-# DINO on 0, vLLM on 1, training on 2..N-1.
+# DINO on 0, vLLM on 1, training on 2..N-1. With --maskfree there IS no DINO, so vLLM
+# takes GPU 0 and training gets the rest -- the same layout as --share-sidecar-gpu, but
+# because a server was removed rather than moved.
+#
+# THAT CHANGES TRAIN_N, AND TRAIN_N IS IN THE GENERATION BATCH. gen_batch =
+# per_device x TRAIN_N x grad_accum, so 8 GPUs here give 7 training procs and gen_batch
+# 56 against the reference's 48 -- a different number of prompts behind each optimizer
+# step and a different meaning for the LR schedule. To reproduce the reference exactly,
+# pass --num-gpus 7: 1 vLLM + 6 training, gen_batch 48. The banner prints gen_batch;
+# check it before deciding the run is comparable.
 DINO_GPU=0
-if [ "$SHARE_SIDECAR_GPU" = true ]; then
+if [ "$WANT_DINO" != true ]; then
+    VLLM_GPU=0
+    TRAIN_N=$(( NUM_GPUS - 1 ))
+    TRAIN_GPUS=$(seq -s, 1 $(( NUM_GPUS - 1 )))
+elif [ "$SHARE_SIDECAR_GPU" = true ]; then
     VLLM_GPU=0
     TRAIN_N=$(( NUM_GPUS - 1 ))
     TRAIN_GPUS=$(seq -s, 1 $(( NUM_GPUS - 1 )))
@@ -569,8 +621,14 @@ fi
 # already resident, so 0.90 can over-subscribe a shared GPU. 0.85 of 185 GB still leaves
 # ~28 GB -- ample for DINO's measured 1.6 GB plus fragmentation. An explicit
 # --vllm-gpu-mem / VLLM_GPU_MEM always wins over both defaults.
+# The 0.85 is a haircut for DINO's resident 1.6 GB, so it applies only when DINO is
+# actually sharing the GPU. Under --maskfree, GPU 0 holds vLLM alone and gets the full 0.90.
 if [ -z "$VLLM_GPU_MEM" ]; then
-    if [ "$SHARE_SIDECAR_GPU" = true ]; then VLLM_GPU_MEM=0.85; else VLLM_GPU_MEM=0.90; fi
+    if [ "$SHARE_SIDECAR_GPU" = true ] && [ "$WANT_DINO" = true ]; then
+        VLLM_GPU_MEM=0.85
+    else
+        VLLM_GPU_MEM=0.90
+    fi
 fi
 
 REFORWARD_SALIENCY=True
@@ -633,6 +691,47 @@ if [[ -n "$PLACEBO" && -z "${W_OVERLAP_SET:-}" ]]; then
         roll)   W_OVERLAP=0.32 ;;
         random) W_OVERLAP=0.013 ;;
         length) W_OVERLAP=0.031 ;;
+    esac
+fi
+
+# --maskfree carries its own weight on the same rule and for the same reason: the point
+# is that it applies the SAME tie-breaking pressure as mean_in w0.4 and differs only in
+# what it scores.
+#
+#   w_maskfree = 0.4 x sd_within(mean_in) / sd_within(maskfree)
+#
+#   MEASURED on the cold-start policy this run starts from, val_natural, temperature 1,
+#   8 generations (231 completions in 30 groups), with sd_within(mean_in) = 0.00715 on
+#   exactly those completions:
+#
+#     variant     level      sd_within   w at w_ref=0.4   default
+#     flatness    0.0513     0.0064      0.447            0.45
+#     mass       12.1621     0.4586      0.006            0.006
+#
+#   Both rows come straight out of `overlap_metric_spread.py`, which computes them by
+#   importing trl/rewards/maskfree_rewards.py -- so the number a run is launched with
+#   comes from the function the run will use, and re-measuring is one command.
+#
+#   `flatness` lands near mean_in's own 0.4 for a structural reason: it IS mean_in with
+#   the union replaced by the image, so it is the same statistic on a superset of the same
+#   patches and its spread can only be close. `mass` is three orders of magnitude away
+#   because it is a log, whose sd is a RATIO spread (0.43 in log space is a factor of
+#   ~1.5), not a level spread.
+#
+#   ONE-CORPUS CAVEAT. Both rows come from val_natural, the same probe that put `roll` at
+#   0.32 while a trained checkpoint put it at 0.52 -- so read these as +-25% like every
+#   other weight here, not as three significant figures. To re-measure on the corpus you
+#   train on (no GPU needed beyond the probe itself):
+#
+#     bash launch_overlap_probe.sh --n-samples 40 --no-judge \
+#         --out-dir outputs/overlap_probe/maskfree_spread --dataset <your dataset>
+#     python overlap_metric_spread.py outputs/overlap_probe/maskfree_spread
+#
+# An explicit --w-overlap always wins, as it does for every other metric.
+if [[ -n "$MASKFREE" && -z "${W_OVERLAP_SET:-}" ]]; then
+    case "$MASKFREE" in
+        flatness) W_OVERLAP=0.45 ;;
+        mass)     W_OVERLAP=0.006 ;;
     esac
 fi
 
@@ -766,6 +865,10 @@ fi
 # directory or a wandb run name with a real one. The weight already differs, but relying
 # on that would break the moment someone passes --w-overlap explicitly.
 [[ -n "$PLACEBO" ]] && SUFFIX="${SUFFIX}_placebo${PLACEBO}"
+# Same rule for --maskfree: it is not the reward its metric names either, and a
+# --maskfree-parity run is a third thing again (same value, DINO-gated scored set).
+[[ -n "$MASKFREE" ]] && SUFFIX="${SUFFIX}_maskfree${MASKFREE}"
+[[ -n "$MASKFREE" && "$MASKFREE_PARITY" == true ]] && SUFFIX="${SUFFIX}_parity"
 [[ -n "$MASS_FLOOR_TAU" ]] && SUFFIX="${SUFFIX}_mf${MASS_FLOOR_TAU}"
 [[ -n "$MAX_UNION_AREA" ]] && SUFFIX="${SUFFIX}_mu${MAX_UNION_AREA}"
 [[ "$MAX_BOX_AREA" == "0" ]] && SUFFIX="${SUFFIX}_nobox"
@@ -816,7 +919,9 @@ _EFFECTIVE_VARIANT="$REWARD_VARIANT"
 case "$_EFFECTIVE_VARIANT" in
     grad)    WANT_REWARD_FN=think_grad_reward;    _MAP_SHOWN=grad ;;
     glimpse) WANT_REWARD_FN=think_glimpse_reward; _MAP_SHOWN=glimpse ;;
-    ours)    WANT_REWARD_FN=$([[ -n "$PLACEBO" ]] && echo think_placebo_reward || echo think_overlap_reward)
+    ours)    if   [[ -n "$PLACEBO"  ]]; then WANT_REWARD_FN=think_placebo_reward
+             elif [[ -n "$MASKFREE" ]]; then WANT_REWARD_FN=think_maskfree_reward
+             else                            WANT_REWARD_FN=think_overlap_reward; fi
              _MAP_SHOWN=attention ;;
     # 'none' and anything else: no saliency slot, so nothing to check and nothing to name.
     *)       WANT_REWARD_FN="";                   _MAP_SHOWN="$_EFFECTIVE_VARIANT" ;;
@@ -836,7 +941,7 @@ if [[ -n "$_GATE_CKPT" && -n "$WANT_REWARD_FN" ]]; then
             echo "  output dir:  $OUTPUT_DIR" >&2
             echo "  resuming:    checkpoint-$_GATE_CKPT, whose last logged saliency reward is" >&2
             echo "               $HAVE_REWARD_FN" >&2
-            echo "  this launch: $WANT_REWARD_FN (--saliency-method $_MAP_SHOWN$([[ -n "$PLACEBO" ]] && echo " --placebo $PLACEBO"))" >&2
+            echo "  this launch: $WANT_REWARD_FN (--saliency-method $_MAP_SHOWN$([[ -n "$PLACEBO" ]] && echo " --placebo $PLACEBO")$([[ -n "$MASKFREE" ]] && echo " --maskfree $MASKFREE"))" >&2
             echo "" >&2
             echo "  Nothing in a checkpoint sets --saliency-method, so a relaunch that omits it" >&2
             echo "  falls back to the attention map and keeps training, silently, at a weight" >&2
@@ -845,6 +950,7 @@ if [[ -n "$_GATE_CKPT" && -n "$WANT_REWARD_FN" ]]; then
                 think_grad_reward)    echo "      --saliency-method grad" >&2 ;;
                 think_glimpse_reward) echo "      --saliency-method glimpse" >&2 ;;
                 think_placebo_reward) echo "      --saliency-method attention --placebo <roll|random|length>" >&2 ;;
+                think_maskfree_reward) echo "      --saliency-method attention --maskfree <flatness|mass>" >&2 ;;
                 *)                    echo "      --saliency-method attention" >&2 ;;
             esac
             echo "  If the map change is deliberate, pass --allow-map-change (and expect one" >&2
@@ -858,12 +964,40 @@ REWARD_WEIGHTS="1.0 ${W_OVERLAP} 1.0 1.0"
 
 echo "=========================================================================="
 echo "Model:            $MODEL"
-echo "GPUs (total $NUM_GPUS):  DINO=cuda:$DINO_GPU  vLLM=cuda:$VLLM_GPU  train=cuda:[$TRAIN_GPUS] ($TRAIN_N procs)$([ "$SHARE_SIDECAR_GPU" = true ] && echo '  [sidecars SHARED on cuda:0]')"
+echo "GPUs (total $NUM_GPUS):  $([ "$WANT_DINO" = true ] && echo "DINO=cuda:$DINO_GPU  " || echo 'DINO=none  ')vLLM=cuda:$VLLM_GPU  train=cuda:[$TRAIN_GPUS] ($TRAIN_N procs)$([ "$SHARE_SIDECAR_GPU" = true ] && [ "$WANT_DINO" = true ] && echo '  [sidecars SHARED on cuda:0]')"
 echo "Generation:       vLLM server  127.0.0.1:$VLLM_PORT  gpu_mem=$VLLM_GPU_MEM  max_len=$VLLM_MAX_MODEL_LEN"
+if [ "$WANT_DINO" != true ]; then
+echo "DINO reward:      NOT STARTED -- --maskfree $MASKFREE scores no boxes"
+else
 echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_box_area=$([[ "$MAX_BOX_AREA" == "0" ]] && echo 'off (no per-box cap)' || echo "$MAX_BOX_AREA") max_union_area=$([[ -n "$MAX_UNION_AREA" ]] && echo "$MAX_UNION_AREA" || echo 'off')"
+fi
 echo "Saliency map:     $_MAP_SHOWN -> ${WANT_REWARD_FN:-(no saliency reward)}$([[ -n "${_GATE_CKPT:-}" ]] && echo "   (resuming checkpoint-$_GATE_CKPT)")"
 echo "Overlap reward:   layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
+if [[ -n "$MASKFREE" ]]; then
+echo "Metric:           (none -- --maskfree replaces the metric; --overlap-metric is ignored)"
+else
 echo "Metric:           $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " mass_floor_tau=$MASS_FLOOR_TAU" || echo " (no mass floor)")"
+fi
+if [[ -n "$MASKFREE" ]]; then
+    case "$MASKFREE" in
+        flatness) _MF_WHAT="mean(m)/max(m) over the whole grid -- mean_in with the union replaced by the image" ;;
+        mass)     _MF_WHAT="log(sum(m)) + anchor -- the probability mass the step's tokens put on the image" ;;
+    esac
+    echo "MASK-FREE:        $MASKFREE -- $_MF_WHAT"
+    echo "                  w=$W_OVERLAP$([[ -n "${W_OVERLAP_SET:-}" ]] && echo ' (explicit --w-overlap)' || echo " (= 0.4 x sd_within(mean_in)/sd_within($MASKFREE), val_natural, cold start)")"
+    echo "                  NO boxes, NO Grounding-DINO. Segmentation and the layer-22 re-forward are kept,"
+    echo "                  so the maps are the ones think_overlap_reward would have scored."
+    if [ "$MASKFREE_PARITY" = true ]; then
+    echo "                  --maskfree-parity ON: DINO IS running, used only as the scored/unscored gate."
+    else
+    echo "                  scored set: every completion with a gradeable observe step (measured identical"
+    echo "                  to the DINO-gated set on val_natural: 231/240 either way). --maskfree-parity re-checks."
+    fi
+    if (( TRAIN_N != 6 )); then
+    echo "                  NOTE: $TRAIN_N training procs -> gen_batch $(( PER_DEVICE_BATCH * TRAIN_N * GRAD_ACCUM )). The reference runs used 48."
+    echo "                        Pass --num-gpus 7 for 6 procs, or adjust --grad-accum."
+    fi
+fi
 if [[ -n "$PLACEBO" ]]; then
     case "$PLACEBO" in
         roll)   _PLACEBO_WHAT="the same metric on the step's own box union MOVED (same area, same shape, wrong place)" ;;
@@ -951,6 +1085,8 @@ if ! $DIRECT; then
                 --overlap-metric $OVERLAP_METRIC \
                 ${MASS_FLOOR_TAU:+--mass-floor-tau $MASS_FLOOR_TAU} \
                 ${PLACEBO:+--placebo $PLACEBO} \
+                ${MASKFREE:+--maskfree $MASKFREE} \
+                $([ "$MASKFREE_PARITY" = true ] && echo --maskfree-parity) \
                 --saliency-method $SALIENCY_METHOD_R \
                 --grad-target $GRAD_TARGET \
                 --grad-null-offsets $GRAD_NULL_OFFSETS \
@@ -1089,11 +1225,18 @@ wait_for_health() {
 }
 
 # ---------- 1. Grounding-DINO reward server on GPU 0 ----------
-echo "[start] Grounding-DINO on cuda:$DINO_GPU -> 127.0.0.1:$DINO_PORT"
-CUDA_VISIBLE_DEVICES=$DINO_GPU DINO_SERVER_BATCH=${DINO_SERVER_BATCH:-8} \
-    python "$REPO/serve_grounding_dino.py" --host 127.0.0.1 --port "$DINO_PORT" \
-    > "$LOG_DIR/dino.log" 2>&1 &
-DINO_PID=$!
+# Skipped entirely under --maskfree: those rewards need no boxes, so there is nothing to
+# serve. This is where the ~16.6 s of a 40.5 s optimizer step goes away, and it is also
+# why the GPU layout above gives training one more process.
+if [ "$WANT_DINO" = true ]; then
+    echo "[start] Grounding-DINO on cuda:$DINO_GPU -> 127.0.0.1:$DINO_PORT"
+    CUDA_VISIBLE_DEVICES=$DINO_GPU DINO_SERVER_BATCH=${DINO_SERVER_BATCH:-8} \
+        python "$REPO/serve_grounding_dino.py" --host 127.0.0.1 --port "$DINO_PORT" \
+        > "$LOG_DIR/dino.log" 2>&1 &
+    DINO_PID=$!
+else
+    echo "[start] Grounding-DINO SKIPPED (--maskfree $MASKFREE needs no boxes)"
+fi
 
 # ---------- 2. vLLM generation server on GPU 1 ----------
 cd "$REPO/trl_repo"
@@ -1116,7 +1259,7 @@ CUDA_VISIBLE_DEVICES=$VLLM_GPU \
 VLLM_PID=$!
 
 # DINO loads fast (~1-2 min); vLLM must load the 8B + capture CUDA graphs (~5-15 min).
-wait_for_health "http://127.0.0.1:$DINO_PORT/health"  "dino" 600  "$DINO_PID"
+[ "$WANT_DINO" = true ] && wait_for_health "http://127.0.0.1:$DINO_PORT/health"  "dino" 600  "$DINO_PID"
 wait_for_health "http://127.0.0.1:$VLLM_PORT/health/" "vllm" 1800 "$VLLM_PID"
 
 # ---------- 3. checkpoint housekeeping ----------
@@ -1163,6 +1306,19 @@ MAX_UNION_FLAG=""
 # every existing run's command line is reproduced byte for byte.
 PLACEBO_FLAG=""
 [[ -n "$PLACEBO" ]] && PLACEBO_FLAG="--placebo $PLACEBO"
+
+# Same shape again. --maskfree_parity is a store_true, so it is present or absent rather
+# than true/false: passing it as `--maskfree_parity False` would set it True.
+MASKFREE_FLAG=""
+[[ -n "$MASKFREE" ]] && MASKFREE_FLAG="--maskfree $MASKFREE"
+[[ -n "$MASKFREE" && "$MASKFREE_PARITY" == true ]] && MASKFREE_FLAG="$MASKFREE_FLAG --maskfree_parity"
+
+# Point at the DINO server only when one was started. Passing a URL to a port nothing is
+# listening on would turn "no grounding needed" into a connection error on the first step
+# if any code path ever reached for boxes -- better to have no address at all, so a stray
+# call fails loudly at the flag rather than silently retrying a dead socket.
+DINO_API_FLAG=""
+[ "$WANT_DINO" = true ] && DINO_API_FLAG="--dino_api_base http://127.0.0.1:$DINO_PORT"
 
 # Omitted when off, so the dataclass default (False) applies and the command line of an
 # existing run is reproduced byte for byte.
@@ -1259,9 +1415,10 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --overlap_metric "$OVERLAP_METRIC" \
     $MASS_FLOOR_FLAG \
     $PLACEBO_FLAG \
+    $MASKFREE_FLAG \
     $NATURAL_ONLY_FLAG \
     $EVAL_FLAGS \
-    --dino_api_base "http://127.0.0.1:$DINO_PORT" \
+    $DINO_API_FLAG \
     --reward_weights $REWARD_WEIGHTS \
     --use_vllm \
     --vllm_mode server \
