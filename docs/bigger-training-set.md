@@ -165,6 +165,11 @@ the `natural`-column change; they differ in how the rows are obtained.
 schema, and were built image-disjoint from each other and from the 8k. Concatenated:
 **24,240 rows, 3× the 8k**, at ~1.7 questions per image.
 
+Verified here rather than taken from the builder: SHA-256 over the stored image bytes of
+all 24,240 rows gives 7,160 distinct pictures in set_c and 6,946 in set_d, sharing
+**0**. (set_d's 6,946 against its recipe's 6,953 is seven pictures stored twice under
+different names — the same thing `build_set_d.py --index` reports for the 8k.)
+
 ```
 24,240 rows x 1 epoch / 6 prompts-per-step = 4,040 steps
 ```
