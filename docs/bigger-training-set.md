@@ -266,10 +266,11 @@ build is cheap next to a 110 h run. `build_set_d.py` already has everything: the
 SHA-256 index, the two-mechanism disjointness proof against the 8k, and the per-source
 pools. Extend its exclusion list with set_d's own images and change two constants.
 
-If the build is not wanted, `set_c` on disk is already 16,160 rows of the right shape and
-can be run under Option B or C directly — at the cost of keeping the 8k's composition,
-whose OCR/document quarter §4 measures as the hack's fuel, and of reusing images two of
-the runs on record were trained on.
+**Double the image budget too, not just the rows.** `set_c` doubled the 8k's rows over
+3.2% more pictures, so it packs **2.26 questions per image against the 8k's 1.16**, and
+`build_set_c.py` never excluded the 8k's pictures either (measured: 1,014 of its 7,160
+images, 14%, are also in the 8k — its *rows* are almost all new, only 118 of 16,160 are
+rows the 8k also holds). Both are avoidable, and §4.1 below is why they are worth avoiding.
 
 Free images after excluding the 8k, set_c and the validation draws
 (`python build_set_d.py --report`): gqa 49,712 · flickr30k 22,694 · textcap 14,844 ·
@@ -291,9 +292,69 @@ infographicsvqa 3,043 · vsr 1,569 — 137k images against the ~14k the recipe n
 | **total** | **16,160** | | | | 24.5% overlap-masked, the same OCR/document share the 8k has |
 
 The non-natural *share* is deliberately unchanged, so nothing is removed from what the
-model sees — only from what the overlap reward is allowed to score. Target ~1.15
-questions per image, as the 8k has; set_c's 2.26 was suspected once and cleared by
-`set_c_ms3900`, but there is no reason to spend the packing.
+model sees — only from what the overlap reward is allowed to score.
+
+**Image budget: double every source's, so questions-per-image stays at the 8k's.** Note
+the 8k is not uniformly 1.16 — docvqa is already 2.38 and infographicsvqa 2.91 — so
+"double the image budget" means preserving each source's own packing, not flattening it.
+Every source clears its pool with room; the tightest is flickr30k at 23% of what is free.
+
+| source | 8k rows / imgs | ×2 rows / imgs | q/img | free imgs | uses |
+|---|---|---|---|---|---|
+| flickr30k | 2,715 / 2,618 | 5,430 / 5,236 | 1.04 | 22,694 | 23% |
+| gqa | 1,765 / 1,752 | 3,530 / 3,504 | 1.01 | 49,712 | 7% |
+| openimages | 860 / 712 | 1,720 / 1,424 | 1.21 | 8,403 | 17% |
+| docvqa | 670 / 282 | 1,340 / 564 | 2.38 | 8,042 | 7% |
+| textcap | 640 / 441 | 1,280 / 882 | 1.45 | 14,844 | 6% |
+| v7w | 610 / 595 | 1,220 / 1,190 | 1.03 | 11,229 | 11% |
+| textvqa | 370 / 307 | 740 / 614 | 1.21 | 12,735 | 5% |
+| infographicsvqa | 300 / 103 | 600 / 206 | 2.91 | 3,043 | 7% |
+| cub | 80 / 80 | 160 / 160 | 1.00 | 4,853 | 3% |
+| vsr | 70 / 63 | 140 / 126 | 1.11 | 1,569 | 8% |
+| **total** | **8,080 / 6,953** | **16,160 / 13,906** | **1.16** | 137,124 | 10% |
+
+(Those free counts already exclude the 8k, set_c and both validation draws; subtracting
+set_d's 6,946 as well leaves every row of the table comfortable.)
+
+Doing this makes `set_e` differ from the 8k in exactly one dimension — size — which
+neither `set_c` nor a row-doubled rebuild would. The row counts above are the recomposed
+ones; if the source reweighting is *not* wanted, `RECIPE_ROWS × 2` and `IMAGE_BUDGET × 2`
+in `build_set_d.py` is a two-constant change that gives a pure size manipulation.
+
+### 4.1 — what 2.26 questions per image would probably do, and why it is not worth finding out
+
+The one control that isolates packing is `set_c_ms3900` (set_c's rows, 2.26 q/img) against
+`set_d` (1.16 q/img), both on the 3,990-step schedule with `set_d` absorbing the
+"different pictures" effect. Through the bins where both have real statistics:
+
+| step bin | tied: set_d → set_c_ms | ov_share | accuracy (set_c_ms − set_d) |
+|---|---|---|---|
+| 0–399 | 0.18 → 0.22 | 0.201 → 0.237 | −0.032 |
+| 400–799 | 0.29 → 0.25 | 0.309 → 0.271 | −0.015 |
+| 800–1199 | 0.31 → 0.37 | 0.324 → 0.384 | +0.025 |
+
+**No clear packing effect** — the differences alternate sign and sit inside the bin-to-bin
+scatter (n ≈ 240–490 groups per cell). The only monotone column is accuracy: set_c_ms
+starts 0.032 *below* set_d and ends 0.025 above, which is the shape image familiarity
+would produce, at a magnitude that is not distinguishable from a different draw.
+
+**But that control stops at step 1,710 — 0.63 of one epoch.** The question is what happens
+over three, where 2.26 q/img presents each picture ~6.8 times against the 8k's ~3.5.
+Nothing on record covers that. Three mechanisms would all push the same way if it matters:
+
+1. **Familiarity inflates accuracy**, which raises the uniform-accuracy fraction, which
+   hands more of the advantage to the overlap term — the §3 channel, entered from the data
+   side. The accuracy trend above is weakly consistent with it.
+2. **Per-image reuse of the hack.** This one is specific to this reward: the hack is
+   "write a broad sentence that Grounding-DINO grounds widely", and *which* sentence works
+   is a property of the picture. Seeing the same picture 6.8 times is 6.8 chances to
+   rediscover and reinforce a per-image trick; 3.5 is half as many.
+3. **Fewer distinct scenes per unit of gradient** — 7,160 against the 13,906 the pools
+   would allow at the same row count.
+
+All three are arguments, none is a measurement. They are also all avoidable for the cost
+of two constants, which is why the recipe doubles the image budget rather than betting on
+a null measured over two-thirds of an epoch.
 
 **Optional pre-build screen, if a GPU hour is available.** The mechanism says the fuel is
 *images where a generic sentence grounds broadly*. That is directly measurable with
