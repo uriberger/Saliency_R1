@@ -2861,6 +2861,26 @@ class GRPOTrainer(Trainer):
                 dtype=torch.float32, device=device,
             )
             self._metrics[mode]["overlap/natural_frac"].append(gather(_nat).mean().item())
+        # --length-guard by-products. Drained OUTSIDE every reward_variant branch, because
+        # the guard is an additional term that applies under all of them (including
+        # 'none'). `frac_penalized` is the one to read: it says what share of completions
+        # the guard is actually touching, which is the open question about the term --
+        # set_c's MEAN length at its worst step sat inside any band wide enough to permit
+        # the healthy shortening every good run does, so the guard reaches that failure
+        # only through the tail, if at all. 0.00 means it is inert and the run's length
+        # behaviour is entirely the other rewards' doing. is_active() is a rank-uniform CLI
+        # decision, so branching the collectives below on it is safe -- same argument as
+        # the placebo and mask-free blocks.
+        from trl.rewards.length_guard_rewards import is_active as _lenguard_active
+        from trl.rewards.length_guard_rewards import pop_diagnostics as pop_lenguard_diagnostics
+
+        if _lenguard_active():
+            for _k, _v in pop_lenguard_diagnostics().items():
+                _t = torch.tensor([_v], dtype=torch.float32, device=device)
+                _g = gather(_t)
+                _g = _g[~torch.isnan(_g)]
+                if _g.numel():
+                    self._metrics[mode][f"lenguard/{_k}"].append(_g.mean().item())
         if self.reward_variant in ("ours", "grad", "glimpse"):
             # Roll-null by-products, when --overlap_metric is 'logratio'. For 'grad'
             # that metric takes grad_rewards' own path instead, so these stay NaN

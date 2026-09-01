@@ -175,6 +175,63 @@ def _load_maskfree_rewards():
     return mod
 
 
+def _load_length_guard_rewards():
+    """Import trl/rewards/length_guard_rewards.py the same way, and for the same reason.
+
+    Safe to call after the two loaders above: they all register the same `trl_spread`
+    stub package, and this module imports nothing from its siblings.
+    """
+    src = ROOT / "trl" / "rewards" / "length_guard_rewards.py"
+    pkg = sys.modules.get("trl_spread")
+    if pkg is None:
+        pkg = types.ModuleType("trl_spread"); pkg.__path__ = [str(ROOT / "trl")]
+        sys.modules["trl_spread"] = pkg
+        sub = types.ModuleType("trl_spread.rewards"); sub.__path__ = [str(src.parent)]
+        sys.modules["trl_spread.rewards"] = sub
+    spec = importlib.util.spec_from_file_location("trl_spread.rewards.length_guard_rewards", src)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["trl_spread.rewards.length_guard_rewards"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def length_guard_group_vals(samples, ref_key, lgr, l_ref, restrict_to_reference):
+    """Per-group length-guard penalties, from the probe's stored `n_completion_tokens`.
+
+    TWO SETS, and the difference is the point of printing both rows.
+
+    `restrict_to_reference=True` keeps only the completions `ref_key` scored, which is the
+    set every other row in this table is measured on. That is the set the WEIGHT must come
+    from: `w = w_ref x sd_within(reference) / sd_within(guard)` is only the ratio it claims
+    to be if both sds are over the same completions.
+
+    `restrict_to_reference=False` is what the reward actually does at training time -- it
+    scores EVERY completion and never returns None, because masking it to the overlap
+    reward's scored set would make "produce no groundable observe step" an escape hatch
+    from the leash (see length_guard_rewards.__doc__, SCORED SET). That row is the one
+    whose sd_within governs the pressure a run really applies, so it is printed too and
+    the two are expected to differ.
+
+    No format gate either, for the same reason: an unparseable completion still has a
+    length, and the guard is not conditional on the rest of the reward stack agreeing.
+    """
+    group_vals = []
+    for s in samples:
+        vals = []
+        for c in s["completions"]:
+            if restrict_to_reference:
+                if not any(st.get("grounded") and st.get(ref_key) is not None
+                           for st in c["observe_steps"]):
+                    continue
+            n = c.get("n_completion_tokens")
+            if n is None:
+                continue
+            vals.append(lgr.penalty(int(n), l_ref))
+        if vals:
+            group_vals.append(vals)
+    return group_vals
+
+
 def maskfree_group_vals(samples, ref_key, kind, mfr):
     """Per-group mask-free rewards, on exactly the completions `ref_key` scored.
 
@@ -371,6 +428,19 @@ def main():
                         "same numbers the run will see")
     p.add_argument("--no-placebo", action="store_true",
                    help="skip the --placebo roll|random|length table")
+    # The length guard's shape knobs, so the weight can be measured for the exact band a
+    # run will be launched with rather than for the default one.
+    p.add_argument("--length-guard-ref", type=float, default=None,
+                   help="reference length in tokens for the lenguard rows. Default: each "
+                        "model's own mean completion length, which is what --length-guard "
+                        "wants when the model is the cold-start policy you train from")
+    p.add_argument("--length-guard-band-lo", type=float, default=0.30,
+                   help="lower edge of the free window, as a MULTIPLE of the reference length")
+    p.add_argument("--length-guard-band-hi", type=float, default=3.0,
+                   help="upper edge of the free window, as a MULTIPLE of the reference length")
+    p.add_argument("--length-guard-knee", type=float, default=1.0)
+    p.add_argument("--no-length-guard", action="store_true",
+                   help="skip the --length-guard rows")
     args = p.parse_args()
 
     path = Path(args.probe_json)
@@ -390,6 +460,9 @@ def main():
     plc = None if args.no_placebo else _load_placebo_rewards()
     # The mask-free rows need the stored maps for the same reason `placebo:roll` does.
     mfr = None if args.no_placebo else _load_maskfree_rewards()
+    # The length guard needs neither maps nor boxes, only the stored token counts, so it
+    # is measurable on any probe -- including one run without --store-maps.
+    lgr = None if args.no_length_guard else _load_length_guard_rewards()
     ref_key = next((k for k, n in METRICS if n == args.reference), None)
 
     for model, m in payload["models"].items():
@@ -441,6 +514,53 @@ def main():
                       f"{'--':>10} {row['reward_mean']:>12.4f} "
                       f"{row['sd_within']:>10.4f} {row['sd_per_sample']:>10.4f} "
                       f"{row['reward_sd_all']:>8.4f} {'--' if ac is None else f'{ac:>8.3f}'}")
+
+        # --- the length guard (--length-guard REF_TOKENS) ------------------------------
+        # Needs no maps, no boxes and no metric -- only the stored token counts -- so it is
+        # the one row that is always measurable. l_ref defaults to THIS model's own mean
+        # completion length, which is exactly the number --length-guard wants: the base
+        # policy's mean length on the corpus being trained on. Pass --length-guard-ref to
+        # score a different reference (e.g. a trained checkpoint against the cold start's).
+        if lgr is not None:
+            _all_n = [int(c["n_completion_tokens"]) for s in m["samples"] for c in s["completions"]
+                      if c.get("n_completion_tokens") is not None]
+            if _all_n:
+                l_ref = float(args.length_guard_ref) if args.length_guard_ref else float(np.mean(_all_n))
+                lgr.configure(l_ref=l_ref, band_lo=args.length_guard_band_lo,
+                              band_hi=args.length_guard_band_hi,
+                              knee=args.length_guard_knee)
+                print(f"lenguard: l_ref={l_ref:.1f} tokens"
+                      f"{'  (--length-guard-ref)' if args.length_guard_ref else '  (= this model mean length)'}"
+                      f"  free band {args.length_guard_band_lo}x..{args.length_guard_band_hi}x ="
+                      f" [{l_ref * args.length_guard_band_lo:.0f}, {l_ref * args.length_guard_band_hi:.0f}] tok"
+                      f"  n={len(_all_n)} completions, mean {np.mean(_all_n):.1f}")
+                for restrict, label in ((True, "lenguard"), (False, "lenguard:all")):
+                    row = _stats(label, length_guard_group_vals(
+                        m["samples"], ref_key, lgr, l_ref, restrict))
+                    if row is None:
+                        continue
+                    # Only the reference-restricted row joins `rows`: the weight table
+                    # below divides sd_within(reference) by each row's, and that ratio is
+                    # meaningless across two different completion sets.
+                    if restrict:
+                        rows.append(row)
+                    print(f"{row['name']:<18} {'--':>7} {row['n_completions']:>6} "
+                          f"{'--':>10} {row['reward_mean']:>12.4f} "
+                          f"{row['sd_within']:>10.4f} {row['sd_per_sample']:>10.4f} "
+                          f"{row['reward_sd_all']:>8.4f} {'--':>8}"
+                          f"{'' if restrict else '   [every completion: the set the reward really scores]'}")
+                # The weight table below answers "what w makes this term as strong as
+                # mean_in", which is the right question for a metric taking the overlap
+                # reward's slot and the WRONG one for a regulator. The guard is meant to be
+                # silent in the middle and expensive at the edges, not co-equal everywhere,
+                # so its k comes from the two cost figures printed here -- not from the
+                # `lenguard` row of that table. See length_guard_rewards.__doc__.
+                _k = 0.20
+                print(f"{'':18} k={_k}: pressure {_k * (row['sd_within'] if row else 0):.4f} "
+                      f"| cost at 0.2x ref {_k * lgr.penalty(int(0.2 * l_ref), l_ref):+.3f}, "
+                      f"at 0.1x {_k * lgr.penalty(int(0.1 * l_ref), l_ref):+.3f}, "
+                      f"at 4x {_k * lgr.penalty(int(4 * l_ref), l_ref):+.3f}"
+                      f"   <- set k from THESE, not from the w table below")
 
         ref = next((r for r in rows if r["name"] == args.reference), None)
         if not ref:

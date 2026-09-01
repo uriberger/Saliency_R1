@@ -134,6 +134,22 @@ echo "  copied placebo-control file (placebo_rewards)"
 cp "$REPO/trl/rewards/maskfree_rewards.py" "$TRL_REPO/trl/rewards/maskfree_rewards.py"
 echo "  copied mask-free reward file (maskfree_rewards)"
 
+# ── 2h. length guard (--length-guard REF_TOKENS) ────────────────────────────
+# An ADDITIONAL reward term, not a slot replacement: it applies under every
+# --saliency-method and under --reward_variant none, so grpo_vlm_qwen3.py appends it and
+# its weight rather than putting it in the overlap reward's position. It imports nothing
+# from the other reward modules (it reads completion_ids and no map, no boxes), so it
+# lands in trl/rewards/ purely to sit beside them.
+#
+# LOAD-BEARING FOR EVERY RUN, not just --length-guard ones, for the same reason 2f is:
+# grpo_trainer_qwen3.py imports is_active/pop_diagnostics from this module in its metrics
+# block, OUTSIDE every reward_variant branch and BEFORE the is_active() guard. Omitting
+# the copy is not "the new flag is unavailable", it is an ImportError on the first metrics
+# log of any run at all. test_import_layout_cpu.py parses this script's copy list, so a
+# missing line here fails on CPU rather than on the second cluster at step 5.
+cp "$REPO/trl/rewards/length_guard_rewards.py" "$TRL_REPO/trl/rewards/length_guard_rewards.py"
+echo "  copied length-guard reward file (length_guard_rewards)"
+
 # ── 2g. ZeRO-3 generation hooks ─────────────────────────────────────────────
 # unwrap_model_for_generation() strips the ZeRO-3 fetch/partition hooks, yields, then
 # re-registers them. Upstream re-registers on the normal path only, so anything raised

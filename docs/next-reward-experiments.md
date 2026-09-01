@@ -288,8 +288,17 @@ control wrapped across the image border and stopped having the union's shape.
 
 ### Which trainer fold you run under — decide this deliberately
 
-`trl_repo/` is deliberately behind `main` on `trl/grpo_trainer_qwen3.py`: `main` imputes
-each group's mean for an unscored reward (commit 8489767), `trl_repo` still folds with
+> **Superseded 2026-09-01.** `trl_repo/` was deliberately behind `main` on
+> `trl/grpo_trainer_qwen3.py` when this was written. It no longer is: all fourteen files
+> `patch_trl_qwen3.sh` copies are byte-identical to their tracked sources, the trainer
+> included, so the patch script is a no-op with respect to this choice and carries no
+> hidden change in fold semantics. Run it rather than hand-copying — it is also how the
+> second cluster gets this code (`git pull` + patch), and hand-copying is exactly the
+> 069bd32 failure the script's §2f comment records. The paragraph below is kept because
+> the reference runs' semantics are still what it says.
+
+`trl_repo/` was deliberately behind `main` on `trl/grpo_trainer_qwen3.py`: `main` imputes
+each group's mean for an unscored reward (commit 8489767), `trl_repo` still folded with
 `.nansum(dim=1)`, which reads an unscored reward as **0**. The four reference runs were
 trained under `nansum`.
 

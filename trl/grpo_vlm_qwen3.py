@@ -724,6 +724,43 @@ if __name__ == "__main__":
     else:
         reward_funcs = [think_format_reward, think_saliency_reward, accuracy_reward, openai_reward]
 
+    # --length-guard: an ADDITIONAL term, APPENDED. Every block above builds a fixed-order
+    # list whose positions --reward_weights lines up against, and every auxiliary reward so
+    # far has taken the overlap reward's SLOT precisely so that alignment never moves. This
+    # one cannot: it is a regulator that has to apply whatever else is being scored,
+    # including --reward_variant none (a 3-element list). So it goes last, and its weight is
+    # appended HERE rather than typed into --reward_weights, which keeps every existing
+    # command line meaning exactly what it meant. Off by default, so a run that does not
+    # pass --length-guard gets a byte-identical reward_funcs and reward_weights -- checked
+    # by test_length_guard_reward_cpu.py, because trl_repo/ is shared and re-patched under
+    # jobs that are already queued.
+    if script_args.length_guard_ref is not None:
+        from trl.rewards.length_guard_rewards import configure as configure_length_guard
+        from trl.rewards.length_guard_rewards import length_guard_reward
+
+        configure_length_guard(
+            l_ref=script_args.length_guard_ref,
+            band_lo=script_args.length_guard_band_lo,
+            band_hi=script_args.length_guard_band_hi,
+            knee=script_args.length_guard_knee,
+        )
+        # reward_weights defaults to None, meaning "1.0 for every function". Appending to
+        # that would need the implicit list made explicit anyway, so do it here: leaving it
+        # None while adding a fifth function would weight the guard at 1.0, which is ~8x
+        # the calibrated strength and would swamp the accuracy reward.
+        if training_args.reward_weights is None:
+            training_args.reward_weights = [1.0] * len(reward_funcs)
+        elif len(training_args.reward_weights) != len(reward_funcs):
+            raise SystemExit(
+                f"--reward_weights has {len(training_args.reward_weights)} values but there "
+                f"are {len(reward_funcs)} reward functions before the length guard. Pass one "
+                "weight per existing reward and let --length_guard_weight carry the guard's."
+            )
+        reward_funcs = reward_funcs + [length_guard_reward]
+        training_args.reward_weights = list(training_args.reward_weights) + [
+            float(script_args.length_guard_weight)
+        ]
+
     ################
     # Training
     ################

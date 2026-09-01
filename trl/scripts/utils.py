@@ -490,6 +490,75 @@ class ScriptArguments:
             "maskfree/mass in the logs and raise this."
         },
     )
+    length_guard_ref: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Install the LENGTH GUARD, an ADDITIONAL reward term (it does not "
+            "replace anything) that is exactly 0 while a completion's token count stays "
+            "near the base policy's and goes negative outside a band around it. The value "
+            "is the REFERENCE LENGTH in tokens: the cold-start model's mean completion "
+            "length on the corpus you are training on, read off completions/mean_length "
+            "at step 0 of a matched run. There is no safe default -- 217 is set_c's and "
+            "would be wrong on a corpus with shorter chains. Its strength is its entry in "
+            "--reward_weights, appended automatically by grpo_vlm_qwen3.py so existing "
+            "--reward_weights command lines are unchanged. Works with every "
+            "--saliency_method and with --reward_variant none, costs nothing (it reads "
+            "completion_ids and no map), and scores every completion rather than "
+            "inheriting any reward's unscored set -- masking it would make 'produce no "
+            "groundable observe step' an escape hatch from the leash. See "
+            "trl/rewards/length_guard_rewards.py."
+        },
+    )
+    length_guard_weight: float = field(
+        default=0.20,
+        metadata={
+            "help": "--length-guard: the term's entry in --reward_weights, i.e. its "
+            "strength k. Appended by grpo_vlm_qwen3.py rather than typed into "
+            "--reward_weights, so every existing command line keeps working. Measured on "
+            "the cold-start policy (val_natural, 240 completions) 0.20 gives 0.0036 of "
+            "effective pressure -- the same order as mean_in w0.4's 0.0028, but "
+            "concentrated on the 1.3% of completions outside the band rather than spread "
+            "over all of them as a brevity gradient -- while costing a collapsed "
+            "completion 0.018 reward units at 49 tokens, 0.12 at 31 and 0.45 at 13. "
+            "Re-measure on your corpus with overlap_metric_spread.py. If baseline noise "
+            "and collapse cost conflict there, WIDEN the band rather than lowering this."
+        },
+    )
+    length_guard_band_lo: float = field(
+        default=0.30,
+        metadata={
+            "help": "--length-guard: lower edge of the free window, as a MULTIPLE of the "
+            "reference length (0.30 = a third of the base length is still free). Measured, "
+            "not guessed: it clears the healthy 8k run's own short tail (p1 = 0.37x) while "
+            "sitting above every length collapse on record -- auroc 0.22x, --maskfree mass "
+            "0.14x, --placebo length 0.06x. This is the side that does the work, because "
+            "collapse has no other guard: a 13-token completion can be perfectly formatted "
+            "and scored correct."
+        },
+    )
+    length_guard_band_hi: float = field(
+        default=3.0,
+        metadata={
+            "help": "--length-guard: upper edge of the free window, as a MULTIPLE of the "
+            "reference length. 3.0 sits between the cold-start policy's p99 (3.5x) and its "
+            "bulk, and below max_completion_length (4.6x at l_ref=221). The long side is "
+            "necessarily weak: truncation already costs a completion BOTH accuracy and "
+            "format (~2.0 reward units), so all this adds is a soft ramp into an existing "
+            "cliff. Do not tighten it to chase a set_c-style inflation -- that run's mean "
+            "sat at 1.15x and its tail at 1.81x, and a band tight enough to reach them "
+            "penalises 22% of healthy completions."
+        },
+    )
+    length_guard_knee: float = field(
+        default=1.0,
+        metadata={
+            "help": "--length-guard: excess (in LOG units) at which the penalty stops "
+            "growing quadratically and grows linearly instead; value and slope are both "
+            "continuous there. Bounds how far one runaway completion can inflate its "
+            "group's reward std, which under scale_rewards=True would shrink every OTHER "
+            "completion's advantage in that group."
+        },
+    )
     overlap_natural_only: bool = field(
         default=False,
         metadata={

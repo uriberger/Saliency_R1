@@ -338,6 +338,39 @@ REWARD_VARIANT=ours      # ours (attention overlap) | grad (roll-null pixel grad
                          # below exists because that fallback is invisible otherwise.
 ALLOW_MAP_CHANGE=false   # --allow-map-change: resume a checkpoint with a DIFFERENT
                          # saliency map than the one it was trained with. Off by default.
+# ---------- regulators: keep GRPO from buying the auxiliary reward with degenerate text --
+# Both are OFF by default, so a run that names neither is byte-identical to every run on
+# record. They cover DIFFERENT failure modes and are meant to be readable separately:
+#
+#   --beta B        KL anchor to the base policy. Under LoRA the trainer needs no second
+#                   model -- it disables the adapter to get the reference
+#                   (grpo_trainer_qwen3.py:836-839, :2480) -- so this costs one extra
+#                   forward per optimizer step and no GPU memory. Every run on record
+#                   used beta=0, at which the trainer sets ref_model=None and there is no
+#                   anchor at all. The one run that did not: 50k set_a, mean_in_v2,
+#                   k_proj, beta 0.004, 5050 steps -- length 236->228 flat, entropy
+#                   0.684->0.713, accuracy 0.434->0.586, overlap +11%, kl reaching 0.049.
+#                   The set_a hack it would otherwise have produced never appeared. Note
+#                   that run also added k_proj, so beta is not cleanly isolated in it.
+#
+#   --length-guard L  A leash on completion length, L tokens = the BASE policy's mean
+#                   length on the corpus you are training on (read completions/mean_length
+#                   at step 0; there is no safe default). Zero inside a band around L,
+#                   quadratic outside. Catches set_a-style padding and all four
+#                   collapse-to-short failures; it does NOT catch a set_c-style entropy
+#                   collapse, whose mean length excursion (+17%) sits inside any band wide
+#                   enough to allow the healthy shortening every good run does. Read
+#                   lenguard/frac_penalized to see whether it is touching anything.
+#                   See trl/rewards/length_guard_rewards.py for the shape and the
+#                   calibration of --length-guard-weight.
+BETA=0
+LENGTH_GUARD_REF=""      # empty = guard off. In TOKENS.
+LENGTH_GUARD_WEIGHT=0.20
+LENGTH_GUARD_BAND_LO=0.30   # free window, as MULTIPLES of the reference length
+LENGTH_GUARD_BAND_HI=3.0
+LENGTH_GUARD_KNEE=1.0
+ALLOW_REGULATOR_CHANGE=false  # --allow-regulator-change: resume a checkpoint whose
+                              # regulator settings differ from this command line.
 GRAD_TARGET=clogit       # clogit (default) | logit | logprob -- see trl/grad_maps.py
 GRAD_NULL_OFFSETS=16
 GRAD_LOGRATIO_CLIP=1.0
@@ -442,6 +475,17 @@ while [[ $# -gt 0 ]]; do
         --placebo)                PLACEBO="$2";                 shift 2 ;;
         --maskfree)               MASKFREE="$2";                shift 2 ;;
         --maskfree-parity)        MASKFREE_PARITY=true;         shift 1 ;;
+        # Regulators. --beta is a real flag rather than an EXTRA_ARGS passthrough
+        # precisely so it can reach SUFFIX below: passed through, a beta run would share a
+        # checkpoint directory and a wandb run with the beta=0 control it is meant to be
+        # compared against.
+        --beta)                   BETA="$2";                    shift 2 ;;
+        --length-guard)           LENGTH_GUARD_REF="$2";        shift 2 ;;
+        --length-guard-weight)    LENGTH_GUARD_WEIGHT="$2";     shift 2 ;;
+        --length-guard-band-lo)   LENGTH_GUARD_BAND_LO="$2";    shift 2 ;;
+        --length-guard-band-hi)   LENGTH_GUARD_BAND_HI="$2";    shift 2 ;;
+        --length-guard-knee)      LENGTH_GUARD_KNEE="$2";       shift 2 ;;
+        --allow-regulator-change) ALLOW_REGULATOR_CHANGE=true;  shift 1 ;;
         --natural-only)           NATURAL_ONLY=true;            shift ;;
         --no-natural-only)        NATURAL_ONLY=false;           shift ;;
         --eval-steps)             EVAL_STEPS="$2";              shift 2 ;;
@@ -875,6 +919,19 @@ fi
 # The reward differs from a plain run, so the checkpoints and the wandb run must not
 # share a name with one.
 [[ "$NATURAL_ONLY" == true ]] && SUFFIX="${SUFFIX}_natonly"
+# Regulators change the objective, so a regulated run must not share a checkpoint
+# directory or a wandb run name with the unregulated control it exists to be compared
+# against. Only non-default settings extend the suffix, which keeps every existing run
+# name and every checkpoint already on disk untouched. The band and knee are appended only
+# when they differ from the calibrated defaults, so the common case reads `_lenguard217`.
+[[ "$BETA" != "0" && "$BETA" != "0.0" ]] && SUFFIX="${SUFFIX}_beta${BETA}"
+if [[ -n "$LENGTH_GUARD_REF" ]]; then
+    SUFFIX="${SUFFIX}_lenguard${LENGTH_GUARD_REF}"
+    [[ "$LENGTH_GUARD_WEIGHT"  != "0.20" ]] && SUFFIX="${SUFFIX}w${LENGTH_GUARD_WEIGHT}"
+    [[ "$LENGTH_GUARD_BAND_LO" != "0.30" ]] && SUFFIX="${SUFFIX}lo${LENGTH_GUARD_BAND_LO}"
+    [[ "$LENGTH_GUARD_BAND_HI" != "3.0"  ]] && SUFFIX="${SUFFIX}hi${LENGTH_GUARD_BAND_HI}"
+    [[ "$LENGTH_GUARD_KNEE"    != "1.0"  ]] && SUFFIX="${SUFFIX}kn${LENGTH_GUARD_KNEE}"
+fi
 # A different adapter is a different experiment, so it must not share a name (or a
 # checkpoint dir) with a q+v run. q_proj,v_proj is the historical set and stays unmarked,
 # which keeps every existing run name and every checkpoint already on disk untouched.
@@ -960,6 +1017,52 @@ if [[ -n "$_GATE_CKPT" && -n "$WANT_REWARD_FN" ]]; then
     fi
 fi
 
+# ---------- resume gate 2: the regulators are not sticky either ------------------------
+# Same failure as the map gate above, one level worse: a relaunch that forgets --beta or
+# --length-guard does not crash, it silently continues the run with the anchor removed --
+# and the checkpoint keeps the name that says the anchor is on. An autoresume chunk is the
+# likely place for it. Both regulators leave a readable trace in trainer_state.json:
+# beta != 0 makes the trainer log a "kl" key every step (grpo_trainer_qwen3.py:3025-3030),
+# and the length guard adds rewards/length_guard_reward/mean under its function's __name__.
+# Read them back and refuse a launch that disagrees, in EITHER direction -- adding a
+# regulator halfway through a run changes the objective just as silently as dropping one.
+_ckpt_has_key() {   # 1 if $2 appears as a JSON key anywhere in the checkpoint's log_history
+    local st="$1/trainer_state.json"
+    [[ -f "$st" ]] || return 1
+    grep -q "\"$2\"" "$st" 2>/dev/null
+}
+if [[ -n "$_GATE_CKPT" ]]; then
+    _CK="$OUTPUT_DIR/checkpoint-$_GATE_CKPT"
+    _REG_MSGS=()
+    _HAVE_KL=false;  _ckpt_has_key "$_CK" "kl"                            && _HAVE_KL=true
+    _HAVE_LG=false;  _ckpt_has_key "$_CK" "rewards/length_guard_reward/mean" && _HAVE_LG=true
+    _WANT_KL=false;  [[ "$BETA" != "0" && "$BETA" != "0.0" ]]             && _WANT_KL=true
+    _WANT_LG=false;  [[ -n "$LENGTH_GUARD_REF" ]]                         && _WANT_LG=true
+    [[ "$_HAVE_KL" == true && "$_WANT_KL" == false ]] && _REG_MSGS+=("checkpoint logged 'kl' (beta != 0) but this launch has --beta $BETA. Add: --beta <the value it used>")
+    [[ "$_HAVE_KL" == false && "$_WANT_KL" == true ]] && _REG_MSGS+=("checkpoint logged no 'kl' (it trained at beta=0) but this launch passes --beta $BETA")
+    [[ "$_HAVE_LG" == true && "$_WANT_LG" == false ]] && _REG_MSGS+=("checkpoint logged rewards/length_guard_reward but this launch has no --length-guard. Add: --length-guard <the reference length it used>")
+    [[ "$_HAVE_LG" == false && "$_WANT_LG" == true ]] && _REG_MSGS+=("checkpoint logged no length guard but this launch passes --length-guard $LENGTH_GUARD_REF")
+    if [[ ${#_REG_MSGS[@]} -gt 0 ]]; then
+        if [[ "$ALLOW_REGULATOR_CHANGE" == true ]]; then
+            echo "WARNING: resuming checkpoint-$_GATE_CKPT with DIFFERENT regulators:" >&2
+            for _m in "${_REG_MSGS[@]}"; do echo "         - $_m" >&2; done
+            echo "         --allow-regulator-change given, continuing. The run's curve now has" >&2
+            echo "         two objectives in it and its name states only one." >&2
+        else
+            echo "ERROR: this launch would resume a checkpoint trained with DIFFERENT regulators." >&2
+            echo "  output dir:  $OUTPUT_DIR" >&2
+            echo "  resuming:    checkpoint-$_GATE_CKPT" >&2
+            for _m in "${_REG_MSGS[@]}"; do echo "  - $_m" >&2; done
+            echo "" >&2
+            echo "  Nothing in a checkpoint sets --beta or --length-guard, so a relaunch that" >&2
+            echo "  omits one keeps training with the regulator gone and says nothing. If the" >&2
+            echo "  change is deliberate, pass --allow-regulator-change, or point --output-dir" >&2
+            echo "  at a new directory." >&2
+            exit 1
+        fi
+    fi
+fi
+
 REWARD_WEIGHTS="1.0 ${W_OVERLAP} 1.0 1.0"
 
 echo "=========================================================================="
@@ -1008,6 +1111,34 @@ if [[ -n "$PLACEBO" ]]; then
     echo "                  w=$W_OVERLAP$([[ -n "${W_OVERLAP_SET:-}" ]] && echo ' (explicit --w-overlap)' || echo " (= 0.4 x sd_within(mean_in)/sd_within($PLACEBO), measured on the cold-start policy)")"
     echo "                  scored on exactly the completions $OVERLAP_METRIC would score: same"
     echo "                  segmentation, same Grounding-DINO call, same union, real metric used as the gate."
+fi
+# Regulators. Printed even when off, because "no anchor at all" is the state every run on
+# record trained in and the thing this block exists to make visible.
+if [[ "$BETA" != "0" && "$BETA" != "0.0" ]]; then
+    echo "KL anchor:        beta=$BETA to the base policy (LoRA adapter disabled = the reference:"
+    echo "                  no second model, no extra GPU memory, one extra forward per step)."
+    echo "                  Read train/kl. On 50k set_a it reached 0.049 over 5050 steps with no hack."
+else
+    echo "KL anchor:        OFF (beta=0 -> ref_model=None, no KL computed and none logged)"
+fi
+if [[ -n "$LENGTH_GUARD_REF" ]]; then
+    # Cosmetic only -- never let the banner abort a launch under `set -e`.
+    read -r _LG_LO _LG_HI _LG_COSTS <<<"$(python3 -c "
+import sys; sys.path.insert(0,'$REPO')
+from trl.rewards.length_guard_rewards import penalty
+R,LO,HI,KN,K = $LENGTH_GUARD_REF,$LENGTH_GUARD_BAND_LO,$LENGTH_GUARD_BAND_HI,$LENGTH_GUARD_KNEE,$LENGTH_GUARD_WEIGHT
+c = lambda x: f'{x:.2f}x:{K*penalty(x*R,R,LO,HI,KN):+.3f}'
+print(f'{LO*R:.0f} {HI*R:.0f} ' + '  '.join(c(x) for x in (0.10,0.20,LO,HI,4.0)))" 2>/dev/null || echo '? ? ?')" || true
+    echo "LENGTH GUARD:     ref=$LENGTH_GUARD_REF tokens, free band ${LENGTH_GUARD_BAND_LO}x..${LENGTH_GUARD_BAND_HI}x = [$_LG_LO, $_LG_HI] tokens"
+    echo "                  k=$LENGTH_GUARD_WEIGHT (appended to --reward_weights as a 5th term), knee=$LENGTH_GUARD_KNEE, log-ratio shape"
+    echo "                  cost at n/ref =  $_LG_COSTS"
+    echo "                  ref must be THIS corpus's base-policy mean length -- read completions/mean_length at step 0,"
+    echo "                  or run overlap_metric_spread.py, which prints it and the resulting pressure."
+    echo "                  STRONG against length COLLAPSE (no other reward penalises a 13-token completion);"
+    echo "                  weak against inflation, which max_completion_length already punishes via accuracy+format."
+    echo "                  Read lenguard/frac_penalized: 0.00 means the guard is inert and length is the other rewards' doing."
+else
+    echo "LENGTH GUARD:     OFF (no --length-guard; reward_funcs and --reward_weights unchanged)"
 fi
 echo "Overlap rows:     $([ "$NATURAL_ONLY" = true ] && echo 'natural images only (non-natural: format+accuracy+judge)' || echo 'all rows')"
 echo "Validation:       $([ -n "$VAL_SETS_DIR" ] && echo "accuracy only, step 0 then every $EVAL_STEPS steps, from $VAL_SETS_DIR" || echo 'off')"
@@ -1102,6 +1233,13 @@ if ! $DIRECT; then
                 --rollnull-seed $ROLLNULL_SEED \
                 $([ "$NATURAL_ONLY" = true ] && echo --natural-only) \
                 $([ "$ALLOW_MAP_CHANGE" = true ] && echo --allow-map-change) \
+                --beta $BETA \
+                ${LENGTH_GUARD_REF:+--length-guard $LENGTH_GUARD_REF} \
+                --length-guard-weight $LENGTH_GUARD_WEIGHT \
+                --length-guard-band-lo $LENGTH_GUARD_BAND_LO \
+                --length-guard-band-hi $LENGTH_GUARD_BAND_HI \
+                --length-guard-knee $LENGTH_GUARD_KNEE \
+                $([ "$ALLOW_REGULATOR_CHANGE" = true ] && echo --allow-regulator-change) \
                 --dino-port $DINO_PORT \
                 --vllm-port $VLLM_PORT \
                 --vllm-gpu-mem $VLLM_GPU_MEM \
@@ -1313,6 +1451,29 @@ MASKFREE_FLAG=""
 [[ -n "$MASKFREE" ]] && MASKFREE_FLAG="--maskfree $MASKFREE"
 [[ -n "$MASKFREE" && "$MASKFREE_PARITY" == true ]] && MASKFREE_FLAG="$MASKFREE_FLAG --maskfree_parity"
 
+# Same shape a third time, and the reason matters more here than for the two above: the
+# length guard is OFF unless --length-guard names a reference length, and off must mean
+# the dataclass defaults apply and reward_funcs/reward_weights come out byte-identical to
+# every run on record. trl_repo/ is shared and re-patched under jobs that are already
+# QUEUED, so a run submitted before this change and started after it must be unaffected.
+# The four shape knobs are only emitted with the guard, so their defaults live in exactly
+# one place per side (the dataclass) rather than being echoed unconditionally.
+# Same rule for --beta. GRPOConfig's own default is 0.0 (grpo_config.py:146), which is
+# what every run on record trained at, so emitting nothing at BETA=0 reproduces their
+# command lines exactly AND is semantically identical -- at beta == 0 the trainer sets
+# ref_model = None and computes no KL at all.
+BETA_FLAG=""
+[[ "$BETA" != "0" && "$BETA" != "0.0" ]] && BETA_FLAG="--beta $BETA"
+
+LENGTH_GUARD_FLAG=""
+if [[ -n "$LENGTH_GUARD_REF" ]]; then
+    LENGTH_GUARD_FLAG="--length_guard_ref $LENGTH_GUARD_REF"
+    LENGTH_GUARD_FLAG="$LENGTH_GUARD_FLAG --length_guard_weight $LENGTH_GUARD_WEIGHT"
+    LENGTH_GUARD_FLAG="$LENGTH_GUARD_FLAG --length_guard_band_lo $LENGTH_GUARD_BAND_LO"
+    LENGTH_GUARD_FLAG="$LENGTH_GUARD_FLAG --length_guard_band_hi $LENGTH_GUARD_BAND_HI"
+    LENGTH_GUARD_FLAG="$LENGTH_GUARD_FLAG --length_guard_knee $LENGTH_GUARD_KNEE"
+fi
+
 # Point at the DINO server only when one was started. Passing a URL to a port nothing is
 # listening on would turn "no grounding needed" into a connection error on the first step
 # if any code path ever reached for boxes -- better to have no address at all, so a stray
@@ -1416,6 +1577,8 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     $MASS_FLOOR_FLAG \
     $PLACEBO_FLAG \
     $MASKFREE_FLAG \
+    $BETA_FLAG \
+    $LENGTH_GUARD_FLAG \
     $NATURAL_ONLY_FLAG \
     $EVAL_FLAGS \
     $DINO_API_FLAG \
