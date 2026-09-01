@@ -156,36 +156,30 @@ hack resistance.
 
 ## 5. The proposal
 
-Three options, cheapest first. All three hold the step count at ~4,000 and all three take
-the `natural`-column change; they differ in how the rows are obtained.
-
-### Option A — no build: `set_c ∪ set_d`, one epoch
-
-`set_c` (16,160) and `set_d` (8,080) are already on disk, share the identical feature
-schema, and were built image-disjoint from each other and from the 8k. Concatenated:
-**24,240 rows, 3× the 8k**, at ~1.7 questions per image.
-
-Verified here rather than taken from the builder: SHA-256 over the stored image bytes of
-all 24,240 rows gives 7,160 distinct pictures in set_c and 6,946 in set_d, sharing
-**0**. (set_d's 6,946 against its recipe's 6,953 is seven pictures stored twice under
-different names — the same thing `build_set_d.py --index` reports for the 8k.)
+### There is no zero-change option, and set_c is what one looks like
 
 ```
-24,240 rows x 1 epoch / 6 prompts-per-step = 4,040 steps
+steps = rows x epochs / prompts_per_step        prompts_per_step = gen_batch / num_generations
+                                                gen_batch        = per_device x train_procs x grad_accum
 ```
 
-Same schedule, same geometry, same wall clock as the 8k reference, **3× the distinct
-prompts**, zero build cost. The only new code is a ~20-line concat that also flips
-`natural` to `False` on textcap and textvqa. One epoch instead of three is not a real
-loss: the 8k's accuracy plateaus by step ~2,500 (epoch 1.9) and its last epoch buys
-nothing measurable.
+and the LR schedule lives on **steps**, not on rows. So "2× the rows, 3 epochs, change
+nothing else" resolves to 8,080 steps at `lr 1e-5` linear — which is `set_c`, which
+hacked. Doubling the corpus at fixed epochs necessarily moves one of {step count,
+prompts per step, learning rate}. The choice is which.
 
-**This is the recommendation** if the goal is "bigger, safely, this week".
+Both options below spend ~2× the 8k reference's compute, because both put 48,480
+prompt-presentations through the model against its 24,240. Measured 8k reference: 3,990
+steps, **57.6 h**. Neither option is cheaper than the other — cost is not the tie-breaker.
 
-### Option B — what was asked for: 2× rows, 3 epochs, doubled generation batch
+| | rows | epochs | presentations | prompts/step | steps | lr at step 1250 | ≈ wall clock |
+|---|---|---|---|---|---|---|---|
+| 8k reference | 8,080 | 3 | 24,240 | 6 | 3,990 | 6.87e-6 | 57.6 h |
+| `set_c` (hacked) | 16,160 | 3 | 48,480 | 6 | 8,080 | **8.45e-6** | 74 h to step 5,280 |
+| **B — bigger batch** | 16,160 | 3 | 48,480 | **12** | **4,040** | 6.91e-6 | ~110 h |
+| **C — stretched LR** | 16,160 | 3 | 48,480 | 6 | 8,080 | 4.2–6.0e-6 | ~110 h |
 
-If each row really should be seen three times, keep the step count at 4,000 by taking
-twice as many prompts per step:
+### Option B — 2× rows, 3 epochs, `--grad-accum 16` *(recommended)*
 
 ```bash
 bash launch_grpo_qwen3_overlap_colocated_job.sh \
@@ -193,27 +187,89 @@ bash launch_grpo_qwen3_overlap_colocated_job.sh \
     --lora-targets q_proj,v_proj --num-gpus 8
 ```
 
-`gen_batch = per_device x train_procs x grad_accum = 1 x 6 x 16 = 96` → 12 prompts per
-step → `16,160 x 3 / 12 = 4,040 steps`, and the LR-versus-step curve is the 8k's. Each
-optimizer step averages over 12 groups instead of 6, which is strictly less gradient
-noise. Per-step wall clock roughly doubles and the step count halves, so the run costs
-what it costs today. **Smoke-test first**: the banner must print `gen_batch=96`, and vLLM
-now gets 96 sequences per request against the 48 the training path is known to sustain
-(256 has wedged it before).
+`gen_batch = 1 x 6 x 16 = 96` → 12 prompts per step → `16,160 x 3 / 12 = 4,040` steps, and
+`lr(s) = 1e-5(1 − s/4040)` is the curve three clean runs were trained on, step for step.
+Every row is seen three times.
 
-Second-choice variant if the batch change is unwelcome: keep `gen_batch 48`, run the full
-8,080 steps, and **halve the peak learning rate to `--learning-rate 5e-6`**. Total
-learning budget `∫lr ds` = 0.0202 against the 8k's 0.0200 — the same amount of learning
-spread over twice as many steps, with the LR never entering the 7–8e-6 band that both
-run-aways turned in. Nothing has been run at 5e-6, so this trades a proven schedule for
-an argued one.
+What it changes is the number of **groups per update**, 6 → 12. `num_generations` stays 8,
+so the group is the same size and the within-group advantage — the only thing the overlap
+reward ever touches — is computed exactly as before. Twelve groups per update is a
+lower-variance estimate of the same gradient, which is the mildest available perturbation
+and points the safe way.
 
-### Option C — build `set_e`: a fresh 16,160-row corpus, recomposed
+**The vLLM concern is smaller than it first looks.** The training path does not send
+`gen_batch` sequences; it sends the *unique* prompts with `n=num_generations`
+(`grpo_trainer.py:1470`). Today that is 6 prompts / 6 images returning 48 sequences; at
+`--grad-accum 16` it is **12 prompts / 12 images returning 96**. The held-out validation
+path already issues 48 images per request against the same server without trouble, and the
+256 that wedged it was 256 images. Still smoke-test it, and check the banner reads
+`gen_batch=96`; if generation does stall, the fix is chunking that one call, not abandoning
+the option.
 
-Worth the build only if the composition change matters on its own. `build_set_d.py`
-already has everything: the archive SHA-256 index, the two-mechanism disjointness proof
-against the 8k, and the per-source pools. Extend its exclusion list with set_d's own
-images and change two constants.
+### Option C — 2× rows, 3 epochs, stretch the schedule instead
+
+Keeps `gen_batch 48` and every geometry knob at the reference, runs the full 8,080 steps,
+and reshapes the LR so it never enters the 7.8–8.5e-6 band both run-aways turned in. Two
+forms, both matching the reference's **total** learning budget `∫lr ds` = 0.0202 against
+the 8k's 0.0200 — the same distance travelled, spread over twice as many steps:
+
+| | flags | lr(0) | lr(1250) | lr(2000) | lr(3000) |
+|---|---|---|---|---|---|
+| 8k reference | *(linear, N=3990)* | 1.00e-5 | 6.87e-6 | 4.99e-6 | 2.48e-6 |
+| C1 lower peak | `--learning-rate 5e-6` | 5.00e-6 | 4.23e-6 | 3.76e-6 | 3.14e-6 |
+| C2 cubic decay | `--lr_scheduler_type polynomial --lr_scheduler_kwargs '{"power":3.0,"lr_end":1e-8}'` | 1.00e-5 | 6.03e-6 | 4.26e-6 | 2.49e-6 |
+
+C2 is the better of the two: `1e-5(1 − s/8080)³` sits **at or below the reference's LR at
+every step through ~3,000** and then trails off, so early training — where the 8k's
+accuracy gain actually happens — is not slowed, which C1's halved peak would slow.
+`polynomial` + `power` is supported by the installed `transformers` and reaches the
+trainer through the launcher's passthrough args, but neither form has ever been run here.
+
+### Why B over C
+
+C moves the learning rate, which is the variable §2 identifies as causal. If the bigger
+set then behaves, nothing separates "the corpus was fine" from "the LR was lowered". B
+holds that variable at the value with three clean runs behind it and moves batch size
+instead, so the run stays interpretable as a corpus result. If B's generation call turns
+out to stall and cannot be chunked cheaply, C2 is the fallback.
+
+### Rejected: `set_c ∪ set_d` at one epoch
+
+The two sets are on disk, feature-identical and verified image-disjoint (SHA-256 over all
+24,240 stored images: 7,160 distinct in set_c, 6,946 in set_d, **0 shared**), so
+concatenating them gives 24,240 rows over 14,106 pictures for no build cost, and
+`24,240 / 6 = 4,040` steps lands on the reference schedule exactly. It is written down
+here because it is free and because the disjointness is now proven.
+
+But it holds presentations at 24,240 — the same number the 8k saw in three epochs — so it
+buys 3× the distinct prompts at 1× the compute and **does not train on more data**. That
+is a different experiment (data diversity at fixed budget) from the one being run here.
+
+### Not recommended
+
+**Do not cut `num_generations` to 4.** It is the cheapest way to halve the step count —
+`gen_batch 48 / 4 = 12` prompts per step at unchanged compute, so 2× rows × 3 epochs would
+cost *less* than the 8k run rather than 2× more. It halves the group, which is the object
+every measurement on this page is about and the denominator `scale_rewards=True` divides
+by. Wrong knob.
+
+**Do not filter to "hard" prompts.** The intuition that set_a hacked because it was easy is
+half right about set_a and wrong as a design rule: the 8k is *more* group-saturated than
+set_a (uniform-accuracy groups reach 0.94–1.00 against set_a's 0.50–0.80) and it did not
+hack.
+
+### The corpus itself — build `set_e`, 16,160 rows
+
+Options B and C say how to *run* 2× the rows; this says which rows. §2 is what keeps the
+run off the attractor, and §4 is what removes the fuel it would burn — do both, since the
+build is cheap next to a 110 h run. `build_set_d.py` already has everything: the archive
+SHA-256 index, the two-mechanism disjointness proof against the 8k, and the per-source
+pools. Extend its exclusion list with set_d's own images and change two constants.
+
+If the build is not wanted, `set_c` on disk is already 16,160 rows of the right shape and
+can be run under Option B or C directly — at the cost of keeping the 8k's composition,
+whose OCR/document quarter §4 measures as the hack's fuel, and of reusing images two of
+the runs on record were trained on.
 
 Free images after excluding the 8k, set_c and the validation draws
 (`python build_set_d.py --report`): gqa 49,712 · flickr30k 22,694 · textcap 14,844 ·
@@ -246,14 +302,6 @@ fixed generic caption — `"the background. a person. a building. trees. a stree
 drop the top quartile by union area. Nothing in this repo has measured per-source DINO
 union area on the Visual-CoT sources, so this would also be the first direct check of the
 claim in §4 rather than the inference from within-group spread.
-
-### Not recommended
-
-**Do not filter to "hard" prompts.** The intuition that set_a hacked because it was easy
-is half right about set_a and wrong as a design rule: the 8k is *more* group-saturated
-than set_a (uniform-accuracy groups reach 0.94–1.00 against set_a's 0.50–0.80) and it did
-not hack. Selecting for difficulty would shrink the pool and buy nothing that §2 does not
-buy for free.
 
 ---
 
