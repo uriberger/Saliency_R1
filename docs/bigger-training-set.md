@@ -324,37 +324,47 @@ in `build_set_d.py` is a two-constant change that gives a pure size manipulation
 ### 4.1 — what 2.26 questions per image would probably do, and why it is not worth finding out
 
 The one control that isolates packing is `set_c_ms3900` (set_c's rows, 2.26 q/img) against
-`set_d` (1.16 q/img), both on the 3,990-step schedule with `set_d` absorbing the
-"different pictures" effect. Through the bins where both have real statistics:
+`set_d` (1.16 q/img), both on the 3,990-step schedule, with `set_d` absorbing the
+"different pictures" effect so the residual is packing. All cells 138–492 groups:
 
-| step bin | tied: set_d → set_c_ms | ov_share | accuracy (set_c_ms − set_d) |
-|---|---|---|---|
-| 0–399 | 0.18 → 0.22 | 0.201 → 0.237 | −0.032 |
-| 400–799 | 0.29 → 0.25 | 0.309 → 0.271 | −0.015 |
-| 800–1199 | 0.31 → 0.37 | 0.324 → 0.384 | +0.025 |
+| global step | uni_acc: set_d → set_c_ms | tied | ov_share | accuracy (set_c_ms − set_d) |
+|---|---|---|---|---|
+| 0–399 | 0.74 → 0.77 | 0.18 → 0.22 | 0.201 → 0.237 | −0.032 |
+| 400–799 | 0.79 → 0.77 | 0.29 → 0.25 | 0.309 → 0.271 | −0.015 |
+| 800–1199 | 0.80 → 0.83 | 0.36 → 0.37 | 0.373 → 0.384 | −0.012 |
+| 1200–1599 | 0.87 → 0.86 | 0.44 → 0.45 | 0.459 → 0.467 | −0.029 |
+| 1600–1710 | 0.90 → 0.91 | 0.56 → 0.49 | 0.574 → 0.505 | −0.073 |
 
-**No clear packing effect** — the differences alternate sign and sit inside the bin-to-bin
-scatter (n ≈ 240–490 groups per cell). The only monotone column is accuracy: set_c_ms
-starts 0.032 *below* set_d and ends 0.025 above, which is the shape image familiarity
-would produce, at a magnitude that is not distinguishable from a different draw.
+**No packing effect on anything.** The `ov_share` differences are +0.036, −0.038, +0.011,
++0.008, −0.070 — alternating sign, no trend, all inside the bin-to-bin scatter. All three
+runs walk the same `ov_share` path (8k 0.22 → 0.51, set_d 0.20 → 0.57, set_c_ms 0.24 →
+0.51), which is §3's point restated: that quantity is a shared trajectory, not a corpus
+property. Accuracy is the one column with a consistent sign, and it runs the *wrong* way
+for a familiarity story — set_c_ms stays below set_d throughout and falls further behind.
 
-**But that control stops at step 1,710 — 0.63 of one epoch.** The question is what happens
-over three, where 2.26 q/img presents each picture ~6.8 times against the 8k's ~3.5.
-Nothing on record covers that. Three mechanisms would all push the same way if it matters:
+> An earlier draft of this table reported a +0.175 jump in `tied` at step 1200 and a
+> monotone accuracy climb. Both were artifacts: the reference cells there held 12–18
+> groups against set_c_ms's 486, because the integer in `completions_<N>_….table.json`
+> is the wandb `_step`, not `train/global_step`, and the two differ by ~33× in these runs.
+> Selecting tables on the filename samples global step ~35 when it looks like ~1200.
 
-1. **Familiarity inflates accuracy**, which raises the uniform-accuracy fraction, which
-   hands more of the advantage to the overlap term — the §3 channel, entered from the data
-   side. The accuracy trend above is weakly consistent with it.
-2. **Per-image reuse of the hack.** This one is specific to this reward: the hack is
-   "write a broad sentence that Grounding-DINO grounds widely", and *which* sentence works
-   is a property of the picture. Seeing the same picture 6.8 times is 6.8 chances to
-   rediscover and reinforce a per-image trick; 3.5 is half as many.
-3. **Fewer distinct scenes per unit of gradient** — 7,160 against the 13,906 the pools
-   would allow at the same row count.
+**The control stops at step 1,710 — 0.63 of one epoch.** That is the reason to double the
+image budget anyway, not the table above. Over three epochs 2.26 q/img presents each
+picture ~6.8 times against the 8k's ~3.5, and nothing on record reaches there. Two
+mechanisms would bite if any does:
 
-All three are arguments, none is a measurement. They are also all avoidable for the cost
-of two constants, which is why the recipe doubles the image budget rather than betting on
-a null measured over two-thirds of an epoch.
+1. **Per-image reuse of the hack** — the sharpest one, and specific to this reward. The
+   hack is "write a broad sentence that Grounding-DINO grounds widely", and *which*
+   sentence works is a property of the picture. 6.8 visits is 6.8 chances to rediscover
+   and reinforce a per-image trick; 3.5 is half as many. Note the null above cannot see
+   this: at 0.63 epoch most pictures have been visited once or twice.
+2. **Fewer distinct scenes per unit of gradient** — 7,160 against the 13,906 the pools
+   allow at the same row count.
+
+Familiarity inflating accuracy is the third candidate and is the one the data argues
+*against*, as far as it reaches. All of it is avoidable for the cost of two constants,
+which is the whole argument: doubling the image budget removes a variable rather than
+betting on a null measured over two-thirds of an epoch.
 
 **Optional pre-build screen, if a GPU hour is available.** The mechanism says the fuel is
 *images where a generic sentence grounds broadly*. That is directly measurable with
