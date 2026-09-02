@@ -272,54 +272,127 @@ pools. Extend its exclusion list with set_d's own images and change two constant
 images, 14%, are also in the 8k — its *rows* are almost all new, only 118 of 16,160 are
 rows the 8k also holds). Both are avoidable, and §4.1 below is why they are worth avoiding.
 
-Free images after excluding the 8k, set_c and the validation draws
-(`python build_set_d.py --report`): gqa 49,712 · flickr30k 22,694 · textcap 14,844 ·
-textvqa 12,735 · v7w 11,229 · openimages 8,403 · docvqa 8,042 · cub 4,853 ·
-infographicsvqa 3,043 · vsr 1,569 — 137k images against the ~14k the recipe needs.
+#### What is already on disk
 
-| source | rows | share | vs 8k | `natural` | why |
+| set | rows | images | q/img | sources | status |
 |---|---|---|---|---|---|
-| gqa | 5,000 | 31.0% | +9.2 | true | the only large source with live accuracy variance (accSD 0.180); 49.7k free images |
-| flickr30k | 3,000 | 18.6% | −15.0 | true | keep for caption-style diversity; halve it because it grades 0.006 |
-| openimages | 2,000 | 12.4% | +1.8 | true | lowest overlap sd_within (0.0087) |
-| v7w | 1,500 | 9.3% | +1.8 | true | question-type diversity; 11.2k free images |
-| docvqa | 1,340 | 8.3% | 0.0 | **false** | keep for non-natural benchmark coverage, unscored for overlap |
-| textcap | 1,280 | 7.9% | 0.0 | **false** | same |
-| textvqa | 740 | 4.6% | 0.0 | **false** | same |
-| infographicsvqa | 600 | 3.7% | 0.0 | **false** | same |
-| vsr | 400 | 2.5% | +1.6 | true | accSD 0.258, the highest measured |
-| cub | 300 | 1.9% | +0.9 | true | accSD 0.196 |
-| **total** | **16,160** | | | | 24.5% overlap-masked, the same OCR/document share the 8k has |
+| `saliency-r1-8k` | 8,080 | 6,953 | 1.16 | 10 Visual-CoT | the reference corpus; 3-epoch run is clean |
+| `set_a` | 50,000 | — | — | gqa, aokvqa, visual7w, openimages, vsr, visdrone | hacked at ~1,500 steps |
+| `set_b` | 50,000 | — | — | set_a's natural ×0.8 + 10k ViRL/docvqa | ran 825 steps, abandoned |
+| `set_c` | 16,160 | 7,160 | **2.26** | the 8k's ten, doubled | hacked at ~2,400 steps |
+| `set_d` | 8,080 | 6,946 | 1.16 | the 8k's ten, fresh pictures | clean to 3,255 steps |
+| `val_natural` / `val_nonnatural` | 256 / 256 | 1 per row | — | set_a's / set_b's proportions | held out, in use |
+| `val_c_*`, `val_d_*` | 256 each | 1 per row | — | set_c's / set_d's proportions | held out |
 
-The non-natural *share* is deliberately unchanged, so nothing is removed from what the
-model sees — only from what the overlap reward is allowed to score.
+So a 2× corpus at the 8k's shape does not exist: `set_c` has the rows but 2.26 q/img and
+a 14% picture overlap with the 8k, and `set_d` has the shape but only 1× the rows.
+`set_e` is `set_c`'s row counts with `set_d`'s packing discipline.
 
-**Image budget: double every source's, so questions-per-image stays at the 8k's.** Note
-the 8k is not uniformly 1.16 — docvqa is already 2.38 and infographicsvqa 2.91 — so
-"double the image budget" means preserving each source's own packing, not flattening it.
-Every source clears its pool with room; the tightest is flickr30k at 23% of what is free.
+#### What the pools still hold
 
-| source | 8k rows / imgs | ×2 rows / imgs | q/img | free imgs | uses |
-|---|---|---|---|---|---|
-| flickr30k | 2,715 / 2,618 | 5,430 / 5,236 | 1.04 | 22,694 | 23% |
-| gqa | 1,765 / 1,752 | 3,530 / 3,504 | 1.01 | 49,712 | 7% |
-| openimages | 860 / 712 | 1,720 / 1,424 | 1.21 | 8,403 | 17% |
-| docvqa | 670 / 282 | 1,340 / 564 | 2.38 | 8,042 | 7% |
-| textcap | 640 / 441 | 1,280 / 882 | 1.45 | 14,844 | 6% |
-| v7w | 610 / 595 | 1,220 / 1,190 | 1.03 | 11,229 | 11% |
-| textvqa | 370 / 307 | 740 / 614 | 1.21 | 12,735 | 5% |
-| infographicsvqa | 300 / 103 | 600 / 206 | 2.91 | 3,043 | 7% |
-| cub | 80 / 80 | 160 / 160 | 1.00 | 4,853 | 3% |
-| vsr | 70 / 63 | 140 / 126 | 1.11 | 1,569 | 8% |
-| **total** | **8,080 / 6,953** | **16,160 / 13,906** | **1.16** | 137,124 | 10% |
+`outputs/hackset_analysis/pool_survey.py` replays every draw on record and reports what
+each has spent. Union of everything ever trained on or drawn for validation: **69,912
+basenames.**
 
-(Those free counts already exclude the 8k, set_c and both validation draws; subtracting
-set_d's 6,946 as well leaves every row of the table comfortable.)
+| set | basenames |
+|---|---|
+| saliency-r1-8k | 26,743 |
+| set_a / set_b | 30,467 |
+| set_c | 7,160 |
+| set_d | 6,946 |
+| val_natural/nonnatural pool | 964 |
+| val_c pool | 3,072 |
+| val_d pool | 3,072 |
 
-Doing this makes `set_e` differ from the 8k in exactly one dimension — size — which
-neither `set_c` nor a row-doubled rebuild would. The row counts above are the recomposed
-ones; if the source reweighting is *not* wanted, `RECIPE_ROWS × 2` and `IMAGE_BUDGET × 2`
-in `build_set_d.py` is a two-constant change that gives a pure size manipulation.
+Excluding the **8k lineage only** — the 8k, set_c, set_d and all three validation pools,
+46,583 basenames — leaves 126,297 free images against the 13,906 the recipe needs:
+
+| source | pool | 8k | a/b | set_c | set_d | val\* | free | set_e needs | rows |
+|---|---|---|---|---|---|---|---|---|---|
+| flickr30k | 28,262 | 2,618 | 0 | 2,618 | 2,618 | 1,176 | 19,488 | 5,236 | 5,430 |
+| gqa | 53,921 | 1,776 | 16,510 | 1,765 | 1,752 | 1,136 | 47,576 | 3,504 | 3,530 |
+| openimages | 29,355 | 20,678 | 4,832 | 862 | 715 | 476 | 7,502 | 1,424 | 1,720 |
+| textcap | 16,425 | 630 | 0 | 790 | 720 | 420 | 13,915 | 882 | 1,280 |
+| v7w | 12,627 | 595 | 4,786 | 595 | 595 | 388 | 10,502 | 1,190 | 1,220 |
+| textvqa | 14,159 | 552 | 0 | 738 | 638 | 378 | 11,901 | 614 | 740 |
+| docvqa | 9,836 | 282 | 1,790 | 282 | 282 | 2,328 | 6,698 | 564 | 1,340 |
+| infographicsvqa | 3,805 | 103 | 872 | 103 | 103 | 1,052 | 2,466 | 206 | 600 |
+| cub | 5,028 | 80 | 0 | 80 | 80 | 36 | 4,755 | 160 | 160 |
+| vsr | 1,765 | 64 | 1,676 | 63 | 63 | 84 | 1,494 | 126 | 140 |
+| **total** | | | | | | | **126,297** | **13,906** | **16,160** |
+
+(The `openimages` 8k column is inflated: textcap and textvqa pictures live under the
+openimages archive directory, so the basename resolution counts them there too. It is
+conservative — it over-excludes.)
+
+**Excluding set_a / set_b as well is infeasible, on exactly one source.** vsr's whole pool
+is 1,765 images and set_a/set_b hold 1,676 of them; 27 are free against the 126 needed.
+Every other source stays OK. So set_a / set_b get **de-prioritised rather than excluded**:
+order each source's candidates so images they never touched are taken first, and fall
+through only where the pool runs out. That yields ~0% incidental overlap everywhere except
+vsr — 126 images, 0.9% of the corpus — instead of the ~22% a blind draw would give. It is
+also what `build_set_c.py` already decided, in its own words: *"two training sets may share
+images"*.
+
+#### The recipe
+
+**Same composition as the 8k, doubled in both dimensions.** Revising what an earlier
+draft of this page proposed: do *not* also reweight the sources. Reweighting buys almost
+nothing for hack resistance (§4: the photographic sources all sit at `ov_share` 0.17–0.29)
+and it would make `set_e` differ from the 8k in two ways at once. The fuel is removed by
+the `natural` column instead, which is a launch-time switch rather than a change to what
+the model sees.
+
+| source | 8k rows / imgs | set_e rows / imgs | q/img | `natural` |
+|---|---|---|---|---|
+| flickr30k | 2,715 / 2,618 | 5,430 / 5,236 | 1.04 | true |
+| gqa | 1,765 / 1,752 | 3,530 / 3,504 | 1.01 | true |
+| openimages | 860 / 712 | 1,720 / 1,424 | 1.21 | true |
+| docvqa | 670 / 282 | 1,340 / 564 | 2.38 | **false** |
+| textcap | 640 / 441 | 1,280 / 882 | 1.45 | **false** |
+| v7w | 610 / 595 | 1,220 / 1,190 | 1.03 | true |
+| textvqa | 370 / 307 | 740 / 614 | 1.21 | **false** |
+| infographicsvqa | 300 / 103 | 600 / 206 | 2.91 | **false** |
+| cub | 80 / 80 | 160 / 160 | 1.00 | true |
+| vsr | 70 / 63 | 140 / 126 | 1.11 | true |
+| **total** | **8,080 / 6,953** | **16,160 / 13,906** | **1.16** | 24.5% false |
+
+Note the 8k is not uniformly 1.16 — docvqa is already 2.38 q/img and infographicsvqa 2.91
+— so doubling the image budget **preserves each source's own packing** rather than
+flattening it. That is what makes `set_e` differ from the 8k in exactly one dimension.
+
+Plus `val_e_natural` / `val_e_nonnatural`, 256 rows each at set_e's proportions, drawn
+from images set_e did not take, exactly as `val_c_*` and `val_d_*` were.
+
+#### The build — `build_set_e.py`, copied from `build_set_d.py`
+
+`build_set_d.py` already holds the machinery: the archive SHA-256 index (cached in
+`_viscot_paths`, no need to re-run `--index`), the two-mechanism resolution of the 8k's
+images, the shard streaming with the login node's 8 GB address-space workarounds, and
+`--verify`. Six changes:
+
+1. **`RECIPE_ROWS = dict(C.RECIPE_ROWS)`** — set_c's row counts *are* 2× the 8k's.
+   (`build_set_d.py:84` currently halves them.)
+2. **`IMAGE_BUDGET = {s: n * 2 for s, n in D.IMAGE_BUDGET.items()}`** — 13,906 images.
+3. **Exclude set_d and val_d too.** `do_build` currently excludes `eightk | set_c | val_c
+   | legacy_val` (`build_set_d.py:439`); add set_d's and val_d's basenames, which
+   `pool_survey.py` already shows how to replay.
+4. **De-prioritise set_a / set_b's images** in `choose_images`, as a sort key rather than
+   a filter — a hard filter makes vsr infeasible.
+5. **A new constant for the overlap gate**, e.g.
+   `OVERLAP_UNGRADEABLE = {"docvqa", "infographicsvqa", "textvqa", "textcap"}`, used at
+   `build_set_c.py:181` in place of `NONNATURAL` for the `natural` column. Leave
+   `NONNATURAL` itself alone — it also partitions the validation draw by *imagery type*,
+   and textvqa/textcap are photographs. Two jobs, two constants.
+6. **`SEED = 2028`, `VAL_SEED = 20280`** — a different draw from set_c's 2026 and set_d's
+   2027.
+
+Then `--report` (feasibility, ~3 min, CPU), `--build`, `--verify`. Expect ~3.2 GB on disk
+(set_d is 1.6 GB for half the images); check `df -h /home/uberger/scratch` first, the
+project quota has hit its ceiling before.
+
+`--natural-only` stays a launch flag. The set is usable with it on or off, so the corpus
+build does not commit you to the §4 decision.
 
 ### 4.1 — what 2.26 questions per image would probably do, and why it is not worth finding out
 
