@@ -167,12 +167,16 @@ def load_baseline(path: str, merged_path: str, models: str):
     """
     d = json.load(open(path))
     want = None if models == "all" else set(models.split(","))
-    src = os.path.abspath(merged_path)
+    # realpath, not abspath: step_box_similarity stores `source` as it was typed, so the
+    # same file is written relatively there and absolutely here, and `outputs/` is a
+    # symlink in every worktree. abspath compares two spellings of one path and finds
+    # them different.
+    src = os.path.realpath(merged_path)
     cands = []
     for res in d:
         if want and res.get("model", "").split("::")[-1] not in want:
             continue
-        same = os.path.abspath(res.get("source", "")) == src
+        same = os.path.realpath(res.get("source", "")) == src
         cands.append((0 if same else 1, res))
     if not cands:
         raise SystemExit(f"{path}: no entry for model(s) {models}")
