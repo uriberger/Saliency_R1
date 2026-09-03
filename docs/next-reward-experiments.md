@@ -343,7 +343,8 @@ prompts per step, and a different meaning for the LR schedule, against an 8-GPU 
 
 # The mask-free rewards — 2026-08-31
 
-Implemented, CPU-tested, **not run**. Branch `feat/maskfree-rewards`.
+Branch `feat/maskfree-rewards`. **`flatness` has since run to 3,990 steps — results at
+the bottom of this page, and they split the prediction in half. `mass` has not run.**
 
 ## Why, in one table
 
@@ -470,3 +471,113 @@ invisible if only the scored quantity is logged.
   not. Watch `maskfree/peak` and `train/entropy` for it.
 - If **neither** moves the benchmark, the union's area/shape mattered after all and the
   flatness reading of `mean_in` is wrong.
+
+---
+
+# Result: `flatness` bought the natural gain and none of the non-natural one — 2026-09-03
+
+`--maskfree flatness` ran to 3,990 steps. Scored against the two 8k runs that bracket it,
+all three at the **same** `n300_100` sample profile, which is the only way these are
+comparable — the top-level `bench_eval/step-*.json` files are an older profile and mixing
+the two is the trap [bench-precision.md](bench-precision.md) exists to name.
+
+| run | bench_eval dir | natural early → late | Δ | non-natural early → late | Δ |
+|---|---|---|---|---|---|
+| `mean_in` wov0.4 | `…-overlap__wov0.4_2head_trmean_saliency_r1_8k/` | 0.7266 → 0.7494 ±0.0042 | **+0.0227** | 0.5184 → 0.5354 ±0.0045 | +0.0170 |
+| `maskfree flatness` w0.45 | `checkpoint/…-maskfree-flatness/` | 0.7265 → 0.7427 ±0.0064 | +0.0162 | 0.5186 → 0.5232 ±0.0046 | **+0.0045** |
+| `mean_in_v2` wov0.033 | `checkpoint/…_saliency_r1_8k_mean_in_v2/` | 0.7266 → 0.7276 ±0.0040 | **+0.0009** | 0.5168 → 0.5457 ±0.0080 | **+0.0289** |
+
+early = steps ≤ 600, late = steps ≥ 2400; ± is the spread **across late checkpoints**, not
+a seed CI. All three start from the same 0.7266 natural, which is the check that the
+profile really is matched.
+
+**Verdict on the pre-registered predictions.**
+
+| prediction | outcome |
+|---|---|
+| `frac_reward_zero_std` ≈ 0 | **held** — logged 0.000 at step 3990 |
+| `flatness` raises `maskfree/mass` unrewarded | **held, strongly** — see the coupling note below |
+| `flatness` ≈ `mean_in` **on both suites** | **half** — natural yes, non-natural no |
+| neither moves the benchmark | **refuted** — `flatness` moved natural |
+| `mass` is the sharper test | **unrun** |
+
+The half that failed is the informative half. On natural, `flatness` recovers 71% of
+`mean_in`'s gain and the 0.0065 shortfall is **below** the ~0.013 seed variance
+[bench-precision.md](bench-precision.md) measured between two runs of one identical
+config — i.e. indistinguishable. On non-natural it recovers 26%, and the 0.0225 gap to
+`mean_in_v2` is well above that floor.
+
+So the two factors of `mean_in` are not redundant, they are **specialised**:
+
+- `flatness` = `mean(m)/max(m)`, box-blind → the **natural** gain
+- `mean_in_v2` = `mean_U(m)/mean(m)`, the box-aware half → the **non-natural** gain, and it
+  is the best of the three there while doing nothing at all on natural
+- `mean_in` = their exact product → the only one that gets both, and the best at neither
+
+## `mean_in` is already a balanced blend, and nobody chose the balance
+
+`mean_in = mean_in_v2 × flatness` holds step by step (see
+[peak-location-results.md](peak-location-results.md)), so in logs the two channels are
+additive. Within-group variance decomposition of `log mean_in` on the cross-run probe,
+per completion with the prompt mean removed — the quantity the advantage keeps:
+
+| model | sd(log v2) | sd(log flat) | corr | var share v2 | var share flat | 2·cov |
+|---|---|---|---|---|---|---|
+| cold start | 0.1273 | 0.1150 | **+0.034** | 0.53 | 0.43 | 0.03 |
+| `mean_in` 8k | 0.1276 | 0.1221 | +0.163 | 0.45 | 0.41 | 0.14 |
+| `mean_in_v2` set_a cp1000 | 0.1297 | 0.1179 | +0.165 | 0.47 | 0.39 | 0.14 |
+
+Two nearly **orthogonal** channels (r = +0.03 at the cold start) carrying nearly **equal**
+pressure. `mean_in` hard-codes exponents (1, 1) and that split is an accident of the
+arithmetic, not a choice anyone made.
+
+Which makes the obvious next reward a **re-weighting, not a new metric**:
+
+    R(α, β) = mean_in_v2^α · flatness^β        reward ∝ α·log v2 + β·log flat
+
+`(1,1)` = `mean_in`, `(1,0)` = `mean_in_v2`, `(0,1)` = `flatness` — three points already
+measured. Both sds are in hand, so the weights follow immediately. Minimal
+implementation: run `mean_in_v2` and `maskfree flatness` as **two reward terms with
+independent weights** (0.033 and 0.45, both already calibrated); the only code change is
+lifting the launcher's refusal to combine `--maskfree` with the DINO reward.
+
+Where to aim, from the dose–response: `mean_in` runs the `v2` channel at ~half dose and
+gets +0.0170 non-natural against `v2`'s +0.0289 — close to linear, so **α > 1 should buy
+non-natural**. On natural `mean_in`'s +0.0227 beats both specialists *and* beats the
+linear prediction (0.5×0.0162 + 0.5×0.0009 = 0.0086), which suggests an interaction — but
+that gap is about one seed-sd, so it is a hypothesis, not a finding.
+
+Pre-register the next run: if `R(1.5, 1)` moves non-natural toward +0.029 while natural
+holds near +0.023, α is a free lunch. If natural collapses to `v2`'s +0.001 the moment α
+rises, the equal balance was load-bearing and the interaction reading was right.
+
+A variant worth naming and rejecting: denominator = `max` over patches **outside** the
+box. It de-peaks only where a peak is unwanted and lets the map stay sharp inside, which
+sounds right — but it is *more* hackable, not less: covering the current peak with a box
+collapses the denominator, and that is exactly the ring migration `mean_in` set_a cp2000
+found (union coverage of the outer ring 0.374 → 0.527 at unchanged total area).
+
+## The coupling claim held
+
+Logged at the end of the `flatness` run: `maskfree/flatness` 0.0716, `maskfree/mass`
+13.664 (= `log(sum m) + 18`, so image mass 0.0131), `maskfree/peak` 0.00139,
+`frac_reward_zero_std` 0.000. The reward is scale-**invariant** and mass rose anyway —
+against the cold start's 0.00393 that is ×3.3, where `mean_in` 8k reached ×2.3. Read the
+ratio, not the level: the logged numbers are on the training corpus and the cold-start
+references are on `val_natural`.
+
+**Caveat on matched pressure.** `w = 0.45` was set from a cold-start `sd_within(flatness)`
+of 0.0064. The run's own `think_maskfree_reward/within_group_std` at step 3990 is
+**0.01077**, 1.7× that, so the realised pressure was not exactly `mean_in`'s. The
+comparator runs' wandb directories are not on this machine, so the same figure could not
+be read for them. This does not touch the *direction* of any result above, but a 1.7×
+pressure difference is inside the range that could move a 0.006 benchmark gap.
+
+## What this does and does not settle about DINO
+
+It does not license dropping DINO. The box term is what carried non-natural transfer, and
+`flatness` is the run that lost it. What it opens instead: a mask-free reward can be
+trained on **non-natural images**, which no run has done — every run above trained on the
+natural 8k and reached non-natural by transfer. That is the experiment only a DINO-free
+reward can run, and it is a cleaner test of whether the non-natural gain needs a box or
+just needs the data.

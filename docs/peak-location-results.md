@@ -146,6 +146,14 @@ gain. It shows the healthy run got its reward from the box-blind half of `mean_i
 the metric that deletes that half did not gain. `--maskfree flatness` and
 `--maskfree mass` are the experiment that can settle it.
 
+**Settled by half, 2026-09-03.** `--maskfree flatness` has since run: it recovers 71% of
+`mean_in`'s **natural** gain (a shortfall inside the seed-variance floor) and 26% of its
+**non-natural** one. So this page's reading holds on natural and fails on non-natural,
+where the box-aware half carries the transfer — `mean_in_v2` beats both there. The
+decomposition above is therefore suite-specific, and the two channels are specialised
+rather than redundant. Numbers and the re-weighting that follows from them are in
+[next-reward-experiments.md](next-reward-experiments.md).
+
 ## Caveats
 
 - **30 images.** Every model saw the same 30 `val_natural` prompts, and the CIs are
