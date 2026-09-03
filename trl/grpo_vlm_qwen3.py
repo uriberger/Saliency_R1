@@ -637,9 +637,10 @@ if __name__ == "__main__":
                 "rewards build their own masks from the same boxes; teaching them the "
                 "rectangle is a separate change, not a silent one."
             )
-        if script_args.placebo or script_args.maskfree:
+        if script_args.placebo or script_args.maskfree or script_args.mismatch_bank:
             other = (f"--placebo {script_args.placebo}" if script_args.placebo
-                     else f"--maskfree {script_args.maskfree}")
+                     else f"--maskfree {script_args.maskfree}" if script_args.maskfree
+                     else "--mismatch_bank")
             raise SystemExit(
                 f"--overlap_rect_frac {script_args.overlap_rect_frac} and {other} cannot be "
                 "combined: the first replaces the overlap reward's MASK, the second "
@@ -659,6 +660,10 @@ if __name__ == "__main__":
             wrong = f"--placebo {script_args.placebo}"
         elif script_args.maskfree:
             wrong = f"--maskfree {script_args.maskfree}"
+        elif script_args.mismatch_bank:
+            # The same experiment one rung further out: this row's own question against
+            # another row's chain. Two runs to compare, never one run to configure.
+            wrong = "--mismatch_bank"
         if wrong:
             raise SystemExit(
                 f"--overlap_question_boxes is only read by the overlap reward, but {wrong} "
