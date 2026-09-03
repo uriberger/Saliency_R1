@@ -193,6 +193,62 @@
 # step instead of 48, halving the prompts per step and changing the LR schedule's meaning.
 # 16 restores 48. The banner prints gen_batch -- check it reads 48.
 #
+# MISMATCHED BOXES -- does it matter that DINO read THAT SENTENCE?
+#
+#   bash launch_mismatch_bank.sh --out-dir outputs/mismatch_bank/8k        # once, ~1-2 h
+#   bash launch_grpo_qwen3_overlap_colocated_job.sh \
+#       --mismatch-bank outputs/mismatch_bank/8k/bank.json --lora-targets q_proj,v_proj
+#
+# Every reward in this launcher is downstream of one assumption: that grounding the STEP'S
+# OWN TEXT is what makes the boxes meaningful. Two offline results say it may not be --
+# two steps of one chain get masks no more alike than two steps of two different chains
+# about the same picture (step_box_similarity.py), and the best single predictor of
+# mean_in is a statistic that never sees a box (--maskfree). Neither can say what a policy
+# TRAINED against wrong boxes would do, because both re-score maps a DINO-trained policy
+# already produced. This flag is that run.
+#
+# The boxes are real Grounding-DINO output on a real photograph for a real cold-start
+# sentence -- only the pairing is wrong. So it is the rung between --placebo roll (own
+# union, moved) and --maskfree (no union): the union keeps DINO's size, shape and
+# object-like structure and loses only its relation to this picture and this sentence.
+#
+# One donor row per PROMPT, shared by every rollout of it, and that is the experiment
+# rather than an implementation detail. Measured on 538 cold-start chains, as the spread
+# across the 8 rollouts of one prompt, which is all GRPO ever sees:
+#
+#     real reward, each completion on its own boxes         0.0115
+#     this control, all 8 sharing ONE donor chain           0.0094   -> w 0.49
+#     changing only which donor chain a completion drew     0.0117
+#
+# A donor drawn per rollout would put the third row inside the group, ~60% of the reward's
+# within-group variance would be the draw, and the run would be --placebo random with a
+# box-shaped distribution. Sharing it keeps 0.82 of the reference's tie-breaking strength
+# with none of it donor noise.
+#
+# Matching the observe-step count therefore comes SECOND, after the donor: the donor row's
+# chain of length n when it has one, its nearest length wrapped when it does not (0.0024,
+# against the 0.0117 of hopping donors to chase an exact length). A completion is never
+# left unscored for want of a length -- the policy picks its own step count, so an
+# unservable count would be a free exit from the reward. Watch mismatch/exact_len_frac: it
+# falls as the policy's chains outgrow the cold start's, which stop at 14 observe steps
+# while the trained checkpoints reach 85.
+#
+# NO Grounding-DINO runs anywhere in the job, so no server is started, its GPU goes to
+# training, and 16.6 s comes off a 40.5 s optimizer step. The price is the one thing that
+# cannot be held equal without it: WHICH completions go unscored follows the donor here
+# and the completion's own text there. That is 3.4% of steps and 0.5% of completions at
+# the cold start -- the bank stores an ungroundable donor step as an empty box list, so
+# the RATE is inherited even though the incidence is not.
+#
+# Read against `overlap mean_in w0.4` on the same corpus, and read a divergence carefully:
+# this control cannot be hacked the way its reference can (repeating a trivially-groundable
+# sentence and describing the background both stop working when the boxes do not respond
+# to the text), so a difference is either "the sentence mattered" or "the reference was
+# hacking". The duplicate-sentence fraction and the union area separate those.
+#
+# --mismatch-bank appends _mismatch<seed> to the run name. Run it twice at two seeds
+# before believing it: a seed is a random pairing, and one pairing is not a result.
+#
 # MIXED CORPORA -- restrict the overlap reward to photographs:
 #
 #   bash launch_grpo_qwen3_overlap_colocated_job.sh --dataset_name cold_data/grpo_sets/set_b --natural-only
@@ -470,6 +526,16 @@ MASKFREE_PARITY=${MASKFREE_PARITY:-false}
 # 0.565 is the fraction to compare against a DINO run -- see the RECTANGLE block in
 # trl/rewards/overlap_rewards.py and outputs/centre_box_probe/report.txt.
 RECT_FRAC=${RECT_FRAC:-}
+# --mismatch-bank <bank.json>: REPLACE the overlap reward with the MISMATCHED-BOX control
+# -- the same metric on the same map, scored against real Grounding-DINO boxes computed
+# for a DIFFERENT question about a DIFFERENT picture. Tests the assumption underneath
+# every variant here: that running DINO on THAT SENTENCE matters. Empty = off. Like
+# --maskfree it starts no Grounding-DINO at all; unlike it, the boxes are real. Build the
+# bank with launch_mismatch_bank.sh; see docs/mismatch-boxes.md.
+MISMATCH_BANK=${MISMATCH_BANK:-}
+# Which donor row each training row is paired with. A second run at another seed is a
+# replicate over a different pairing, which is how a result is told from a pairing.
+MISMATCH_SEED=${MISMATCH_SEED:-0}
 
 # ---------- sidecar defaults ----------
 DINO_PORT=${DINO_PORT:-8100}
@@ -537,6 +603,8 @@ while [[ $# -gt 0 ]]; do
         --maskfree)               MASKFREE="$2";                shift 2 ;;
         --maskfree-parity)        MASKFREE_PARITY=true;         shift 1 ;;
         --overlap-rect-frac)      RECT_FRAC="$2";               shift 2 ;;
+        --mismatch-bank)          MISMATCH_BANK="$2";           shift 2 ;;
+        --mismatch-seed)          MISMATCH_SEED="$2";           shift 2 ;;
         # Regulators. --beta is a real flag rather than an EXTRA_ARGS passthrough
         # precisely so it can reach SUFFIX below: passed through, a beta run would share a
         # checkpoint directory and a wandb run with the beta=0 control it is meant to be
@@ -677,9 +745,9 @@ if [[ -n "$RECT_FRAC" ]]; then
         echo "       build their own masks from the same boxes; that is a separate change." >&2
         exit 1
     fi
-    if [[ -n "$PLACEBO" || -n "$MASKFREE" ]]; then
+    if [[ -n "$PLACEBO" || -n "$MASKFREE" || -n "$MISMATCH_BANK" ]]; then
         echo "ERROR: --overlap-rect-frac replaces the overlap reward's MASK, while --placebo /" >&2
-        echo "       --maskfree replace the reward itself. Pick one." >&2
+        echo "       --maskfree / --mismatch-bank replace the reward itself. Pick one." >&2
         exit 1
     fi
     # The mask is the same on every step, so a union cap is all-or-nothing here: above the
@@ -693,6 +761,44 @@ if [[ -n "$RECT_FRAC" ]]; then
         exit 1
     fi
     # THE POINT OF THE FLAG: no detector, so no sidecar and its GPU goes to training.
+    WANT_DINO=false
+fi
+
+# ---------- --mismatch-bank: the wrong-question, wrong-picture control ----------
+if [[ -n "$MISMATCH_BANK" ]]; then
+    if [[ ! -f "$MISMATCH_BANK" ]]; then
+        echo "ERROR: --mismatch-bank $MISMATCH_BANK does not exist. Build one first:" >&2
+        echo "       bash launch_mismatch_bank.sh --out-dir outputs/mismatch_bank/8k" >&2
+        exit 1
+    fi
+    if [[ "$REWARD_VARIANT" != "ours" ]]; then
+        echo "ERROR: --mismatch-bank needs the attention map (--saliency-method attention);" >&2
+        echo "       got --saliency-method $REWARD_VARIANT. The weight below was measured on" >&2
+        echo "       that map; another map needs its own probe run first." >&2
+        exit 1
+    fi
+    if [[ -n "$PLACEBO" || -n "$MASKFREE" || -n "$RECT_FRAC" ]]; then
+        echo "ERROR: --mismatch-bank replaces the overlap reward, and so does" >&2
+        echo "       ${PLACEBO:+--placebo $PLACEBO}${MASKFREE:+--maskfree $MASKFREE}${RECT_FRAC:+--overlap-rect-frac $RECT_FRAC} (which replaces its mask). Pick one." >&2
+        exit 1
+    fi
+    # --overlap_question_boxes is the sibling control -- the row's OWN question, grounded
+    # offline -- and it lives inside think_overlap_reward, which this replaces. Two box
+    # sources, one of which would be silently ignored.
+    if [[ -n "${QUESTION_BOXES:-}" ]]; then
+        echo "ERROR: --mismatch-bank and --overlap-question-boxes are two different offline" >&2
+        echo "       box sources for the same slot: the first replaces the reward, the second" >&2
+        echo "       feeds it. Pick one. They are the two rungs of the same experiment --" >&2
+        echo "       the row's own question against another row's chain -- so run them as two" >&2
+        echo "       runs, not one." >&2
+        exit 1
+    fi
+    # THE POINT OF THE FLAG, exactly as for --maskfree: the boxes were grounded offline,
+    # so no DINO server is started and the GPU it would have held goes to training. There
+    # is no parity escape hatch here -- a parity gate would have to run the real DINO on
+    # the real sentence, which is the dependence this control exists to sever. What that
+    # costs is 0.5% of completions (the share the cold start's DINO leaves with nothing
+    # gradeable); see docs/mismatch-boxes.md.
     WANT_DINO=false
 fi
 
@@ -766,7 +872,7 @@ fi
 if [ "$WANT_DINO" != true ] || [ "$SHARE_SIDECAR_GPU" = true ]; then MIN_GPUS=2; else MIN_GPUS=3; fi
 if (( NUM_GPUS < MIN_GPUS )); then
     if [ "$WANT_DINO" != true ]; then
-        echo "ERROR: need >=2 GPUs with $([[ -n "$RECT_FRAC" ]] && echo '--overlap-rect-frac' || [[ -n "$QUESTION_BOXES" ]] && echo '--question-boxes' || echo '--maskfree') (1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
+        echo "ERROR: need >=2 GPUs with $([[ -n "$RECT_FRAC" ]] && echo '--overlap-rect-frac' || [[ -n "$QUESTION_BOXES" ]] && echo '--question-boxes' || [[ -n "$MISMATCH_BANK" ]] && echo '--mismatch-bank' || echo '--maskfree') (1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
     elif [ "$SHARE_SIDECAR_GPU" = true ]; then
         echo "ERROR: need >=2 GPUs with --share-sidecar-gpu (1 shared DINO+vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
     else
@@ -936,6 +1042,41 @@ if [[ -n "$MASKFREE" && -z "${W_OVERLAP_SET:-}" ]]; then
     esac
 fi
 
+# --mismatch-bank carries its own weight on the same rule again: the control must apply
+# the SAME tie-breaking pressure as mean_in w0.4 and differ only in which sentence and
+# which picture the boxes were grounded on.
+#
+#   w_mismatch = 0.4 x sd_within(mean_in) / sd_within(mismatch)
+#
+#   MEASURED by re-scoring the maps the val_natural and grad_spread probes stored for the
+#   cold-start policy (538 chains over 70 images), completion-level, within generation
+#   group, 24 donor chains per group:
+#
+#     real reward (each completion on its own boxes)         0.0115
+#     mismatched, all 8 rollouts on ONE donor chain          0.0094   -> w 0.49
+#
+#   0.82 of the reference's spread survives losing the pairing entirely, which is the
+#   headline of the offline evidence and the reason this run is worth its GPUs. The
+#   weight is close to mean_in's own 0.4 for the same structural reason --maskfree
+#   flatness lands near it: it is the SAME metric on the SAME map, and only the mask
+#   differs.
+#
+#   The number that must NOT be used here is the one a per-completion donor would give:
+#   drawing a donor per rollout adds 0.0117 of pure draw noise, which would roughly
+#   double the spread and halve the weight -- and the run would be --placebo random.
+#
+#   ONE-CORPUS CAVEAT, as everywhere in this block: read it as +-25%. To re-measure on
+#   the corpus you train on, once a bank exists:
+#
+#     bash launch_overlap_probe.sh --n-samples 40 --no-judge \
+#         --out-dir outputs/overlap_probe/mismatch_spread --dataset <your dataset>
+#     python overlap_metric_spread.py outputs/overlap_probe/mismatch_spread
+#
+# An explicit --w-overlap always wins, as it does for every other metric.
+if [[ -n "$MISMATCH_BANK" && -z "${W_OVERLAP_SET:-}" ]]; then
+    W_OVERLAP=0.49
+fi
+
 # --grad replaces the attention map with the PIXEL GRADIENT of each observe step's own
 # tokens and the metric with the roll-null log ratio. It carries NO weight default: the
 # spread of log(||g_U||/||g_null||) has not been measured on this corpus, and copying
@@ -1074,6 +1215,10 @@ fi
 # a different mask, which is exactly the kind of difference that must not share a
 # checkpoint dir with its reference. The fraction is in the name because it is the arm.
 [[ -n "$RECT_FRAC" ]] && SUFFIX="${SUFFIX}_rect${RECT_FRAC}"
+# Same rule a third time. The seed is in the name because it IS the experiment: two
+# mismatch runs at different seeds are different random pairings of the same corpus, and
+# they must not land in one checkpoint directory.
+[[ -n "$MISMATCH_BANK" ]] && SUFFIX="${SUFFIX}_mismatch${MISMATCH_SEED}"
 [[ -n "$MASS_FLOOR_TAU" ]] && SUFFIX="${SUFFIX}_mf${MASS_FLOOR_TAU}"
 [[ -n "$MAX_UNION_AREA" ]] && SUFFIX="${SUFFIX}_mu${MAX_UNION_AREA}"
 [[ "$MAX_BOX_AREA" == "0" ]] && SUFFIX="${SUFFIX}_nobox"
@@ -1143,6 +1288,7 @@ case "$_EFFECTIVE_VARIANT" in
     glimpse) WANT_REWARD_FN=think_glimpse_reward; _MAP_SHOWN=glimpse ;;
     ours)    if   [[ -n "$PLACEBO"  ]]; then WANT_REWARD_FN=think_placebo_reward
              elif [[ -n "$MASKFREE" ]]; then WANT_REWARD_FN=think_maskfree_reward
+             elif [[ -n "$MISMATCH_BANK" ]]; then WANT_REWARD_FN=think_mismatch_reward
              else                            WANT_REWARD_FN=think_overlap_reward; fi
              _MAP_SHOWN=attention ;;
     # 'none' and anything else: no saliency slot, so nothing to check and nothing to name.
@@ -1163,7 +1309,7 @@ if [[ -n "$_GATE_CKPT" && -n "$WANT_REWARD_FN" ]]; then
             echo "  output dir:  $OUTPUT_DIR" >&2
             echo "  resuming:    checkpoint-$_GATE_CKPT, whose last logged saliency reward is" >&2
             echo "               $HAVE_REWARD_FN" >&2
-            echo "  this launch: $WANT_REWARD_FN (--saliency-method $_MAP_SHOWN$([[ -n "$PLACEBO" ]] && echo " --placebo $PLACEBO")$([[ -n "$MASKFREE" ]] && echo " --maskfree $MASKFREE"))" >&2
+            echo "  this launch: $WANT_REWARD_FN (--saliency-method $_MAP_SHOWN$([[ -n "$PLACEBO" ]] && echo " --placebo $PLACEBO")$([[ -n "$MASKFREE" ]] && echo " --maskfree $MASKFREE")$([[ -n "$MISMATCH_BANK" ]] && echo " --mismatch-bank $MISMATCH_BANK"))" >&2
             echo "" >&2
             echo "  Nothing in a checkpoint sets --saliency-method, so a relaunch that omits it" >&2
             echo "  falls back to the attention map and keeps training, silently, at a weight" >&2
@@ -1173,6 +1319,7 @@ if [[ -n "$_GATE_CKPT" && -n "$WANT_REWARD_FN" ]]; then
                 think_glimpse_reward) echo "      --saliency-method glimpse" >&2 ;;
                 think_placebo_reward) echo "      --saliency-method attention --placebo <roll|random|length>" >&2 ;;
                 think_maskfree_reward) echo "      --saliency-method attention --maskfree <flatness|mass>" >&2 ;;
+                think_mismatch_reward) echo "      --saliency-method attention --mismatch-bank <bank.json>" >&2 ;;
                 *)                    echo "      --saliency-method attention" >&2 ;;
             esac
             echo "  If the map change is deliberate, pass --allow-map-change (and expect one" >&2
@@ -1297,6 +1444,17 @@ if [[ -n "$PLACEBO" ]]; then
     echo "                  scored on exactly the completions $OVERLAP_METRIC would score: same"
     echo "                  segmentation, same Grounding-DINO call, same union, real metric used as the gate."
 fi
+if [[ -n "$MISMATCH_BANK" ]]; then
+    echo "MISMATCHED BOXES: real DINO unions from a DIFFERENT question about a DIFFERENT picture"
+    echo "                  bank=$MISMATCH_BANK  seed=$MISMATCH_SEED (which row is paired with which)"
+    echo "                  w=$W_OVERLAP$([[ -n "${W_OVERLAP_SET:-}" ]] && echo ' (explicit --w-overlap)' || echo " (= 0.4 x 0.0115/0.0094: the control keeps 0.82 of the reference's within-group spread)")"
+    echo "                  one donor row per PROMPT, shared by all $NUM_GENERATIONS rollouts -- a donor per"
+    echo "                  rollout would add 0.0117 of draw noise to a 0.0115 reward, i.e. --placebo random."
+    echo "                  step count matched inside that donor when it can be; otherwise its nearest"
+    echo "                  length, wrapped. Watch mismatch/exact_len_frac: it falls as the policy's"
+    echo "                  chains outgrow the cold start's (which stop at 14 observe steps)."
+    echo "                  NO Grounding-DINO anywhere in this run -- that is 16.6 s off a 40.5 s step."
+fi
 # Regulators. Printed even when off, because "no anchor at all" is the state every run on
 # record trained in and the thing this block exists to make visible.
 if [[ "$BETA" != "0" && "$BETA" != "0.0" ]]; then
@@ -1404,6 +1562,7 @@ if ! $DIRECT; then
                 ${MASKFREE:+--maskfree $MASKFREE} \
                 $([ "$MASKFREE_PARITY" = true ] && echo --maskfree-parity) \
                 ${RECT_FRAC:+--overlap-rect-frac $RECT_FRAC} \
+                ${MISMATCH_BANK:+--mismatch-bank $MISMATCH_BANK --mismatch-seed $MISMATCH_SEED} \
                 --saliency-method $SALIENCY_METHOD_R \
                 --grad-target $GRAD_TARGET \
                 --grad-null-offsets $GRAD_NULL_OFFSETS \
@@ -1560,7 +1719,7 @@ if [ "$WANT_DINO" = true ]; then
         > "$LOG_DIR/dino.log" 2>&1 &
     DINO_PID=$!
 else
-    echo "[start] Grounding-DINO SKIPPED ($([[ -n "$RECT_FRAC" ]] && echo "--overlap-rect-frac $RECT_FRAC scores a fixed rectangle" || [[ -n "$QUESTION_BOXES" ]] && echo "--question-boxes: grounded once per question before the run" || echo "--maskfree $MASKFREE needs no boxes"))"
+    echo "[start] Grounding-DINO SKIPPED ($([[ -n "$RECT_FRAC" ]] && echo "--overlap-rect-frac $RECT_FRAC scores a fixed rectangle" || [[ -n "$QUESTION_BOXES" ]] && echo "--question-boxes: grounded once per question before the run" || [[ -n "$MISMATCH_BANK" ]] && echo "--mismatch-bank: another question's boxes, grounded before the run" || echo "--maskfree $MASKFREE needs no boxes"))"
 fi
 
 # ---------- 2. vLLM generation server on GPU 1 ----------
@@ -1642,6 +1801,10 @@ MASKFREE_FLAG=""
 # DINO union) applies and every existing run's command line is byte-identical.
 RECT_FLAG=""
 [[ -n "$RECT_FRAC" ]] && RECT_FLAG="--overlap_rect_frac $RECT_FRAC"
+# Same shape again, and the seed goes with it: --mismatch_seed has a dataclass default of
+# 0, so emitting it only with the bank keeps every existing run's command line byte-identical.
+MISMATCH_FLAG=""
+[[ -n "$MISMATCH_BANK" ]] && MISMATCH_FLAG="--mismatch_bank $MISMATCH_BANK --mismatch_seed $MISMATCH_SEED"
 
 # Same shape a third time, and the reason matters more here than for the two above: the
 # length guard is OFF unless --length-guard names a reference length, and off must mean
@@ -1775,6 +1938,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     $PLACEBO_FLAG \
     $MASKFREE_FLAG \
     $RECT_FLAG \
+    $MISMATCH_FLAG \
     $BETA_FLAG \
     $LENGTH_GUARD_FLAG \
     $NATURAL_ONLY_FLAG \

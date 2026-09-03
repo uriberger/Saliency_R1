@@ -460,10 +460,12 @@ def phase_verify(args):
     # sample of them and confirm it terminates on a donor with a different question AND a
     # different picture. This is the property the control is named for, so it is checked
     # rather than assumed.
-    sys.path.insert(0, str(REPO))
-    MM = _load_module("_bank_mismatch_rewards", "trl/rewards/mismatch_rewards.py")
+    # Loaded under its DOTTED name so its `from . import overlap_rewards` resolves to the
+    # copy overlap_probe already registered -- a second copy would carry its own _CFG and
+    # the check would not be against the boxes the reward will actually rasterise.
+    MM = _load_module("trl.rewards.mismatch_rewards", "trl/rewards/mismatch_rewards.py")
     MM._CFG["bank"] = str(out / BANK_NAME)
-    MM._CFG["seed"] = args.seed
+    MM._CFG["seed"] = args.mismatch_seed
     rng = np.random.default_rng(0)
     keys = list(idx)
     sample = [keys[i] for i in rng.choice(len(keys), size=min(2000, len(keys)), replace=False)]
@@ -514,7 +516,12 @@ def main():
                     help="chains per donor row; sets how many observe-step counts it covers")
     ap.add_argument("--max-per-length", type=int, default=8,
                     help="cap on stored chains per (donor, length)")
-    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--seed", type=int, default=1234,
+                    help="chooses WHICH rows become donors (bank-build time)")
+    ap.add_argument("--mismatch-seed", type=int, default=0,
+                    help="--verify only: the --mismatch_seed a run will use, i.e. which "
+                         "donor each row is paired with. Separate from --seed because the "
+                         "two are set at different times by different people.")
 
     ap.add_argument("--shard", type=int, default=None, help="phase 2: this shard's index")
     ap.add_argument("--num-shards", type=int, default=1)
