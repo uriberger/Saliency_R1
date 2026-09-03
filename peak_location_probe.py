@@ -51,10 +51,14 @@ import numpy as np
 
 # Order matters only for the report; unknown models are appended in file order.
 PREFERRED_ORDER = [
+    # The 8k pair first: same corpus, same calibrated pressure, and neither run
+    # collapsed, so it is the only place the two metrics can be read against each other
+    # without the hack in between.
     "base_coldstart",
+    "mean_in_saliency_r1_8k",
+    "mean_in_v2_saliency_r1_8k",
     "mean_in_set_a_1000",
     "mean_in_set_a_2000",
-    "mean_in_saliency_r1_8k",
     "mean_in_v2_set_a_1000",
     "mean_in_v2_set_a_1500",
     "mean_in_v2_set_a_1700",
@@ -198,7 +202,31 @@ def step_stats(step: dict) -> dict | None:
     }
 
 
-def collect(probe_json: Path) -> tuple[dict, dict]:
+#: Config fields that must agree before two probe runs may be pooled. The corpus ones
+#: because every CI here is paired on the image, and a model probed on other prompts
+#: would be compared against a bootstrap resample of prompts it never saw; the map ones
+#: because a map from another layer, head set or saliency source is a different
+#: measurement wearing the same column names.
+MUST_MATCH = ("dataset", "split", "n_samples", "seed", "num_generations",
+              "max_new_tokens", "temperature", "map", "overlap_layer", "overlap_heads",
+              "token_reduction", "box_threshold", "max_box_area", "max_union_area")
+
+
+def _cfg_val(cfg: dict, key: str) -> str:
+    """One config field, normalised for comparison across probe runs.
+
+    `dataset` is resolved because /home/uberger/scratch/... and /lustre/fs1/... are the
+    same directory through a symlink, and two runs launched from the two spellings are
+    the same corpus. `map` defaults to attn because the flag postdates the cross-run
+    probe, whose config has no such key.
+    """
+    if key == "dataset":
+        v = cfg.get(key)
+        return str(Path(v).resolve()) if v else ""
+    return str(cfg.get(key, "attn" if key == "map" else None))
+
+
+def collect_one(probe_json: Path) -> tuple[dict, dict]:
     """-> ({model: {image_id: [step stats]}}, config)"""
     d = json.loads(probe_json.read_text())
     out = {}
@@ -215,6 +243,43 @@ def collect(probe_json: Path) -> tuple[dict, dict]:
                     by_image[img].append(s)
         out[name] = dict(by_image)
     return out, d["config"]
+
+
+def collect(probe_jsons: list[Path]) -> tuple[dict, dict]:
+    """Pool several probe runs into one model table.
+
+    The cross-run probe and any later single-model run are separate files, and the
+    comparison between them is only meaningful if they drew the same prompts through
+    the same map. Both are checked here rather than left to the reader: a mismatch on
+    MUST_MATCH is fatal, and a model probed on a different set of images is fatal too
+    (the bootstrap pairs on the image id, and a silent partial overlap would quietly
+    turn a paired CI into an unpaired one).
+    """
+    models, cfg0, base_images = {}, None, None
+    for pj in probe_jsons:
+        got, cfg = collect_one(pj)
+        if cfg0 is None:
+            cfg0 = cfg
+        else:
+            bad = [k for k in MUST_MATCH if _cfg_val(cfg, k) != _cfg_val(cfg0, k)]
+            if bad:
+                raise SystemExit(
+                    f"{pj} disagrees with the first probe on {bad} -- these runs are not "
+                    f"the same measurement and pooling them would compare a model on one "
+                    f"corpus against a bootstrap over another. Values: "
+                    + ", ".join(f"{k}={cfg.get(k)!r} vs {cfg0.get(k)!r}" for k in bad))
+        for name, by in got.items():
+            imgs = set(by)
+            if base_images is None:
+                base_images = imgs
+            elif imgs != base_images:
+                raise SystemExit(
+                    f"model {name!r} in {pj} covers {len(imgs)} images, the first probe "
+                    f"{len(base_images)}; {len(imgs ^ base_images)} differ. The image-"
+                    f"paired bootstrap needs one corpus.")
+            key = name if name not in models else f"{name}@{pj.parent.name}"
+            models[key] = by
+    return models, cfg0
 
 
 COLUMNS = ["union_frac", "peak_in", "peak_border", "peak_row_frac", "peak_col_frac",
@@ -291,8 +356,9 @@ def fmt(x, nd=3):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--probe", required=True,
-                   help="an overlap_probe out-dir (uses its probe_merged.json)")
+    p.add_argument("--probe", required=True, action="append",
+                   help="an overlap_probe out-dir (uses its probe_merged.json). Repeat "
+                        "to pool several runs; they must share the corpus and the map.")
     p.add_argument("--out", default="", help="write the full numbers as JSON here")
     p.add_argument("--n-boot", type=int, default=2000)
     p.add_argument("--seed", type=int, default=0)
@@ -301,13 +367,15 @@ def main():
                    help="re-derive the stored mean_in / mean_in_v2 from the decode")
     args = p.parse_args()
 
-    probe = Path(args.probe)
-    merged = probe if probe.is_file() else probe / "probe_merged.json"
+    merged = []
+    for pr in args.probe:
+        probe = Path(pr)
+        merged.append(probe if probe.is_file() else probe / "probe_merged.json")
     models, cfg = collect(merged)
     names = [n for n in PREFERRED_ORDER if n in models] + \
             [n for n in models if n not in PREFERRED_ORDER]
 
-    print(f"probe      : {merged}")
+    print("probe      : " + "\n             ".join(str(m) for m in merged))
     print(f"dataset    : {cfg.get('dataset')}  split={cfg.get('split')} "
           f"n_samples={cfg.get('n_samples')} x {cfg.get('num_generations')} gens")
     print(f"map        : {cfg.get('map', 'attn')}  L{cfg.get('overlap_layer')} "
@@ -505,7 +573,7 @@ def main():
 
     if args.out:
         Path(args.out).write_text(json.dumps({
-            "probe": str(merged), "config": cfg, "images": images,
+            "probe": [str(m) for m in merged], "config": cfg, "images": images,
             "point": point, "per_completion": pcomp,
             "ci": {n: {k: ci([b[k] for b in boots[n]])
                        for k in list(COLUMNS) + ["peak_lift"]} for n in names},
