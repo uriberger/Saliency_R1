@@ -96,6 +96,22 @@ the *worst*-contrast stratum. Result 5 in [probe-results.md](probe-results.md). 
 α=0.25/0.5 only** — at α=1.0 box and roll both gain ~0.9 nats and agree to 0.0003, which
 is off-manifold, not grounding.
 
+**9. Half of result 3 is a fact about the TARGETS, not about the attention.** Two steps of
+one chain get DINO unions that sit **72%** of the way from "unrelated given their sizes"
+to "as identical as their sizes allow" — and two steps of two *different* chains about the
+same image sit at **70%**. The gap is nothing, in all 14 model-by-run cells measured, and
+negative in 10 of them. Same on the raw box lists (best-match IoU 0.480 within vs 0.485
+across chains) so it is not the patch grid blurring them together. Different image drops to
+0.235, so the measure is not saturated. Consequences: a step scores higher on its own mask
+than on a sibling's only **52.6%** of the time (`mean_in`; **53.2%** under `auroc`, which
+reproduces result 3's 0.534 independently), and running DINO **once per chain** instead of
+once per step keeps the within-group reward ranking at rho **0.62**. The per-step structure
+of the reward is close to decorative. The 0.953 oracle never contradicted this — it scores
+each mask against itself, which stays maximal however alike the masks are. Full numbers and
+caveats in [step-box-similarity.md](step-box-similarity.md); it also puts a condition on
+open question 4, since a contrastive `L_attn` across a chain's own steps needs those steps'
+targets to differ.
+
 Definitions of every map named above — the rollout, the two head merges, the increment,
 the gradient map and the intervention edit — are in
 [saliency-maps.md](saliency-maps.md), with the notation stated once.
@@ -172,6 +188,8 @@ the gradient map and the intervention edit — are in
 | `flow_intervene_probe.py` | causal test of the INDIRECT path: re-allocates each head's mass over image-*carrying* keys toward union-carriers, at every layer up to a cutoff. `selftest` / `run` / `report` / `monitor`. Reports `ushare`/`rshare` on every forward — a null with a flat `ushare` is a failed intervention, not a result |
 | `test_flow_intervene_cpu.py` | CPU checks for the edit algebra against naive references, the carried scalars, the deepstack re-seed and the report pairing |
 | `overlap_probe.py` | the original offline reward probe (generation + per-step breakdown) |
+| `step_box_similarity.py` | do a chain's steps get DIFFERENT boxes? CPU-only, reads `probe_merged.json` written with `--store-maps`. Within-chain vs same-image vs different-image mask overlap, plus the mask-swap rescoring. `--verify` checks every metric it recomputes against the value the probe stored |
+| `dino_text_sensitivity.py` | the GPU follow-up: re-grounds the same images with wrong / scrambled / empty text and measures how far the boxes move. DINO only — no VLM, no generation. `real` must reproduce the stored boxes or the run is misconfigured |
 | `test_intervene_probe_cpu.py` | CPU checks for the intervention algebra, resume, report |
 | `docs/saliency-maps.md` | **every map defined in one place** — direct, rollout-mean, rollout-wnorm, increment, gradient, and the intervention edit — with the notation, the scoring, the fixed-vs-swept parameters and the deepstack facts stated once. Start here before reading any probe |
 | `docs/attention-intervention-plan.md` | the P0–P5 plan, with its Stage 0→1 gate marked invalid |
