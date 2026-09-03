@@ -8,7 +8,8 @@ script produces the boxes, once, offline, so that training loads no DINO at all.
 
 What a bank holds:
 
-    index    every row key ("<dataset>/<question_id>") of every corpus given to
+    index    every row key (overlap_rewards.qbox_key: "<dataset>|<split>|<question_id>",
+             the same key --overlap_question_boxes uses) of every corpus given to
              --index-dataset, mapped to a hash of its encoded image bytes. The reward
              needs this to reject a donor that shares the row's PICTURE and not just its
              question -- 793 of saliency-r1-8k's 6714 images carry more than one
@@ -79,6 +80,19 @@ def _load_module(name: str, relpath: str):
 PROBE = _load_module("_bank_overlap_probe", "overlap_probe.py")
 OSTEPS = PROBE.OSTEPS
 OREW = PROBE.OREW
+# Loaded under its DOTTED name so its `from . import overlap_rewards` resolves to the copy
+# overlap_probe already registered. This is where the row key lives -- the bank must be
+# keyed by exactly what the reward will look rows up by, so both call one function.
+MM = _load_module("trl.rewards.mismatch_rewards", "trl/rewards/mismatch_rewards.py")
+
+
+KEY_COLUMNS = OREW.QBOX_KEY_COLUMNS
+
+
+def _key(rec) -> str:
+    """The bank's row key for a dataset record. One definition, shared with the reward."""
+    return MM.row_key(*(rec[c] for c in KEY_COLUMNS))
+
 
 BANK_VERSION = 1
 PLAN_NAME = "bank_plan.json"
@@ -149,16 +163,17 @@ def build_index(paths, verbose=True) -> dict[str, str]:
     for path in paths:
         ds = _open_dataset(path)
         cols = ds.column_names
-        for need in ("dataset", "question_id", "image"):
+        for need in (*KEY_COLUMNS, "image"):
             if need not in cols:
                 raise SystemExit(
                     f"{path} has no '{need}' column (has {cols}). The mismatched-box "
-                    "control identifies a row by (dataset, question_id) and its picture by "
-                    "the image bytes; a corpus without those cannot be indexed."
+                    f"control identifies a row by {KEY_COLUMNS} -- the same key "
+                    "--overlap_question_boxes uses -- and its picture by the image bytes; "
+                    "a corpus without those cannot be indexed."
                 )
         n_before = len(index)
-        for rec in ds.select_columns(["dataset", "question_id", "image"]):
-            index[f"{rec['dataset']}/{rec['question_id']}"] = image_group(rec["image"])
+        for rec in ds.select_columns([*KEY_COLUMNS, "image"]):
+            index[_key(rec)] = image_group(rec["image"])
         if verbose:
             print(f"  indexed {len(index) - n_before:6d} rows from {path}")
     return index
@@ -178,8 +193,8 @@ def choose_donors(dataset_path: str, split: str, index: dict, n_donors: int, see
     """
     ds = _carve(_open_dataset(dataset_path), split)
     keys, groups = [], []
-    for rec in ds.select_columns(["dataset", "question_id", "image"]):
-        keys.append(f"{rec['dataset']}/{rec['question_id']}")
+    for rec in ds.select_columns([*KEY_COLUMNS, "image"]):
+        keys.append(_key(rec))
         groups.append(image_group(rec["image"]))
     rng = np.random.default_rng(seed)
     order = rng.permutation(len(keys))
@@ -302,9 +317,9 @@ def phase_shard(args):
     written = []
     for di, d in enumerate(mine):
         row = ds[d["row_index"]]
-        assert f"{row['dataset']}/{row['question_id']}" == d["key"], (
+        assert _key(row) == d["key"], (
             f"donor {d['key']} is at index {d['row_index']} in the plan but that index now "
-            f"holds {row['dataset']}/{row['question_id']} -- the corpus or the carve moved"
+            f"holds {_key(row)} -- the corpus or the carve moved"
         )
         image = PROBE.prepare_image(row["image"])
         question = row["problem"]
@@ -369,7 +384,15 @@ def phase_shard(args):
     cfg = {"model": args.model, "steps_ckpt": args.steps_ckpt,
            "temperature": args.temperature, "max_new_tokens": args.max_new_tokens,
            "box_threshold": args.box_threshold, "max_per_length": args.max_per_length,
-           "n_generations": n_generations}
+           "n_generations": n_generations,
+           # Recorded, and deliberately NOT checked against the run's, unlike
+           # --overlap_question_boxes, which must refuse a mismatch. There the cache holds
+           # boxes for the row's OWN picture, so a detector shown a different resolution
+           # gives the run the wrong boxes for its own image. Here every box belongs to a
+           # different picture the run never sees: the resolution is a property of how the
+           # bank was built, not a claim about this run's images. Recorded so the bank can
+           # be reproduced.
+           "max_image_side": PROBE.MAX_IMAGE_SIDE}
     path = out / f"bank_shard{args.shard:02d}.json"
     path.write_text(json.dumps({"config": cfg, "donors": written}))
     print(f"wrote {path}  ({path.stat().st_size / 1e6:.1f} MB)")
@@ -536,10 +559,9 @@ def phase_verify(args):
     # sample of them and confirm it terminates on a donor with a different question AND a
     # different picture. This is the property the control is named for, so it is checked
     # rather than assumed.
-    # Loaded under its DOTTED name so its `from . import overlap_rewards` resolves to the
-    # copy overlap_probe already registered -- a second copy would carry its own _CFG and
-    # the check would not be against the boxes the reward will actually rasterise.
-    MM = _load_module("trl.rewards.mismatch_rewards", "trl/rewards/mismatch_rewards.py")
+    # The module-level MM (loaded once, under its dotted name so its relative import
+    # resolves to overlap_probe's copy of overlap_rewards) -- not a fresh one, so the check
+    # runs against the same _CFG the boxes will be rasterised under.
     MM._CFG["bank"] = str(out / BANK_NAME)
     MM._CFG["seed"] = args.mismatch_seed
     rng = np.random.default_rng(0)

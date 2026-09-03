@@ -58,10 +58,12 @@ all rollouts of a row are scored against the same donor row, and the surviving 0
 0.82x the real reward's tie-breaking strength with none of it donor noise.
 
 The donor row is chosen by hashing the row's identity, not by drawing at random, so it is
-the same in every epoch, on every rank and across a restart. Identity is the (dataset,
-question_id) pair: the trainer forwards every dataset column to the reward, and the pair
-is unique over all 8080 rows of saliency-r1-8k (`problem` is not -- 6844 unique texts for
-8080 rows, one question repeated 41 times).
+the same in every epoch, on every rank and across a restart. Identity is `overlap_rewards.qbox_key`,
+the (dataset, split, question_id) triple --  the same function --overlap_question_boxes
+keys its own offline box cache by, not a second spelling of it. The trainer forwards every
+dataset column to the reward, and the triple is unique in every corpus this trainer
+accepts (`problem` is not -- 6844 distinct texts for saliency-r1-8k's 8080 rows, one
+question repeated 41 times).
 
 DIFFERENT QUESTION **AND** DIFFERENT PICTURE. 793 of the 6714 images in saliency-r1-8k
 carry more than one question (up to 10), so excluding the row itself is not enough. The
@@ -263,9 +265,18 @@ def _blake_u64(*parts) -> int:
     return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "big")
 
 
-def row_key(dataset, question_id) -> str:
-    """The row identity the bank is keyed by. Unique per row; see the module docstring."""
-    return f"{dataset}/{question_id}"
+def row_key(dataset, split, question_id) -> str:
+    """The row identity the bank is keyed by.
+
+    Deliberately `overlap_rewards.qbox_key` itself and not a second spelling of it:
+    --overlap_question_boxes keys its offline box cache the same way, and two offline-box
+    features that disagreed about what a row IS would be a trap nobody would find. The
+    triple (dataset, split, question_id) is unique in every corpus this trainer accepts
+    and `problem` is deliberately not part of it -- questions repeat across images (35343
+    distinct strings over set_a's 50000 rows), so keying on the text would collapse
+    different pictures onto one entry.
+    """
+    return _ORW.qbox_key(dataset, split, question_id)
 
 
 def donor_for(key: str):
@@ -319,7 +330,7 @@ def chain_for(donor, n_steps: int, h: int):
 
 def think_mismatch_reward(
     completions=None, saliency_map=None, valid_list=None, image=None, natural=None,
-    dataset=None, question_id=None, **kwargs
+    dataset=None, split=None, question_id=None, **kwargs
 ):
     """Per-completion mismatched-box reward. See module docstring.
 
@@ -335,12 +346,15 @@ def think_mismatch_reward(
     if valid_list is None:
         valid_list = [True] * n
 
-    if dataset is None or question_id is None:
+    missing = [n for n, v in zip(_ORW.QBOX_KEY_COLUMNS, (dataset, split, question_id))
+               if v is None]
+    if missing:
         raise KeyError(
-            "--mismatch_bank needs the 'dataset' and 'question_id' columns to identify the "
-            "row (the trainer forwards every dataset column to the reward), but they did "
-            "not arrive. Every corpus this repo trains on carries both -- "
-            "peterant330/saliency-r1-8k and everything build_grpo_sets.py writes."
+            f"--mismatch_bank needs the {', '.join(repr(m) for m in missing)} column(s) to "
+            "identify the row (the trainer forwards every dataset column to the reward), "
+            "but they did not arrive. Every corpus this repo trains on carries all of "
+            f"{_ORW.QBOX_KEY_COLUMNS} -- peterant330/saliency-r1-8k and everything "
+            "build_grpo_sets.py writes."
         )
 
     # --overlap_natural_only, read from the overlap reward's config so the flag means the
@@ -366,7 +380,7 @@ def think_mismatch_reward(
             rewards.append(None)  # no observe step at all -> mask (neutral)
             continue
 
-        donor, h = donor_for(row_key(dataset[c], question_id[c]))
+        donor, h = donor_for(row_key(dataset[c], split[c], question_id[c]))
         chain, L = chain_for(donor, len(steps), h)
 
         vals = []

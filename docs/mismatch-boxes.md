@@ -34,8 +34,10 @@ That places it between two controls that already exist:
 | control | the union it scores against |
 |---|---|
 | the reference | the step's own text, this picture |
+| `--overlap_question_boxes` | this row's own *question*, this picture, grounded offline |
 | `--placebo roll` | the step's own union, moved to a wrong place (same area, same shape) |
 | **`--mismatch-bank`** | **another chain's real union, from another picture** |
+| `--overlap_rect_frac` | a centred rectangle, no detector at all |
 | `--maskfree` | no union at all |
 
 `roll` keeps the correct union's size and shape and breaks only its position, and it still
@@ -127,7 +129,7 @@ unservable count is a free exit from the reward, and it would be found.
 
 ## The rule, in full
 
-For a completion with *n* observe steps, on training row `(dataset, question_id)`:
+For a completion with *n* observe steps, on training row `(dataset, split, question_id)`:
 
 1. **Donor row.** `blake2b(seed, "mismatch-donor", row_key) % D` picks a starting index
    into the bank's donor list; scan forward to the first donor whose question *and*
@@ -149,9 +151,13 @@ exists to sever.
 
 ### Identity
 
-`(dataset, question_id)`, which the trainer forwards to every reward as a dataset column.
-Unique across all 8080 rows of `saliency-r1-8k`; `problem` is not (6844 unique texts, one
-question repeated 41 times).
+`overlap_rewards.qbox_key` — the `(dataset, split, question_id)` triple, joined with
+`|` — which the trainer forwards to every reward as dataset columns. This is **that
+function, not a copy of it**: `--overlap_question_boxes` keys its own offline box cache
+the same way, and two offline-box features that disagreed about what a row *is* would be a
+trap nobody would find. `test_mismatch_reward_cpu.py` T1g pins the identity. The triple is
+unique in every corpus this trainer accepts; `problem` is not (6844 distinct texts over
+saliency-r1-8k's 8080 rows, one question repeated 41 times).
 
 "Different picture" is enforced, not assumed: 793 of the corpus's 6714 images carry more
 than one question, up to 10, so excluding the row itself would still let a row be scored

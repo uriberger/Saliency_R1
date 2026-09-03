@@ -72,10 +72,15 @@ TMP = Path(tempfile.mkdtemp(prefix="mismatch_bank_"))
 # 12 rows over 10 pictures: rows 0 and 1 share picture "img0", rows 2 and 3 share "img1".
 # Those two pairs are the whole point of the image_group column -- excluding the row
 # itself would still let row 0 be scored against its own picture through row 1.
-INDEX = {f"ds/{i}": f"img{max(0, i - 1) if i < 2 else (1 if i in (2, 3) else i - 2)}"
-         for i in range(12)}
-INDEX["ds/0"] = INDEX["ds/1"] = "img0"
-INDEX["ds/2"] = INDEX["ds/3"] = "img1"
+# Keys are overlap_rewards.qbox_key's: "<dataset>|<split>|<question_id>", the same key
+# --overlap_question_boxes uses. T1g pins that this is that function and not a copy.
+def K(i):
+    return f"ds|train|{i}"
+
+
+INDEX = {K(i): f"img{i - 2}" for i in range(12)}
+INDEX[K(0)] = INDEX[K(1)] = "img0"
+INDEX[K(2)] = INDEX[K(3)] = "img1"
 
 _LEFT = [[0.0, 0.0, 0.5, 1.0]]        # left half of any grid
 _RIGHT = [[0.5, 0.0, 1.0, 1.0]]       # right half
@@ -105,7 +110,7 @@ for i in range(12):
     }
     if i == 7:
         chains["9"] = [[_TOP] * 9]           # one donor reaches further than the rest
-    DONORS.append({"key": f"ds/{i}", "image_group": INDEX[f"ds/{i}"], "chains": chains})
+    DONORS.append({"key": K(i), "image_group": INDEX[K(i)], "chains": chains})
 BANK_PATH = _write(_bank(DONORS))
 
 
@@ -129,7 +134,7 @@ for key in INDEX:
 print("[T1a] every row resolves to a donor with a different question AND a different picture")
 
 # The two image-sharing pairs are the ones that would slip through a question-only check.
-for a, b in (("ds/0", "ds/1"), ("ds/2", "ds/3")):
+for a, b in ((K(0), K(1)), (K(2), K(3))):
     assert mm.donor_for(a)[0]["key"] != b, f"{a} was scored against its own picture via {b}"
     assert mm.donor_for(b)[0]["key"] != a
 print("[T1b] a second question about the SAME picture is excluded, not just the row itself")
@@ -153,12 +158,28 @@ print(f"[T1e] 12 rows spread over {len(_used)} distinct donors: {dict(_used)}")
 # A row the bank never indexed raises: without its image group the "different picture"
 # half of the exclusion cannot be enforced, and quietly enforcing half of it is worse.
 try:
-    mm.donor_for("otherds/999")
+    mm.donor_for("otherds|train|999")
 except KeyError as e:
     assert "index" in str(e)
     print("[T1f] a row outside the bank's index raises instead of half-excluding")
 else:
     raise AssertionError("expected KeyError for an unindexed row")
+
+# THE SHARED KEY. --overlap_question_boxes keys its own offline box cache by the same
+# triple, and two offline-box features that disagreed about what a row IS would be a trap
+# nobody would find. So this is that function, not a copy of it -- asserted, because a
+# copy would keep passing every other test in this file.
+assert mm.row_key is not orw.qbox_key          # it wraps, for the docstring
+assert mm.row_key("ds", "train", 5) == orw.qbox_key("ds", "train", 5) == "ds|train|5"
+assert mm.row_key.__doc__ and "qbox_key" in mm.row_key.__doc__
+try:
+    mm.row_key("d|s", "train", 5)              # the separator check comes with it
+except ValueError as e:
+    assert "separator" in str(e)
+else:
+    raise AssertionError("expected the shared key's '|' collision check")
+print("[T1g] the row key IS overlap_rewards.qbox_key -- one definition of a row across "
+      "both offline-box features")
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +188,8 @@ else:
 # From the LOADED bank, not the JSON fixture: the loader is what turns the string keys a
 # JSON object forces into the ints an observe-step count is everywhere else.
 LOADED = {d["key"]: d for d in mm._load_bank()["donors"]}
-assert all(isinstance(k, int) for k in LOADED["ds/7"]["chains"])
-donor = LOADED["ds/7"]                 # lengths {1,2,3,5,9}
+assert all(isinstance(k, int) for k in LOADED[K(7)]["chains"])
+donor = LOADED[K(7)]                 # lengths {1,2,3,5,9}
 h = 0
 for n, want in ((1, 1), (2, 2), (3, 3), (5, 5), (9, 9)):
     chain, L = mm.chain_for(donor, n, h)
@@ -220,12 +241,12 @@ def _steps(n, **kw):
 
 orw, mm = _fresh()
 # Pin one row's donor so the expected value can be written down.
-key = "ds/5"
+key = K(5)
 d, hh = mm.donor_for(key)
 chain, L = mm.chain_for(d, 2, hh)
 
 kw = dict(saliency_map=[_steps(2)], valid_list=[True], image=[None],
-          dataset=["ds"], question_id=[5], completions=[[{"role": "assistant", "content": "x"}]])
+          dataset=["ds"], split=["train"], question_id=[5], completions=[[{"role": "assistant", "content": "x"}]])
 got = mm.think_mismatch_reward(**kw)[0]
 # mean_in = mean of the peak-normalised map inside the donor's union, averaged over steps.
 want = float(np.mean([
@@ -294,11 +315,11 @@ print("[T3h] --overlap_metric / the mass floor / the area caps all come from ove
 counts = [2, 3, 3, 5, 1, 2, 9, 3]
 kw8 = dict(saliency_map=[_steps(n) for n in counts],
            valid_list=[True] * 8, image=[None] * 8,
-           dataset=["ds"] * 8, question_id=[5] * 8,
+           dataset=["ds"] * 8, split=["train"] * 8, question_id=[5] * 8,
            completions=[[{"role": "assistant", "content": f"c{i}"}] for i in range(8)])
 out = mm.think_mismatch_reward(**kw8)
 assert all(v is not None for v in out), out
-donors_used = {mm.donor_for(mm.row_key("ds", 5))[0]["key"]}
+donors_used = {mm.donor_for(mm.row_key("ds", "train", 5))[0]["key"]}
 assert len(donors_used) == 1
 # and the same completion in a different group position gets the same score
 assert out[1] == out[2] == out[7], out       # identical maps, identical count -> identical
@@ -354,14 +375,14 @@ else:
 
 # A bank whose every donor is excluded for a row must say so rather than score it against
 # its own picture.
-_solo = [{"key": "ds/1", "image_group": "img0", "chains": {"1": [[_LEFT]]}}]
+_solo = [{"key": K(1), "image_group": "img0", "chains": {"1": [[_LEFT]]}}]
 _ps = _write({"meta": {"version": 1, "box_threshold": 0.10}, "index": INDEX,
               "donors": _solo}, "bank_solo.json")
 _orw5, _mm5 = _load_tree()
 _orw5.configure(box_threshold=0.10)
 _mm5.configure(bank=_ps)
 try:
-    _mm5.donor_for("ds/0")            # shares img0 with the only donor
+    _mm5.donor_for(K(0))            # shares img0 with the only donor
 except RuntimeError as e:
     assert "excluded" in str(e)
     print("[T5e] a row every donor is excluded for raises, rather than being paired with "
