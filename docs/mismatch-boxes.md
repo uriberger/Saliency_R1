@@ -228,9 +228,26 @@ Logged as `mismatch/*`:
                every one lands on a different question and a different picture; asserts
                step counts 1..19, 40, 85 and 200 all resolve; prints the length coverage.
 
-Defaults are 256 donor rows × 64 chains = 16,384 chains, ~1–2 hours on 8 cards. 256 is
-enough because a donor row is reused by ~31 training rows and the corpus is still spread
-over 256 distinct wrong regions; the reason to raise it is diversity, not correctness.
+Defaults are 256 donor rows × 64 chains = 16,384 chains, ~1–2 hours on 8 cards.
+
+**256 donor rows** is enough because a donor row is reused by ~31 training rows and the
+corpus is still spread over 256 distinct wrong regions. Raising it buys diversity, not
+correctness.
+
+**64 chains per donor row** is where the exact-length service rate stops improving. Chains
+per donor row against the share of completions whose step count its own donor row can
+match exactly, at the cold-start length mix (analytic from the histogram above; the
+builder's `--verify` prints the same figure measured from the bank it actually built, and
+the two agreed to 0.8 points on a 40-donor test):
+
+| chains per donor | 4 | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|
+| exact-length service | 49% | 71% | 87% | 94% | **97%** | 98% |
+
+At 64, lengths 1–6 are covered by essentially every donor row and n = 7 by 87%; the
+misses are the tail the cold start itself barely produces. 128 buys 1.3 points for double
+the GPU time. Everything past the bank's longest chain is unservable at any size — see the
+length ladder above, which is what makes that acceptable rather than fatal.
 
 Everything that decides what a chain *is* comes from `overlap_probe.py` rather than being
 reimplemented — the same `SYSTEM_PROMPT`, the same 512px image cap, the same sampling

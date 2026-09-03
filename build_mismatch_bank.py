@@ -88,11 +88,15 @@ BANK_NAME = "bank.json"
 # ---------------------------------------------------------------------------
 # phase 1: plan -- index every image, choose the donor rows
 # ---------------------------------------------------------------------------
-def _open_dataset(path: str, split: str = "train"):
-    """Load a corpus by hub name or by save_to_disk directory, undecoded images.
+def _open_dataset(path: str, decode: bool = False):
+    """Load a corpus by hub name or by save_to_disk directory. Always the WHOLE corpus.
 
     decode=False is what makes the index cheap: the encoded bytes are what gets hashed,
-    so no image is ever rasterised here.
+    so no image is ever rasterised for it. The generation phase passes decode=True.
+
+    The trainer's holdout carve is NOT applied here -- see _carve. The index deliberately
+    covers every row of the corpus, the 100 held-out ones included: the reward raises on a
+    row it cannot look up, and an evaluation pass over the holdout sees those rows.
     """
     from datasets import Image as HFImage
     from datasets import load_dataset, load_from_disk
@@ -103,10 +107,26 @@ def _open_dataset(path: str, split: str = "train"):
     ):
         ds = load_from_disk(str(p))
         if hasattr(ds, "keys"):
-            ds = ds[split]
+            ds = ds["train"]
     else:
-        ds = load_dataset(path, split=split)
-    return ds.cast_column("image", HFImage(decode=False))
+        ds = load_dataset(path, split="train")
+    return ds if decode else ds.cast_column("image", HFImage(decode=False))
+
+
+def _carve(ds, split: str):
+    """The trainer's 100-row seed-42 holdout, reproduced.
+
+    `train` is the side the policy is optimised on, and donors are drawn from it so a
+    donor chain comes from a picture the model saw exactly as often as the rows scored
+    against it. ONE definition, called by both the planning and the generation phase,
+    because the donor list is a list of INDICES into whatever this returns -- two
+    spellings of the carve would mean the shards generate for different rows than the
+    plan chose, silently.
+    """
+    if split == "all" or len(ds) <= 100:
+        return ds
+    parts = ds.train_test_split(test_size=100, seed=42)
+    return parts["train" if split == "train" else "test"]
 
 
 def image_group(rec) -> str:
@@ -123,11 +143,11 @@ def image_group(rec) -> str:
     return "path:" + str(rec.get("path"))
 
 
-def build_index(paths, split, verbose=True) -> dict[str, str]:
-    """{row key: image group} over every corpus in `paths`."""
+def build_index(paths, verbose=True) -> dict[str, str]:
+    """{row key: image group} over every corpus in `paths`, holdout rows included."""
     index = {}
     for path in paths:
-        ds = _open_dataset(path, split)
+        ds = _open_dataset(path)
         cols = ds.column_names
         for need in ("dataset", "question_id", "image"):
             if need not in cols:
@@ -156,9 +176,7 @@ def choose_donors(dataset_path: str, split: str, index: dict, n_donors: int, see
     The trainer holds out 100 rows with seed 42 before training; drawing from the same
     `train` side keeps donors on the corpus the policy actually sees.
     """
-    ds = _open_dataset(dataset_path, split)
-    if split != "all" and len(ds) > 100:
-        ds = ds.train_test_split(test_size=100, seed=42)["train" if split == "train" else "test"]
+    ds = _carve(_open_dataset(dataset_path), split)
     keys, groups = [], []
     for rec in ds.select_columns(["dataset", "question_id", "image"]):
         keys.append(f"{rec['dataset']}/{rec['question_id']}")
@@ -187,9 +205,11 @@ def choose_donors(dataset_path: str, split: str, index: dict, n_donors: int, see
 def phase_plan(args):
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    index_paths = args.index_dataset or [args.dataset]
+    # The donor corpus is always indexed, whatever else was asked for: the reward looks up
+    # the ROW it is scoring, and every row of --dataset is one.
+    index_paths = list(dict.fromkeys([args.dataset] + (args.index_dataset or [])))
     print(f"indexing {len(index_paths)} corpus/corpora ...")
-    index = build_index(index_paths, args.split)
+    index = build_index(index_paths)
     print(f"  {len(index)} rows, {len(set(index.values()))} distinct images")
     print(f"choosing {args.n_donors} donor rows from {args.dataset} ...")
     donors = choose_donors(args.dataset, args.split, index, args.n_donors, args.seed)
@@ -270,23 +290,22 @@ def phase_shard(args):
     clf = OSTEPS.OverlapStepsClassifier.load(args.steps_ckpt, device=args.steps_device)
     tok = processor.tokenizer
 
-    # The rows themselves, decoded this time -- the plan holds only their indices.
-    from datasets import load_dataset, load_from_disk
-
-    p = PROBE.repo_path(plan["dataset"]) if not os.path.isabs(plan["dataset"]) else Path(plan["dataset"])
-    if os.path.isfile(os.path.join(p, "state.json")) or os.path.isfile(os.path.join(p, "dataset_dict.json")):
-        ds = load_from_disk(str(p))
-        if hasattr(ds, "keys"):
-            ds = ds["train"]
-    else:
-        ds = load_dataset(plan["dataset"], split="train")
-    if plan["split"] != "all" and len(ds) > 100:
-        ds = ds.train_test_split(test_size=100, seed=42)[
-            "train" if plan["split"] == "train" else "test"]
+    # The rows themselves, decoded this time -- the plan holds only their indices, into
+    # exactly this carve. Same two functions the plan used, so the indices cannot drift.
+    ds = _carve(_open_dataset(plan["dataset"], decode=True), plan["split"])
+    # The plan is also where the chain count comes from. Passing --n-generations here as
+    # well would let a shard silently disagree with the meta the merge writes.
+    n_generations = int(plan["n_generations"])
+    if d0 := [d["key"] for d in mine][:1]:
+        print(f"  first donor {d0[0]}, {n_generations} chains each")
 
     written = []
     for di, d in enumerate(mine):
         row = ds[d["row_index"]]
+        assert f"{row['dataset']}/{row['question_id']}" == d["key"], (
+            f"donor {d['key']} is at index {d['row_index']} in the plan but that index now "
+            f"holds {row['dataset']}/{row['question_id']} -- the corpus or the carve moved"
+        )
         image = PROBE.prepare_image(row["image"])
         question = row["problem"]
 
@@ -295,7 +314,7 @@ def phase_shard(args):
         # on one card. The chunks are independent samples, so this is not a different
         # distribution from one big call.
         texts, clean = [], []
-        left = args.n_generations
+        left = n_generations
         while left > 0:
             k = min(args.gen_batch, left)
             _inputs, prompt_len, seqs = PROBE.generate(
@@ -342,8 +361,17 @@ def phase_shard(args):
         print(f"  [{di + 1}/{len(mine)}] {d['key']:>28s}  {n_ch:3d} chains  "
               f"lengths {sorted(int(k) for k in kept)}", flush=True)
 
+    # The shard records the config it ACTUALLY generated and grounded under, and the merge
+    # copies that into the bank's meta rather than re-reading its own flags. Otherwise a
+    # merge invoked with a different --model or --box-threshold than the shards ran with
+    # would write a meta that describes a bank nobody built -- and box_threshold in
+    # particular is load-bearing: the reward refuses a run whose threshold differs from it.
+    cfg = {"model": args.model, "steps_ckpt": args.steps_ckpt,
+           "temperature": args.temperature, "max_new_tokens": args.max_new_tokens,
+           "box_threshold": args.box_threshold, "max_per_length": args.max_per_length,
+           "n_generations": n_generations}
     path = out / f"bank_shard{args.shard:02d}.json"
-    path.write_text(json.dumps({"donors": written}))
+    path.write_text(json.dumps({"config": cfg, "donors": written}))
     print(f"wrote {path}  ({path.stat().st_size / 1e6:.1f} MB)")
 
 
@@ -356,9 +384,21 @@ def phase_merge(args):
     shards = sorted(out.glob("bank_shard*.json"))
     if not shards:
         raise SystemExit(f"no bank_shard*.json in {out}; run --shard first")
-    donors = []
+    donors, cfgs = [], []
     for s in shards:
-        donors.extend(json.loads(s.read_text())["donors"])
+        blob = json.loads(s.read_text())
+        donors.extend(blob["donors"])
+        cfgs.append((s.name, blob.get("config", {})))
+    # Every shard must have run the same model, sampling and threshold, or the bank is two
+    # different experiments in one file.
+    base_name, base = cfgs[0]
+    for name, c in cfgs[1:]:
+        if c != base:
+            raise SystemExit(
+                f"{name} was generated with a different config than {base_name}:\n"
+                f"  {base_name}: {base}\n  {name}: {c}\n"
+                "Re-run the shards, or delete the odd one out and re-run just it."
+            )
     seen = set()
     for d in donors:
         if d["key"] in seen:
@@ -376,13 +416,8 @@ def phase_merge(args):
             "split": plan["split"],
             "index_datasets": plan["index_datasets"],
             "seed": plan["seed"],
-            "n_generations": plan["n_generations"],
-            "model": args.model,
-            "steps_ckpt": args.steps_ckpt,
-            "temperature": args.temperature,
-            "max_new_tokens": args.max_new_tokens,
-            "box_threshold": args.box_threshold,
             "n_donors": len(donors),
+            **base,          # the config the shards actually ran under, not this call's
         },
         "index": plan["index"],
         "donors": donors,
@@ -420,15 +455,21 @@ def _report(bank):
     for n in sorted(lens):
         cov = sum(1 for s in per_donor_lengths if n in s)
         print(f"{n:3d}  {lens[n]:7d}   {100 * cov / max(1, len(donors)):5.1f}%")
-    # The rate that matters at reward time: a completion whose step count no donor row
-    # can match is served the nearest length instead (0.21x the reward's within-group
-    # spread, against 1.02x for switching donor). This says how often that is.
-    cold = {1: .108, 2: .217, 3: .235, 4: .174, 5: .105, 6: .063, 7: .031, 8: .015}
+    # The rate that matters at reward time: a completion whose step count its donor row
+    # cannot match is served that donor's nearest length instead (0.21x the reward's
+    # within-group spread, against 1.02x for switching donor). This says how often that
+    # is, at the cold start's own mix of observe-step counts -- 880 chains from the
+    # val_natural and grad_spread probes, conditioned on having at least one observe step
+    # (3.1% have none and are never scored by any of these rewards). It is a floor on the
+    # drift, not a forecast: a training run walks up the length distribution, and the tail
+    # past the bank's longest chain is unservable at any bank size.
+    cold = {1: .108, 2: .217, 3: .235, 4: .174, 5: .105, 6: .063, 7: .031, 8: .015,
+            9: .007, 10: .005, 11: .005, 12: .003, 13: .001, 14: .002}
+    mass = sum(cold.values())
     exact = sum(p * (sum(1 for s in per_donor_lengths if n in s) / max(1, len(donors)))
-                for n, p in cold.items())
+                for n, p in cold.items()) / mass
     print(f"\nexpected exact-length service at the cold-start length mix: {100 * exact:.1f}%"
-          f"\n(the remainder takes the nearest length the donor row has; the tail beyond "
-          f"the bank's\n longest chain always does, and no bank size changes that -- see "
+          f"\n(the rest takes the nearest length the SAME donor row has -- see "
           f"docs/mismatch-boxes.md)")
 
 
