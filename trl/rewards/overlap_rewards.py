@@ -166,6 +166,58 @@ Box-coverage caps (two independent filters, both in _union_mask):
       incumbent weight transfers, and note the launchers add _mu<x> to the run name so
       a capped run never shares a checkpoint dir or wandb name with an uncapped one.
 
+A FIXED RECTANGLE INSTEAD OF THE BOXES (--overlap_rect_frac, default None = OFF):
+
+      Replaces the Grounding-DINO union with an axis-aligned rectangle in the middle
+      of the patch grid, covering `frac` of it at the grid's own aspect:
+
+          rows = round(grid_h * sqrt(frac)),  cols = round(grid_w * sqrt(frac))
+
+      centred, clamped to at least one patch. Nothing else changes: the same
+      --overlap_metric scores it, the same format gate multiplies it, the same
+      --overlap_natural_only masks it, and it occupies the same reward_funcs slot, so
+      --reward_weights lines up with a DINO reference run unchanged. _dino_boxes is
+      never called and the detector is never constructed, so the run needs no DINO
+      GPU and no DINO server.
+
+      WHY. centre_box_probe.py (outputs/centre_box_probe/report.txt) measured what
+      the boxes are worth to this reward, on the val_natural probe. Two findings,
+      pointing opposite ways:
+
+        - The rectangle is NOT DINO's mask. Given the step's own union AREA, so that
+          only placement is left to differ, its closeness to that union is 0.230 --
+          against a different-image floor of 0.235. It is no closer to what DINO drew
+          than boxes drawn on an unrelated picture are.
+        - But the reward cannot tell. The per-completion reward built on the
+          rectangle reproduces the real per-step-DINO reward's ranking of a group's
+          8 rollouts at rho 0.651, against 0.621 for running DINO once per chain --
+          and 0.638 for NO MASK AT ALL. GRPO only ever sees that ranking.
+
+      This flag is the training arm of that measurement: if a rectangle trains as
+      well as the boxes, the detector was not buying the gradient. 0.565 is the
+      fraction the probe used -- the mean union coverage DINO produces on these runs
+      -- so the rectangle gives away nothing on mask SIZE and differs from its
+      reference in mask PLACEMENT alone.
+
+      Two behavioural differences to expect, both because the mask no longer depends
+      on the step's sentence:
+
+        - Nothing is ever ungroundable, so EVERY observe step is scored and no
+          completion is masked for having none. The scored set is therefore larger
+          than its DINO reference's -- the point, not a bug, but it does mean the two
+          runs' logged reward means are over different populations of steps. (The one
+          exception is a grid so coarse that the rectangle rounds up to all of it: at
+          0.565 that is a 2x2 grid and nothing else, and such a step takes the same
+          skipped-not-zeroed path as a degenerate union. Real patch grids are ~10x16.)
+        - --box_threshold, --max_box_area and --dino_api_base are dead knobs here.
+          --max_union_area is REFUSED when it would drop the rectangle: the mask is
+          identical on every step, so that cap is all-or-nothing and would silently
+          leave every completion unscored.
+
+      w_overlap does not transfer from a DINO run unread -- the value distribution
+      moves with the mask. Re-measure the within-group sd (overlap_metric_spread.py)
+      rather than assuming the incumbent weight.
+
 There is deliberately NO step-count term. The observe-step count carries essentially
 no correctness signal (r -0.004..-0.022), so an anti-brevity multiplier costs 24% of
 the reward's predictive value and a hard gate costs 50-70%, to close a step-dropping
@@ -199,6 +251,7 @@ w_overlap is applied by the trainer via --reward_weights, not here.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 
 import numpy as np
@@ -256,6 +309,9 @@ _CFG = {
     "dino_device": None,     # local device override; default cuda if available
     "dino_batch_size": 32,
     "natural_only": False,   # True -> mask (None) the reward on rows with natural=False
+    # None or <= 0 -> score the DINO union (the incumbent). A fraction in (0, 1] ->
+    # score a centred rectangle of that area instead, and never call DINO at all.
+    "rect_frac": None,
 }
 
 # Lazily-loaded local Grounding-DINO singleton (one per training process).
@@ -299,6 +355,32 @@ def configure(**kwargs):
         if v is not None:
             _CFG[k] = v
     _ROLL_RNG = np.random.default_rng(int(_CFG["roll_seed"]))
+    _validate_rect()
+
+
+def rect_active() -> bool:
+    """True when the reward scores a fixed rectangle instead of Grounding-DINO boxes."""
+    f = _CFG.get("rect_frac")
+    return f is not None and float(f) > 0
+
+
+def _validate_rect():
+    """Refuse the two --overlap_rect_frac settings that fail silently rather than loudly."""
+    if not rect_active():
+        return
+    f = float(_CFG["rect_frac"])
+    if f > 1.0:
+        raise ValueError(
+            f"--overlap_rect_frac must be in (0, 1], got {f}: it is the fraction of the "
+            "patch grid the rectangle covers.")
+    cap = _CFG.get("max_union_area")
+    if cap is not None and float(cap) > 0 and f > float(cap):
+        raise ValueError(
+            f"--overlap_rect_frac {f} exceeds --max_union_area {cap}. The rectangle is the "
+            "SAME on every step, so unlike a DINO union that cap is all-or-nothing: it "
+            "would drop every step of every completion and the reward would be None "
+            "everywhere, which reads in the logs as a run with no overlap signal rather "
+            "than as a misconfiguration. Lower the fraction or drop the cap.")
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +566,45 @@ def _union_mask(boxes, grid_h, grid_w, apply_union_cap=True):
     return mask
 
 
+# One rectangle per (grid, fraction); the grids repeat all run long and the mask is a
+# pure function of them.
+_RECT_CACHE: dict = {}
+
+
+def _centre_rect_mask(grid_h, grid_w, frac):
+    """Centred axis-aligned rectangle covering ~frac of the patch grid; None if degenerate.
+
+    The area is split equally between the two axes (sqrt(frac) on each), so the
+    rectangle keeps the frame's aspect and is not secretly a wide or tall band: the
+    only thing it differs from a DINO union in is WHERE it sits, which is what the
+    --overlap_rect_frac arm is testing.
+
+    Rasterised on the patch grid, and rounded to whole patches like _union_mask, for
+    the same reason -- the grid mask is what the metric scores. On a grid this coarse
+    (10x16 is typical) the rounding moves the realised area a few points off `frac`;
+    that is deliberate and shared with centre_box_probe.py, which this reproduces
+    exactly so the training arm scores the same rectangle the probe measured.
+    """
+    key = (int(grid_h), int(grid_w), round(float(frac), 6))
+    hit = _RECT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    s = math.sqrt(min(1.0, max(0.0, float(frac))))
+    rows = min(grid_h, max(1, int(round(grid_h * s))))
+    cols = min(grid_w, max(1, int(round(grid_w * s))))
+    mask = np.zeros((grid_h, grid_w), dtype=bool)
+    r0, c0 = (grid_h - rows) // 2, (grid_w - cols) // 2
+    mask[r0:r0 + rows, c0:c0 + cols] = True
+    n_in = int(mask.sum())
+    if n_in == 0 or n_in == grid_h * grid_w:
+        # Same refusal as a degenerate union: "inside vs outside" is not a question on
+        # a mask that covers everything or nothing. Not cached -- it is a config error,
+        # and _validate_rect catches the frac that causes it before training starts.
+        return None
+    _RECT_CACHE[key] = mask
+    return mask
+
+
 def _mean_in(step_map, mask):
     """mean of MAX-normalized (/max -> [0,1]) saliency inside the mask."""
     vmax = float(step_map.max())
@@ -599,6 +720,11 @@ def think_overlap_reward(
     Returns a list (len == n completions) of floats, or None where there is no grounded
     observe step, or where --overlap_natural_only masks a non-natural row (masked ->
     neutral in GRPO). w_overlap is applied by --reward_weights.
+
+    Under --overlap_rect_frac the mask is a centred rectangle rather than the DINO
+    union, and Grounding-DINO is not called at all. Every step then has a mask, so the
+    only remaining route to None is a completion with no observe steps, or the
+    --overlap_natural_only mask.
     """
     n = len(saliency_map)
     if valid_list is None:
@@ -617,27 +743,40 @@ def think_overlap_reward(
     else:
         scored = [True] * n
 
-    # Flatten every (completion, observe-step) into one batched DINO call. Masked rows
-    # never reach DINO -- the trainer normally hands them no maps anyway, but a row
-    # masked here must not cost a grounding call even if it does.
-    flat_images, flat_texts, flat_owner = [], [], []
-    for c, steps in enumerate(saliency_map):
-        if not steps or not scored[c]:
-            continue
-        img = image[c]
-        for si, st in enumerate(steps):
-            flat_images.append(img)
-            flat_texts.append(st["text"])
-            flat_owner.append((c, si))
+    rect = rect_active()
 
-    boxes_per_item = _dino_boxes(flat_images, flat_texts) if flat_images else []
+    if rect:
+        # --overlap_rect_frac: the mask is a function of the GRID alone, so nothing here
+        # reads the step's text or the image, and _dino_boxes is never called. That is
+        # what makes the run detector-free -- _load_dino_local is lazy, so not calling it
+        # is the whole mechanism, and the launcher's WANT_DINO=false path can then give
+        # the GPU DINO would have held to training.
+        flat_owner = [(c, si) for c, steps in enumerate(saliency_map)
+                      if steps and scored[c] for si in range(len(steps))]
+        boxes_per_item = [None] * len(flat_owner)
+    else:
+        # Flatten every (completion, observe-step) into one batched DINO call. Masked rows
+        # never reach DINO -- the trainer normally hands them no maps anyway, but a row
+        # masked here must not cost a grounding call even if it does.
+        flat_images, flat_texts, flat_owner = [], [], []
+        for c, steps in enumerate(saliency_map):
+            if not steps or not scored[c]:
+                continue
+            img = image[c]
+            for si, st in enumerate(steps):
+                flat_images.append(img)
+                flat_texts.append(st["text"])
+                flat_owner.append((c, si))
+
+        boxes_per_item = _dino_boxes(flat_images, flat_texts) if flat_images else []
 
     # Gather grounded mean_in per completion.
     per_completion = [[] for _ in range(n)]
     for (c, si), boxes in zip(flat_owner, boxes_per_item):
         step_map = saliency_map[c][si]["map"]
         gh, gw = step_map.shape
-        mask = _union_mask(boxes, gh, gw)
+        mask = (_centre_rect_mask(gh, gw, _CFG["rect_frac"]) if rect
+                else _union_mask(boxes, gh, gw))
         if mask is None:
             continue  # DINO couldn't ground this step -> skip (do NOT score 0)
         s = _step_score(step_map, mask)

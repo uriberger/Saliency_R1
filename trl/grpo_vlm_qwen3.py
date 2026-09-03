@@ -600,6 +600,27 @@ if __name__ == "__main__":
             f"--maskfree {script_args.maskfree} and --placebo {script_args.placebo} both "
             "REPLACE the overlap reward in the same reward_funcs slot. Pick one."
         )
+    # --overlap_rect_frac does NOT take that slot -- it stays the overlap reward and swaps
+    # only its mask -- so it cannot be caught by the rule above. It still conflicts with
+    # both, and with the two variants that read the DINO union out of the same config.
+    if script_args.overlap_rect_frac is not None:
+        if script_args.reward_variant != "ours":
+            raise SystemExit(
+                f"--overlap_rect_frac {script_args.overlap_rect_frac} needs "
+                "--saliency_method attention (--reward_variant ours); got "
+                f"reward_variant='{script_args.reward_variant}'. The gradient and glimpse "
+                "rewards build their own masks from the same boxes; teaching them the "
+                "rectangle is a separate change, not a silent one."
+            )
+        if script_args.placebo or script_args.maskfree:
+            other = (f"--placebo {script_args.placebo}" if script_args.placebo
+                     else f"--maskfree {script_args.maskfree}")
+            raise SystemExit(
+                f"--overlap_rect_frac {script_args.overlap_rect_frac} and {other} cannot be "
+                "combined: the first replaces the overlap reward's MASK, the second "
+                "replaces the reward itself, so the rectangle would be built and then "
+                "thrown away. Pick one."
+            )
 
     if script_args.reward_variant == "ours":
         from trl.rewards.overlap_rewards import configure as configure_overlap
@@ -617,6 +638,9 @@ if __name__ == "__main__":
             mass_floor_tau=script_args.mass_floor_tau,
             dino_api_base=script_args.dino_api_base,
             natural_only=script_args.overlap_natural_only,
+            # None keeps the incumbent DINO-union path; a fraction switches the mask to a
+            # centred rectangle and stops the detector being constructed at all.
+            rect_frac=script_args.overlap_rect_frac,
         )
         if script_args.placebo:
             # --placebo takes the overlap reward's SLOT, so --reward_weights lines up

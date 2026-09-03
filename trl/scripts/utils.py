@@ -391,9 +391,32 @@ class ScriptArguments:
             "Sweep dimension — appears in the model/wandb name.",
         },
     )
+    overlap_rect_frac: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "reward_variant='ours': score each step's map against a CENTRED "
+            "RECTANGLE covering this fraction of the patch grid instead of against the "
+            "step's Grounding-DINO box union. NO DETECTOR IS RUN — no DINO GPU, no DINO "
+            "server, and the launchers drop the sidecar. Everything else is unchanged "
+            "(same --overlap_metric, same format gate, same reward slot and weights), so "
+            "the run differs from a DINO reference in the mask and nothing else. "
+            "0.565 is the fraction to use for that comparison: it is the mean union "
+            "coverage DINO produces on these runs, so the rectangle gives away nothing on "
+            "mask SIZE and differs in PLACEMENT alone. Measured motivation, from "
+            "centre_box_probe.py: the rectangle is NOT DINO's mask (area-matched "
+            "closeness 0.230, against a 0.235 different-image floor), yet the "
+            "per-completion reward built on it reproduces the real per-step-DINO reward's "
+            "ranking of a group at rho 0.651 vs 0.621 for DINO once per chain — so this "
+            "arm asks whether the detector was buying the gradient at all. Note every "
+            "step becomes scoreable (nothing is ungroundable), so the scored set is larger "
+            "than its DINO reference's, and w_overlap should be re-measured rather than "
+            "carried over. Sweep dimension — appears in the model/wandb name.",
+        },
+    )
     box_threshold: float = field(
         default=0.10,
-        metadata={"help": "reward_variant='ours': Grounding-DINO confidence threshold for per-step boxes."},
+        metadata={"help": "reward_variant='ours': Grounding-DINO confidence threshold for per-step boxes. "
+                          "Ignored under --overlap_rect_frac (no boxes are requested)."},
     )
     max_box_area: float = field(
         default=0.5,

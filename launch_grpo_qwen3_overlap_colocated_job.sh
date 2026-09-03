@@ -123,6 +123,37 @@
 # penalty an unscored mean_in already takes. Under the merged trainer the two are
 # identical. See "WHICH TRAINER IS RUNNING" below.
 #
+# A FIXED RECTANGLE INSTEAD OF THE BOXES -- is the detector buying anything?
+#
+#   bash launch_grpo_qwen3_overlap_colocated_job.sh --overlap-rect-frac 0.565
+#
+# Keeps think_overlap_reward and its metric, its slot and its weight, and swaps ONLY the
+# mask: each step is scored against a centred rectangle covering that fraction of the
+# patch grid instead of against its own Grounding-DINO union. NO DINO IS STARTED, so the
+# sidecar's GPU goes to training (2 GPUs are enough, as with --maskfree).
+#
+# Measured motivation (centre_box_probe.py, outputs/centre_box_probe/report.txt, on the
+# val_natural probe). Two findings that point opposite ways:
+#
+#   the rectangle is NOT DINO's mask   given the step's own union AREA, so that only
+#                                      placement differs, closeness to that union is
+#                                      0.230 -- against a 0.235 different-image floor.
+#   but the reward cannot tell         the per-completion reward built on the rectangle
+#                                      reproduces the real per-step-DINO reward's ranking
+#                                      of a group at rho 0.651, vs 0.621 for DINO once
+#                                      per chain -- and 0.638 for NO MASK AT ALL.
+#
+# GRPO only ever sees that ranking, so this run is the training arm: if the rectangle
+# trains as well as the boxes, the detector was not buying the gradient. 0.565 is the
+# fraction the probe used -- DINO's own mean union coverage -- so the arm differs from its
+# reference in mask PLACEMENT alone and gives nothing away on mask SIZE.
+#
+# Two things to expect. Nothing is ever ungroundable, so EVERY observe step is scored and
+# the scored set is larger than the reference's; and w_overlap was calibrated on DINO
+# unions, so re-check it with overlap_metric_spread.py before calling the two runs
+# pressure-matched. The run name carries _rect<frac> so it cannot share a checkpoint
+# directory with the DINO run it is compared against.
+#
 # WHICH TRAINER IS RUNNING. As of 2026-08-20 trl_repo/ is deliberately behind main on
 # trl/grpo_trainer_qwen3.py: main imputes each group's mean for an unscored reward
 # (8489767), trl_repo still folds with nansum, and that was not shipped because it
@@ -409,6 +440,13 @@ PLACEBO=${PLACEBO:-}
 # header and the GPU layout below.
 MASKFREE=${MASKFREE:-}
 MASKFREE_PARITY=${MASKFREE_PARITY:-false}
+# --overlap-rect-frac F: keep the overlap reward but score each step against a CENTRED
+# RECTANGLE covering F of the patch grid instead of against its DINO boxes. Empty = off
+# (the real union). Like --maskfree this starts no Grounding-DINO; unlike --maskfree it
+# is still think_overlap_reward, so --overlap-metric and the reward weights carry over.
+# 0.565 is the fraction to compare against a DINO run -- see the RECTANGLE block in
+# trl/rewards/overlap_rewards.py and outputs/centre_box_probe/report.txt.
+RECT_FRAC=${RECT_FRAC:-}
 
 # ---------- sidecar defaults ----------
 DINO_PORT=${DINO_PORT:-8100}
@@ -475,6 +513,7 @@ while [[ $# -gt 0 ]]; do
         --placebo)                PLACEBO="$2";                 shift 2 ;;
         --maskfree)               MASKFREE="$2";                shift 2 ;;
         --maskfree-parity)        MASKFREE_PARITY=true;         shift 1 ;;
+        --overlap-rect-frac)      RECT_FRAC="$2";               shift 2 ;;
         # Regulators. --beta is a real flag rather than an EXTRA_ARGS passthrough
         # precisely so it can reach SUFFIX below: passed through, a beta run would share a
         # checkpoint directory and a wandb run with the beta=0 control it is meant to be
@@ -593,6 +632,41 @@ if [[ -n "$MASKFREE" ]]; then
     fi
 fi
 
+# ---------- --overlap-rect-frac: the overlap reward on a fixed rectangle ----------
+# Sets the same WANT_DINO switch for the same reason -- no boxes are ever requested -- but
+# the reward is still think_overlap_reward, so unlike --maskfree it keeps --overlap-metric,
+# the reward slot and (subject to the warning below) the weight.
+if [[ -n "$RECT_FRAC" ]]; then
+    if ! awk -v f="$RECT_FRAC" 'BEGIN{exit !(f+0 > 0 && f+0 <= 1)}' </dev/null; then
+        echo "ERROR: --overlap-rect-frac must be in (0, 1] (got '$RECT_FRAC')." >&2
+        echo "       It is the fraction of the patch grid the rectangle covers." >&2
+        exit 1
+    fi
+    if [[ "$REWARD_VARIANT" != "ours" ]]; then
+        echo "ERROR: --overlap-rect-frac needs the attention map (--saliency-method attention);" >&2
+        echo "       got --saliency-method $REWARD_VARIANT. The gradient and glimpse rewards" >&2
+        echo "       build their own masks from the same boxes; that is a separate change." >&2
+        exit 1
+    fi
+    if [[ -n "$PLACEBO" || -n "$MASKFREE" ]]; then
+        echo "ERROR: --overlap-rect-frac replaces the overlap reward's MASK, while --placebo /" >&2
+        echo "       --maskfree replace the reward itself. Pick one." >&2
+        exit 1
+    fi
+    # The mask is the same on every step, so a union cap is all-or-nothing here: above the
+    # rectangle's own area it drops every step and the run trains with no overlap term at
+    # all, which looks in the logs like a weak reward rather than a broken one.
+    if [[ -n "$MAX_UNION_AREA" ]] && \
+       awk -v f="$RECT_FRAC" -v c="$MAX_UNION_AREA" 'BEGIN{exit !(c+0 > 0 && f+0 > c+0)}' </dev/null; then
+        echo "ERROR: --overlap-rect-frac $RECT_FRAC exceeds --max-union-area $MAX_UNION_AREA." >&2
+        echo "       The rectangle is identical on every step, so that cap would drop all of" >&2
+        echo "       them and every completion would go unscored. Lower one or drop the cap." >&2
+        exit 1
+    fi
+    # THE POINT OF THE FLAG: no detector, so no sidecar and its GPU goes to training.
+    WANT_DINO=false
+fi
+
 # ---------- --placebo: the three direction controls ----------
 if [[ -n "$PLACEBO" ]]; then
     case "$PLACEBO" in
@@ -622,7 +696,7 @@ fi
 if [ "$WANT_DINO" != true ] || [ "$SHARE_SIDECAR_GPU" = true ]; then MIN_GPUS=2; else MIN_GPUS=3; fi
 if (( NUM_GPUS < MIN_GPUS )); then
     if [ "$WANT_DINO" != true ]; then
-        echo "ERROR: need >=2 GPUs with --maskfree (1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
+        echo "ERROR: need >=2 GPUs with $([[ -n "$RECT_FRAC" ]] && echo '--overlap-rect-frac' || echo '--maskfree') (1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
     elif [ "$SHARE_SIDECAR_GPU" = true ]; then
         echo "ERROR: need >=2 GPUs with --share-sidecar-gpu (1 shared DINO+vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
     else
@@ -729,6 +803,19 @@ fi
 #
 #   (the probe must keep its maps -- the default -- or the `roll` row cannot be built).
 #
+# --overlap-rect-frac gets no weight of its own, deliberately: it is the SAME metric on a
+# different mask, so the metric's weight is the honest starting point and inventing a
+# second number would hide the one thing the arm is meant to isolate. But it is not known
+# to transfer either -- the rectangle moves the value spread, and it scores every step
+# where a DINO run scores only the groundable ones -- so say so once, here, after the
+# metric has picked W_OVERLAP and before the run name is built.
+if [[ -n "$RECT_FRAC" && -z "${W_OVERLAP_SET:-}" ]]; then
+    echo "NOTE: --overlap-rect-frac $RECT_FRAC keeps w_overlap=$W_OVERLAP, the weight measured" >&2
+    echo "      for --overlap-metric $OVERLAP_METRIC on DINO unions. The rectangle changes the" >&2
+    echo "      value spread and scores EVERY step, so re-check it with overlap_metric_spread.py" >&2
+    echo "      if this run is meant to be pressure-matched to a DINO reference." >&2
+fi
+
 # An explicit --w-overlap always wins, as it does for every other metric.
 if [[ -n "$PLACEBO" && -z "${W_OVERLAP_SET:-}" ]]; then
     case "$PLACEBO" in
@@ -913,6 +1000,10 @@ fi
 # --maskfree-parity run is a third thing again (same value, DINO-gated scored set).
 [[ -n "$MASKFREE" ]] && SUFFIX="${SUFFIX}_maskfree${MASKFREE}"
 [[ -n "$MASKFREE" && "$MASKFREE_PARITY" == true ]] && SUFFIX="${SUFFIX}_parity"
+# Same rule again: --overlap-rect-frac IS the reward its metric names, but scored against
+# a different mask, which is exactly the kind of difference that must not share a
+# checkpoint dir with its reference. The fraction is in the name because it is the arm.
+[[ -n "$RECT_FRAC" ]] && SUFFIX="${SUFFIX}_rect${RECT_FRAC}"
 [[ -n "$MASS_FLOOR_TAU" ]] && SUFFIX="${SUFFIX}_mf${MASS_FLOOR_TAU}"
 [[ -n "$MAX_UNION_AREA" ]] && SUFFIX="${SUFFIX}_mu${MAX_UNION_AREA}"
 [[ "$MAX_BOX_AREA" == "0" ]] && SUFFIX="${SUFFIX}_nobox"
@@ -1070,7 +1161,7 @@ echo "Model:            $MODEL"
 echo "GPUs (total $NUM_GPUS):  $([ "$WANT_DINO" = true ] && echo "DINO=cuda:$DINO_GPU  " || echo 'DINO=none  ')vLLM=cuda:$VLLM_GPU  train=cuda:[$TRAIN_GPUS] ($TRAIN_N procs)$([ "$SHARE_SIDECAR_GPU" = true ] && [ "$WANT_DINO" = true ] && echo '  [sidecars SHARED on cuda:0]')"
 echo "Generation:       vLLM server  127.0.0.1:$VLLM_PORT  gpu_mem=$VLLM_GPU_MEM  max_len=$VLLM_MAX_MODEL_LEN"
 if [ "$WANT_DINO" != true ]; then
-echo "DINO reward:      NOT STARTED -- --maskfree $MASKFREE scores no boxes"
+echo "DINO reward:      NOT STARTED -- $([[ -n "$RECT_FRAC" ]] && echo "--overlap-rect-frac $RECT_FRAC scores a fixed rectangle" || echo "--maskfree $MASKFREE scores no boxes")"
 else
 echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_box_area=$([[ "$MAX_BOX_AREA" == "0" ]] && echo 'off (no per-box cap)' || echo "$MAX_BOX_AREA") max_union_area=$([[ -n "$MAX_UNION_AREA" ]] && echo "$MAX_UNION_AREA" || echo 'off')"
 fi
@@ -1080,6 +1171,12 @@ if [[ -n "$MASKFREE" ]]; then
 echo "Metric:           (none -- --maskfree replaces the metric; --overlap-metric is ignored)"
 else
 echo "Metric:           $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " mass_floor_tau=$MASS_FLOOR_TAU" || echo " (no mass floor)")"
+fi
+if [[ -n "$RECT_FRAC" ]]; then
+echo "Mask:             CENTRED RECTANGLE covering $RECT_FRAC of the patch grid -- no Grounding-DINO."
+echo "                  Same metric, same reward slot, same weight; only the mask differs from a"
+echo "                  DINO run. Every observe step is scored (nothing can be ungroundable), so"
+echo "                  the scored set is LARGER than its reference's -- see outputs/centre_box_probe."
 fi
 if [[ -n "$MASKFREE" ]]; then
     case "$MASKFREE" in
@@ -1218,6 +1315,7 @@ if ! $DIRECT; then
                 ${PLACEBO:+--placebo $PLACEBO} \
                 ${MASKFREE:+--maskfree $MASKFREE} \
                 $([ "$MASKFREE_PARITY" = true ] && echo --maskfree-parity) \
+                ${RECT_FRAC:+--overlap-rect-frac $RECT_FRAC} \
                 --saliency-method $SALIENCY_METHOD_R \
                 --grad-target $GRAD_TARGET \
                 --grad-null-offsets $GRAD_NULL_OFFSETS \
@@ -1373,7 +1471,7 @@ if [ "$WANT_DINO" = true ]; then
         > "$LOG_DIR/dino.log" 2>&1 &
     DINO_PID=$!
 else
-    echo "[start] Grounding-DINO SKIPPED (--maskfree $MASKFREE needs no boxes)"
+    echo "[start] Grounding-DINO SKIPPED ($([[ -n "$RECT_FRAC" ]] && echo "--overlap-rect-frac $RECT_FRAC scores a fixed rectangle" || echo "--maskfree $MASKFREE needs no boxes"))"
 fi
 
 # ---------- 2. vLLM generation server on GPU 1 ----------
@@ -1450,6 +1548,11 @@ PLACEBO_FLAG=""
 MASKFREE_FLAG=""
 [[ -n "$MASKFREE" ]] && MASKFREE_FLAG="--maskfree $MASKFREE"
 [[ -n "$MASKFREE" && "$MASKFREE_PARITY" == true ]] && MASKFREE_FLAG="$MASKFREE_FLAG --maskfree_parity"
+
+# Same shape once more: omitted when unset, so the dataclass default (None = score the
+# DINO union) applies and every existing run's command line is byte-identical.
+RECT_FLAG=""
+[[ -n "$RECT_FRAC" ]] && RECT_FLAG="--overlap_rect_frac $RECT_FRAC"
 
 # Same shape a third time, and the reason matters more here than for the two above: the
 # length guard is OFF unless --length-guard names a reference length, and off must mean
@@ -1577,6 +1680,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     $MASS_FLOOR_FLAG \
     $PLACEBO_FLAG \
     $MASKFREE_FLAG \
+    $RECT_FLAG \
     $BETA_FLAG \
     $LENGTH_GUARD_FLAG \
     $NATURAL_ONLY_FLAG \
