@@ -26,7 +26,7 @@ same SYSTEM_PROMPT, the same 512px image cap, the same sampling parameters, the 
 FLAN-T5 observe-step segmentation, the same format regex, the same --box_threshold. All
 of it is reused from overlap_probe.py rather than reimplemented.
 
-Three phases, because only the middle one wants a GPU:
+Four phases, because only the second one wants a GPU:
 
     # 1. plan (CPU, ~2 min): hash every image, pick the donor rows
     python build_mismatch_bank.py --plan --out-dir outputs/mismatch_bank/8k \
@@ -39,10 +39,10 @@ Three phases, because only the middle one wants a GPU:
     # 3. merge (CPU): one bank.json for --mismatch_bank
     python build_mismatch_bank.py --merge --out-dir outputs/mismatch_bank/8k
 
-    # and then, any time
+    # 4. verify (CPU): re-run the real donor resolution and describe what was built
     python build_mismatch_bank.py --verify --out-dir outputs/mismatch_bank/8k
 
-launch_mismatch_bank.sh runs all three.
+launch_mismatch_bank.sh runs all four; --smoke does 4 donors x 4 chains on one card.
 """
 
 from __future__ import annotations
@@ -425,17 +425,31 @@ def phase_merge(args):
     path = out / BANK_NAME
     path.write_text(json.dumps(bank))
     print(f"wrote {path}  ({path.stat().st_size / 1e6:.1f} MB), {len(donors)} donor rows")
-    _report(bank)
+    _report(bank, args.max_box_area)
 
 
 # ---------------------------------------------------------------------------
 # --verify
 # ---------------------------------------------------------------------------
-def _report(bank):
+# The patch grids the cold-start policy actually produces on this corpus, from the
+# val_natural and grad_spread probes: the 512px cap and Qwen3-VL's patch merge put every
+# image in a narrow band around 11x16. The union is rasterised onto the RECIPIENT's grid,
+# so a donor's boxes are only skipped or kept relative to one of these.
+TYPICAL_GRIDS = ((11, 16), (12, 16), (10, 16), (16, 12), (16, 11))
+
+
+def _report(bank, max_box_area=0.5):
+    # _union_mask reads the caps out of overlap_rewards' own config, not from arguments,
+    # so set them here rather than passing them -- the printed rate has to be the one the
+    # reward would produce under these caps, and the reward will read this same config.
+    OREW.configure(max_box_area=max_box_area)
+    OREW._CFG["max_union_area"] = None
     donors = bank["donors"]
     lens = Counter()
     per_donor_lengths = []
     n_steps = n_ungrounded = 0
+    skipped = Counter()
+    union_frac = []
     for d in donors:
         ls = sorted(int(k) for k in d["chains"])
         per_donor_lengths.append(set(ls))
@@ -445,11 +459,32 @@ def _report(bank):
                 for step in chain:
                     n_steps += 1
                     n_ungrounded += 1 if not step else 0
+                    for gh, gw in TYPICAL_GRIDS:
+                        m = OREW._union_mask(step, gh, gw)
+                        if m is None:
+                            skipped[(gh, gw)] += 1
+                        else:
+                            union_frac.append(float(m.mean()))
     total = sum(lens.values())
     print(f"\ndonor rows            {len(donors)}")
     print(f"chains                {total}   ({total / max(1, len(donors)):.1f} per donor)")
-    print(f"steps                 {n_steps}   ungrounded {n_ungrounded} "
-          f"({100 * n_ungrounded / max(1, n_steps):.1f}%; the cold start's own rate is 3.4%)")
+    print(f"steps                 {n_steps}   DINO grounded nothing on {n_ungrounded} "
+          f"({100 * n_ungrounded / max(1, n_steps):.1f}%)")
+    # The number to compare with the reference, and not the same as the line above: the
+    # reward skips a step when the boxes give NO USABLE UNION, which also covers every box
+    # losing --max_box_area and the union coming out empty or full on the recipient's grid.
+    # The cold start's own end-to-end rate, measured over 3008 observe steps of the
+    # val_natural and grad_spread probes, is 3.4% -- that is what this should look like.
+    if n_steps:
+        lo = 100 * min(skipped[g] for g in TYPICAL_GRIDS) / n_steps
+        hi = 100 * max(skipped[g] for g in TYPICAL_GRIDS) / n_steps
+        print(f"steps the REWARD would skip  {lo:.1f}-{hi:.1f}% over the grids this corpus "
+              f"produces\n                      (--max_box_area {max_box_area}; the cold "
+              f"start's own end-to-end rate is 3.4%)")
+        if union_frac:
+            q = np.percentile(union_frac, [10, 50, 90])
+            print(f"donor union coverage  p10 {q[0]:.2f} / median {q[1]:.2f} / p90 {q[2]:.2f} "
+                  f"of the patch grid\n                      (the cold start's own median is 0.58)")
     print("\nchains by observe-step count, and the share of donor rows that can serve it")
     print("  n   chains   donors covering n")
     for n in sorted(lens):
@@ -530,7 +565,7 @@ def phase_verify(args):
             assert len(chain) == L and L >= 1
     print(f"  ok   step counts 1..19, 40, 85, 200 all resolve to a chain")
 
-    _report(bank)
+    _report(bank, args.max_box_area)
     print("\n" + ("VERIFY OK" if ok else "VERIFY FAILED"))
     return 0 if ok else 1
 
@@ -576,6 +611,11 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=1024)
     ap.add_argument("--gen-batch", type=int, default=8,
                     help="sequences per generate() call; the KV-cache knob")
+    ap.add_argument("--max-box-area", type=float, default=0.5,
+                    help="--merge/--verify reporting only: the per-box area cap the RUN "
+                         "will apply, used to print the skip rate the reward would see. "
+                         "Not baked into the bank -- unlike --box-threshold it is applied "
+                         "at scoring time, so a run is free to differ.")
     ap.add_argument("--box-threshold", type=float, default=0.10,
                     help="DINO confidence floor. Baked into the bank: the reward refuses "
                          "a bank whose threshold differs from the run's.")

@@ -226,7 +226,12 @@ Logged as `mismatch/*`:
     --merge    CPU. Shards + plan -> bank.json.
     --verify   CPU. Re-runs the real donor resolution over 2000 sampled rows and asserts
                every one lands on a different question and a different picture; asserts
-               step counts 1..19, 40, 85 and 200 all resolve; prints the length coverage.
+               step counts 1..19, 40, 85 and 200 all resolve; prints the length coverage,
+               the donor unions' grid coverage, and the rate at which the REWARD would
+               skip a step -- which is not the rate at which DINO grounded nothing, since
+               a step is also skipped when every box loses --max_box_area or the union
+               comes out empty or full on the recipient's grid. That rate is what has to
+               look like the reference's 3.4%.
 
 Defaults are 256 donor rows × 64 chains = 16,384 chains, ~1–2 hours on 8 cards.
 
