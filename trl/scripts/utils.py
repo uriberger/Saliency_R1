@@ -529,6 +529,33 @@ class ScriptArguments:
             "maskfree/mass in the logs and raise this."
         },
     )
+    mismatch_bank: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "reward_variant='ours': REPLACE the attention-overlap reward with the "
+            "MISMATCHED-BOX control -- the same metric on the same map, but scored against "
+            "real Grounding-DINO boxes computed for a DIFFERENT question about a DIFFERENT "
+            "picture. Tests the assumption every other variant is downstream of: that "
+            "running DINO on THAT SENTENCE matters. Takes the path of a bank written by "
+            "build_mismatch_bank.py; no DINO is loaded at training time at all, which is "
+            "16.6 s off a 40.5 s optimizer step. The donor row is fixed per training row "
+            "and shared by all of a prompt's rollouts -- drawing one per completion would "
+            "put 0.0117 of donor noise inside a group whose whole real reward spans 0.0115, "
+            "i.e. re-run --placebo random. Within-group spread is 0.82x the reference's, so "
+            "the launcher gives it ~1.22x mean_in's weight. Takes the overlap reward's slot "
+            "in reward_funcs, so --reward_weights is unchanged. See "
+            "docs/mismatch-boxes.md and trl/rewards/mismatch_rewards.py."
+        },
+    )
+    mismatch_seed: int = field(
+        default=0,
+        metadata={
+            "help": "--mismatch_bank: chooses which donor row each training row is paired "
+            "with, and which of that donor's chains is used at each length. Two runs "
+            "differing only in it are independent replicates of the control over a "
+            "different random pairing, which is the way to tell a result from a pairing."
+        },
+    )
     length_guard_ref: Optional[float] = field(
         default=None,
         metadata={

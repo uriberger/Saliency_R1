@@ -605,11 +605,25 @@ if __name__ == "__main__":
             "The mask-free rewards are controls for the attention-overlap reward and "
             "their weights were measured on that map."
         )
-    # Both take the same slot in reward_funcs, so one of them would silently win.
-    if script_args.maskfree and script_args.placebo:
+    # --mismatch_bank is a third control on the same reference, and the same argument
+    # applies: its donor boxes are scored by the ATTENTION map's metric at the ATTENTION
+    # map's scale, and its weight was measured there.
+    if script_args.mismatch_bank and script_args.reward_variant != "ours":
         raise SystemExit(
-            f"--maskfree {script_args.maskfree} and --placebo {script_args.placebo} both "
-            "REPLACE the overlap reward in the same reward_funcs slot. Pick one."
+            f"--mismatch_bank needs --saliency_method attention "
+            f"(--reward_variant ours); got reward_variant='{script_args.reward_variant}'. "
+            "The mismatched-box control is a control for the attention-overlap reward and "
+            "its weight was measured on that map."
+        )
+    # All three take the same slot in reward_funcs, so any two would mean one silently
+    # wins and the run is named after the loser.
+    _slot = [n for n, v in (("--placebo", script_args.placebo),
+                            ("--maskfree", script_args.maskfree),
+                            ("--mismatch_bank", script_args.mismatch_bank)) if v]
+    if len(_slot) > 1:
+        raise SystemExit(
+            f"{' and '.join(_slot)} all REPLACE the overlap reward in the same "
+            "reward_funcs slot. Pick one."
         )
     # --overlap_rect_frac does NOT take that slot -- it stays the overlap reward and swaps
     # only its mask -- so it cannot be caught by the rule above. It still conflicts with
@@ -716,6 +730,22 @@ if __name__ == "__main__":
                                parity=script_args.maskfree_parity,
                                mass_anchor=script_args.maskfree_mass_anchor)
             reward_funcs = [think_format_reward, think_maskfree_reward, accuracy_reward, openai_reward]
+        elif script_args.mismatch_bank:
+            # --mismatch_bank takes the same slot again, and like --maskfree it loads no
+            # Grounding-DINO: the boxes were computed offline by build_mismatch_bank.py.
+            # configure_overlap above still ran, and is read rather than duplicated -- the
+            # metric, the mass floor, --max_box_area, --max_union_area and
+            # --overlap_natural_only all come from it, so this run differs from its
+            # reference in exactly one thing: which sentence and which picture the boxes
+            # were computed for. Configured AFTER it for that reason, and because it
+            # checks --box_threshold against the bank's (that filter was applied when the
+            # bank was written and cannot be re-applied here).
+            from trl.rewards.mismatch_rewards import configure as configure_mismatch
+            from trl.rewards.mismatch_rewards import think_mismatch_reward
+
+            configure_mismatch(bank=script_args.mismatch_bank,
+                               seed=script_args.mismatch_seed)
+            reward_funcs = [think_format_reward, think_mismatch_reward, accuracy_reward, openai_reward]
         else:
             reward_funcs = [think_format_reward, think_overlap_reward, accuracy_reward, openai_reward]
     elif script_args.reward_variant == "grad":

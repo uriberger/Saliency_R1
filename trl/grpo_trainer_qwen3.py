@@ -2934,6 +2934,24 @@ class GRPOTrainer(Trainer):
                     _g = _g[~torch.isnan(_g)]
                     if _g.numel():
                         self._metrics[mode][f"maskfree/{_k}"].append(_g.mean().item())
+
+            # --mismatch_bank by-products. `exact_len_frac` is the one to read: the donor
+            # bank is built from the cold-start model, whose chains stop at 14 observe
+            # steps, and a drifting policy walks past that (the trained checkpoints in the
+            # same probes reach 85). It falling is the run leaving the lengths the bank can
+            # match exactly, which is a description of the drift and not a failure -- the
+            # nearest length from the SAME donor row costs 0.21x the reward's within-group
+            # spread. Same rank-uniform argument as the two blocks above.
+            from trl.rewards.mismatch_rewards import is_active as _mismatch_active
+            from trl.rewards.mismatch_rewards import pop_diagnostics as pop_mismatch_diagnostics
+
+            if _mismatch_active():
+                for _k, _v in pop_mismatch_diagnostics().items():
+                    _t = torch.tensor([_v], dtype=torch.float32, device=device)
+                    _g = gather(_t)
+                    _g = _g[~torch.isnan(_g)]
+                    if _g.numel():
+                        self._metrics[mode][f"mismatch/{_k}"].append(_g.mean().item())
         if self.reward_variant == "grad":
             # The roll-null closes box size and confidence; it does not close the centre
             # hack (`ecc` rising, and correlating with the score), the reward going hollow

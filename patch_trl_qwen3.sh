@@ -134,6 +134,21 @@ echo "  copied placebo-control file (placebo_rewards)"
 cp "$REPO/trl/rewards/maskfree_rewards.py" "$TRL_REPO/trl/rewards/maskfree_rewards.py"
 echo "  copied mask-free reward file (maskfree_rewards)"
 
+# ── 2i. mismatched-box control (--mismatch_bank) ────────────────────────────
+# Same placement rule as 2e and 2f: mismatch_rewards.py does `from . import
+# overlap_rewards` -- it reuses that module's _union_mask, _step_score and every knob
+# they read, so the control differs from its reference in the boxes and nothing else --
+# so it lands beside it in trl/rewards/. No map module and no DINO: the boxes come from
+# a bank built offline by build_mismatch_bank.py, and it takes the same reward_funcs slot
+# as --placebo and --maskfree.
+#
+# LOAD-BEARING FOR EVERY `--reward_variant ours` RUN for the same reason 2f is:
+# grpo_trainer_qwen3.py imports is_active/pop_diagnostics from this module in its "ours"
+# metrics block, BEFORE the is_active() guard. Omitting the copy is not "the new flag is
+# unavailable", it is an ImportError on the first metrics log of a plain mean_in run.
+cp "$REPO/trl/rewards/mismatch_rewards.py" "$TRL_REPO/trl/rewards/mismatch_rewards.py"
+echo "  copied mismatched-box control file (mismatch_rewards)"
+
 # ── 2h. length guard (--length-guard REF_TOKENS) ────────────────────────────
 # An ADDITIONAL reward term, not a slot replacement: it applies under every
 # --saliency-method and under --reward_variant none, so grpo_vlm_qwen3.py appends it and
