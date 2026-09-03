@@ -5,10 +5,17 @@
 #
 #   bash launch_precompute_question_boxes_job.sh \
 #       --dataset cold_data/grpo_sets/set_a \
-#       [--out <file>] [--gpus 8] [--duration 1] [--box-threshold 0.10] [--dry-run]
+#       [--out <file>] [--gpus 8] [--duration 1] [--box-threshold 0.10] \
+#       [--direct] [--dry-run]
 #
 # --out defaults to outputs/question_boxes/<dataset>_bt<threshold>.json, which is
 # gitignored and symlinked into every worktree, so the cache is built once and shared.
+#
+# --direct runs the shard fan-out HERE instead of submitting it, for when you are already
+# inside an allocation (or on a GPU box with no SLURM). Same runner script either way, so
+# the two paths cannot diverge. With --direct and no explicit --gpus, the shard count comes
+# from the GPUs actually visible rather than the 8 a submitted job would ask for -- fanning
+# 8 shards at 2 visible cards would put four processes on each and OOM.
 #
 # The output feeds `launch_grpo_qwen3_overlap_job.sh --question-boxes <out>`, which then
 # runs with no Grounding-DINO on the training device at all.
@@ -28,7 +35,10 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DATASET=""
 OUT=""
-GPUS=8
+# GPUS doubles as the shard count. Left unset so --direct can tell "the user asked for N"
+# from "nobody said", and default to the visible cards in the second case only.
+GPUS=""
+DIRECT=false
 DURATION=1
 BOX_THRESHOLD=0.10
 # The detector's own batch. 32 OOMs on an 80GB card at 512px and halves itself, which
@@ -41,6 +51,7 @@ EXTRA=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)        DRY_RUN=1;            shift   ;;
+        --direct)         DIRECT=true;          shift   ;;
         --dataset)        DATASET="$2";         shift 2 ;;
         --out)            OUT="$2";             shift 2 ;;
         --gpus)           GPUS="$2";            shift 2 ;;
@@ -54,6 +65,32 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$DATASET" ]] || { echo "ERROR: --dataset is required." >&2; exit 2; }
+
+# How many shards, and therefore how many cards the fan-out expects. A submitted job asks
+# SLURM for the number, so 8 is simply the request; running here, the number is a FACT
+# about this machine, and getting it wrong stacks shards onto the same card.
+VISIBLE=""
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    VISIBLE=$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
+elif command -v nvidia-smi >/dev/null 2>&1; then
+    VISIBLE=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)
+fi
+if $DIRECT; then
+    if [[ -z "$GPUS" ]]; then
+        [[ -n "$VISIBLE" && "$VISIBLE" -gt 0 ]] || {
+            echo "ERROR: --direct could not see any GPU (no CUDA_VISIBLE_DEVICES, and" >&2
+            echo "       nvidia-smi found nothing). Pass --gpus N if you know better." >&2
+            exit 1; }
+        GPUS=$VISIBLE
+        echo "[note] --direct: fanning $GPUS shard(s) over the $GPUS visible GPU(s)."
+    elif [[ -n "$VISIBLE" && "$VISIBLE" -gt 0 && "$GPUS" -gt "$VISIBLE" ]]; then
+        echo "ERROR: --gpus $GPUS but only $VISIBLE GPU(s) are visible. The fan-out gives" >&2
+        echo "       shard i to GPU i, so the extra shards would stack onto cards that are" >&2
+        echo "       already busy and OOM. Lower --gpus, or drop it to use all $VISIBLE." >&2
+        exit 1
+    fi
+fi
+GPUS=${GPUS:-8}
 
 # A local corpus must be absolutised, because the runner cds to $REPO. Look for it in the
 # invocation cwd first and in $REPO second -- a worktree does not have cold_data/grpo_sets
@@ -84,8 +121,12 @@ OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
 
 # shellcheck source=/dev/null
 source "$REPO/cluster_env.sh"
-PARTITION=${PARTITION:-$(SR1_JOB_HOURS=$DURATION sr1_pick_partition)}
-ACCOUNT=${ACCOUNT:-nvr_israel_rlop}
+# Neither is read on the --direct path, and resolving a partition there would ask SLURM a
+# question about a job that is not being submitted.
+if ! $DIRECT; then
+    PARTITION=${PARTITION:-$(SR1_JOB_HOURS=$DURATION sr1_pick_partition)}
+    ACCOUNT=${ACCOUNT:-nvr_israel_rlop}
+fi
 CONDA_ENV=${CONDA_ENV:-saliency_r1_qwen3_vllm}
 
 CONDA_ROOT=${CONDA_ROOT:-}
@@ -97,8 +138,11 @@ if [[ -z "$CONDA_ROOT" ]]; then
 fi
 [[ -n "$CONDA_ROOT" ]] || { echo "ERROR: no conda root found." >&2; exit 1; }
 
-sr1_find_submit_job || [[ $DRY_RUN -eq 1 ]] || {
-    echo "ERROR: submit_job not found under the cluster-interface paths." >&2; exit 1; }
+if ! $DIRECT; then
+    sr1_find_submit_job || [[ $DRY_RUN -eq 1 ]] || {
+        echo "ERROR: submit_job not found under the cluster-interface paths. Use --direct" >&2
+        echo "       to run here instead." >&2; exit 1; }
+fi
 
 LOG_ROOT="$REPO/outputs/logs"
 mkdir -p "$LOG_ROOT"
@@ -153,7 +197,11 @@ RUNNER_EOF
 chmod +x "$RUNNER"
 
 echo "=========================================================================="
+if $DIRECT; then
+echo "Job       : $NAME   (direct, no SLURM, ${GPUS} GPU)"
+else
 echo "Job       : $NAME   ($ACCOUNT, $PARTITION, ${DURATION}h, ${GPUS} GPU)"
+fi
 echo "Dataset   : $DATASET"
 echo "Out       : $OUT"
 echo "DINO      : box_threshold=$BOX_THRESHOLD batch_size=$BATCH_SIZE"
@@ -162,7 +210,12 @@ echo "==========================================================================
 cat "$RUNNER"
 echo "=========================================================================="
 
-[[ $DRY_RUN -eq 1 ]] && { echo "[dry-run] not submitting."; exit 0; }
+[[ $DRY_RUN -eq 1 ]] && { echo "[dry-run] not $($DIRECT && echo running || echo submitting)."; exit 0; }
+
+# The SAME runner the submitted path would have handed to the node, so the two modes
+# cannot drift. exec, so this script's exit status IS the build's -- a failed shard must
+# not look like a success to whatever called this.
+if $DIRECT; then exec bash "$RUNNER"; fi
 
 submit_job \
     --account "$ACCOUNT" \
