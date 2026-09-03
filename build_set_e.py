@@ -41,6 +41,20 @@ is resolved the two ways build_set_d documents at length -- archive SHA-256 inde
 content match in the metadata -- because the 8k re-encoded 2,793 of its own rows and a
 basename alone does not reach them.
 
+Only two of those are requirements. The validation pools are the one real leakage channel
+-- set_e's checkpoints get scored against val_e, val_c, val_d or the legacy pair, so a
+training image in any of them corrupts a number. The 8k matters because overlap would let
+a 2x-data result be read as memorisation. set_c and set_d are excluded because the pools
+are ample enough that not re-spending an image costs nothing (126,297 free against the
+13,906 needed), NOT because set_e must be disjoint from them; --verify counts that overlap
+rather than asserting it.
+
+Exclusion is by basename, and a basename is not an identity: Visual-CoT stores
+byte-identical pictures under different names, so a basename filter leaks at the margin.
+Measured on the 2026-09-03 build, that margin is 33 images inside set_e itself (13,906
+slots resolve to 13,873 distinct pictures) and 3 against set_c/set_d. The 8k check does
+not rely on names alone, which is why it comes out exactly clean.
+
 Soft de-prioritisation: set_a / set_b's Visual-CoT images. Excluding them outright is
 infeasible on exactly one source -- vsr's whole pool is 1,765 images and set_a/set_b hold
 1,676 of them, leaving 27 against the 126 set_e needs. So they are ordered last in every
@@ -446,8 +460,33 @@ def link_val_dir(out_dir):
     print(f"\nvalidation aliases: {link_dir}/{{val_natural,val_nonnatural}}")
 
 
+# Every validation set set_e's checkpoints can be scored against. A training image
+# sitting in any of these corrupts a number someone will read, so an overlap is a
+# failure -- this is the only genuine leakage channel set_e has.
+VAL_SETS = ("val_e_natural", "val_e_nonnatural",
+            "val_c_natural", "val_c_nonnatural",
+            "val_d_natural", "val_d_nonnatural",
+            "val_natural", "val_nonnatural")
+
+# Sibling TRAINING corpora. Overlap here is reported, not asserted: they are never
+# trained on alongside set_e, and the benchmarks are separate corpora, so a shared
+# picture leaks nothing. build_set_d asserted this because being image-disjoint from
+# the 8k and from set_c was the whole point of set_d -- it exists to absorb the
+# "different pictures" effect so a set_c contrast leaves packing as the residual.
+# set_e has no such role. If anything, the one contrast set_e and set_c might be put
+# to -- packing at fixed rows, which set_c_ms3900 stopped too early (0.63 epoch) to
+# settle -- wants shared pictures rather than disjoint ones.
+SIBLING_SETS = ("set_c", "set_d")
+
+
 def do_verify(args):
-    """Check the saved artifacts, on the same two notions of identity build_set_d uses."""
+    """Check the saved artifacts, on the same two notions of identity build_set_d uses.
+
+    Asserts what set_e was specified to hold: no overlap with saliency-r1-8k (which
+    would confound a 2x-data comparison with memorisation) and no overlap with any
+    validation set (which would be leakage). Overlap with set_c / set_d is counted and
+    printed, because it is not a property set_e was ever asked for -- see SIBLING_SETS.
+    """
     if os.environ.get("MALLOC_ARENA_MAX") != "2":
         os.environ["MALLOC_ARENA_MAX"] = "2"
         os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -464,31 +503,40 @@ def do_verify(args):
     print(f"  set_e: {len(train)} rows, {len(train_set)} distinct images "
           f"({100 * len(train_set) / max(1, len(train)):.1f}% unique)\n")
 
+    print("Validation sets -- an overlap here is leakage:")
     seen = {}
-    for name in ("val_e_natural", "val_e_nonnatural", "set_c", "set_d",
-                 "val_c_natural", "val_c_nonnatural", "val_d_natural",
-                 "val_d_nonnatural", "val_natural", "val_nonnatural"):
+    for name in VAL_SETS:
         path = out_dir / name
         if not path.exists():
-            print(f"{name}: absent, skipped")
+            print(f"  {name}: absent, skipped")
             continue
-        print(f"Hashing {name} ...")
         hashes = B.stored_image_hashes(path)
         leaked = train_set.intersection(hashes)
         print(f"  {name}: {len(hashes)} rows, {len(set(hashes))} distinct images")
         if leaked:
-            print(f"  FAIL: {len(leaked)} image(s) also appear in set_e")
+            print(f"    FAIL: {len(leaked)} image(s) also appear in set_e")
             ok = False
-        if name.startswith("val"):
-            dupes = len(hashes) - len(set(hashes))
-            cross = set(hashes).intersection(seen)
-            seen.update({h: name for h in hashes})
-            if dupes:
-                print(f"  FAIL: {dupes} row(s) repeat an image within the set")
-                ok = False
-            if cross:
-                print(f"  FAIL: {len(cross)} image(s) shared with another validation set")
-                ok = False
+        dupes = len(hashes) - len(set(hashes))
+        cross = set(hashes).intersection(seen)
+        seen.update({h: name for h in hashes})
+        if dupes:
+            print(f"    FAIL: {dupes} row(s) repeat an image within the set")
+            ok = False
+        if cross:
+            print(f"    FAIL: {len(cross)} image(s) shared with another validation set")
+            ok = False
+
+    print("\nSibling training corpora -- reported, not asserted:")
+    for name in SIBLING_SETS:
+        path = out_dir / name
+        if not path.exists():
+            print(f"  {name}: absent, skipped")
+            continue
+        hashes = B.stored_image_hashes(path)
+        shared = train_set.intersection(hashes)
+        pct = 100 * len(shared) / max(1, len(train_set))
+        print(f"  {name}: {len(hashes)} rows, {len(set(hashes))} distinct images"
+              f"   shares {len(shared)} picture(s) with set_e ({pct:.2f}%)")
 
     print("\nChecking against saliency-r1-8k ...")
     rows8k, per8k, hashes8k = D.eightk_image_hashes()
