@@ -86,6 +86,13 @@ from trl import (
 )
 from trl.rewards import think_format_reward, think_saliency_reward, openai_reward
 
+# The long-side cap every image is resized to before the model or any detector sees it.
+# Module-level because --overlap_question_boxes grounds the same images in a separate
+# offline job (precompute_question_boxes.py), and Grounding-DINO shown a different
+# resolution returns different boxes -- the value is written into that file and checked
+# back when it is loaded, so the two copies cannot drift apart in silence.
+MAX_IMAGE_SIDE = 512
+
 
 def _with_image_placeholder(messages):
     """Rewrite a text-only conversation into multimodal content, as the trainer does.
@@ -438,7 +445,11 @@ if __name__ == "__main__":
     # VisDrone) do not -- dropping oversized samples would silently discard most
     # of such a dataset, so downscale instead of filtering. Boxes in the `bbox`
     # column are normalized to [0, 1], so they survive the resize unchanged.
-    MAX_IMAGE_SIDE = 512
+    #
+    # MAX_IMAGE_SIDE is module-level (see the top of this file) because
+    # --overlap_question_boxes grounds the same images in a separate offline job, and a
+    # detector shown a different resolution returns different boxes. The value is written
+    # into that file and checked back here, so the two cannot drift apart quietly.
 
     def prepare_image(example):
         image = example["image"]
@@ -622,6 +633,25 @@ if __name__ == "__main__":
                 "thrown away. Pick one."
             )
 
+    # --overlap_question_boxes is read by think_overlap_reward and by nothing else. Every
+    # other variant flattens (completion, step) into its OWN _dino_boxes call, so passing
+    # the flag to one of them would leave the per-step grounding running and change
+    # nothing -- a null result that looks like a finding. Refuse instead of ignoring.
+    if script_args.overlap_question_boxes:
+        wrong = None
+        if script_args.reward_variant != "ours":
+            wrong = f"--reward_variant {script_args.reward_variant}"
+        elif script_args.placebo:
+            wrong = f"--placebo {script_args.placebo}"
+        elif script_args.maskfree:
+            wrong = f"--maskfree {script_args.maskfree}"
+        if wrong:
+            raise SystemExit(
+                f"--overlap_question_boxes is only read by the overlap reward, but {wrong} "
+                "puts a different reward in that slot and grounds per step itself. The run "
+                "would be identical to one without the flag."
+            )
+
     if script_args.reward_variant == "ours":
         from trl.rewards.overlap_rewards import configure as configure_overlap
         from trl.rewards.overlap_rewards import think_overlap_reward
@@ -641,7 +671,19 @@ if __name__ == "__main__":
             # None keeps the incumbent DINO-union path; a fraction switches the mask to a
             # centred rectangle and stops the detector being constructed at all.
             rect_frac=script_args.overlap_rect_frac,
+            # The other way to stop constructing the detector: read one union per dataset
+            # row, grounded on its question before the run. configure() refuses the pair.
+            question_boxes=script_args.overlap_question_boxes,
         )
+        if script_args.overlap_question_boxes:
+            # Load and validate NOW rather than on the first reward call: a threshold or
+            # resolution mismatch is a configuration error, and finding it after the model
+            # has loaded and the first generations are done costs an allocation.
+            from trl.rewards.overlap_rewards import load_question_boxes
+
+            load_question_boxes(script_args.overlap_question_boxes,
+                                box_threshold=script_args.box_threshold,
+                                max_image_side=MAX_IMAGE_SIDE)
         if script_args.placebo:
             # --placebo takes the overlap reward's SLOT, so --reward_weights lines up
             # unchanged and the run differs from its reference in the reward's value and

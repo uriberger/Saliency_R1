@@ -203,6 +203,21 @@
 # the overlap term on those rows (their `natural` column is False); they keep format +
 # accuracy + judge. Adds _natonly to the run name. Off by default.
 #
+# ONE GROUNDING PER QUESTION, DONE BEFORE THE RUN:
+#
+#   bash launch_precompute_question_boxes_job.sh --dataset cold_data/grpo_sets/set_a
+#   bash launch_grpo_qwen3_overlap_colocated_job.sh \
+#       --dataset_name cold_data/grpo_sets/set_a \
+#       --question-boxes outputs/question_boxes/set_a_bt0.10.json
+#
+# Instead of calling Grounding-DINO once per observe step on that step's own sentence,
+# ground once per dataset ROW on the row's QUESTION, offline, and score every step of that
+# row against the one union. dino_text_sensitivity.py is why this is not a worse mask: the
+# question recovers a step's real mask at IoU 0.649 / closeness 0.785, where a DIFFERENT
+# REAL STEP OF THE SAME CHAIN gets 0.635 / 0.721, at the same mask size. No DINO server is
+# started, so its GPU goes to training -- which changes TRAIN_N and gen_batch, so check the
+# banner before comparing to a per-step run. Adds _qbox to the run name.
+#
 # WATCHING A RUN INSTEAD OF ONLY AUTOPSYING IT
 #
 # Two independent evaluations, both landing in the same WandB run -- one during
@@ -430,6 +445,14 @@ MASS_FLOOR_TAU=""        # unset -> off for mean_in, 0.0022 for auroc (see below
 # overlap term is worse than none. Only meaningful on a mixed corpus with a `natural`
 # column (cold_data/grpo_sets/set_b); OFF by default so existing runs are unchanged.
 NATURAL_ONLY=${NATURAL_ONLY:-false}
+# --question-boxes <file>: ground ONCE per dataset row, on the row's question, before the
+# run, and reuse that union for every observe step -- instead of one Grounding-DINO call
+# per step on the step's own sentence. Build the file with
+# launch_precompute_question_boxes_job.sh. It must cover the corpus this run trains on and
+# be built at the same --box-threshold; the trainer refuses a mismatch rather than training
+# on the wrong boxes. Setting it also turns the DINO sidecar OFF and gives its GPU to
+# training. Empty -> the incumbent per-step grounding, so a bare invocation is unchanged.
+QUESTION_BOXES=""
 # --placebo roll|random|length: REPLACE the overlap reward with a control that has its
 # within-group spread but none of its grounding, to find out whether its DIRECTION
 # matters. Empty = off (the real reward). See the PLACEBO block in the header.
@@ -527,6 +550,12 @@ while [[ $# -gt 0 ]]; do
         --allow-regulator-change) ALLOW_REGULATOR_CHANGE=true;  shift 1 ;;
         --natural-only)           NATURAL_ONLY=true;            shift ;;
         --no-natural-only)        NATURAL_ONLY=false;           shift ;;
+        # Absolutised while still in the invocation cwd: the training command runs from
+        # $REPO/trl_repo, and this script re-invokes itself inside the allocation.
+        --question-boxes)
+            QUESTION_BOXES="$2"
+            [[ -e "$QUESTION_BOXES" ]] && QUESTION_BOXES="$(cd "$(dirname "$QUESTION_BOXES")" && pwd)/$(basename "$QUESTION_BOXES")"
+            shift 2 ;;
         --eval-steps)             EVAL_STEPS="$2";              shift 2 ;;
         --no-eval)                VAL_SETS_DIR="";              shift ;;
         --val-sets-dir)           VAL_SETS_DIR="$2";            shift 2 ;;
@@ -692,11 +721,52 @@ if [[ -n "$PLACEBO" ]]; then
     fi
 fi
 
+# ---------- --question-boxes: one grounding per question, done before the run ----------
+# The other way to reach WANT_DINO=false, and for the same reason as --maskfree: no boxes
+# are needed AT TRAINING TIME, so no server is started and the GPU it would have held goes
+# to training. Here the boxes still exist -- they were grounded once per dataset row by
+# precompute_question_boxes.py -- so unlike --maskfree the reward is still a box-overlap
+# reward. See dino_text_sensitivity.py for why one grounding per question is not a worse
+# mask than one per step.
+#
+# THE GPU LAYOUT CHANGES, and that changes TRAIN_N and hence gen_batch. Read the
+# --maskfree note under the layout block below before comparing this run to a per-step
+# reference; --num-gpus 7 reproduces the reference's gen_batch of 48.
+if [[ -n "$QUESTION_BOXES" ]]; then
+    if [[ "$REWARD_VARIANT" != "ours" ]]; then
+        echo "ERROR: --question-boxes is read by the attention-overlap reward only," >&2
+        echo "       but --saliency-method $REWARD_VARIANT puts a different reward in that" >&2
+        echo "       slot and grounds per step itself. The run would be identical to one" >&2
+        echo "       without the flag." >&2
+        exit 1
+    fi
+    if [[ -n "$PLACEBO" || -n "$MASKFREE" ]]; then
+        echo "ERROR: --question-boxes and --${PLACEBO:+placebo }${MASKFREE:+maskfree }both" >&2
+        echo "       act on the overlap reward's slot; the placebo/maskfree rewards do their" >&2
+        echo "       own grounding and would ignore the cache." >&2
+        exit 1
+    fi
+    # Both replace the per-step union, in the same place. Whichever won, the other arm's
+    # name would be on a run that is not it. overlap_rewards._validate_rect refuses the
+    # pair too, so this cannot be reached round the launcher either.
+    if [[ -n "$RECT_FRAC" ]]; then
+        echo "ERROR: --question-boxes and --overlap-rect-frac $RECT_FRAC both REPLACE the" >&2
+        echo "       per-step DINO union. Pick one." >&2
+        exit 1
+    fi
+    if [[ ! -f "$QUESTION_BOXES" ]]; then
+        echo "ERROR: --question-boxes $QUESTION_BOXES does not exist. Build it first:" >&2
+        echo "       bash launch_precompute_question_boxes_job.sh --dataset <corpus>" >&2
+        exit 1
+    fi
+    WANT_DINO=false
+fi
+
 
 if [ "$WANT_DINO" != true ] || [ "$SHARE_SIDECAR_GPU" = true ]; then MIN_GPUS=2; else MIN_GPUS=3; fi
 if (( NUM_GPUS < MIN_GPUS )); then
     if [ "$WANT_DINO" != true ]; then
-        echo "ERROR: need >=2 GPUs with $([[ -n "$RECT_FRAC" ]] && echo '--overlap-rect-frac' || echo '--maskfree') (1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
+        echo "ERROR: need >=2 GPUs with $([[ -n "$RECT_FRAC" ]] && echo '--overlap-rect-frac' || [[ -n "$QUESTION_BOXES" ]] && echo '--question-boxes' || echo '--maskfree') (1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
     elif [ "$SHARE_SIDECAR_GPU" = true ]; then
         echo "ERROR: need >=2 GPUs with --share-sidecar-gpu (1 shared DINO+vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
     else
@@ -1010,6 +1080,10 @@ fi
 # The reward differs from a plain run, so the checkpoints and the wandb run must not
 # share a name with one.
 [[ "$NATURAL_ONLY" == true ]] && SUFFIX="${SUFFIX}_natonly"
+# One grounding per question is a different reward, not a cheaper way of computing the
+# same one -- it changes which steps are scored. It must never share a checkpoint dir or
+# a wandb name with a per-step run.
+[[ -n "$QUESTION_BOXES" ]] && SUFFIX="${SUFFIX}_qbox"
 # Regulators change the objective, so a regulated run must not share a checkpoint
 # directory or a wandb run name with the unregulated control it exists to be compared
 # against. Only non-default settings extend the suffix, which keeps every existing run
@@ -1160,10 +1234,17 @@ echo "==========================================================================
 echo "Model:            $MODEL"
 echo "GPUs (total $NUM_GPUS):  $([ "$WANT_DINO" = true ] && echo "DINO=cuda:$DINO_GPU  " || echo 'DINO=none  ')vLLM=cuda:$VLLM_GPU  train=cuda:[$TRAIN_GPUS] ($TRAIN_N procs)$([ "$SHARE_SIDECAR_GPU" = true ] && [ "$WANT_DINO" = true ] && echo '  [sidecars SHARED on cuda:0]')"
 echo "Generation:       vLLM server  127.0.0.1:$VLLM_PORT  gpu_mem=$VLLM_GPU_MEM  max_len=$VLLM_MAX_MODEL_LEN"
-if [ "$WANT_DINO" != true ]; then
+# Three different reasons to have no DINO server, and they must not read alike:
+# --maskfree scores no boxes at all, --overlap-rect-frac scores a rectangle instead of
+# boxes, and --question-boxes scores boxes that were grounded before the run.
+if [[ -n "$QUESTION_BOXES" ]]; then
+echo "DINO reward:      NOT STARTED -- boxes were grounded before the run  box_threshold=$BOX_THRESHOLD max_box_area=$([[ "$MAX_BOX_AREA" == "0" ]] && echo 'off (no per-box cap)' || echo "$MAX_BOX_AREA") max_union_area=$([[ -n "$MAX_UNION_AREA" ]] && echo "$MAX_UNION_AREA" || echo 'off')"
+echo "Grounding:        ONCE per question, from $QUESTION_BOXES"
+elif [ "$WANT_DINO" != true ]; then
 echo "DINO reward:      NOT STARTED -- $([[ -n "$RECT_FRAC" ]] && echo "--overlap-rect-frac $RECT_FRAC scores a fixed rectangle" || echo "--maskfree $MASKFREE scores no boxes")"
 else
 echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_box_area=$([[ "$MAX_BOX_AREA" == "0" ]] && echo 'off (no per-box cap)' || echo "$MAX_BOX_AREA") max_union_area=$([[ -n "$MAX_UNION_AREA" ]] && echo "$MAX_UNION_AREA" || echo 'off')"
+echo "Grounding:        once per observe step, on the step text"
 fi
 echo "Saliency map:     $_MAP_SHOWN -> ${WANT_REWARD_FN:-(no saliency reward)}$([[ -n "${_GATE_CKPT:-}" ]] && echo "   (resuming checkpoint-$_GATE_CKPT)")"
 echo "Overlap reward:   layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
@@ -1177,6 +1258,13 @@ echo "Mask:             CENTRED RECTANGLE covering $RECT_FRAC of the patch grid 
 echo "                  Same metric, same reward slot, same weight; only the mask differs from a"
 echo "                  DINO run. Every observe step is scored (nothing can be ungroundable), so"
 echo "                  the scored set is LARGER than its reference's -- see outputs/centre_box_probe."
+fi
+if [[ -n "$QUESTION_BOXES" ]]; then
+echo "Mask:             the row's QUESTION union, grounded once before the run -- no Grounding-DINO."
+echo "                  Same metric, same reward slot, same weight; only where the boxes came from"
+echo "                  differs. The scored SET differs too: a row grounds for all of its steps or"
+echo "                  for none, where per-step grounding skips only the steps that ground nothing,"
+echo "                  and --max-union-area is likewise now per row -- see dino_text_sensitivity.py."
 fi
 if [[ -n "$MASKFREE" ]]; then
     case "$MASKFREE" in
@@ -1330,6 +1418,7 @@ if ! $DIRECT; then
                 --rollnull-clip $ROLLNULL_CLIP \
                 --rollnull-seed $ROLLNULL_SEED \
                 $([ "$NATURAL_ONLY" = true ] && echo --natural-only) \
+                ${QUESTION_BOXES:+--question-boxes $QUESTION_BOXES} \
                 $([ "$ALLOW_MAP_CHANGE" = true ] && echo --allow-map-change) \
                 --beta $BETA \
                 ${LENGTH_GUARD_REF:+--length-guard $LENGTH_GUARD_REF} \
@@ -1471,7 +1560,7 @@ if [ "$WANT_DINO" = true ]; then
         > "$LOG_DIR/dino.log" 2>&1 &
     DINO_PID=$!
 else
-    echo "[start] Grounding-DINO SKIPPED ($([[ -n "$RECT_FRAC" ]] && echo "--overlap-rect-frac $RECT_FRAC scores a fixed rectangle" || echo "--maskfree $MASKFREE needs no boxes"))"
+    echo "[start] Grounding-DINO SKIPPED ($([[ -n "$RECT_FRAC" ]] && echo "--overlap-rect-frac $RECT_FRAC scores a fixed rectangle" || [[ -n "$QUESTION_BOXES" ]] && echo "--question-boxes: grounded once per question before the run" || echo "--maskfree $MASKFREE needs no boxes"))"
 fi
 
 # ---------- 2. vLLM generation server on GPU 1 ----------
@@ -1584,6 +1673,11 @@ fi
 DINO_API_FLAG=""
 [ "$WANT_DINO" = true ] && DINO_API_FLAG="--dino_api_base http://127.0.0.1:$DINO_PORT"
 
+# Same shape again: omitted when unset, so the dataclass default (None = grounding once
+# per observe step) applies and an existing run's command line is reproduced byte for byte.
+QUESTION_BOXES_FLAG=""
+[[ -n "$QUESTION_BOXES" ]] && QUESTION_BOXES_FLAG="--overlap_question_boxes $QUESTION_BOXES"
+
 # Omitted when off, so the dataclass default (False) applies and the command line of an
 # existing run is reproduced byte for byte.
 NATURAL_ONLY_FLAG=""
@@ -1684,6 +1778,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     $BETA_FLAG \
     $LENGTH_GUARD_FLAG \
     $NATURAL_ONLY_FLAG \
+    $QUESTION_BOXES_FLAG \
     $EVAL_FLAGS \
     $DINO_API_FLAG \
     --reward_weights $REWARD_WEIGHTS \

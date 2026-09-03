@@ -245,6 +245,35 @@ Natural-images-only gating (--overlap_natural_only, OFF by default):
       would drag the logged rewards/think_overlap_reward/mean down with rows the
       reward was never evaluated on.
 
+One grounding per QUESTION instead of one per step (--overlap_question_boxes, OFF by
+default):
+
+      Normally this reward calls Grounding-DINO once per observe step, on that step's
+      own sentence. dino_text_sensitivity.py measured what that buys on the cold-start
+      policy (30 images, 859 steps): re-grounding a step with the sample's QUESTION
+      instead of its own sentence recovers the step's real mask at IoU 0.649 /
+      closeness 0.785, against 0.635 / 0.721 for a DIFFERENT REAL STEP OF THE SAME
+      CHAIN -- at the same mask size (median union 0.568 vs the real 0.578). Grounding
+      on the single word "object" scores 0.636 / 0.740, also at the per-step level. The
+      per-step call is therefore not buying a per-step mask.
+
+      With this flag the reward reads one box list per dataset ROW from a file built
+      ahead of the run by precompute_question_boxes.py, and scores every step of that
+      row's completions against that one union. Consequences worth knowing:
+
+        * Grounding-DINO is never loaded. No detector on the training device, no
+          per-batch grounding call.
+        * WHICH steps are scored changes. Per-step grounding skips (not zeroes) a step
+          whose own sentence grounds nothing; here the question either grounds for the
+          whole row or for none of it, so a row is scored on all of its steps or masked
+          entirely. --max_union_area likewise now applies per row, not per step.
+        * The step-duplication hack loses its lever on the mask, though not on the mean:
+          repeating a trivially-groundable sentence no longer changes which boxes are
+          used, but a duplicated step still enters the per-completion mean.
+        * The cache stores RAW boxes, before --max_box_area, so the two area caps stay
+          run-time knobs. --box_threshold is baked in by DINO and cannot be, so the
+          loader refuses a cache built at a different threshold.
+
 w_overlap is applied by the trainer via --reward_weights, not here.
 """
 
@@ -312,6 +341,11 @@ _CFG = {
     # None or <= 0 -> score the DINO union (the incumbent). A fraction in (0, 1] ->
     # score a centred rectangle of that area instead, and never call DINO at all.
     "rect_frac": None,
+    # Path to a precompute_question_boxes.py file. Set -> one grounding per dataset ROW,
+    # read from disk, and no DINO at all at training time. See the module docstring.
+    # Mutually exclusive with rect_frac: both replace the per-step union, in the same
+    # place, and _validate_rect refuses the pair.
+    "question_boxes": None,
 }
 
 # Lazily-loaded local Grounding-DINO singleton (one per training process).
@@ -368,6 +402,11 @@ def _validate_rect():
     """Refuse the two --overlap_rect_frac settings that fail silently rather than loudly."""
     if not rect_active():
         return
+    if _CFG.get("question_boxes"):
+        raise ValueError(
+            "--overlap_rect_frac and --overlap_question_boxes both REPLACE the per-step "
+            "Grounding-DINO union, in the same place. Whichever won, the other arm's name "
+            "would be on a run it did not describe. Pick one.")
     f = float(_CFG["rect_frac"])
     if f > 1.0:
         raise ValueError(
@@ -505,6 +544,140 @@ def _dino_boxes(images, texts):
         except Exception as e:  # noqa: BLE001
             print(f"[overlap_reward] served DINO failed ({e}); falling back to local")
     return _dino_boxes_local(images, texts)
+
+
+# ---------------------------------------------------------------------------
+# Precomputed per-question boxes (--overlap_question_boxes)
+# ---------------------------------------------------------------------------
+# One box list per dataset ROW, grounded once on the row's question by
+# precompute_question_boxes.py before the run, and reused for every observe step of
+# every completion of that row. See the module docstring for why the per-step call is
+# not buying a per-step mask.
+
+QBOX_VERSION = 1
+
+# The row identity. Every corpus this trainer accepts carries all three -- the
+# saliency-r1-8k default and every cold_data/grpo_sets/* built by build_grpo_sets.py --
+# and the triple is unique in each of them (the builder checks, and so does the loader).
+# `problem` is deliberately NOT part of it: questions repeat across images (35343 distinct
+# strings over set_a's 50000 rows), so keying on the text would collapse different
+# pictures onto one box list.
+QBOX_KEY_COLUMNS = ("dataset", "split", "question_id")
+
+# Loaded once per process, on first use.
+_QBOX: dict = {"path": None, "boxes": None, "meta": None}
+
+
+def qbox_key(dataset, split, question_id) -> str:
+    """The cache key for one dataset row.
+
+    Joined with '|' rather than JSON-encoded so the file stays readable; no corpus here
+    has a separator in any of the three fields, and the builder refuses one that does
+    instead of silently producing a key that two rows could share.
+    """
+    parts = [str(dataset), str(split), str(question_id)]
+    for name, part in zip(QBOX_KEY_COLUMNS, parts):
+        if "|" in part:
+            raise ValueError(
+                f"question-box key column `{name}` contains the '|' separator: {part!r}. "
+                "Two rows could then collide onto one key."
+            )
+    return "|".join(parts)
+
+
+def load_question_boxes(path: str, box_threshold=None, max_image_side=None) -> dict:
+    """Read (once per process) and validate a precomputed question-box file.
+
+    Both checks are hard failures, because both fail SILENTLY otherwise -- the run would
+    train happily on boxes that are not the ones its own configuration describes:
+
+      box_threshold   applied inside DINO, so it cannot be re-applied here. A cache built
+                      at 0.10 cannot serve a run asking for 0.25.
+      max_image_side  the detector sees a different picture at a different resolution.
+                      The trainer passes its own constant so the two cannot drift.
+    """
+    if _QBOX["path"] == path and _QBOX["boxes"] is not None:
+        return _QBOX["boxes"]
+
+    import json
+
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"--overlap_question_boxes {path} does not exist. Build it first with "
+            f"precompute_question_boxes.py (it needs a GPU, and it is a separate job)."
+        )
+    with open(path) as f:
+        d = json.load(f)
+
+    got_v = d.get("version")
+    if got_v != QBOX_VERSION:
+        raise ValueError(f"{path}: question-box file version {got_v}, expected {QBOX_VERSION}")
+
+    meta = d.get("config") or {}
+    if box_threshold is not None:
+        want, have = float(box_threshold), meta.get("box_threshold")
+        if have is None or abs(float(have) - want) > 1e-9:
+            raise ValueError(
+                f"{path} was built with box_threshold={have}, but this run asks for "
+                f"{want}. The threshold is applied inside Grounding-DINO, so the cached "
+                "boxes cannot be re-filtered to it -- rebuild the cache, or match the flag."
+            )
+    if max_image_side is not None:
+        want, have = int(max_image_side), meta.get("max_image_side")
+        if have is None or int(have) != want:
+            raise ValueError(
+                f"{path} was built with max_image_side={have}, but the trainer resizes to "
+                f"{want}. Grounding-DINO sees a different picture at a different "
+                "resolution -- rebuild the cache against this trainer."
+            )
+
+    boxes = d.get("boxes")
+    if not isinstance(boxes, dict) or not boxes:
+        raise ValueError(f"{path}: no `boxes` mapping")
+
+    _QBOX.update(path=path, boxes=boxes, meta=meta)
+    n_empty = sum(1 for v in boxes.values() if not v)
+    print(f"[overlap_reward] question boxes: {len(boxes)} rows from {path} "
+          f"(box_threshold={meta.get('box_threshold')}, "
+          f"max_image_side={meta.get('max_image_side')}, "
+          f"{n_empty} rows grounded nothing). Grounding-DINO will not be loaded.",
+          flush=True)
+    return boxes
+
+
+def _question_boxes_per_row(kwargs, wanted):
+    """-> {completion index: raw box list} for the completions in `wanted`.
+
+    Only the completions that actually have steps to score are looked up, for the same
+    reason masked rows never reach DINO on the per-step path: a row this call is not
+    scoring must not be able to fail it.
+
+    A key the cache does not hold IS a hard failure. It means the cache was built for a
+    different corpus, and masking those rows instead would show up only as a quietly
+    smaller reward on part of the batch.
+    """
+    if not wanted:
+        return {}
+    absent = [c for c in QBOX_KEY_COLUMNS if kwargs.get(c) is None]
+    if absent:
+        raise KeyError(
+            f"--overlap_question_boxes needs the {', '.join(QBOX_KEY_COLUMNS)} columns to "
+            f"identify a row, but {', '.join(absent)} did not reach the reward function. "
+            "Use a corpus built by build_grpo_sets.py (cold_data/grpo_sets/*) or the "
+            "saliency-r1-8k default."
+        )
+    boxes = load_question_boxes(_CFG["question_boxes"])
+    cols = [kwargs[c] for c in QBOX_KEY_COLUMNS]
+    out = {}
+    for c in sorted(wanted):
+        key = qbox_key(*(col[c] for col in cols))
+        if key not in boxes:
+            raise KeyError(
+                f"row {key!r} is not in {_CFG['question_boxes']}. The cache does not cover "
+                "the dataset being trained on -- rebuild it for this corpus."
+            )
+        out[c] = boxes[key]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -745,15 +918,31 @@ def think_overlap_reward(
 
     rect = rect_active()
 
-    if rect:
-        # --overlap_rect_frac: the mask is a function of the GRID alone, so nothing here
-        # reads the step's text or the image, and _dino_boxes is never called. That is
-        # what makes the run detector-free -- _load_dino_local is lazy, so not calling it
-        # is the whole mechanism, and the launcher's WANT_DINO=false path can then give
-        # the GPU DINO would have held to training.
+    qbox = bool(_CFG.get("question_boxes"))
+
+    if rect or qbox:
+        # Neither arm reads the step's TEXT, so neither builds the image/text lists and
+        # neither calls _dino_boxes. That is what makes both runs detector-free --
+        # _load_dino_local is lazy, so not calling it is the whole mechanism, and the
+        # launcher's WANT_DINO=false path can then give the GPU DINO would have held to
+        # training. Masked rows are excluded here exactly as they are on the DINO path.
         flat_owner = [(c, si) for c, steps in enumerate(saliency_map)
                       if steps and scored[c] for si in range(len(steps))]
-        boxes_per_item = [None] * len(flat_owner)
+        if rect:
+            # --overlap_rect_frac: the mask is a function of the GRID alone, and is built
+            # in the scoring loop below rather than from any boxes.
+            boxes_per_item = [None] * len(flat_owner)
+        else:
+            # --overlap_question_boxes: one grounding per ROW, done before the run. Every
+            # step of a completion gets the same box list, so the loop below is unchanged:
+            # it rasterises that one list onto each step's grid (identical for all steps of
+            # a completion -- same image, same patch grid) and scores each step's own map
+            # against it. Deliberately NOT hoisted out of the loop: a duplicated
+            # `_union_mask` on a 16x10 grid costs nothing, and keeping one scoring path
+            # means the cached and per-step runs differ in where the boxes came from and in
+            # nothing else.
+            per_row = _question_boxes_per_row(kwargs, {c for c, _si in flat_owner})
+            boxes_per_item = [per_row[c] for c, _si in flat_owner]
     else:
         # Flatten every (completion, observe-step) into one batched DINO call. Masked rows
         # never reach DINO -- the trainer normally hands them no maps anyway, but a row

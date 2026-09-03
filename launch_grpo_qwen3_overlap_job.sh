@@ -132,6 +132,12 @@ MASS_FLOOR_TAU=""        # unset -> off for mean_in, 0.0022 for auroc (see below
 # corpus with a `natural` column (cold_data/grpo_sets/set_b); OFF by default.
 NATURAL_ONLY=${NATURAL_ONLY:-false}
 DINO_API_BASE=""
+# --question-boxes <file>: ground ONCE per dataset row, on the row's question, before the
+# run, and reuse that union for every observe step -- instead of one DINO call per step
+# on the step's own sentence. Build the file with precompute_question_boxes.py; it must
+# cover the corpus this run trains on and be built at the same --box-threshold. Empty ->
+# the incumbent per-step grounding, so a bare invocation is unchanged.
+QUESTION_BOXES=""
 
 # ---------- parse args ----------
 while [[ $# -gt 0 ]]; do
@@ -159,6 +165,12 @@ while [[ $# -gt 0 ]]; do
         --natural-only)           NATURAL_ONLY=true;            shift ;;
         --no-natural-only)        NATURAL_ONLY=false;           shift ;;
         --dino-api-base)          DINO_API_BASE="$2";           shift 2 ;;
+        # Same absolutisation as --dataset_name below, and for the same reason: the
+        # training command runs from $REPO/trl_repo.
+        --question-boxes)
+            QUESTION_BOXES="$2"
+            [[ -e "$QUESTION_BOXES" ]] && QUESTION_BOXES="$(cd "$(dirname "$QUESTION_BOXES")" && pwd)/$(basename "$QUESTION_BOXES")"
+            shift 2 ;;
         # The training command runs from $REPO/trl_repo, so a relative dataset path
         # given on the command line would be resolved against the wrong directory.
         # Absolutize it here, while we are still in the invocation cwd; anything
@@ -206,6 +218,10 @@ SUFFIX="__wov${W_OVERLAP}_${N_HEADS}head_tr${TOKEN_REDUCTION}"
 # The reward differs from a plain run, so the checkpoints and the wandb run must not
 # share a name with one.
 [[ "$NATURAL_ONLY" == true ]] && SUFFIX="${SUFFIX}_natonly"
+# One grounding per question is a different reward, not a cheaper way to compute the same
+# one -- it changes which steps are scored. It must never share a checkpoint dir or a
+# wandb name with a per-step run.
+[[ -n "$QUESTION_BOXES" ]] && SUFFIX="${SUFFIX}_qbox"
 MODEL_SLUG=$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g')
 RUN_NAME="grpo-${MODEL_SLUG}-overlap${SUFFIX}"
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$REPO/checkpoint/${RUN_NAME}"
@@ -220,6 +236,7 @@ echo "Overlap reward: layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reductio
 echo "Metric:         $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " mass_floor_tau=$MASS_FLOOR_TAU" || echo " (no mass floor)")"
 echo "Overlap rows:   $([ "$NATURAL_ONLY" = true ] && echo 'natural images only (non-natural: format+accuracy+judge)' || echo 'all rows')"
 echo "DINO:           box_threshold=$BOX_THRESHOLD max_box_area=$([[ "$MAX_BOX_AREA" == "0" ]] && echo 'off (no per-box cap)' || echo "$MAX_BOX_AREA") max_union_area=$([[ -n "$MAX_UNION_AREA" ]] && echo "$MAX_UNION_AREA" || echo 'off')  $([[ -n "$DINO_API_BASE" ]] && echo "served=$DINO_API_BASE" || echo 'local-on-device')"
+echo "Grounding:      $([[ -n "$QUESTION_BOXES" ]] && echo "ONCE per question, precomputed: $QUESTION_BOXES (no DINO at train time)" || echo 'once per observe step, on the step text (DINO on the training device)')"
 echo "Run name:       $RUN_NAME"
 echo "Output dir:     $OUTPUT_DIR"
 echo "Mode:           $($DIRECT && echo 'direct (no SLURM)' || echo "SLURM ($PARTITION, ${DURATION}h)")"
@@ -276,6 +293,7 @@ if ! $DIRECT; then
                 --box-threshold $BOX_THRESHOLD \
                 --max-box-area $MAX_BOX_AREA \
                 ${DINO_API_BASE:+--dino-api-base $DINO_API_BASE} \
+                ${QUESTION_BOXES:+--question-boxes $QUESTION_BOXES} \
                 $EXTRA_ARGS
         '"
     echo "Submitted $RUN_NAME"
@@ -387,6 +405,11 @@ MAX_UNION_FLAG=""
 NATURAL_ONLY_FLAG=""
 [[ "$NATURAL_ONLY" == true ]] && NATURAL_ONLY_FLAG="--overlap_natural_only True"
 
+# Same shape again: omitted when unset, so the dataclass default (None = per-step
+# grounding) applies and an existing run's command line is reproduced byte for byte.
+QUESTION_BOXES_FLAG=""
+[[ -n "$QUESTION_BOXES" ]] && QUESTION_BOXES_FLAG="--overlap_question_boxes $QUESTION_BOXES"
+
 accelerate launch \
     --config_file examples/accelerate_configs/deepspeed_zero3.yaml \
     --num_processes "$NUM_GPUS" \
@@ -410,6 +433,7 @@ accelerate launch \
     --overlap_metric "$OVERLAP_METRIC" \
     $MASS_FLOOR_FLAG \
     $NATURAL_ONLY_FLAG \
+    $QUESTION_BOXES_FLAG \
     $DINO_FLAG \
     --reward_weights $REWARD_WEIGHTS \
     --use_peft \

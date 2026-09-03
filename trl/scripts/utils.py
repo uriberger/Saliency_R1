@@ -444,6 +444,22 @@ class ScriptArguments:
             "If unset, DINO runs locally on each training process's device."
         },
     )
+    overlap_question_boxes: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "reward_variant='ours': path to a precompute_question_boxes.py file. Ground ONCE "
+            "per dataset row, on the row's question, before the run, and score every observe step of "
+            "that row against that one box union — instead of calling Grounding-DINO once per step on "
+            "the step's own sentence. No detector is loaded at training time at all. Justified by "
+            "dino_text_sensitivity.py: the question recovers a step's real mask at IoU 0.649 / "
+            "closeness 0.785, where a different real step of the SAME chain gets 0.635 / 0.721, at the "
+            "same mask size — so the per-step call is not buying a per-step mask. Changes WHICH steps "
+            "are scored: a row now grounds for all of its steps or for none, where per-step grounding "
+            "skips only the steps whose own sentence grounds nothing. --box_threshold and the "
+            "trainer's 512px image cap are baked into the file and a mismatch is refused. Sweep "
+            "dimension — appears in the model/wandb name."
+        },
+    )
     placebo: Optional[str] = field(
         default=None,
         metadata={
