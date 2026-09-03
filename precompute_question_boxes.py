@@ -59,10 +59,16 @@ REPO = Path(__file__).resolve().parent
 # either side is a loud failure rather than a silently different reward.
 MAX_IMAGE_SIDE = 512
 
-# The nominal grid used only for the summary printed at the end. The real patch grid is
-# per-image and is not known until training; the union fraction of boxes this large is
-# not sensitive to it, and the number is here as a sanity check, not as an input.
-SUMMARY_GRID = 16
+# Qwen3-VL's vision tower: 16px patches merged 2x2, so one cell of the grid the reward
+# scores on is 32px of the (already resized) image, and smart_resize rounds each side to a
+# multiple of that. Recorded per row for the SUMMARY ONLY -- the reward reads the true grid
+# off the step's own attention map and never looks at this. It is here because the
+# alternative, a fixed nominal grid, biases the union fraction: rasterisation gives every
+# box at least one row and column, so a coarser grid reports MORE coverage for the same
+# boxes, and the summary could not then be compared with the per-step numbers it exists to
+# be compared with. Checked against overlap_probe's stored grids: a 500x332 image gives
+# (10, 16), which is what the probe recorded.
+GRID_CELL_PX = 32
 
 
 def _load_module(name: str, relpath: str):
@@ -128,6 +134,12 @@ def prepare_image(image):
     return image
 
 
+def patch_grid(image) -> list[int]:
+    """(gh, gw) the reward will score on. Diagnostic only -- see GRID_CELL_PX."""
+    w, h = image.size
+    return [max(1, round(h / GRID_CELL_PX)), max(1, round(w / GRID_CELL_PX))]
+
+
 # ---------------------------------------------------------------------------
 def build(args) -> dict:
     ds = load_dataset_like_the_trainer(args.dataset, args.dataset_split)
@@ -148,33 +160,39 @@ def build(args) -> dict:
         idx = idx[: args.limit]
     mine = [i for i in idx if i % args.num_shards == args.shard]
 
+    # Two different batch sizes, and conflating them is what makes every call OOM once:
+    # --rows-per-call is how many rows are decoded and handed over at a time, and
+    # --batch-size is how many of those Grounding-DINO forwards together. _dino_boxes
+    # halves its own batch on OOM, so it only has room to do that if it is given more than
+    # one batch's worth.
     OREW.configure(box_threshold=args.box_threshold, dino_batch_size=args.batch_size)
     print(f"[question_boxes] {args.dataset}: {len(ds)} rows, shard {args.shard}/"
           f"{args.num_shards} takes {len(mine)}; box_threshold={args.box_threshold} "
-          f"max_image_side={MAX_IMAGE_SIDE} batch={args.batch_size}", flush=True)
+          f"max_image_side={MAX_IMAGE_SIDE} dino_batch={args.batch_size} "
+          f"rows_per_call={args.rows_per_call}", flush=True)
 
     out: dict[str, list] = {}
-    keys_seen: dict[str, int] = {}
+    grids: dict[str, list] = {}
     done = 0
-    for start in range(0, len(mine), args.batch_size):
-        rows = [ds[i] for i in mine[start:start + args.batch_size]]
+    for start in range(0, len(mine), args.rows_per_call):
+        rows = [ds[i] for i in mine[start:start + args.rows_per_call]]
         images = [prepare_image(r["image"]) for r in rows]
         texts = [r[args.text_column] or "object" for r in rows]
         boxes = OREW._dino_boxes(images, texts)
-        for r, b in zip(rows, boxes):
+        for r, im, b in zip(rows, images, boxes):
             key = OREW.qbox_key(*(r[c] for c in OREW.QBOX_KEY_COLUMNS))
-            if key in keys_seen:
+            if key in out:
                 raise SystemExit(
                     f"{args.dataset}: duplicate row key {key!r}. The cache is a mapping, "
                     "so two rows sharing a key would silently share one box list."
                 )
-            keys_seen[key] = 1
             out[key] = [[round(float(v), 5) for v in box] for box in (b or [])]
+            grids[key] = patch_grid(im)
         done += len(rows)
-        if done % (args.batch_size * 20) < args.batch_size:
-            print(f"[question_boxes] {done}/{len(mine)}", flush=True)
+        print(f"[question_boxes] {done}/{len(mine)}", flush=True)
 
     return {
+        "grids": grids,
         "version": OREW.QBOX_VERSION,
         "config": {
             "box_threshold": float(args.box_threshold),
@@ -192,7 +210,7 @@ def build(args) -> dict:
 
 def merge(paths, out_path):
     """Combine shard files. Their configs must agree, or the halves are not comparable."""
-    merged, cfg, version, total = {}, None, None, 0
+    merged, grids, cfg, version = {}, {}, None, None
     for p in paths:
         with open(p) as f:
             d = json.load(f)
@@ -208,7 +226,7 @@ def merge(paths, out_path):
             if k in merged:
                 raise SystemExit(f"{p}: key {k!r} already came from an earlier shard")
             merged[k] = v
-        total += len(d["boxes"])
+        grids.update(d.get("grids") or {})
         print(f"[merge] {p}: {len(d['boxes'])} rows", flush=True)
 
     want = cfg.get("dataset_rows")
@@ -217,25 +235,34 @@ def merge(paths, out_path):
             f"merged {len(merged)} rows but the corpus has {want}. A shard is missing "
             "or was built with --limit; refusing to write a partial cache."
         )
-    return {"version": version, "config": cfg, "boxes": merged}
+    return {"version": version, "config": cfg, "grids": grids, "boxes": merged}
 
 
 # ---------------------------------------------------------------------------
 def summarise(d) -> str:
     """What the run will actually see, so a bad cache is visible before training on it."""
     boxes = d["boxes"]
+    grids = d.get("grids") or {}
     n = len(boxes)
     raw = np.array([len(v) for v in boxes.values()], dtype=float)
     cap = 0.5  # the --max_box_area default; the run's own value may differ
     kept = np.array([sum(1 for b in v if OREW._box_area(b) <= cap) for v in boxes.values()],
                     dtype=float)
 
-    # Union coverage on a nominal square grid -- see SUMMARY_GRID.
-    fracs = []
-    for v in boxes.values():
-        m = OREW._union_mask([b for b in v if OREW._box_area(b) <= cap],
-                             SUMMARY_GRID, SUMMARY_GRID, apply_union_cap=False)
-        fracs.append(float(m.sum()) / m.size if m is not None else 0.0)
+    # Union coverage on each row's own patch grid, which is the whole point of recording
+    # it -- see GRID_CELL_PX. A row whose union swallows the grid rasterises to None and
+    # the REWARD SKIPS IT, so it is counted here rather than folded in as 1.0.
+    fracs, degenerate = [], 0
+    for k, v in boxes.items():
+        g = grids.get(k)
+        if not g:
+            continue
+        m = OREW._union_mask([b for b in v if OREW._box_area(b) <= cap], g[0], g[1],
+                             apply_union_cap=False)
+        if m is None:
+            degenerate += 1
+            continue
+        fracs.append(float(m.sum()) / m.size)
     fr = np.array(fracs, dtype=float)
 
     L = []
@@ -245,11 +272,17 @@ def summarise(d) -> str:
       f"({(raw == 0).mean():.1%} -- these rows are MASKED by the reward, not scored 0)")
     P(f"  boxes per row (raw)               mean {raw.mean():.1f}, median {np.median(raw):.0f}")
     P(f"  boxes per row (after area<={cap})   mean {kept.mean():.1f}, median {np.median(kept):.0f}")
-    P(f"  union coverage on a {SUMMARY_GRID}x{SUMMARY_GRID} grid    mean {fr.mean():.3f}, "
+    if not fr.size:
+        P("  union coverage                    (no per-row grids stored; rebuild to get it)")
+        return "\n".join(L)
+    P(f"  union covers the whole grid       {degenerate}  "
+      f"({degenerate / n:.1%} -- also MASKED, like an ungroundable row)")
+    P(f"  union coverage, per-row grid      mean {fr.mean():.3f}, "
       f"median {np.median(fr):.3f}, p10 {np.percentile(fr, 10):.3f}, "
       f"p90 {np.percentile(fr, 90):.3f}")
-    P("  (dino_text_sensitivity.py measured the question mask's real median coverage at")
-    P("   0.568, against 0.578 for the per-step masks -- a median far from that is a bug)")
+    P("  (dino_text_sensitivity.py measured the question mask's median coverage at 0.568")
+    P("   and the per-step masks' at 0.578, on the real grids of a val_natural sample --")
+    P("   a median far from that on a natural corpus is a bug, not a finding)")
     return "\n".join(L)
 
 
@@ -263,7 +296,12 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--box-threshold", type=float, default=0.10,
                     help="must match the run's --box_threshold; baked into the cache")
-    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--batch-size", type=int, default=16,
+                    help="images Grounding-DINO forwards at once. 32 OOMs and halves "
+                         "itself on an 80GB card at 512px, which costs a retry per call")
+    ap.add_argument("--rows-per-call", type=int, default=256,
+                    help="rows decoded and handed to the detector at a time. Larger than "
+                         "--batch-size on purpose, so its OOM halving has room to work")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
     ap.add_argument("--limit", type=int, default=0, help="0 = the whole corpus")

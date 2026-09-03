@@ -148,7 +148,8 @@ class Args:
     dataset_split = "train"
     text_column = "problem"
     box_threshold = 0.10
-    batch_size = 4
+    batch_size = 2
+    rows_per_call = 4
     shard = 0
     num_shards = 1
     limit = 0
@@ -169,6 +170,11 @@ check("builder: stores RAW boxes, before the area cap",
           [round(v, 5) for v in b] for b in fake_boxes_for("what is in region 0?")])
 check("builder: a row DINO could not ground is kept, as an empty list",
       built["boxes"]["cub|validation|1004"] == [])
+# 640x480 -> the 512 cap -> 512x384 -> 32px cells -> (12, 16).
+check("builder: records the patch grid the summary needs",
+      set(built["boxes"]) == set(built["grids"])
+      and built["grids"]["cub|validation|1000"] == [12, 16],
+      str(built["grids"]["cub|validation|1000"]))
 
 # sharding must partition the corpus, not sample it
 shards = []
@@ -196,7 +202,13 @@ for i, d in enumerate(shards):
 
 merged = PQB.merge(shard_paths, os.path.join(tmp, "merged.json"))
 check("merge: reassembles every row", merged["boxes"] == built["boxes"])
+check("merge: carries the grids across", merged["grids"] == built["grids"])
 check("merge: drops the per-shard bookkeeping", "shard" not in merged)
+check("summary: reads without raising and reports the row count",
+      f"{N_ROWS}" in PQB.summarise(merged))
+check("summary: still works on a file with no grids",
+      "no per-row grids" in PQB.summarise(
+          {"boxes": merged["boxes"], "config": merged["config"]}))
 
 bad = json.loads(json.dumps(shards[0]))
 bad["config"]["box_threshold"] = 0.25

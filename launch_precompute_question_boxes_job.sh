@@ -31,7 +31,9 @@ OUT=""
 GPUS=8
 DURATION=1
 BOX_THRESHOLD=0.10
-BATCH_SIZE=32
+# The detector's own batch. 32 OOMs on an 80GB card at 512px and halves itself, which
+# works but costs a retry on most calls -- measured on val_natural, job 6542363.
+BATCH_SIZE=16
 NAME=""
 DRY_RUN=0
 EXTRA=()
