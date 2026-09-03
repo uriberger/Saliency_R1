@@ -32,9 +32,13 @@ Run (on a GPU node, one card is plenty):
 
     python dino_text_sensitivity.py \
         outputs/overlap_probe/20260809-021810-crossrun-val_natural-plus/probe_merged.json \
-        --models base_coldstart --out-dir outputs/dino_text_sensitivity
+        --models base_coldstart --out-dir outputs/dino_text_sensitivity \
+        --baseline outputs/step_box_similarity/mean_in/report.json
 
-`--limit-steps` caps the work; the default covers everything the file has.
+`--limit-steps` caps the work; the default covers everything the file has. `--baseline`
+prints step_box_similarity's within / same-image / diff-image rows on the same table, so
+a variant's IoU is read against two real steps of the same chain without transcribing
+anything by hand.
 """
 
 from __future__ import annotations
@@ -154,6 +158,35 @@ def collect(path: str, keep_models, limit_steps: int, rng):
     return recs, cfg
 
 
+def load_baseline(path: str, merged_path: str, models: str):
+    """The three real-step pairings out of step_box_similarity's report.json.
+
+    Matched on the model key, and preferring the entry whose `source` is the very file
+    being re-grounded here: the two reports have to be describing the same run, or the
+    reference rows are decoration rather than a comparison.
+    """
+    d = json.load(open(path))
+    want = None if models == "all" else set(models.split(","))
+    src = os.path.abspath(merged_path)
+    cands = []
+    for res in d:
+        if want and res.get("model", "").split("::")[-1] not in want:
+            continue
+        same = os.path.abspath(res.get("source", "")) == src
+        cands.append((0 if same else 1, res))
+    if not cands:
+        raise SystemExit(f"{path}: no entry for model(s) {models}")
+    cands.sort(key=lambda t: t[0])
+    rank, res = cands[0]
+    if rank:
+        print(f"[dino_text_sensitivity] warning: {path} has no entry generated from "
+              f"{src}; falling back to `{res.get('model')}`", file=sys.stderr)
+    rows = [(label, res[tag]) for tag, label in
+            (("within", "within"), ("cross_comp", "same-image"), ("cross_img", "diff-image"))
+            if res.get(tag)]
+    return rows, res.get("model", path)
+
+
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
@@ -163,7 +196,14 @@ def main():
                     help="comma-separated model keys, or 'all'")
     ap.add_argument("--out-dir", default="outputs/dino_text_sensitivity")
     ap.add_argument("--limit-steps", type=int, default=0, help="0 = every step in the file")
-    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--baseline", default=None,
+                    help="step_box_similarity report.json, e.g. "
+                         "outputs/step_box_similarity/mean_in/report.json. Its within / "
+                         "same-image / diff-image rows for the same model are printed on "
+                         "the same table as the variants.")
+    ap.add_argument("--batch-size", type=int, default=0,
+                    help="0 = whatever dino_batch_size the analysed run used, which is "
+                         "one fewer thing for `real` to disagree with")
     ap.add_argument("--max-image-side", type=int, default=512,
                     help="must match the probe's MAX_IMAGE_SIDE, or `real` will not "
                          "reproduce the stored boxes")
@@ -176,15 +216,22 @@ def main():
     keep = None if args.models == "all" else set(args.models.split(","))
     recs, cfg = collect(args.merged, keep, args.limit_steps, rng)
 
+    # Read before the GPU work, so a wrong path fails in a second rather than after the
+    # groundings.
+    base_rows, base_src = ([], None)
+    if args.baseline:
+        base_rows, base_src = load_baseline(args.baseline, args.merged, args.models)
+
     # Ground exactly as the run being analysed did.
     OREW.configure(box_threshold=cfg.get("box_threshold", 0.10),
                    max_box_area=cfg.get("max_box_area"),
                    max_union_area=cfg.get("max_union_area"),
-                   dino_batch_size=args.batch_size)
+                   dino_batch_size=args.batch_size or int(cfg.get("dino_batch_size") or 16))
     print(f"[dino_text_sensitivity] {len(recs)} steps x {len(VARIANTS)} variants "
           f"= {len(recs) * len(VARIANTS)} groundings; "
           f"box_threshold={OREW._CFG['box_threshold']} "
-          f"max_box_area={OREW._CFG['max_box_area']}", flush=True)
+          f"max_box_area={OREW._CFG['max_box_area']} "
+          f"batch={OREW._CFG['dino_batch_size']}", flush=True)
 
     # One decoded copy per image, resized the way the probe resized it before DINO saw it.
     cache: dict[str, "Image.Image"] = {}
@@ -226,7 +273,11 @@ def main():
             bm, bh = SBS.box_set_match(r["boxes_stored"], kept)
             row[v] = {"grounded": True, "n_boxes": len(kept),
                       "union_frac": float(m.sum()) / m.size,
-                      "iou": o, "closeness": z, "identical": bool(np.array_equal(real, m)),
+                      # chance and best are carried per step, not just closeness, so the
+                      # variant rows can be printed on step_box_similarity's own table --
+                      # where every IoU sits between its two size-dependent references.
+                      "iou": o, "iou_chance": c, "iou_best": best, "closeness": z,
+                      "identical": bool(np.array_equal(real, m)),
                       "box_match": bm, "box_hit": bh,
                       "mean_in": SBS.m_mean_in(r["smap"], m),
                       "auroc": SBS.m_auroc(r["smap"], m)}
@@ -279,6 +330,69 @@ def main():
           f"{np.mean(col(v,'union_frac')):7.2f} {np.mean(col(v,'iou')):7.3f} "
           f"{np.mean(col(v,'closeness')):11.3f} {np.mean(col(v,'identical')):9.1%} "
           f"{rr:9.3f}")
+    P("")
+
+    # ---- the same IoUs, laid out exactly as step_box_similarity lays out its three
+    # pairings, so a variant row can be read straight against `within` / `same-image` /
+    # `diff-image` without re-deriving anything. `--baseline` supplies those three rows
+    # from that script's own report.json rather than having them transcribed by hand.
+    P("-" * 92)
+    P("ON step_box_similarity's SCALE  (IoU against the step's own stored mask)")
+    P("-" * 92)
+    P("  chance  the IoU two INDEPENDENT masks of these two sizes would get.")
+    P("  best    the IoU those two sizes get when one sits entirely inside the other.")
+    P("")
+    P("               steps      IoU  (p10   p50   p90)   chance   best  closeness  IoU>=.9  identical")
+    for v in VARIANTS:
+        ious = col(v, "iou")
+        if not ious:
+            P(f"  {v:11s} {0:7d}        -       -     -     -        -      -          -        -")
+            continue
+        qi = SBS.q(ious)
+        P(f"  {v:11s} {len(ious):7d}   {SBS.fmt(float(np.mean(ious)))}  "
+          f"({SBS.fmt(qi['p10'])} {SBS.fmt(qi['p50'])} {SBS.fmt(qi['p90'])})   "
+          f"{SBS.fmt(float(np.mean(col(v,'iou_chance'))))}  "
+          f"{SBS.fmt(float(np.mean(col(v,'iou_best'))))}    "
+          f"{SBS.fmt(float(np.mean(col(v,'closeness'))))}     "
+          f"{np.mean([x >= 0.90 for x in ious]):.1%}     "
+          f"{np.mean(col(v,'identical')):.1%}")
+    if base_rows:
+        P("  " + "." * 26 + "  two REAL steps, from step_box_similarity  " + "." * 20)
+        for label, r in base_rows:
+            P(f"  {label:11s} {r['n_pairs']:7d}   {SBS.fmt(r['iou_mean'])}  "
+              f"({SBS.fmt(r['iou']['p10'])} {SBS.fmt(r['iou']['p50'])} {SBS.fmt(r['iou']['p90'])})   "
+              f"{SBS.fmt(r['iou_chance_mean'])}  {SBS.fmt(r['iou_best_mean'])}    "
+              f"{SBS.fmt(r['closeness_mean'])}     {r['frac_iou_ge_90']:.1%}     "
+              f"{r['frac_identical']:.1%}")
+        P(f"  (baseline read from {base_src})")
+    else:
+        P("  (no --baseline given: the within / same-image / diff-image rows of")
+        P("   step_box_similarity's report are not shown here.)")
+    P("")
+
+    # ---- how big each variant's blob is. A variant can only be read as `it found the
+    # same thing` if it also covers a comparable area: a mask that swallows the grid
+    # scores a high IoU against anything, which is what `chance` above prices in.
+    P("-" * 92)
+    P("UNION AREA  (fraction of the patch grid the variant's mask covers)")
+    P("-" * 92)
+    P("               steps    mean    p10    p50    p90")
+    for v in VARIANTS:
+        uf = col(v, "union_frac")
+        if not uf:
+            P(f"  {v:11s} {0:7d}       -      -      -      -")
+            continue
+        qu = SBS.q(uf)
+        P(f"  {v:11s} {len(uf):7d}  {np.mean(uf):6.3f} {qu['p10']:6.3f} {qu['p50']:6.3f} "
+          f"{qu['p90']:6.3f}")
+    ruf = [r["real_union_frac"] for r in rows]
+    qr = SBS.q(ruf)
+    P(f"  {'stored':11s} {len(ruf):7d}  {np.mean(ruf):6.3f} {qr['p10']:6.3f} {qr['p50']:6.3f} "
+      f"{qr['p90']:6.3f}   <- the masks the reward actually used")
+    P("")
+    P("  `stored` is the same population step_box_similarity reports as `a step's mask")
+    P("  covers X% of the patch grid`, weighted per STEP here rather than per step PAIR,")
+    P("  so the two medians should agree to about a point.")
     P("")
     P(f"  the real mask covers {np.mean([r['real_union_frac'] for r in rows]):.2f} of the "
       f"grid on average and scores mean_in {real_mi.mean():.4f}.")
