@@ -413,10 +413,66 @@ class ScriptArguments:
             "carried over. Sweep dimension — appears in the model/wandb name.",
         },
     )
+    overlap_rect_placement: str = field(
+        default="centre",
+        metadata={
+            "help": "reward_variant='ours', read only with --overlap_rect_frac: WHERE the "
+            "rectangle sits. 'centre' (default) is the incumbent and is byte-identical to "
+            "what --overlap_rect_frac did before this flag existed. The other two restore a "
+            "per-COMPLETION mask without a detector, which the centred rectangle cannot "
+            "have: a mask that is the same for all 8 rollouts cancels out of the advantage "
+            "except through the map, and the surviving contrast is 0.90-0.93 correlated "
+            "with the box-blind `flatness` statistic against 0.69-0.76 for the per-step "
+            "DINO union. 'interior_centre' = the same construction on the grid's INTERIOR "
+            "(everything but the one-patch border), sized to --overlap_rect_frac of the "
+            "interior's area; the matched control. 'interior_hash' = those dims placed at "
+            "one of the strictly-interior positions, chosen by blake2b(--overlap_rect_seed "
+            "| completion text), so it is fixed per completion and stable across ranks and "
+            "restarts. The interior restriction is load-bearing and not a detail: the "
+            "border carries 48-52% of the attention mass and 76-85% of map peaks, and a "
+            "rectangle merely displaced IN FRAME lets a different slice of it back in on "
+            "every draw, which drops the reward's ring signal (-0.38..-0.52) below the "
+            "box-blind statistic's (-0.44..-0.54). Confined to the interior, ring coverage "
+            "is exactly 0 for every completion and only placement varies. Note the "
+            "fraction is read against the INTERIOR under both interior modes, so the mask "
+            "is smaller than the same fraction gives under 'centre' -- re-measure "
+            "w_overlap. Sweep dimension - appears in the model/wandb name."
+        },
+    )
+    overlap_rect_seed: int = field(
+        default=0,
+        metadata={
+            "help": "reward_variant='ours': seed mixed into the "
+            "--overlap_rect_placement interior_hash draw. A second run at another seed is a "
+            "replicate over a different lottery, which is how a result is told from a draw."
+        },
+    )
+    overlap_chain_boxes: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "reward_variant='ours': call Grounding-DINO ONCE PER COMPLETION, on one "
+            "observe step's sentence ('first'|'last'), and score every step of that "
+            "completion against the union it returns - instead of once per step on each "
+            "step's own sentence. The middle rung between the incumbent and "
+            "--overlap_question_boxes (once per row), and unlike those two it still needs "
+            "the detector: it is cheaper, not detector-free. Detector calls fall from the "
+            "completion's step count (2.1 on the trained 8k policy, 3.7 at the cold start) "
+            "to one. Use 'last': first steps are the most stereotyped in a chain - two "
+            "chains' opening steps are more alike (closeness 0.81-0.88) than two steps of "
+            "ONE chain (0.58-0.73), where last steps sit at 0.62-0.79 - so grounding on the "
+            "first gives a prompt's 8 rollouts the most nearly identical masks available, "
+            "which is the opposite of the point. Changes WHICH completions are scored: if "
+            "the chosen step grounds nothing the whole completion is unscored (masked, not "
+            "zeroed), with no fallback, because a fallback costs a second call; watch "
+            "mask/chain_ungrounded_frac. --max_union_area likewise becomes per completion. "
+            "Sweep dimension - appears in the model/wandb name."
+        },
+    )
     box_threshold: float = field(
         default=0.10,
         metadata={"help": "reward_variant='ours': Grounding-DINO confidence threshold for per-step boxes. "
-                          "Ignored under --overlap_rect_frac (no boxes are requested)."},
+                          "Ignored under --overlap_rect_frac (no boxes are requested); under "
+                          "--overlap_chain_boxes it still applies, to the one call per completion."},
     )
     max_box_area: float = field(
         default=0.5,

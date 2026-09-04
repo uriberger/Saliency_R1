@@ -68,7 +68,8 @@ def cfg(**kw):
     """Reset to the shipped defaults, then apply kw. configure() ignores None."""
     ORW._CFG.update(box_threshold=0.10, max_box_area=0.5, max_union_area=None,
                     metric="mean_in", mass_floor_tau=None, natural_only=False,
-                    rect_frac=None)
+                    rect_frac=None, rect_placement="centre", rect_seed=0,
+                    chain_boxes=None)
     ORW.configure(**kw)
 
 
@@ -246,6 +247,158 @@ for _ in range(300):
         if not np.isfinite(v) or not (0.0 <= v <= 1.0):
             bad += 1
 check("300 random batches", bad == 0, f"{bad} bad")
+
+print("\n9. --overlap_rect_placement: the interior modes never touch the ring")
+# The contract the whole flag rests on. The grid's one-patch border holds ~half the
+# attention mass and 76-85% of map peaks, and mean_in divides by that peak, so a mask
+# that reaches the border is scoring the sink against itself. `centre` already avoids it
+# at frac 0.565; the interior modes must avoid it at EVERY fraction and on every grid,
+# which a plain in-frame offset does not.
+cfg(rect_frac=F)
+check("placement defaults to centre", ORW._CFG["rect_placement"] == "centre")
+bad, checked = [], 0
+for gh in range(3, 22):
+    for gw in range(3, 22):
+        for frac in (0.1, 0.3, 0.565, 0.9, 0.999):
+            got = ORW.interior_placements(gh, gw, frac)
+            if got is None:
+                bad.append((gh, gw, frac, "no placements on a grid with an interior"))
+                continue
+            rows, cols, n_r, n_c = got
+            for idx in range(n_r * n_c):
+                m = ORW._interior_rect_mask(gh, gw, frac, index=idx)
+                if m is None:
+                    bad.append((gh, gw, frac, idx, "None"))
+                    continue
+                checked += 1
+                if ORW._ring_frac(m) != 0.0:
+                    bad.append((gh, gw, frac, idx, "touches the ring"))
+                if int(m.sum()) != rows * cols:
+                    bad.append((gh, gw, frac, idx, "wrong area"))
+check(f"ring coverage is exactly 0 for all {checked} interior placements",
+      not bad, f"{len(bad)} bad, first {bad[:3]}")
+check("a grid with no interior gives no interior rectangle",
+      all(ORW._interior_rect_mask(gh, gw, F) is None
+          for gh, gw in ((1, 1), (2, 2), (2, 30), (30, 2))))
+check("... and such a step is SKIPPED, not scored 0",
+      (cfg(rect_frac=F, rect_placement="interior_centre") or
+       reward([steps(np.ones((2, 9), dtype=np.float32))], valid_list=[True])) == [None])
+cfg(rect_frac=F, rect_placement="interior_centre")
+ic = ORW._interior_rect_mask(*GRID, F)
+check("interior_centre is 6 x 11 on a 10 x 16 grid (frac is of the INTERIOR)",
+      (int(ic.any(axis=1).sum()), int(ic.any(axis=0).sum())) == (6, 11),
+      f"got {(int(ic.any(axis=1).sum()), int(ic.any(axis=0).sum()))}")
+check("... which is smaller than the same frac centred on the whole grid",
+      ic.sum() < ORW._centre_rect_mask(*GRID, F).sum())
+check("12 placements on the modal grid", ORW.interior_placements(*GRID, F)[2:] == (3, 4))
+
+print("\n10. interior_hash: one mask per COMPLETION, stable, and not the same for all")
+cfg(rect_frac=F, rect_placement="interior_hash")
+m = (np.random.default_rng(3).random(GRID) ** 2).astype(np.float32)
+
+
+def rw(texts):
+    """One completion per text, one step each, on the same map -- so any difference in
+    the score is the mask and nothing else."""
+    return ORW.think_overlap_reward(
+        completions=[[{"content": t}] for t in texts],
+        saliency_map=[steps(m) for _ in texts], image=[None] * len(texts),
+        valid_list=[True] * len(texts))
+
+
+group = [f"rollout {i}" for i in range(8)]
+first = rw(group)
+check("all 8 rollouts scored", all(v is not None for v in first))
+check("the group is NOT constant -- a mask that is cancels out of the advantage",
+      len(set(np.round(first, 12))) > 1, f"got {first}")
+check("stable: the same texts score the same twice", np.allclose(first, rw(group)))
+check("stable across a 'restart': same values from a fresh configure()",
+      (cfg(rect_frac=F, rect_placement="interior_hash") or np.allclose(first, rw(group))))
+cfg(rect_frac=F, rect_placement="interior_hash", rect_seed=1)
+check("--overlap_rect_seed moves the lottery", not np.allclose(first, rw(group)))
+cfg(rect_frac=F, rect_placement="interior_hash")
+check("identical completions get identical masks (it is a function of the TEXT)",
+      len(set(np.round(rw(["same"] * 4), 12))) == 1)
+# Over many texts the draw must cover the placement space rather than favouring one.
+seen = set()
+for i in range(400):
+    ORW._interior_rect_mask(*GRID, F)  # warm the cache; irrelevant to the draw
+    seen.add(ORW._rect_mask_for(*GRID, f"completion {i}").tobytes())
+check("the draw reaches all 12 placements", len(seen) == 12, f"got {len(seen)}")
+check("every drawn mask is ring-free",
+      all(ORW._ring_frac(ORW._rect_mask_for(*GRID, f"c{i}")) == 0.0 for i in range(200)))
+# The centred modes must NOT read the completions, so a run that forgets to pass them
+# still works; interior_hash must refuse loudly rather than silently making one mask.
+cfg(rect_frac=F, rect_placement="interior_hash")
+try:
+    ORW.think_overlap_reward(completions=None, saliency_map=[steps(m)], image=[None],
+                             valid_list=[True])
+    check("interior_hash without completions is refused", False, "no error raised")
+except KeyError:
+    check("interior_hash without completions is refused", True)
+for placement in ("centre", "interior_centre"):
+    cfg(rect_frac=F, rect_placement=placement)
+    out = ORW.think_overlap_reward(completions=None, saliency_map=[steps(m)],
+                                   image=[None], valid_list=[True])
+    check(f"{placement} does not need the completions", out[0] is not None)
+
+print("\n11. placement configurations that would fail silently are refused")
+cfg()
+for bad_placement in ("interior", "INTERIOR_HASH", "middle"):
+    try:
+        ORW.configure(rect_frac=F, rect_placement=bad_placement)
+        check(f"placement {bad_placement!r} refused", False, "no error raised")
+    except ValueError:
+        check(f"placement {bad_placement!r} refused", True)
+    cfg()
+try:
+    ORW.configure(rect_placement="interior_hash")     # no --overlap_rect_frac
+    check("a placement without a fraction is refused", False, "no error raised")
+except ValueError:
+    check("a placement without a fraction is refused", True)
+cfg()
+
+print("\n12. mask/* diagnostics say what was actually scored")
+cfg(rect_frac=F, rect_placement="interior_hash")
+ORW.pop_mask_diagnostics()
+rw(group)
+d = ORW.pop_mask_diagnostics()
+check("mask_diag_active() under a rectangle", ORW.mask_diag_active() is True)
+check("ring_frac logged as 0", d["ring_frac"] == 0.0, f"got {d['ring_frac']}")
+check("n_placements logged as 12", d["n_placements"] == 12.0, f"got {d['n_placements']}")
+check("union_frac is the realised coverage", abs(d["union_frac"] - ic.mean()) < 1e-9,
+      f"got {d['union_frac']} vs {ic.mean()}")
+check("chain_ungrounded_frac is NaN when no chain grounding ran",
+      np.isnan(d["chain_ungrounded_frac"]))
+check("pop clears", np.isnan(ORW.pop_mask_diagnostics()["ring_frac"]))
+cfg()
+check("mask_diag_active() False on the incumbent path", ORW.mask_diag_active() is False)
+
+print("\n13. random batches under every placement")
+for placement in ("centre", "interior_centre", "interior_hash"):
+    cfg(rect_frac=F, rect_placement=placement)
+    rng = np.random.default_rng(11)
+    bad = 0
+    for _ in range(200):
+        n = int(rng.integers(1, 4))
+        batch = [steps(*[(rng.random((int(rng.integers(2, 14)), int(rng.integers(2, 14))))
+                          * 10.0 ** int(rng.integers(-7, 2))).astype(np.float32)
+                         for _ in range(int(rng.integers(1, 4)))]) for _ in range(n)]
+        out = ORW.think_overlap_reward(
+            completions=[[{"content": f"c{i}"}] for i in range(n)],
+            saliency_map=batch, image=[None] * n, valid_list=[True] * n)
+        if len(out) != n:
+            bad += 1
+            continue
+        for comp, v in zip(batch, out):
+            if v is None:
+                if all(ORW._rect_mask_for(*st["map"].shape, "c0") is None for st in comp):
+                    continue
+                bad += 1
+                continue
+            if not np.isfinite(v) or not (0.0 <= v <= 1.0):
+                bad += 1
+    check(f"200 random batches, placement={placement}", bad == 0, f"{bad} bad")
 
 ORW._dino_boxes = _REAL_DINO
 print("\n" + ("ALL PASS" if not FAILED else f"{len(FAILED)} FAILED: {FAILED}"))

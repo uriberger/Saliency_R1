@@ -2952,6 +2952,26 @@ class GRPOTrainer(Trainer):
                     _g = _g[~torch.isnan(_g)]
                     if _g.numel():
                         self._metrics[mode][f"mismatch/{_k}"].append(_g.mean().item())
+
+            # Where the MASK came from, under --overlap_rect_placement and
+            # --overlap_chain_boxes. `ring_frac` is the one to read: the grid's one-patch
+            # border is the sink `mean_in` divides by (it holds ~half the attention mass
+            # and most of the peaks), so a mask that reaches it is scoring the sink
+            # against itself. Both interior placements contract to 0.000, and the number
+            # drifting off zero means the arm is no longer the control it is named for.
+            # `chain_ungrounded_frac` says how often one-call-per-completion grounding
+            # lost a whole completion where per-step grounding would have lost one step.
+            # Same rank-uniform argument as the three blocks above.
+            from trl.rewards.overlap_rewards import mask_diag_active as _mask_diag_active
+            from trl.rewards.overlap_rewards import pop_mask_diagnostics
+
+            if _mask_diag_active():
+                for _k, _v in pop_mask_diagnostics().items():
+                    _t = torch.tensor([_v], dtype=torch.float32, device=device)
+                    _g = gather(_t)
+                    _g = _g[~torch.isnan(_g)]
+                    if _g.numel():
+                        self._metrics[mode][f"mask/{_k}"].append(_g.mean().item())
         if self.reward_variant == "grad":
             # The roll-null closes box size and confidence; it does not close the centre
             # hack (`ecc` rising, and correlating with the score), the reward going hollow

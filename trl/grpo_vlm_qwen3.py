@@ -648,6 +648,30 @@ if __name__ == "__main__":
                 "thrown away. Pick one."
             )
 
+    # --overlap_chain_boxes lives inside think_overlap_reward too, and it is the only one
+    # of the four mask sources that still needs the detector -- so the failure it has to
+    # be protected from is the opposite one: a run that quietly keeps per-step grounding.
+    if script_args.overlap_chain_boxes:
+        if script_args.reward_variant != "ours":
+            raise SystemExit(
+                f"--overlap_chain_boxes {script_args.overlap_chain_boxes} needs "
+                "--saliency_method attention (--reward_variant ours); got "
+                f"reward_variant='{script_args.reward_variant}'. The gradient and glimpse "
+                "rewards flatten (completion, step) into their own _dino_boxes call, so "
+                "the flag would leave per-step grounding running and change nothing -- a "
+                "null result that looks like a finding."
+            )
+        for _name, _val in (("--placebo", script_args.placebo),
+                            ("--maskfree", script_args.maskfree),
+                            ("--mismatch_bank", script_args.mismatch_bank)):
+            if _val:
+                raise SystemExit(
+                    f"--overlap_chain_boxes {script_args.overlap_chain_boxes} and {_name} "
+                    "cannot be combined: the first changes which sentence the overlap "
+                    "reward grounds, the second replaces that reward outright, so the one "
+                    "call per completion would be made and thrown away."
+                )
+
     # --overlap_question_boxes is read by think_overlap_reward and by nothing else. Every
     # other variant flattens (completion, step) into its OWN _dino_boxes call, so passing
     # the flag to one of them would leave the per-step grounding running and change
@@ -690,9 +714,16 @@ if __name__ == "__main__":
             # None keeps the incumbent DINO-union path; a fraction switches the mask to a
             # centred rectangle and stops the detector being constructed at all.
             rect_frac=script_args.overlap_rect_frac,
+            # Where that rectangle sits. 'centre' keeps the incumbent construction; the
+            # interior placements restrict it to patches off the border sink and, for
+            # interior_hash, move it per completion.
+            rect_placement=script_args.overlap_rect_placement,
+            rect_seed=script_args.overlap_rect_seed,
             # The other way to stop constructing the detector: read one union per dataset
             # row, grounded on its question before the run. configure() refuses the pair.
             question_boxes=script_args.overlap_question_boxes,
+            # And the rung between them: the detector still runs, once per completion.
+            chain_boxes=script_args.overlap_chain_boxes,
         )
         if script_args.overlap_question_boxes:
             # Load and validate NOW rather than on the first reward call: a threshold or

@@ -218,6 +218,61 @@ A FIXED RECTANGLE INSTEAD OF THE BOXES (--overlap_rect_frac, default None = OFF)
       moves with the mask. Re-measure the within-group sd (overlap_metric_spread.py)
       rather than assuming the incumbent weight.
 
+WHERE THE RECTANGLE SITS (--overlap_rect_placement, default 'centre'):
+
+      The centred rectangle is the same for all 8 rollouts of a prompt, and GRPO
+      subtracts the group mean, so a constant mask cancels out of the advantage except
+      through the map. Measured on the val_natural cross-run probe (6 policies,
+      identical generations, only the mask varied), the surviving contrast is 0.90-0.93
+      correlated with `flatness` = mean(m)/max(m), the mask-free statistic --maskfree
+      rewards, against 0.69-0.76 for the per-step DINO union. This flag restores a
+      per-COMPLETION mask without a detector.
+
+        centre           the incumbent: rows = round(grid_h * sqrt(frac)), centred on the
+                         grid. Byte-identical to what --overlap_rect_frac did before this
+                         flag existed, so an existing run's semantics do not move.
+        interior_centre  the same construction on the INTERIOR of the grid (everything but
+                         the one-patch border), sized to `frac` of the interior's area and
+                         centred in it. The matched control for the mode below: same area,
+                         same zero ring coverage, no per-completion variation.
+        interior_hash    those dims, placed at one of the strictly-interior positions,
+                         chosen by blake2b(seed | completion text). Deterministic per
+                         completion and stable across restarts and ranks.
+
+      WHY THE INTERIOR, and not just any offset. The outer ring of the patch grid is
+      32.5% of a 10x16 grid and carries 48-52% of the attention mass -- 2.6-3.1x the
+      interior's per-patch density -- and 76-85% of map peaks sit on it. `mean_in`
+      divides by that peak, so where a mask sits relative to the ring is not a detail:
+
+          mask                                ring patches covered   r(reward, ring mass)
+          centred rectangle f=0.565                          0.000        -0.70 .. -0.78
+          box drawn among INTERIOR placements                0.000        -0.49 .. -0.62
+          DINO union                                        ~0.374        -0.46 .. -0.56
+          rectangle at a random IN-FRAME offset              0.226        -0.38 .. -0.52
+          whole grid (`flatness`)                            1.000        -0.44 .. -0.54
+
+      A rectangle merely displaced inside the frame lets a different slice of the ring
+      back in on every draw, which pushes the reward's ring signal BELOW `flatness`'s --
+      it dilutes the mechanism it was meant to preserve. Restricting the draw to
+      placements that touch no ring patch holds ring coverage at exactly 0 for every
+      completion and leaves interior placement as the only per-completion variable.
+      Measured for that mode: within-group sd 0.97-1.24x the per-step DINO reward's
+      (restored), correlation with `flatness` 0.66-0.70 (down from 0.87-0.91 centred).
+
+      Two consequences worth knowing:
+
+        * `frac` is read as a fraction of the INTERIOR under both interior_* modes, so
+          the mask is smaller than the same `frac` gives under 'centre' -- 0.394 of a
+          10x16 grid at frac 0.565, not 0.565. That is what makes it fit with room to
+          move. Re-measure w_overlap; do not carry the centred arm's weight over.
+        * A coarse grid leaves few positions -- 12 on the modal 10x16. The per-completion
+          mask takes about a dozen distinct values, which is a real limit on how much
+          variation this can restore, and `mask/n_placements` logs it.
+
+      On a grid with no interior at all (grid_h < 3 or grid_w < 3) both interior modes
+      return None, and the step takes the same skipped-not-zeroed path as a degenerate
+      union.
+
 There is deliberately NO step-count term. The observe-step count carries essentially
 no correctness signal (r -0.004..-0.022), so an anti-brevity multiplier costs 24% of
 the reward's predictive value and a hard gate costs 50-70%, to close a step-dropping
@@ -244,6 +299,53 @@ Natural-images-only gating (--overlap_natural_only, OFF by default):
       for the advantage (a per-group constant cancels in reward - group_mean) but
       would drag the logged rewards/think_overlap_reward/mean down with rows the
       reward was never evaluated on.
+
+One grounding per COMPLETION instead of one per step (--overlap_chain_boxes, OFF by
+default):
+
+      The middle rung of the ladder that --overlap_question_boxes ends: ground once per
+      step (incumbent), once per COMPLETION (here), once per ROW (question boxes), or
+      not at all (--overlap_rect_frac). Grounding-DINO is called on ONE observe step's
+      sentence per completion and the union it returns is scored against every step of
+      that completion. Detector calls fall from the completion's step count -- 2.1 on
+      the trained 8k policy, 3.7 at the cold start -- to exactly one.
+
+      WHICH STEP, and why not the first. Mask closeness between chains of the same image
+      (step_box_similarity.py's measure, so mask size is already controlled for), over
+      six policies on the val_natural probe:
+
+          two steps of ONE chain                          0.58 .. 0.73
+          first step vs first step, different chains      0.81 .. 0.88   <- the most alike
+          random step vs random step                      0.65 .. 0.80
+          last step vs last step                          0.62 .. 0.79
+
+      The first sentence of a chain is the most stereotyped thing in it -- two chains'
+      opening steps are more alike than two steps of one chain -- so grounding on it
+      gives the 8 rollouts of a prompt the most nearly identical masks available, which
+      is the opposite of what this flag is for. 'last' is the default for that reason.
+      'first' is kept because it is the naive choice and the comparison is cheap.
+
+      Consequences:
+
+        * WHICH completions are scored changes, at completion granularity. If the chosen
+          step grounds nothing, the whole completion is unscored (masked, not zeroed) --
+          where per-step grounding would have skipped that one step and kept the rest.
+          There is deliberately NO fallback to another step: a fallback costs a second
+          detector call and would make "one call per completion" untrue. The rate is
+          logged as `mask/chain_ungrounded_frac`; read it before reading the reward.
+        * --max_union_area now applies per completion, not per step, for the same reason.
+        * The step-duplication hack loses its lever on the mask -- repeating a
+          trivially-groundable sentence no longer changes which boxes are used -- but a
+          duplicated step still enters the per-completion mean, exactly as under
+          --overlap_question_boxes.
+        * Unlike the two flags around it this one still needs Grounding-DINO, so the
+          sidecar stays up. It is cheaper, not detector-free.
+
+      Within-group sd is 1.06-1.37x the per-step reward's for 'first' and 1.18-1.52x for
+      'last', i.e. the per-completion mask keeps the spread rather than losing it, and
+      correlation with `flatness` stays at 0.48-0.69 against a fixed mask's 0.85-0.93.
+      w_overlap still needs re-measuring: 0.4 x sd(per-step)/sd(scheme) puts 'last' near
+      0.32 on the cold start.
 
 One grounding per QUESTION instead of one per step (--overlap_question_boxes, OFF by
 default):
@@ -280,6 +382,7 @@ w_overlap is applied by the trainer via --reward_weights, not here.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import math
 import os
 
@@ -341,11 +444,21 @@ _CFG = {
     # None or <= 0 -> score the DINO union (the incumbent). A fraction in (0, 1] ->
     # score a centred rectangle of that area instead, and never call DINO at all.
     "rect_frac": None,
+    # Where that rectangle sits: "centre" (the incumbent, unchanged), "interior_centre"
+    # (same construction on the grid's interior, so it covers no ring patch) or
+    # "interior_hash" (those dims at a per-COMPLETION interior position, drawn from a
+    # stable hash of the completion's text). Read only when rect_frac is active.
+    "rect_placement": "centre",
+    "rect_seed": 0,          # mixed into the interior_hash draw; a second run, a second lottery
     # Path to a precompute_question_boxes.py file. Set -> one grounding per dataset ROW,
     # read from disk, and no DINO at all at training time. See the module docstring.
     # Mutually exclusive with rect_frac: both replace the per-step union, in the same
     # place, and _validate_rect refuses the pair.
     "question_boxes": None,
+    # None (incumbent, one DINO call per observe step) | "first" | "last" -> one call per
+    # COMPLETION, on that step's sentence, reused for every step of the completion. Still
+    # needs the detector; see the module docstring for why "last" is the default.
+    "chain_boxes": None,
 }
 
 # Lazily-loaded local Grounding-DINO singleton (one per training process).
@@ -370,6 +483,42 @@ def _diag(key: str, value: float):
     _DIAG.setdefault(key, []).append(float(value))
 
 
+# Where the MASK came from, for --overlap_rect_placement and --overlap_chain_boxes. A
+# second FIXED key set, drained through its own gated block in the trainer, for the same
+# NCCL reason as above.
+#
+# `ring_frac` is the one to watch. It is the share of the scored mask's patches that lie
+# on the grid's one-patch border -- the edge sink that holds ~half the attention mass and
+# 76-85% of map peaks. 0.000 is the contract for both interior placements; anything above
+# it means the mask reached the sink `mean_in` divides by, and the arm has stopped being
+# the control it was named for. `chain_ungrounded_frac` is the other one: it says how
+# often --overlap_chain_boxes lost a whole completion because its chosen step grounded
+# nothing, which the per-step path would have survived.
+MASK_DIAG_KEYS = ("union_frac", "ring_frac", "n_placements", "chain_ungrounded_frac")
+_MASK_DIAG: dict[str, list[float]] = {}
+
+
+def _mask_diag(key: str, value: float):
+    _MASK_DIAG.setdefault(key, []).append(float(value))
+
+
+def mask_diag_active() -> bool:
+    """True when a mask-source flag is installed, so the trainer may branch its logging
+    collectives on it. Rank-uniform: it is a CLI decision made on every process."""
+    return rect_active() or bool(_CFG.get("chain_boxes"))
+
+
+def pop_mask_diagnostics() -> dict[str, float]:
+    """Mean of each mask-source diagnostic since the last call, then clear.
+
+    Always all of MASK_DIAG_KEYS; NaN for a key nothing was recorded under.
+    """
+    out = {k: (float(np.mean(_MASK_DIAG[k])) if _MASK_DIAG.get(k) else float("nan"))
+           for k in MASK_DIAG_KEYS}
+    _MASK_DIAG.clear()
+    return out
+
+
 def pop_diagnostics() -> dict[str, float]:
     """Mean of each roll-null diagnostic since the last call, then clear.
 
@@ -390,6 +539,7 @@ def configure(**kwargs):
             _CFG[k] = v
     _ROLL_RNG = np.random.default_rng(int(_CFG["roll_seed"]))
     _validate_rect()
+    _validate_chain_boxes()
 
 
 def rect_active() -> bool:
@@ -398,9 +548,46 @@ def rect_active() -> bool:
     return f is not None and float(f) > 0
 
 
+RECT_PLACEMENTS = ("centre", "interior_centre", "interior_hash")
+CHAIN_SELECTORS = ("first", "last")
+
+
+def chain_boxes_active() -> bool:
+    """True when Grounding-DINO is called once per COMPLETION instead of once per step."""
+    return bool(_CFG.get("chain_boxes"))
+
+
+def _validate_chain_boxes():
+    """--overlap_chain_boxes conflicts with every other source of the mask."""
+    sel = _CFG.get("chain_boxes")
+    if not sel:
+        return
+    if sel not in CHAIN_SELECTORS:
+        raise ValueError(
+            f"--overlap_chain_boxes must be one of {'|'.join(CHAIN_SELECTORS)}, got {sel!r}.")
+    other = ("--overlap_rect_frac" if rect_active()
+             else "--overlap_question_boxes" if _CFG.get("question_boxes") else None)
+    if other:
+        raise ValueError(
+            f"--overlap_chain_boxes {sel} and {other} both decide where the mask comes "
+            "from, and only one of them can win. They are consecutive rungs of one "
+            "experiment -- per step, per completion, per row, no detector -- so run them "
+            "as separate runs, not as one configuration.")
+
+
 def _validate_rect():
-    """Refuse the two --overlap_rect_frac settings that fail silently rather than loudly."""
+    """Refuse the --overlap_rect_frac settings that fail silently rather than loudly."""
+    placement = _CFG.get("rect_placement") or "centre"
+    if placement not in RECT_PLACEMENTS:
+        raise ValueError(
+            f"--overlap_rect_placement must be one of {'|'.join(RECT_PLACEMENTS)}, "
+            f"got {placement!r}.")
     if not rect_active():
+        if placement != "centre":
+            raise ValueError(
+                f"--overlap_rect_placement {placement} needs --overlap_rect_frac: it says "
+                "where the rectangle sits, and without a fraction there is no rectangle. "
+                "The flag would be silently dead.")
         return
     if _CFG.get("question_boxes"):
         raise ValueError(
@@ -419,7 +606,10 @@ def _validate_rect():
             "SAME on every step, so unlike a DINO union that cap is all-or-nothing: it "
             "would drop every step of every completion and the reward would be None "
             "everywhere, which reads in the logs as a run with no overlap signal rather "
-            "than as a misconfiguration. Lower the fraction or drop the cap.")
+            "than as a misconfiguration. Lower the fraction or drop the cap. (Under the "
+            "interior placements `f` is a fraction of the INTERIOR, so the realised "
+            "coverage is smaller and this check is conservative -- it refuses a little "
+            "early rather than letting an all-or-nothing cap through.)")
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +968,111 @@ def _centre_rect_mask(grid_h, grid_w, frac):
     return mask
 
 
+def _rect_dims(extent_h, extent_w, frac):
+    """Rows and columns covering ~frac of an extent_h x extent_w area, at its aspect."""
+    s = math.sqrt(min(1.0, max(0.0, float(frac))))
+    return (min(extent_h, max(1, int(round(extent_h * s)))),
+            min(extent_w, max(1, int(round(extent_w * s)))))
+
+
+def interior_placements(grid_h, grid_w, frac):
+    """(rows, cols, n_rows_of_positions, n_cols_of_positions) for the interior rectangle.
+
+    The interior is the grid minus its one-patch border -- the edge sink that carries
+    ~half the attention mass and most of the peaks (see the module docstring). `frac` is
+    read as a fraction of that interior, not of the whole grid, which is what leaves the
+    rectangle room to move without ever touching the ring.
+
+    None when the grid has no interior at all (either side below 3 patches).
+    """
+    ih, iw = int(grid_h) - 2, int(grid_w) - 2
+    if ih < 1 or iw < 1:
+        return None
+    rows, cols = _rect_dims(ih, iw, frac)
+    return rows, cols, ih - rows + 1, iw - cols + 1
+
+
+def _placed_rect_mask(grid_h, grid_w, rows, cols, r0, c0):
+    """Boolean grid with a rows x cols block at (r0, c0); None if degenerate."""
+    key = (int(grid_h), int(grid_w), int(rows), int(cols), int(r0), int(c0))
+    hit = _RECT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    mask = np.zeros((int(grid_h), int(grid_w)), dtype=bool)
+    mask[r0:r0 + rows, c0:c0 + cols] = True
+    n_in = int(mask.sum())
+    if n_in == 0 or n_in == int(grid_h) * int(grid_w):
+        return None
+    _RECT_CACHE[key] = mask
+    return mask
+
+
+def _interior_rect_mask(grid_h, grid_w, frac, index=None):
+    """The interior rectangle, centred (index=None) or at placement `index`.
+
+    Placements are numbered row-major over the strictly-interior positions, so every
+    index gives a mask with ring coverage exactly 0 -- the property that separates this
+    from a rectangle merely displaced inside the frame, which lets a different slice of
+    the ring back in on every draw and dilutes the reward's ring signal below the
+    box-blind statistic's. See the module docstring for the measured table.
+    """
+    got = interior_placements(grid_h, grid_w, frac)
+    if got is None:
+        return None
+    rows, cols, n_r, n_c = got
+    if index is None:
+        r_i, c_i = (n_r - 1) // 2, (n_c - 1) // 2
+    else:
+        i = int(index) % (n_r * n_c)
+        r_i, c_i = divmod(i, n_c)
+    return _placed_rect_mask(grid_h, grid_w, rows, cols, 1 + r_i, 1 + c_i)
+
+
+def _completion_text(completion) -> str:
+    """The assistant text of one completion, in either shape the trainer may hand over.
+
+    A local copy of placebo_rewards._completion_text: that module imports this one, so
+    importing it back would be a cycle.
+    """
+    if isinstance(completion, list) and completion and isinstance(completion[0], dict):
+        return completion[0].get("content", "") or ""
+    return completion if isinstance(completion, str) else ""
+
+
+def _blake_u64(*parts: str) -> int:
+    """Stable 64-bit digest. Stable across processes, ranks and restarts, unlike Python's
+    own hash(), which is salted per interpreter -- so the same completion draws the same
+    rectangle on every rank and after every resume."""
+    return int.from_bytes(
+        hashlib.blake2b("\x1f".join(parts).encode("utf-8"), digest_size=8).digest(), "big")
+
+
+def _ring_frac(mask) -> float:
+    """Share of a mask's patches that lie on the grid's one-patch border."""
+    n_in = int(mask.sum())
+    if n_in == 0:
+        return float("nan")
+    ring = np.zeros_like(mask)
+    ring[0, :] = ring[-1, :] = True
+    ring[:, 0] = ring[:, -1] = True
+    return float(np.logical_and(mask, ring).sum()) / n_in
+
+
+def _rect_mask_for(grid_h, grid_w, text):
+    """The configured rectangle for one step, under --overlap_rect_placement."""
+    frac = _CFG["rect_frac"]
+    placement = _CFG.get("rect_placement") or "centre"
+    if placement == "centre":
+        return _centre_rect_mask(grid_h, grid_w, frac)
+    if placement == "interior_centre":
+        return _interior_rect_mask(grid_h, grid_w, frac)
+    # interior_hash: the position is a pure function of the completion's own text, so it
+    # is fixed for a completion and varies between the 8 rollouts of a prompt -- which is
+    # the whole point, since a mask constant inside a group cancels out of the advantage.
+    idx = _blake_u64("overlap-rect", str(_CFG.get("rect_seed", 0)), text)
+    return _interior_rect_mask(grid_h, grid_w, frac, index=idx)
+
+
 def _mean_in(step_map, mask):
     """mean of MAX-normalized (/max -> [0,1]) saliency inside the mask."""
     vmax = float(step_map.max())
@@ -894,10 +1189,15 @@ def think_overlap_reward(
     observe step, or where --overlap_natural_only masks a non-natural row (masked ->
     neutral in GRPO). w_overlap is applied by --reward_weights.
 
-    Under --overlap_rect_frac the mask is a centred rectangle rather than the DINO
-    union, and Grounding-DINO is not called at all. Every step then has a mask, so the
-    only remaining route to None is a completion with no observe steps, or the
-    --overlap_natural_only mask.
+    Under --overlap_rect_frac the mask is a rectangle rather than the DINO union, and
+    Grounding-DINO is not called at all. Every step then has a mask, so the only
+    remaining route to None is a completion with no observe steps, or the
+    --overlap_natural_only mask -- unless --overlap_rect_placement is an interior mode on
+    a grid too small to have an interior, which skips the step like a degenerate union.
+
+    Under --overlap_chain_boxes the detector IS called, once per completion instead of
+    once per observe step, and the union it returns is scored against every step of that
+    completion. A completion whose chosen step grounds nothing is unscored as a whole.
     """
     n = len(saliency_map)
     if valid_list is None:
@@ -943,6 +1243,30 @@ def think_overlap_reward(
             # nothing else.
             per_row = _question_boxes_per_row(kwargs, {c for c, _si in flat_owner})
             boxes_per_item = [per_row[c] for c, _si in flat_owner]
+    elif chain_boxes_active():
+        # --overlap_chain_boxes: ONE grounding call per completion, on the chosen step's
+        # own sentence, then every step of that completion is scored against it. The
+        # scoring loop below is untouched -- the per-completion box list is simply
+        # repeated across the completion's steps -- so this arm differs from the per-step
+        # reference in which sentence was grounded and in nothing else.
+        sel = _CFG["chain_boxes"]
+        sel_c, sel_images, sel_texts = [], [], []
+        for c, steps in enumerate(saliency_map):
+            if not steps or not scored[c]:
+                continue
+            si = 0 if sel == "first" else len(steps) - 1
+            sel_c.append(c)
+            sel_images.append(image[c])
+            sel_texts.append(steps[si]["text"])
+        got = _dino_boxes(sel_images, sel_texts) if sel_images else []
+        per_comp = dict(zip(sel_c, got))
+        # Ungrounded here costs the WHOLE completion, not one step: there is no fallback
+        # to a second sentence, because a fallback would cost a second detector call and
+        # make "one call per completion" untrue. Logged rather than papered over.
+        _mask_diag("chain_ungrounded_frac",
+                   float(np.mean([not per_comp[c] for c in sel_c])) if sel_c else float("nan"))
+        flat_owner = [(c, si) for c in sel_c for si in range(len(saliency_map[c]))]
+        boxes_per_item = [per_comp[c] for c, _si in flat_owner]
     else:
         # Flatten every (completion, observe-step) into one batched DINO call. Masked rows
         # never reach DINO -- the trainer normally hands them no maps anyway, but a row
@@ -959,15 +1283,42 @@ def think_overlap_reward(
 
         boxes_per_item = _dino_boxes(flat_images, flat_texts) if flat_images else []
 
+    # --overlap_rect_placement interior_hash draws the rectangle's position from the
+    # completion's own text, so the texts have to be here. Resolved once, up front, so a
+    # missing `completions` fails before any scoring rather than on one unlucky row.
+    diag_on = mask_diag_active()
+    hashed_rect = rect and (_CFG.get("rect_placement") == "interior_hash")
+    if hashed_rect:
+        if completions is None:
+            raise KeyError(
+                "--overlap_rect_placement interior_hash needs the completions to place the "
+                "rectangle, but none reached the reward function. The position IS the "
+                "completion's identity here; without it every rollout of a prompt would "
+                "get the same mask, which is the arm this one exists to differ from.")
+        texts = [_completion_text(x) for x in completions]
+    else:
+        texts = [""] * n
+
     # Gather grounded mean_in per completion.
     per_completion = [[] for _ in range(n)]
     for (c, si), boxes in zip(flat_owner, boxes_per_item):
         step_map = saliency_map[c][si]["map"]
         gh, gw = step_map.shape
-        mask = (_centre_rect_mask(gh, gw, _CFG["rect_frac"]) if rect
+        mask = (_rect_mask_for(gh, gw, texts[c]) if rect
                 else _union_mask(boxes, gh, gw))
         if mask is None:
             continue  # DINO couldn't ground this step -> skip (do NOT score 0)
+        if diag_on:
+            _mask_diag("union_frac", float(mask.sum()) / mask.size)
+            _mask_diag("ring_frac", _ring_frac(mask))
+            if hashed_rect:
+                # How many distinct masks the draw could have produced on THIS grid. A
+                # coarse grid leaves about a dozen, which bounds how much per-completion
+                # variation the arm can restore -- read it before reading the spread.
+                got = interior_placements(gh, gw, _CFG["rect_frac"])
+                _mask_diag("n_placements", float(got[2] * got[3]) if got else 1.0)
+            elif rect:
+                _mask_diag("n_placements", 1.0)
         s = _step_score(step_map, mask)
         if s is not None:
             per_completion[c].append(s)

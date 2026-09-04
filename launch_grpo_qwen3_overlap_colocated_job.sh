@@ -280,6 +280,51 @@
 # started, so its GPU goes to training -- which changes TRAIN_N and gen_batch, so check the
 # banner before comparing to a per-step run. Adds _qbox to the run name.
 #
+# ONE GROUNDING PER COMPLETION -- the rung between per step and per question:
+#
+#   bash launch_grpo_qwen3_overlap_colocated_job.sh --chain-boxes last --w-overlap 0.32
+#
+# Grounding-DINO is called once per COMPLETION, on that completion's LAST observe step,
+# and the union it returns scores every step of that completion. Detector calls fall from
+# the completion's step count (2.1 on the trained 8k policy, 3.7 at the cold start) to
+# one. Unlike --question-boxes and --overlap-rect-frac the detector is still needed, so
+# the sidecar stays up and the GPU layout is a normal DINO run's -- this is cheaper, not
+# detector-free. Adds _chainlast to the run name.
+#
+# Use `last`, not `first`. Mask closeness between chains of the same image (six policies,
+# val_natural): two chains' FIRST steps sit at 0.81-0.88, more alike than two steps of ONE
+# chain (0.58-0.73), where last steps sit at 0.62-0.79. The opening sentence of a chain is
+# the most stereotyped thing in it, so grounding on it hands a prompt's 8 rollouts the most
+# nearly identical masks available -- the opposite of what a per-completion mask is for.
+#
+# Why a per-completion mask at all: a mask that is CONSTANT across a generation group
+# cancels out of the advantage except through the map, and what survives is 0.85-0.93
+# correlated with the box-blind `flatness` statistic (against 0.69-0.76 for the per-step
+# union). --question-boxes and --overlap-rect-frac both have that property; this does not,
+# and its within-group sd is 1.06-1.52x the per-step reward's rather than 0.67-0.92x.
+#
+# A PER-COMPLETION RECTANGLE, STILL WITHOUT A DETECTOR:
+#
+#   bash launch_grpo_qwen3_overlap_colocated_job.sh \
+#       --overlap-rect-frac 0.565 --rect-placement interior_hash --w-overlap 0.30
+#   bash launch_grpo_qwen3_overlap_colocated_job.sh \
+#       --overlap-rect-frac 0.565 --rect-placement interior_centre --w-overlap 0.30
+#
+# The same question on the detector-free side, and the pair above is the one-variable
+# comparison: identical mask area, identical (zero) ring coverage, and only the placement
+# differs -- fixed for the whole run, or drawn per completion from a hash of its own text.
+#
+# The interior restriction is the load-bearing part. The grid's one-patch border is 32.5%
+# of a 10x16 grid and carries 48-52% of the attention mass, 2.6-3.1x the interior's
+# per-patch density, with 76-85% of map peaks on it; `mean_in` divides by that peak. A
+# rectangle merely displaced IN FRAME lets a different slice of the border back in on
+# every draw, which drops the reward's correlation with ring mass to -0.38..-0.52 --
+# BELOW the box-blind statistic's -0.44..-0.54, i.e. it dilutes the mechanism it was meant
+# to preserve. Confined to the interior it is 0 for every completion by construction.
+# `--overlap-rect-frac` is read against the interior under both modes, so the mask is
+# ~0.41 of a 10x16 grid rather than 0.60; re-measure w_overlap. Adds _inctr / _inhash<seed>
+# to the run name.
+#
 # WATCHING A RUN INSTEAD OF ONLY AUTOPSYING IT
 #
 # Two independent evaluations, both landing in the same WandB run -- one during
@@ -532,6 +577,27 @@ MASKFREE_PARITY=${MASKFREE_PARITY:-false}
 # 0.565 is the fraction to compare against a DINO run -- see the RECTANGLE block in
 # trl/rewards/overlap_rewards.py and outputs/centre_box_probe/report.txt.
 RECT_FRAC=${RECT_FRAC:-}
+# --rect-placement centre|interior_centre|interior_hash: WHERE that rectangle sits. Only
+# read with --overlap-rect-frac. `centre` is the incumbent and leaves an existing run's
+# command line byte-identical. The other two put the rectangle strictly inside the grid's
+# one-patch border -- the edge sink that carries ~half the attention mass and 76-85% of
+# map peaks -- and `interior_hash` moves it per COMPLETION, from a hash of the completion's
+# own text. That is the point: a mask that is the same for all 8 rollouts of a prompt
+# cancels out of the advantage, and what is left correlates 0.90-0.93 with the box-blind
+# `flatness` statistic. A plain in-frame offset would NOT do -- it lets a slice of the ring
+# back in on every draw and dilutes the ring signal below flatness's. See the
+# --overlap_rect_placement help in trl/scripts/utils.py for the measured tables.
+RECT_PLACEMENT=${RECT_PLACEMENT:-centre}
+# Seed for that draw. A second run at another seed is a replicate over a different
+# lottery, which is how a result is told from a draw. It is in the run name for the same
+# reason --mismatch-seed is.
+RECT_SEED=${RECT_SEED:-0}
+# --chain-boxes first|last: call Grounding-DINO ONCE PER COMPLETION, on that step's own
+# sentence, and score every step of the completion against the union it returns. The rung
+# between the incumbent (once per step) and --question-boxes (once per row). Unlike those
+# two this one STILL NEEDS the detector, so the sidecar stays up and the GPU layout is
+# unchanged -- it is cheaper, not detector-free. Empty = off.
+CHAIN_BOXES=${CHAIN_BOXES:-}
 # --mismatch-bank <bank.json>: REPLACE the overlap reward with the MISMATCHED-BOX control
 # -- the same metric on the same map, scored against real Grounding-DINO boxes computed
 # for a DIFFERENT question about a DIFFERENT picture. Tests the assumption underneath
@@ -609,6 +675,11 @@ while [[ $# -gt 0 ]]; do
         --maskfree)               MASKFREE="$2";                shift 2 ;;
         --maskfree-parity)        MASKFREE_PARITY=true;         shift 1 ;;
         --overlap-rect-frac)      RECT_FRAC="$2";               shift 2 ;;
+        # None of these three is a path, so none needs the absolutisation --mismatch-bank
+        # and --question-boxes get: a placement, a seed and a step selector.
+        --rect-placement)         RECT_PLACEMENT="$2";          shift 2 ;;
+        --rect-seed)              RECT_SEED="$2";               shift 2 ;;
+        --chain-boxes)            CHAIN_BOXES="$2";             shift 2 ;;
         # Absolutised here for the same reason as --question-boxes below, and it bites
         # harder: the existence check further down runs in the invocation cwd and PASSES
         # on a relative path, so the run gets all the way to six ranks importing torch
@@ -782,6 +853,65 @@ if [[ -n "$RECT_FRAC" ]]; then
     fi
     # THE POINT OF THE FLAG: no detector, so no sidecar and its GPU goes to training.
     WANT_DINO=false
+fi
+
+# ---------- --rect-placement: where that rectangle sits ----------
+case "$RECT_PLACEMENT" in
+    centre|interior_centre|interior_hash) ;;
+    *)
+        echo "ERROR: --rect-placement must be centre|interior_centre|interior_hash (got '$RECT_PLACEMENT')." >&2
+        exit 1 ;;
+esac
+if [[ "$RECT_PLACEMENT" != "centre" && -z "$RECT_FRAC" ]]; then
+    echo "ERROR: --rect-placement $RECT_PLACEMENT needs --overlap-rect-frac: it says where the" >&2
+    echo "       rectangle sits, and without a fraction there is no rectangle. The flag would" >&2
+    echo "       be silently dead and the run would be an ordinary DINO one under a name that" >&2
+    echo "       says otherwise." >&2
+    exit 1
+fi
+if [[ "$RECT_PLACEMENT" != "centre" ]]; then
+    # The fraction is read against the INTERIOR under these modes, so the mask is smaller
+    # than the same fraction gives centred on the whole grid (0.41 of a 10x16 grid at
+    # 0.565, not 0.60). w_overlap was measured on the per-step DINO union and does not
+    # transfer; say so once, here, rather than leaving it to be discovered in the logs.
+    echo "NOTE: --rect-placement $RECT_PLACEMENT reads --overlap-rect-frac $RECT_FRAC as a" >&2
+    echo "      fraction of the grid's INTERIOR (the grid minus its one-patch border), so the" >&2
+    echo "      mask is smaller than the centred rectangle's -- ~0.41 of a 10x16 grid, not 0.60." >&2
+    echo "      Ring coverage is 0 by construction, which is the property being bought." >&2
+fi
+
+# ---------- --chain-boxes: one grounding per completion ----------
+# The only mask source here that still needs the detector, so WANT_DINO is untouched and
+# the GPU layout is a normal DINO run's. What it changes is how many calls that detector
+# gets: one per completion instead of one per observe step.
+if [[ -n "$CHAIN_BOXES" ]]; then
+    case "$CHAIN_BOXES" in
+        first|last) ;;
+        *)
+            echo "ERROR: --chain-boxes must be first|last (got '$CHAIN_BOXES')." >&2
+            echo "       Use 'last'. First steps are the most stereotyped in a chain -- two" >&2
+            echo "       chains' opening steps are more alike (closeness 0.81-0.88) than two" >&2
+            echo "       steps of ONE chain (0.58-0.73) -- so grounding on the first gives a" >&2
+            echo "       prompt's 8 rollouts the most nearly identical masks available, which" >&2
+            echo "       is the opposite of what this arm is for. 'first' exists only because" >&2
+            echo "       it is the naive choice and the comparison is cheap." >&2
+            exit 1 ;;
+    esac
+    if [[ "$REWARD_VARIANT" != "ours" ]]; then
+        echo "ERROR: --chain-boxes needs the attention map (--saliency-method attention);" >&2
+        echo "       got --saliency-method $REWARD_VARIANT. The gradient and glimpse rewards" >&2
+        echo "       flatten (completion, step) into their own grounding call, so the flag" >&2
+        echo "       would leave per-step grounding running and change nothing -- a null" >&2
+        echo "       result that looks like a finding." >&2
+        exit 1
+    fi
+    if [[ -n "$PLACEBO" || -n "$MASKFREE" || -n "$MISMATCH_BANK" || -n "$RECT_FRAC" || -n "${QUESTION_BOXES:-}" ]]; then
+        echo "ERROR: --chain-boxes and ${PLACEBO:+--placebo $PLACEBO}${MASKFREE:+--maskfree $MASKFREE}${MISMATCH_BANK:+--mismatch-bank}${RECT_FRAC:+--overlap-rect-frac $RECT_FRAC}${QUESTION_BOXES:+--overlap-question-boxes} both decide" >&2
+        echo "       where the overlap reward's mask comes from, and only one can win. The four" >&2
+        echo "       box sources -- per step, per completion, per row, no detector -- are" >&2
+        echo "       consecutive rungs of one experiment. Run them as separate runs." >&2
+        exit 1
+    fi
 fi
 
 # ---------- --mismatch-bank: the wrong-question, wrong-picture control ----------
@@ -1012,6 +1142,23 @@ if [[ -n "$RECT_FRAC" && -z "${W_OVERLAP_SET:-}" ]]; then
     echo "      if this run is meant to be pressure-matched to a DINO reference." >&2
 fi
 
+# The interior placements shrink the mask further (the fraction is read against the grid's
+# interior), and a per-completion mask has MORE within-group spread than the per-step DINO
+# reward rather than less -- so the incumbent weight is wrong in a known direction here,
+# not merely unverified.
+if [[ -n "$RECT_FRAC" && "$RECT_PLACEMENT" != "centre" && -z "${W_OVERLAP_SET:-}" ]]; then
+    echo "NOTE: --rect-placement $RECT_PLACEMENT keeps w_overlap=$W_OVERLAP. That weight was" >&2
+    echo "      measured on the per-step DINO union; this mask is smaller (the fraction is of" >&2
+    echo "      the INTERIOR) and, under interior_hash, varies per completion. Re-measure with" >&2
+    echo "      overlap_metric_spread.py if this run is meant to be pressure-matched." >&2
+fi
+if [[ -n "$CHAIN_BOXES" && -z "${W_OVERLAP_SET:-}" ]]; then
+    echo "NOTE: --chain-boxes $CHAIN_BOXES keeps w_overlap=$W_OVERLAP, measured on the per-step" >&2
+    echo "      union. A per-completion mask carries 1.06-1.52x that reward's within-group sd on" >&2
+    echo "      the val_natural probe, so matched pressure is nearer 0.32 at w_ref 0.4." >&2
+    echo "      Re-measure with overlap_metric_spread.py or pass --w-overlap deliberately." >&2
+fi
+
 # An explicit --w-overlap always wins, as it does for every other metric.
 if [[ -n "$PLACEBO" && -z "${W_OVERLAP_SET:-}" ]]; then
     case "$PLACEBO" in
@@ -1235,6 +1382,16 @@ fi
 # a different mask, which is exactly the kind of difference that must not share a
 # checkpoint dir with its reference. The fraction is in the name because it is the arm.
 [[ -n "$RECT_FRAC" ]] && SUFFIX="${SUFFIX}_rect${RECT_FRAC}"
+# Where that rectangle sits is a different reward again -- interior_hash gives each
+# completion its own mask, which is the whole variable -- and the seed IS the experiment
+# for the same reason --mismatch-seed is: two hash runs at different seeds are two
+# different lotteries over one corpus. `centre` adds nothing, so every existing rect run
+# keeps its name and its checkpoint directory.
+[[ -n "$RECT_FRAC" && "$RECT_PLACEMENT" == "interior_centre" ]] && SUFFIX="${SUFFIX}_inctr"
+[[ -n "$RECT_FRAC" && "$RECT_PLACEMENT" == "interior_hash" ]] && SUFFIX="${SUFFIX}_inhash${RECT_SEED}"
+# One grounding per completion changes which sentence is grounded AND which completions
+# are scored, so it must never share a checkpoint dir or a wandb name with a per-step run.
+[[ -n "$CHAIN_BOXES" ]] && SUFFIX="${SUFFIX}_chain${CHAIN_BOXES}"
 # Same rule a third time. The seed is in the name because it IS the experiment: two
 # mismatch runs at different seeds are different random pairings of the same corpus, and
 # they must not land in one checkpoint directory.
@@ -1418,7 +1575,11 @@ elif [ "$WANT_DINO" != true ]; then
 echo "DINO reward:      NOT STARTED -- $([[ -n "$RECT_FRAC" ]] && echo "--overlap-rect-frac $RECT_FRAC scores a fixed rectangle" || { [[ -n "$MISMATCH_BANK" ]] && echo "--mismatch-bank: another row's boxes, grounded before the run" || echo "--maskfree $MASKFREE scores no boxes"; })"
 else
 echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_box_area=$([[ "$MAX_BOX_AREA" == "0" ]] && echo 'off (no per-box cap)' || echo "$MAX_BOX_AREA") max_union_area=$([[ -n "$MAX_UNION_AREA" ]] && echo "$MAX_UNION_AREA" || echo 'off')"
+if [[ -n "$CHAIN_BOXES" ]]; then
+echo "Grounding:        ONCE per completion, on its $CHAIN_BOXES observe step (not once per step)"
+else
 echo "Grounding:        once per observe step, on the step text"
+fi
 fi
 echo "Saliency map:     $_MAP_SHOWN -> ${WANT_REWARD_FN:-(no saliency reward)}$([[ -n "${_GATE_CKPT:-}" ]] && echo "   (resuming checkpoint-$_GATE_CKPT)")"
 echo "Overlap reward:   layer=$OVERLAP_LAYER heads=[$OVERLAP_HEADS] token_reduction=$TOKEN_REDUCTION w_overlap=$W_OVERLAP"
@@ -1427,11 +1588,29 @@ echo "Metric:           (none -- --maskfree replaces the metric; --overlap-metri
 else
 echo "Metric:           $OVERLAP_METRIC$([[ -n "$MASS_FLOOR_TAU" ]] && echo " mass_floor_tau=$MASS_FLOOR_TAU" || echo " (no mass floor)")"
 fi
-if [[ -n "$RECT_FRAC" ]]; then
+if [[ -n "$RECT_FRAC" && "$RECT_PLACEMENT" == "centre" ]]; then
 echo "Mask:             CENTRED RECTANGLE covering $RECT_FRAC of the patch grid -- no Grounding-DINO."
 echo "                  Same metric, same reward slot, same weight; only the mask differs from a"
 echo "                  DINO run. Every observe step is scored (nothing can be ungroundable), so"
 echo "                  the scored set is LARGER than its reference's -- see outputs/centre_box_probe."
+elif [[ -n "$RECT_FRAC" ]]; then
+echo "Mask:             RECTANGLE covering $RECT_FRAC of the grid's INTERIOR (~0.41 of a 10x16 grid),"
+echo "                  placed $([[ "$RECT_PLACEMENT" == "interior_hash" ]] && echo "PER COMPLETION from blake2b(seed $RECT_SEED | completion text)" || echo "at the centre of the interior") -- no Grounding-DINO."
+echo "                  Ring coverage is 0 by construction: the grid's one-patch border holds ~half"
+echo "                  the attention mass and 76-85% of map peaks, and mean_in divides by that peak,"
+echo "                  so a mask reaching it scores the sink against itself. A plain in-frame offset"
+echo "                  does NOT have this property -- see --overlap_rect_placement in trl/scripts/utils.py."
+if [[ "$RECT_PLACEMENT" == "interior_hash" ]]; then
+echo "                  Each of a prompt's 8 rollouts gets its OWN mask; mask/n_placements says how"
+echo "                  many distinct ones the grid allows (12 on the modal 10x16)."
+fi
+fi
+if [[ -n "$CHAIN_BOXES" ]]; then
+echo "Mask:             the completion'"'"'s $CHAIN_BOXES observe step'"'"'s union, reused for all of its steps."
+echo "                  Same metric, same reward slot; Grounding-DINO still runs, once per COMPLETION"
+echo "                  instead of once per step. The scored SET differs: if that one step grounds"
+echo "                  nothing the whole completion is unscored, with no fallback -- watch"
+echo "                  mask/chain_ungrounded_frac. --max-union-area is now per completion too."
 fi
 if [[ -n "$QUESTION_BOXES" ]]; then
 echo "Mask:             the row's QUESTION union, grounded once before the run -- no Grounding-DINO."
@@ -1852,6 +2031,14 @@ MASKFREE_FLAG=""
 # DINO union) applies and every existing run's command line is byte-identical.
 RECT_FLAG=""
 [[ -n "$RECT_FRAC" ]] && RECT_FLAG="--overlap_rect_frac $RECT_FRAC"
+# The placement and its seed go with the fraction, and only when they are not the
+# dataclass defaults, so an existing rect run's command line is byte-identical.
+[[ -n "$RECT_FRAC" && "$RECT_PLACEMENT" != "centre" ]] && \
+    RECT_FLAG="$RECT_FLAG --overlap_rect_placement $RECT_PLACEMENT --overlap_rect_seed $RECT_SEED"
+# Same shape again: omitted when unset, so the dataclass default (None = once per observe
+# step) applies and an existing run's command line is reproduced byte for byte.
+CHAIN_BOXES_FLAG=""
+[[ -n "$CHAIN_BOXES" ]] && CHAIN_BOXES_FLAG="--overlap_chain_boxes $CHAIN_BOXES"
 # Same shape again, and the seed goes with it: --mismatch_seed has a dataclass default of
 # 0, so emitting it only with the bank keeps every existing run's command line byte-identical.
 MISMATCH_FLAG=""
@@ -1994,6 +2181,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     $LENGTH_GUARD_FLAG \
     $NATURAL_ONLY_FLAG \
     $QUESTION_BOXES_FLAG \
+    $CHAIN_BOXES_FLAG \
     $EVAL_FLAGS \
     $DINO_API_FLAG \
     --reward_weights $REWARD_WEIGHTS \
