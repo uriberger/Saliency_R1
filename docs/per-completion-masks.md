@@ -125,24 +125,79 @@ What that buys and costs, all pairwise against its own centred control `interior
 - the border term weakens in **11 of 11** (−0.605 vs −0.714). That is the price of the
   position varying, and it is the number to watch if the arm underperforms.
 
-## The two flags
+## The two flags, and only two runs
 
 ```fish
 # one DINO call per completion, on its LAST observe step
-bash launch_grpo_qwen3_overlap_colocated_job.sh --chain-boxes last --w-overlap 0.32
+bash launch_grpo_qwen3_overlap_colocated_job.sh \
+    --saliency-method attention --overlap-metric mean_in \
+    --chain-boxes last --w-overlap 0.32 \
+    --num-gpus 8 --lora-targets q_proj,v_proj \
+    --dataset_name peterant330/saliency-r1-8k
 
 # a detector-free rectangle that moves per completion, never onto the border
 bash launch_grpo_qwen3_overlap_colocated_job.sh \
-    --overlap-rect-frac 0.565 --rect-placement interior_hash --w-overlap 0.37
-# ... and its matched control, identical in every way but the placement
-bash launch_grpo_qwen3_overlap_colocated_job.sh \
-    --overlap-rect-frac 0.565 --rect-placement interior_centre --w-overlap 0.45
+    --saliency-method attention --overlap-metric mean_in \
+    --overlap-rect-frac 0.565 --rect-placement interior_hash --w-overlap 0.32 \
+    --num-gpus 7 --lora-targets q_proj,v_proj \
+    --dataset_name peterant330/saliency-r1-8k
 ```
 
-Weights are the cold-start match (`0.4 x sd_within(per-step) / sd_within(scheme)`), which is
-the convention every other arm's weight was set by; brackets over the 11 checkpoints are
-[0.19, 0.34] for `chain last`, [0.37, 0.58] for `interior_hash`, [0.42, 0.73] for
-`interior_centre`. Read them as ±25%, as everywhere else.
+`--num-gpus` differs because only the first needs the detector; both give 6 training procs
+and `gen_batch` 48. `--lora-targets q_proj,v_proj` matters — the launcher's default is
+`q_proj,k_proj,v_proj`, a different experiment that adds `_loraqkv` to the name.
+`--w-overlap` must be passed: the launcher's default is 0.2 and `mean_in` does not override
+it, which is why the reference runs pass 0.4 by hand.
+
+### `interior_centre` is NOT the control to run — 2026-09-04
+
+The first draft of this page called for a third run, `--rect-placement interior_centre`, as
+the matched control for `interior_hash`: same area, same zero border coverage, placement
+fixed instead of per completion. **Do not run it.** The already-running `--overlap-rect-frac
+0.565` arm does that job, and the residual confound is measured and small.
+
+`interior_hash` differs from that running arm in two things — mask AREA (0.412 of the grid
+against 0.600) and PLACEMENT. Separated pairwise over the 11 checkpoints:
+
+| quantity | AREA only (0.600 → 0.412) | PLACEMENT only | ratio |
+|---|---|---|---|
+| within-group sd | +0.010 [−0.040, +0.050] | **+0.180** [+0.080, +0.240] | 18x |
+| r with `flatness` | −0.041 [−0.056, −0.017] | **−0.178** [−0.296, −0.129] | 4.3x |
+| r with border mass | −0.021 [−0.050, +0.053] | **+0.136** [+0.055, +0.207] | 6.5x |
+| border covered | 0.000 → 0.000 | 0.000 → 0.000 | — |
+
+The placement effect moves the same way in 11 of 11 checkpoints on all three rows. The area
+effect is 4–18x smaller and is not even sign-consistent on the sd (7 of 11). The last row is
+the one that matters most for this page's argument: the CENTRED rectangle already has zero
+border coverage, so the edge-sink dimension is matched between the two arms for free.
+
+It could not have been designed away in any case. On a 10x16 grid the interior is 8x14 =
+112 patches and the running rectangle is 8x12 = 96. It fits — with 1 x 3 = 3 placements and
+no vertical freedom at all. Same area *and* room to move does not exist on this grid, which
+is why the fraction is read against the interior.
+
+Recompute the table from the report with `rect_centre` (the running arm) and `rect_inctr`
+(area changed, placement not) as the two rungs; both rows are already in it.
+
+### Weights
+
+`chain last` is calibrated the family's usual way — the cold-start
+`0.4 x sd_within(per-step DINO) / sd_within(scheme)`, so it is pressure-matched to
+`mean_in w0.4` like every other arm. 0.32, bracket [0.19, 0.34] over the 11 checkpoints.
+
+`interior_hash` is **not**, deliberately: its comparator is the running rectangle arm, not
+`mean_in`, so it is matched to that instead —
+`0.4 x sd_within(rect_centre) / sd_within(interior_hash)`. That also happens to be 0.32, and
+it is a much steadier number than the `mean_in` match because it is the same statistic on
+two similar masks:
+
+| calibrated against | cold start | range over 11 checkpoints |
+|---|---|---|
+| the running `rect_frac` arm (**use this**) | 0.32 | 0.28 – 0.36 |
+| `mean_in` w0.4, the family convention | 0.37 | 0.37 – 0.58 |
+
+Read either as ±25%, as everywhere else. If a third run ever happens and the comparison is
+against `mean_in` rather than against the rectangle, use 0.37 and say so in the run name.
 
 Details that will otherwise be discovered the hard way:
 
@@ -174,10 +229,18 @@ Pre-registered:
   decorative but the per-**completion** one is not, and DINO calls can drop 2–4x for free.
 - `chain last` ≈ `question_boxes` (i.e. both below the reference) ⇒ granularity is not what
   matters and the ladder ends; look elsewhere.
-- `interior_hash` > `interior_centre` on natural ⇒ per-completion mask variation is worth
-  something even with no detector at all, and the fixed-mask arms were handicapped.
-- `interior_hash` ≈ `interior_centre` ⇒ variation is not the missing ingredient, and the
-  running `rect_frac` arm can be read at face value after all.
+- `interior_hash` > the running `rect_frac` arm on natural ⇒ per-completion mask variation
+  is worth something even with no detector at all, and every fixed-mask arm was handicapped.
+- `interior_hash` ≈ `rect_frac` ⇒ variation is not the missing ingredient, and `rect_frac`
+  can be read at face value after all.
+
+The second reading has one escape hatch, and it is the only thing `interior_centre` would
+be for: a difference SMALLER than the ~0.013 seed floor cannot be told apart from the
+uncontrolled area change (0.600 → 0.412 of the grid). The table above bounds that channel at
+4–18x below the placement channel, which is why it is a bound rather than a control — so if
+the two arms land within noise of each other, run `interior_centre` at w 0.45 before
+concluding that placement does nothing. If they land far apart, do not bother: the area
+channel is too small to have carried it.
 
 Traps carried over from [next-reward-experiments.md](next-reward-experiments.md): the
 benchmark cannot resolve differences below ~0.013 (the measured seed variance between two

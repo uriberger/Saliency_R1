@@ -275,9 +275,13 @@ WHERE THE RECTANGLE SITS (--overlap_rect_placement, default 'centre'):
         * `frac` is read as a fraction of the INTERIOR under both interior_* modes, so
           the mask is smaller than the same `frac` gives under 'centre' -- 6x11 = 0.412
           of a 10x16 grid at frac 0.565, against the centred 8x12 = 0.600. That is what
-          makes it fit with room to move. Re-measure w_overlap; the cold-start match at
-          w_ref 0.4 is 0.37 for interior_hash and 0.45 for interior_centre, bracketed by
-          [0.37, 0.58] and [0.42, 0.73] over the 11 checkpoints.
+          makes it fit with room to move. Re-measure w_overlap, against whichever run is
+          the comparator: matched to a CENTRED --overlap_rect_frac arm the cold-start
+          weights are 0.32 for interior_hash and 0.45 for interior_centre;
+          matched to mean_in w0.4 they are 0.37 and 0.45. The first is the steadier
+          number -- 0.28-0.36 over the 11 checkpoints against 0.37-0.58 -- because it is
+          the same statistic on two similar masks. docs/per-completion-masks.md says why
+          the centred arm, not interior_centre, is the control worth spending a GPU on.
         * a coarse grid leaves few positions -- 12 on the modal 10x16. The per-completion
           mask takes about a dozen distinct values, which is a real limit on how much
           variation this can restore, and `mask/n_placements` logs it.

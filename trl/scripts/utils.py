@@ -442,9 +442,12 @@ class ScriptArguments:
             "in 11 of 11 (0.709 vs 0.891, where the per-step union is 0.723), at the cost "
             "of a weaker border term (median -0.605 vs -0.714). Note the fraction is read "
             "against the INTERIOR under both interior modes, so the mask is 0.412 of a "
-            "10x16 grid rather than 0.600 -- re-measure w_overlap (cold-start match at "
-            "w_ref 0.4: 0.37 interior_hash, 0.45 interior_centre). Sweep dimension - "
-            "appears in the model/wandb name."
+            "10x16 grid rather than 0.600 -- re-measure w_overlap. Which reference to "
+            "match depends on the comparator: against a CENTRED --overlap_rect_frac run, "
+            "0.32 for interior_hash and 0.45 for interior_centre; against mean_in w0.4, "
+            "0.37 and 0.45. The first is the steadier number (0.28-0.36 over 11 "
+            "checkpoints against 0.37-0.58) because it is the same statistic on two "
+            "similar masks. Sweep dimension - appears in the model/wandb name."
         },
     )
     overlap_rect_seed: int = field(

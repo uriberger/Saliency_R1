@@ -308,13 +308,21 @@
 # A PER-COMPLETION RECTANGLE, STILL WITHOUT A DETECTOR:
 #
 #   bash launch_grpo_qwen3_overlap_colocated_job.sh \
-#       --overlap-rect-frac 0.565 --rect-placement interior_hash --w-overlap 0.30
-#   bash launch_grpo_qwen3_overlap_colocated_job.sh \
-#       --overlap-rect-frac 0.565 --rect-placement interior_centre --w-overlap 0.30
+#       --overlap-rect-frac 0.565 --rect-placement interior_hash --w-overlap 0.32
 #
-# The same question on the detector-free side, and the pair above is the one-variable
-# comparison: identical mask area, identical (zero) ring coverage, and only the placement
-# differs -- fixed for the whole run, or drawn per completion from a hash of its own text.
+# The same question on the detector-free side. ONE run: its control is the already-running
+# --overlap-rect-frac arm, which differs from it in mask AREA (0.412 of the grid against
+# 0.600) and in PLACEMENT, and the area channel is 4-18x the smaller of the two and not
+# even sign-consistent, where the placement channel moves the same way in 11 of 11
+# checkpoints. Both have ZERO border coverage, so the edge-sink dimension is matched for
+# free. --rect-placement interior_centre is the exact area-matched control and is worth a
+# GPU only if the two arms land within the ~0.013 seed floor of each other; run it at
+# w 0.45 then. See docs/per-completion-masks.md.
+#
+# w 0.32 is matched to the RUNNING rectangle arm (0.4 x sd_within(centre)/sd_within(hash)),
+# not to mean_in, because that arm is the comparator. It is also the steadier number:
+# 0.28-0.36 across 11 checkpoints against 0.37-0.58 for the mean_in match, because it is
+# the same statistic on two similar masks.
 #
 # The interior restriction is the load-bearing part. The grid's one-patch border is 30%
 # of a 10x16 grid and carries 48-52% of the attention mass, 2.6-3.1x the interior's
@@ -326,8 +334,7 @@
 # for every completion and the reward tracks border mass MORE strongly than flatness in 8
 # of 11 and than the DINO union in 11 of 11. `--overlap-rect-frac` is read against the
 # interior under both modes, so the mask is 6x11 = 0.412 of a 10x16 grid rather than the
-# centred 8x12 = 0.600; re-measure w_overlap (cold-start match 0.37 / 0.45 at w_ref 0.4).
-# Adds _inctr / _inhash<seed>
+# centred 8x12 = 0.600. Adds _inctr / _inhash<seed>
 # to the run name.
 #
 # WATCHING A RUN INSTEAD OF ONLY AUTOPSYING IT
@@ -1165,8 +1172,9 @@ fi
 if [[ -n "$RECT_FRAC" && "$RECT_PLACEMENT" != "centre" && -z "${W_OVERLAP_SET:-}" ]]; then
     echo "NOTE: --rect-placement $RECT_PLACEMENT keeps w_overlap=$W_OVERLAP. That weight was" >&2
     echo "      measured on the per-step DINO union; this mask is 0.412 of the grid (the" >&2
-    echo "      fraction is of the INTERIOR) and under interior_hash varies per completion. Re-measure with" >&2
-    echo "      overlap_metric_spread.py if this run is meant to be pressure-matched." >&2
+    echo "      fraction is of the INTERIOR) and under interior_hash varies per completion." >&2
+    echo "      Matched to the CENTRED rectangle arm -- the comparator -- interior_hash wants" >&2
+    echo "      0.32 and interior_centre 0.45; matched to mean_in w0.4, 0.37 and 0.45." >&2
 fi
 if [[ -n "$CHAIN_BOXES" && -z "${W_OVERLAP_SET:-}" ]]; then
     echo "NOTE: --chain-boxes $CHAIN_BOXES keeps w_overlap=$W_OVERLAP, measured on the per-step" >&2
