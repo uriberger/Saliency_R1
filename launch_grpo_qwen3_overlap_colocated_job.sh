@@ -292,8 +292,9 @@
 # detector-free. Adds _chainlast to the run name.
 #
 # Use `last`, not `first`. Mask closeness between chains of the same image (six policies,
-# val_natural): two chains' FIRST steps sit at 0.81-0.88, more alike than two steps of ONE
-# chain (0.58-0.73), where last steps sit at 0.62-0.79. The opening sentence of a chain is
+# val_natural, 11 checkpoints): two chains' FIRST steps sit at median closeness 0.842, more
+# alike than two steps of ONE chain (0.614), where last steps sit at 0.699 -- and first
+# beats last pairwise in 9 of the 11. The opening sentence of a chain is
 # the most stereotyped thing in it, so grounding on it hands a prompt's 8 rollouts the most
 # nearly identical masks available -- the opposite of what a per-completion mask is for.
 #
@@ -301,7 +302,8 @@
 # cancels out of the advantage except through the map, and what survives is 0.85-0.93
 # correlated with the box-blind `flatness` statistic (against 0.69-0.76 for the per-step
 # union). --question-boxes and --overlap-rect-frac both have that property; this does not,
-# and its within-group sd is 1.06-1.52x the per-step reward's rather than 0.67-0.92x.
+# and it RAISES the reward's within-group spread (median 1.45x the per-step reward's for
+# `last`, 11 of 11 checkpoints) where every fixed-mask arm lowers it to 0.67-0.75x.
 #
 # A PER-COMPLETION RECTANGLE, STILL WITHOUT A DETECTOR:
 #
@@ -314,15 +316,18 @@
 # comparison: identical mask area, identical (zero) ring coverage, and only the placement
 # differs -- fixed for the whole run, or drawn per completion from a hash of its own text.
 #
-# The interior restriction is the load-bearing part. The grid's one-patch border is 32.5%
+# The interior restriction is the load-bearing part. The grid's one-patch border is 30%
 # of a 10x16 grid and carries 48-52% of the attention mass, 2.6-3.1x the interior's
 # per-patch density, with 76-85% of map peaks on it; `mean_in` divides by that peak. A
 # rectangle merely displaced IN FRAME lets a different slice of the border back in on
-# every draw, which drops the reward's correlation with ring mass to -0.38..-0.52 --
-# BELOW the box-blind statistic's -0.44..-0.54, i.e. it dilutes the mechanism it was meant
-# to preserve. Confined to the interior it is 0 for every completion by construction.
-# `--overlap-rect-frac` is read against the interior under both modes, so the mask is
-# ~0.41 of a 10x16 grid rather than 0.60; re-measure w_overlap. Adds _inctr / _inhash<seed>
+# every draw -- it takes 21% of the border, and tracks a completion's border mass LESS
+# strongly than the box-blind `flatness` statistic does in 10 of 11 checkpoints, i.e. it
+# dilutes the mechanism it was meant to preserve. Confined to the interior, coverage is 0
+# for every completion and the reward tracks border mass MORE strongly than flatness in 8
+# of 11 and than the DINO union in 11 of 11. `--overlap-rect-frac` is read against the
+# interior under both modes, so the mask is 6x11 = 0.412 of a 10x16 grid rather than the
+# centred 8x12 = 0.600; re-measure w_overlap (cold-start match 0.37 / 0.45 at w_ref 0.4).
+# Adds _inctr / _inhash<seed>
 # to the run name.
 #
 # WATCHING A RUN INSTEAD OF ONLY AUTOPSYING IT
@@ -583,10 +588,11 @@ RECT_FRAC=${RECT_FRAC:-}
 # one-patch border -- the edge sink that carries ~half the attention mass and 76-85% of
 # map peaks -- and `interior_hash` moves it per COMPLETION, from a hash of the completion's
 # own text. That is the point: a mask that is the same for all 8 rollouts of a prompt
-# cancels out of the advantage, and what is left correlates 0.90-0.93 with the box-blind
-# `flatness` statistic. A plain in-frame offset would NOT do -- it lets a slice of the ring
-# back in on every draw and dilutes the ring signal below flatness's. See the
-# --overlap_rect_placement help in trl/scripts/utils.py for the measured tables.
+# cancels out of the advantage, and what is left correlates 0.90-0.97 with the box-blind
+# `flatness` statistic against the per-step union's 0.57-0.78. A plain in-frame offset
+# would NOT do -- it takes 21% of the border and tracks border mass LESS strongly than
+# flatness in 10 of 11 checkpoints. See the --overlap_rect_placement help in
+# trl/scripts/utils.py, and mask_variance_probe.py for the tables.
 RECT_PLACEMENT=${RECT_PLACEMENT:-centre}
 # Seed for that draw. A second run at another seed is a replicate over a different
 # lottery, which is how a result is told from a draw. It is in the run name for the same
@@ -876,8 +882,8 @@ if [[ "$RECT_PLACEMENT" != "centre" ]]; then
     # transfer; say so once, here, rather than leaving it to be discovered in the logs.
     echo "NOTE: --rect-placement $RECT_PLACEMENT reads --overlap-rect-frac $RECT_FRAC as a" >&2
     echo "      fraction of the grid's INTERIOR (the grid minus its one-patch border), so the" >&2
-    echo "      mask is smaller than the centred rectangle's -- ~0.41 of a 10x16 grid, not 0.60." >&2
-    echo "      Ring coverage is 0 by construction, which is the property being bought." >&2
+    echo "      mask is 6x11 = 0.412 of a 10x16 grid, not the centred 8x12 = 0.600." >&2
+    echo "      Border coverage is 0 by construction, which is the property being bought." >&2
 fi
 
 # ---------- --chain-boxes: one grounding per completion ----------
@@ -890,8 +896,8 @@ if [[ -n "$CHAIN_BOXES" ]]; then
         *)
             echo "ERROR: --chain-boxes must be first|last (got '$CHAIN_BOXES')." >&2
             echo "       Use 'last'. First steps are the most stereotyped in a chain -- two" >&2
-            echo "       chains' opening steps are more alike (closeness 0.81-0.88) than two" >&2
-            echo "       steps of ONE chain (0.58-0.73) -- so grounding on the first gives a" >&2
+            echo "       chains' opening steps are more alike (median closeness 0.842) than" >&2
+            echo "       two steps of ONE chain (0.614), last at 0.699 -- so the first gives a" >&2
             echo "       prompt's 8 rollouts the most nearly identical masks available, which" >&2
             echo "       is the opposite of what this arm is for. 'first' exists only because" >&2
             echo "       it is the naive choice and the comparison is cheap." >&2
@@ -1148,14 +1154,14 @@ fi
 # not merely unverified.
 if [[ -n "$RECT_FRAC" && "$RECT_PLACEMENT" != "centre" && -z "${W_OVERLAP_SET:-}" ]]; then
     echo "NOTE: --rect-placement $RECT_PLACEMENT keeps w_overlap=$W_OVERLAP. That weight was" >&2
-    echo "      measured on the per-step DINO union; this mask is smaller (the fraction is of" >&2
-    echo "      the INTERIOR) and, under interior_hash, varies per completion. Re-measure with" >&2
+    echo "      measured on the per-step DINO union; this mask is 0.412 of the grid (the" >&2
+    echo "      fraction is of the INTERIOR) and under interior_hash varies per completion. Re-measure with" >&2
     echo "      overlap_metric_spread.py if this run is meant to be pressure-matched." >&2
 fi
 if [[ -n "$CHAIN_BOXES" && -z "${W_OVERLAP_SET:-}" ]]; then
     echo "NOTE: --chain-boxes $CHAIN_BOXES keeps w_overlap=$W_OVERLAP, measured on the per-step" >&2
-    echo "      union. A per-completion mask carries 1.06-1.52x that reward's within-group sd on" >&2
-    echo "      the val_natural probe, so matched pressure is nearer 0.32 at w_ref 0.4." >&2
+    echo "      union. A per-completion mask carries MORE (median 1.45x for last, 11 of 11" >&2
+    echo "      checkpoints), so matched pressure is 0.32 at w_ref 0.4 on the cold start." >&2
     echo "      Re-measure with overlap_metric_spread.py or pass --w-overlap deliberately." >&2
 fi
 
@@ -1594,9 +1600,9 @@ echo "                  Same metric, same reward slot, same weight; only the mas
 echo "                  DINO run. Every observe step is scored (nothing can be ungroundable), so"
 echo "                  the scored set is LARGER than its reference's -- see outputs/centre_box_probe."
 elif [[ -n "$RECT_FRAC" ]]; then
-echo "Mask:             RECTANGLE covering $RECT_FRAC of the grid's INTERIOR (~0.41 of a 10x16 grid),"
+echo "Mask:             RECTANGLE covering $RECT_FRAC of the grid's INTERIOR (0.412 of a 10x16 grid),"
 echo "                  placed $([[ "$RECT_PLACEMENT" == "interior_hash" ]] && echo "PER COMPLETION from blake2b(seed $RECT_SEED | completion text)" || echo "at the centre of the interior") -- no Grounding-DINO."
-echo "                  Ring coverage is 0 by construction: the grid's one-patch border holds ~half"
+echo "                  Border coverage is 0 by construction: the grid's one-patch border holds ~half"
 echo "                  the attention mass and 76-85% of map peaks, and mean_in divides by that peak,"
 echo "                  so a mask reaching it scores the sink against itself. A plain in-frame offset"
 echo "                  does NOT have this property -- see --overlap_rect_placement in trl/scripts/utils.py."

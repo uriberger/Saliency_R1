@@ -222,11 +222,11 @@ WHERE THE RECTANGLE SITS (--overlap_rect_placement, default 'centre'):
 
       The centred rectangle is the same for all 8 rollouts of a prompt, and GRPO
       subtracts the group mean, so a constant mask cancels out of the advantage except
-      through the map. Measured on the val_natural cross-run probe (6 policies,
-      identical generations, only the mask varied), the surviving contrast is 0.90-0.93
-      correlated with `flatness` = mean(m)/max(m), the mask-free statistic --maskfree
-      rewards, against 0.69-0.76 for the per-step DINO union. This flag restores a
-      per-COMPLETION mask without a detector.
+      through the map. Measured on the val_natural cross-run probe (11 checkpoints,
+      identical generations, only the mask varied -- mask_variance_probe.py), the
+      surviving contrast is 0.90-0.97 correlated with `flatness` = mean(m)/max(m), the
+      mask-free statistic --maskfree rewards, against 0.57-0.78 for the per-step DINO
+      union. This flag restores a per-COMPLETION mask without a detector.
 
         centre           the incumbent: rows = round(grid_h * sqrt(frac)), centred on the
                          grid. Byte-identical to what --overlap_rect_frac did before this
@@ -234,38 +234,51 @@ WHERE THE RECTANGLE SITS (--overlap_rect_placement, default 'centre'):
         interior_centre  the same construction on the INTERIOR of the grid (everything but
                          the one-patch border), sized to `frac` of the interior's area and
                          centred in it. The matched control for the mode below: same area,
-                         same zero ring coverage, no per-completion variation.
+                         same zero border coverage, no per-completion variation.
         interior_hash    those dims, placed at one of the strictly-interior positions,
                          chosen by blake2b(seed | completion text). Deterministic per
                          completion and stable across restarts and ranks.
 
-      WHY THE INTERIOR, and not just any offset. The outer ring of the patch grid is
-      32.5% of a 10x16 grid and carries 48-52% of the attention mass -- 2.6-3.1x the
-      interior's per-patch density -- and 76-85% of map peaks sit on it. `mean_in`
-      divides by that peak, so where a mask sits relative to the ring is not a detail:
+      WHY THE INTERIOR, and not just any offset. The border of the patch grid is 30% of a
+      10x16 grid and carries 48-52% of the attention mass -- 2.6-3.1x the interior's
+      per-patch density -- and 76-85% of map peaks sit on it. `mean_in` divides by that
+      peak, so where a mask sits relative to the border is not a detail. Border coverage
+      (share of border patches the mask takes) and the group-centred correlation of the
+      resulting reward with a completion's own border mass, over the same 11 checkpoints:
 
-          mask                                ring patches covered   r(reward, ring mass)
-          centred rectangle f=0.565                          0.000        -0.70 .. -0.78
-          box drawn among INTERIOR placements                0.000        -0.49 .. -0.62
-          DINO union                                        ~0.374        -0.46 .. -0.56
-          rectangle at a random IN-FRAME offset              0.226        -0.38 .. -0.52
-          whole grid (`flatness`)                            1.000        -0.44 .. -0.54
+          mask                                border covered     r(reward, border mass)
+          centred rectangle f=0.565               0.000            -0.32 .. -0.78
+          box among INTERIOR placements           0.000            -0.21 .. -0.70
+          DINO union                              0.26 .. 0.53     -0.08 .. -0.56
+          rectangle at any IN-FRAME offset        0.21             -0.02 .. -0.46
+          whole grid (`flatness`)                 1.000            -0.08 .. -0.57
 
-      A rectangle merely displaced inside the frame lets a different slice of the ring
-      back in on every draw, which pushes the reward's ring signal BELOW `flatness`'s --
-      it dilutes the mechanism it was meant to preserve. Restricting the draw to
-      placements that touch no ring patch holds ring coverage at exactly 0 for every
-      completion and leaves interior placement as the only per-completion variable.
-      Measured for that mode: within-group sd 0.97-1.24x the per-step DINO reward's
-      (restored), correlation with `flatness` 0.66-0.70 (down from 0.87-0.91 centred).
+      Ranges overlap because the collapsed set_a checkpoints sit at one end of all of
+      them, so the claim is made pairwise on the same generations instead. A rectangle
+      merely displaced inside the frame tracks border mass LESS strongly than `flatness`
+      does in 10 of 11 checkpoints and less strongly than the DINO union in 8 of 11: it
+      dilutes the mechanism it was meant to preserve, because it lets a different slice of
+      the border back in on every draw. The interior draw goes the other way -- stronger
+      than `flatness` in 8 of 11 and stronger than the DINO union in 11 of 11.
+
+      What the per-completion draw costs, also pairwise:
+
+        * against its own centred control it is weaker on the border term in 11 of 11
+          (median r -0.605 vs -0.714). That is the price of the position varying.
+        * it buys back spread: within-group sd rises against interior_centre in 11 of 11
+          (median ratio to the per-step reward 0.85 vs 0.69), and it pulls the
+          flatness correlation down in 11 of 11, from 0.891 to 0.709 -- which is the
+          per-step DINO union's own 0.723.
 
       Two consequences worth knowing:
 
         * `frac` is read as a fraction of the INTERIOR under both interior_* modes, so
-          the mask is smaller than the same `frac` gives under 'centre' -- 0.394 of a
-          10x16 grid at frac 0.565, not 0.565. That is what makes it fit with room to
-          move. Re-measure w_overlap; do not carry the centred arm's weight over.
-        * A coarse grid leaves few positions -- 12 on the modal 10x16. The per-completion
+          the mask is smaller than the same `frac` gives under 'centre' -- 6x11 = 0.412
+          of a 10x16 grid at frac 0.565, against the centred 8x12 = 0.600. That is what
+          makes it fit with room to move. Re-measure w_overlap; the cold-start match at
+          w_ref 0.4 is 0.37 for interior_hash and 0.45 for interior_centre, bracketed by
+          [0.37, 0.58] and [0.42, 0.73] over the 11 checkpoints.
+        * a coarse grid leaves few positions -- 12 on the modal 10x16. The per-completion
           mask takes about a dozen distinct values, which is a real limit on how much
           variation this can restore, and `mask/n_placements` logs it.
 
@@ -311,19 +324,20 @@ default):
       the trained 8k policy, 3.7 at the cold start -- to exactly one.
 
       WHICH STEP, and why not the first. Mask closeness between chains of the same image
-      (step_box_similarity.py's measure, so mask size is already controlled for), over
-      six policies on the val_natural probe:
+      (step_box_similarity.py's measure, so mask size is already controlled for), median
+      over the 11 checkpoints of the val_natural probe:
 
-          two steps of ONE chain                          0.58 .. 0.73
-          first step vs first step, different chains      0.81 .. 0.88   <- the most alike
-          random step vs random step                      0.65 .. 0.80
-          last step vs last step                          0.62 .. 0.79
+          two steps of ONE chain                          0.614
+          first step vs first step, different chains      0.842   <- the most alike
+          random step vs random step                      0.754
+          last step vs last step                          0.699
 
-      The first sentence of a chain is the most stereotyped thing in it -- two chains'
-      opening steps are more alike than two steps of one chain -- so grounding on it
-      gives the 8 rollouts of a prompt the most nearly identical masks available, which
-      is the opposite of what this flag is for. 'last' is the default for that reason.
-      'first' is kept because it is the naive choice and the comparison is cheap.
+      The opening sentence of a chain is the most stereotyped thing in it -- two chains'
+      first steps are more alike than two steps of one chain -- so grounding on it gives
+      the 8 rollouts of a prompt the most nearly identical masks available, which is the
+      opposite of what this flag is for. It holds pairwise: first beats last in 9 of the
+      11 checkpoints. 'last' is the default for that reason. 'first' is kept because it is
+      the naive choice and the comparison is cheap.
 
       Consequences:
 
@@ -341,11 +355,13 @@ default):
         * Unlike the two flags around it this one still needs Grounding-DINO, so the
           sidecar stays up. It is cheaper, not detector-free.
 
-      Within-group sd is 1.06-1.37x the per-step reward's for 'first' and 1.18-1.52x for
-      'last', i.e. the per-completion mask keeps the spread rather than losing it, and
-      correlation with `flatness` stays at 0.48-0.69 against a fixed mask's 0.85-0.93.
-      w_overlap still needs re-measuring: 0.4 x sd(per-step)/sd(scheme) puts 'last' near
-      0.32 on the cold start.
+      This is the only mask source measured that RAISES the reward's within-group spread
+      rather than lowering it: median ratio to the per-step reward 1.45 for 'last' (11 of
+      11 checkpoints above 1) and 1.14 for 'first' (10 of 11), where every fixed-mask arm
+      sits at 0.67-0.75. Correlation with `flatness` falls to 0.498 / 0.562 against the
+      per-step union's own 0.723 -- the fixed-mask arms are at 0.89-0.93. w_overlap needs
+      re-measuring: 0.4 x sd(per-step)/sd(scheme) puts 'last' at 0.32 on the cold start,
+      bracketed by [0.19, 0.34] over the 11 checkpoints.
 
 One grounding per QUESTION instead of one per step (--overlap_question_boxes, OFF by
 default):
