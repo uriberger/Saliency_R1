@@ -911,11 +911,21 @@ if [[ -n "$CHAIN_BOXES" ]]; then
         echo "       result that looks like a finding." >&2
         exit 1
     fi
-    if [[ -n "$PLACEBO" || -n "$MASKFREE" || -n "$MISMATCH_BANK" || -n "$RECT_FRAC" || -n "${QUESTION_BOXES:-}" ]]; then
-        echo "ERROR: --chain-boxes and ${PLACEBO:+--placebo $PLACEBO}${MASKFREE:+--maskfree $MASKFREE}${MISMATCH_BANK:+--mismatch-bank}${RECT_FRAC:+--overlap-rect-frac $RECT_FRAC}${QUESTION_BOXES:+--overlap-question-boxes} both decide" >&2
-        echo "       where the overlap reward's mask comes from, and only one can win. The four" >&2
-        echo "       box sources -- per step, per completion, per row, no detector -- are" >&2
+    # Two different clashes, and they must not read alike: the other three MASK SOURCES
+    # would each want to win the same decision, while --placebo / --maskfree /
+    # --mismatch-bank replace the reward outright, so the one call per completion would be
+    # made and then thrown away.
+    if [[ -n "$RECT_FRAC" || -n "${QUESTION_BOXES:-}" ]]; then
+        echo "ERROR: --chain-boxes $CHAIN_BOXES and ${RECT_FRAC:+--overlap-rect-frac $RECT_FRAC}${QUESTION_BOXES:+--overlap-question-boxes} both decide where the" >&2
+        echo "       overlap reward's mask comes from, and only one can win. The four box" >&2
+        echo "       sources -- per step, per completion, per row, no detector -- are" >&2
         echo "       consecutive rungs of one experiment. Run them as separate runs." >&2
+        exit 1
+    fi
+    if [[ -n "$PLACEBO" || -n "$MASKFREE" || -n "$MISMATCH_BANK" ]]; then
+        echo "ERROR: --chain-boxes $CHAIN_BOXES changes which sentence the overlap reward grounds," >&2
+        echo "       while ${PLACEBO:+--placebo $PLACEBO}${MASKFREE:+--maskfree $MASKFREE}${MISMATCH_BANK:+--mismatch-bank} replaces that reward outright. The one" >&2
+        echo "       grounding call per completion would be made and then thrown away. Pick one." >&2
         exit 1
     fi
 fi
