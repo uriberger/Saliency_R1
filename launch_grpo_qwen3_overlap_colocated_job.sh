@@ -197,7 +197,13 @@
 #
 #   bash launch_mismatch_bank.sh --out-dir outputs/mismatch_bank/8k        # once, ~1-2 h
 #   bash launch_grpo_qwen3_overlap_colocated_job.sh \
-#       --mismatch-bank outputs/mismatch_bank/8k/bank.json --lora-targets q_proj,v_proj
+#       --mismatch-bank outputs/mismatch_bank/8k/bank.json \
+#       --num-gpus 7 --lora-targets q_proj,v_proj
+#
+# --num-gpus 7, NOT 8: no detector runs, so its GPU goes to training and eight cards give
+# SEVEN training procs -- gen_batch 56 against the reference's 48. Seven cards restore six
+# procs and 48, and --grad-accum cannot (48/7 is not an integer). The GEN BATCH: line in
+# the banner says so whenever the number is not 48.
 #
 # Every reward in this launcher is downstream of one assumption: that grounding the STEP'S
 # OWN TEXT is what makes the boxes meaningful. Two offline results say it may not be --
@@ -1428,10 +1434,34 @@ if [[ -n "$MASKFREE" ]]; then
     echo "                  scored set: every completion with a gradeable observe step (measured identical"
     echo "                  to the DINO-gated set on val_natural: 231/240 either way). --maskfree-parity re-checks."
     fi
-    if (( TRAIN_N != 6 )); then
-    echo "                  NOTE: $TRAIN_N training procs -> gen_batch $(( PER_DEVICE_BATCH * TRAIN_N * GRAD_ACCUM )). The reference runs used 48."
-    echo "                        Pass --num-gpus 7 for 6 procs, or adjust --grad-accum."
+fi
+# gen_batch != the reference's 48. Printed for EVERY cause, not just --maskfree's, which
+# is where this note used to live and where it caught one of the four flags that reach it.
+#
+# Every flag that removes Grounding-DINO gives its GPU to training, so TRAIN_N goes from
+# NUM_GPUS-2 to NUM_GPUS-1 and eight cards produce SEVEN training procs: gen_batch 56
+# against 48, i.e. seven prompts behind each optimizer step instead of six, and a
+# different meaning for the same LR schedule. That is four flags now (--maskfree,
+# --overlap-rect-frac, --question-boxes, --mismatch-bank) plus --share-sidecar-gpu and any
+# odd --num-gpus, so the note belongs to TRAIN_N rather than to any one of them.
+#
+# Two ways back to 48, and which ones exist depends on TRAIN_N. More GPUs always works:
+# TRAIN_N is NUM_GPUS minus the sidecars, so asking for (sidecars + 6) restores six procs.
+# --grad-accum only works when TRAIN_N divides 48 -- it does at 3 procs (grad_accum 16,
+# which is what the 4-GPU recipe in the header uses) and does NOT at 7, where 48/7 is not
+# an integer. So the suggestion is computed rather than fixed; a wrong one here is how a
+# run ends up looking comparable and not being.
+if (( TRAIN_N != 6 )); then
+    _WHY=""
+    [ "$WANT_DINO" != true ] && _WHY=" (no Grounding-DINO, so its GPU went to training)"
+    [ "$SHARE_SIDECAR_GPU" = true ] && [ "$WANT_DINO" = true ] && _WHY=" (--share-sidecar-gpu)"
+    _FIX="pass --num-gpus $(( NUM_GPUS - TRAIN_N + 6 )) for 6 procs"
+    if (( 48 % (TRAIN_N * PER_DEVICE_BATCH) == 0 )); then
+        _FIX="$_FIX, or --grad-accum $(( 48 / (TRAIN_N * PER_DEVICE_BATCH) )) at this proc count"
     fi
+    echo "GEN BATCH:        $TRAIN_N training procs -> gen_batch $(( PER_DEVICE_BATCH * TRAIN_N * GRAD_ACCUM ))$_WHY."
+    echo "                  The reference runs used 48 (1 x 6 x 8), so this run is NOT step-for-step"
+    echo "                  comparable with them: $_FIX."
 fi
 if [[ -n "$PLACEBO" ]]; then
     case "$PLACEBO" in

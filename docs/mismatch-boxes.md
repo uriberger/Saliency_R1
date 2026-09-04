@@ -21,7 +21,16 @@ that a DINO-trained policy already produced. This is that run.
 
     bash launch_mismatch_bank.sh --out-dir outputs/mismatch_bank/8k          # once, ~1-2 h
     bash launch_grpo_qwen3_overlap_colocated_job.sh \
-        --mismatch-bank outputs/mismatch_bank/8k/bank.json --lora-targets q_proj,v_proj
+        --mismatch-bank outputs/mismatch_bank/8k/bank.json \
+        --num-gpus 7 --lora-targets q_proj,v_proj
+
+**`--num-gpus 7`, not 8.** No Grounding-DINO runs, so its GPU goes to training and eight
+cards give *seven* training procs: gen_batch `1 x 7 x 8 = 56` against the reference's
+`1 x 6 x 8 = 48`, i.e. seven prompts behind each optimizer step instead of six, and a
+different meaning for the same LR schedule. Seven cards restore six procs and 48.
+`--grad-accum` cannot fix it at seven procs — 48/7 is not an integer. The launcher prints
+a `GEN BATCH:` line whenever the number is not 48; the same applies to every other flag
+that removes the detector (`--maskfree`, `--overlap-rect-frac`, `--question-boxes`).
 
 ## What it is
 
