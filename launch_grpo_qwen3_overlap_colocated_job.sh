@@ -609,7 +609,15 @@ while [[ $# -gt 0 ]]; do
         --maskfree)               MASKFREE="$2";                shift 2 ;;
         --maskfree-parity)        MASKFREE_PARITY=true;         shift 1 ;;
         --overlap-rect-frac)      RECT_FRAC="$2";               shift 2 ;;
-        --mismatch-bank)          MISMATCH_BANK="$2";           shift 2 ;;
+        # Absolutised here for the same reason as --question-boxes below, and it bites
+        # harder: the existence check further down runs in the invocation cwd and PASSES
+        # on a relative path, so the run gets all the way to six ranks importing torch
+        # before mismatch_rewards._load_bank() looks for it under $REPO/trl_repo and does
+        # not find it. The usage block above spells the flag relative.
+        --mismatch-bank)
+            MISMATCH_BANK="$2"
+            [[ -e "$MISMATCH_BANK" ]] && MISMATCH_BANK="$(cd "$(dirname "$MISMATCH_BANK")" && pwd)/$(basename "$MISMATCH_BANK")"
+            shift 2 ;;
         --mismatch-seed)          MISMATCH_SEED="$2";           shift 2 ;;
         # Regulators. --beta is a real flag rather than an EXTRA_ARGS passthrough
         # precisely so it can reach SUFFIX below: passed through, a beta run would share a
@@ -632,7 +640,13 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --eval-steps)             EVAL_STEPS="$2";              shift 2 ;;
         --no-eval)                VAL_SETS_DIR="";              shift ;;
-        --val-sets-dir)           VAL_SETS_DIR="$2";            shift 2 ;;
+        # Third one. Its default is already absolute, so only a relative --val-sets-dir
+        # is affected, and it fails late but honestly: the "$VAL_SETS_DIR/$_split not
+        # found" check below runs AFTER the cd, so it names a directory that does exist.
+        --val-sets-dir)
+            VAL_SETS_DIR="$2"
+            [[ -e "$VAL_SETS_DIR" ]] && VAL_SETS_DIR="$(cd "$VAL_SETS_DIR" && pwd)"
+            shift 2 ;;
         # Accepted and ignored. Benchmarks are never run during training now, but a
         # run that was submitted before that change re-invokes this script with the
         # flag on every requeue, and the catch-all below would forward it to the
@@ -878,7 +892,7 @@ fi
 if [ "$WANT_DINO" != true ] || [ "$SHARE_SIDECAR_GPU" = true ]; then MIN_GPUS=2; else MIN_GPUS=3; fi
 if (( NUM_GPUS < MIN_GPUS )); then
     if [ "$WANT_DINO" != true ]; then
-        echo "ERROR: need >=2 GPUs with $([[ -n "$RECT_FRAC" ]] && echo '--overlap-rect-frac' || [[ -n "$QUESTION_BOXES" ]] && echo '--question-boxes' || [[ -n "$MISMATCH_BANK" ]] && echo '--mismatch-bank' || echo '--maskfree') (1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
+        echo "ERROR: need >=2 GPUs with $([[ -n "$RECT_FRAC" ]] && echo '--overlap-rect-frac' || { [[ -n "$QUESTION_BOXES" ]] && echo '--question-boxes' || { [[ -n "$MISMATCH_BANK" ]] && echo '--mismatch-bank' || echo '--maskfree'; }; }) (1 vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
     elif [ "$SHARE_SIDECAR_GPU" = true ]; then
         echo "ERROR: need >=2 GPUs with --share-sidecar-gpu (1 shared DINO+vLLM + >=1 training); got --num-gpus $NUM_GPUS" >&2
     else
@@ -1387,14 +1401,21 @@ echo "==========================================================================
 echo "Model:            $MODEL"
 echo "GPUs (total $NUM_GPUS):  $([ "$WANT_DINO" = true ] && echo "DINO=cuda:$DINO_GPU  " || echo 'DINO=none  ')vLLM=cuda:$VLLM_GPU  train=cuda:[$TRAIN_GPUS] ($TRAIN_N procs)$([ "$SHARE_SIDECAR_GPU" = true ] && [ "$WANT_DINO" = true ] && echo '  [sidecars SHARED on cuda:0]')"
 echo "Generation:       vLLM server  127.0.0.1:$VLLM_PORT  gpu_mem=$VLLM_GPU_MEM  max_len=$VLLM_MAX_MODEL_LEN"
-# Three different reasons to have no DINO server, and they must not read alike:
+# Four different reasons to have no DINO server, and they must not read alike:
 # --maskfree scores no boxes at all, --overlap-rect-frac scores a rectangle instead of
-# boxes, and --question-boxes scores boxes that were grounded before the run.
+# boxes, --question-boxes scores boxes that were grounded before the run, and
+# --mismatch-bank scores ANOTHER ROW'S boxes, grounded before the run. This banner is
+# the run's only record of which one it was, so the mismatch arm must not print itself
+# as "--maskfree  scores no boxes" (with an empty MASKFREE) the way it used to.
+#
+# The braces around the tail are load-bearing: `A && echo X || B && echo Y` groups as
+# `((A && echo X) || B) && echo Y`, so a true A prints BOTH arms. Every three-way
+# reason string below is braced for that reason.
 if [[ -n "$QUESTION_BOXES" ]]; then
 echo "DINO reward:      NOT STARTED -- boxes were grounded before the run  box_threshold=$BOX_THRESHOLD max_box_area=$([[ "$MAX_BOX_AREA" == "0" ]] && echo 'off (no per-box cap)' || echo "$MAX_BOX_AREA") max_union_area=$([[ -n "$MAX_UNION_AREA" ]] && echo "$MAX_UNION_AREA" || echo 'off')"
 echo "Grounding:        ONCE per question, from $QUESTION_BOXES"
 elif [ "$WANT_DINO" != true ]; then
-echo "DINO reward:      NOT STARTED -- $([[ -n "$RECT_FRAC" ]] && echo "--overlap-rect-frac $RECT_FRAC scores a fixed rectangle" || echo "--maskfree $MASKFREE scores no boxes")"
+echo "DINO reward:      NOT STARTED -- $([[ -n "$RECT_FRAC" ]] && echo "--overlap-rect-frac $RECT_FRAC scores a fixed rectangle" || { [[ -n "$MISMATCH_BANK" ]] && echo "--mismatch-bank: another row's boxes, grounded before the run" || echo "--maskfree $MASKFREE scores no boxes"; })"
 else
 echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_box_area=$([[ "$MAX_BOX_AREA" == "0" ]] && echo 'off (no per-box cap)' || echo "$MAX_BOX_AREA") max_union_area=$([[ -n "$MAX_UNION_AREA" ]] && echo "$MAX_UNION_AREA" || echo 'off')"
 echo "Grounding:        once per observe step, on the step text"
@@ -1749,7 +1770,7 @@ if [ "$WANT_DINO" = true ]; then
         > "$LOG_DIR/dino.log" 2>&1 &
     DINO_PID=$!
 else
-    echo "[start] Grounding-DINO SKIPPED ($([[ -n "$RECT_FRAC" ]] && echo "--overlap-rect-frac $RECT_FRAC scores a fixed rectangle" || [[ -n "$QUESTION_BOXES" ]] && echo "--question-boxes: grounded once per question before the run" || [[ -n "$MISMATCH_BANK" ]] && echo "--mismatch-bank: another question's boxes, grounded before the run" || echo "--maskfree $MASKFREE needs no boxes"))"
+    echo "[start] Grounding-DINO SKIPPED ($([[ -n "$RECT_FRAC" ]] && echo "--overlap-rect-frac $RECT_FRAC scores a fixed rectangle" || { [[ -n "$QUESTION_BOXES" ]] && echo "--question-boxes: grounded once per question before the run" || { [[ -n "$MISMATCH_BANK" ]] && echo "--mismatch-bank: another question's boxes, grounded before the run" || echo "--maskfree $MASKFREE needs no boxes"; }; }))"
 fi
 
 # ---------- 2. vLLM generation server on GPU 1 ----------
