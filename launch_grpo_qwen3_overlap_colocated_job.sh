@@ -1753,6 +1753,23 @@ echo "WandB:            $([[ -n "${WANDB_API_KEY:-}" ]] && echo '(online)' || ec
 echo "=========================================================================="
 
 # ---------- SLURM path ----------
+#
+# The job re-invokes THIS script with --direct inside the allocation, and it does so by
+# re-spelling every flag by hand. That list is the failure surface: a knob added to the
+# arg loop but not to the list is silently dropped, the inner run falls back to the
+# default, and nothing says so -- the SLURM job name, the .out filename and the log
+# directory are all computed OUT HERE, from the flags that were passed, so they still
+# advertise the experiment that did not run.
+#
+# It has happened. `--chain-boxes last` and `--rect-placement interior_hash` were both
+# missing here, so jobs 6577777 and 6580781 wrote logs called `_chainlast` and `_inhash0`
+# while training a plain per-step DINO run and a plain centred rectangle. Two arms of a
+# five-arm experiment were lost, and the only evidence was inside the banner
+# (`Grounding: once per observe step`) and in `mask/n_placements` logging 1.
+#
+# `test_launcher_forwarding_cpu.py` now derives the required set from the SUFFIX block
+# rather than trusting this list: anything that changes the run's NAME is by definition
+# something that changes the experiment, so it must survive the hop.
 if ! $DIRECT; then
     if ! command -v submit_job >/dev/null 2>&1; then
         for CI_ROOT in \
@@ -1815,7 +1832,8 @@ if ! $DIRECT; then
                 ${PLACEBO:+--placebo $PLACEBO} \
                 ${MASKFREE:+--maskfree $MASKFREE} \
                 $([ "$MASKFREE_PARITY" = true ] && echo --maskfree-parity) \
-                ${RECT_FRAC:+--overlap-rect-frac $RECT_FRAC} \
+                ${RECT_FRAC:+--overlap-rect-frac $RECT_FRAC --rect-placement $RECT_PLACEMENT --rect-seed $RECT_SEED} \
+                ${CHAIN_BOXES:+--chain-boxes $CHAIN_BOXES} \
                 ${MISMATCH_BANK:+--mismatch-bank $MISMATCH_BANK --mismatch-seed $MISMATCH_SEED} \
                 --saliency-method $SALIENCY_METHOD_R \
                 --grad-target $GRAD_TARGET \

@@ -125,6 +125,50 @@ What that buys and costs, all pairwise against its own centred control `interior
 - the border term weakens in **11 of 11** (−0.605 vs −0.714). That is the price of the
   position varying, and it is the number to watch if the arm underperforms.
 
+## NEITHER ARM HAS RUN — 2026-09-06
+
+Both were submitted on 2026-09-04 and **both silently trained something else.** The
+launcher's SLURM path re-invokes itself with `--direct` and re-spells every flag by hand
+(`launch_grpo_qwen3_overlap_colocated_job.sh`, the block under `# ---------- SLURM path`).
+`--chain-boxes`, `--rect-placement` and `--rect-seed` were not in that list, so they were
+dropped on the hop. `RUN_NAME`, the `.out` filename and the log directory are all computed
+in the OUTER invocation, from the flags that *were* passed, so every artefact on disk went
+on advertising the arm that did not run.
+
+| submitted as | wandb run | what actually trained | w |
+|---|---|---|---|
+| `--chain-boxes last` | `grpo-coldstart-chain-boxes` | **per-step DINO union** — the reference recipe | 0.32 |
+| `--rect-placement interior_hash` | `grpo-coldstart-rect-placement` | **centred rectangle 0.565** — identical to the `rect_frac` arm | 0.32 |
+
+Four independent confirmations, in case this has to be re-checked on another pair of runs:
+
+- the banner. `Grounding: once per observe step, on the step text`, and
+  `Mask: CENTRED RECTANGLE covering 0.565` — the branches at lines ~1602 and ~1615 that
+  only print when `CHAIN_BOXES` is empty and `RECT_PLACEMENT` is `centre`.
+- the resolved run name, `…wov0.32_2head_trmean` and `…wov0.32_2head_trmean_rect0.565`,
+  carrying neither `_chainlast` nor `_inhash0` — while the enclosing `.out` files are
+  called `…_chainlast.6577777.out` and `…_inhash0.6580781.out`.
+- `mask/n_placements` = 1.0 and `mask/union_frac` ≈ 0.574 at **all 798** logged points of
+  the "interior_hash" run. The contract for that arm is ~12 and 0.412.
+- `profiling/…think_overlap_reward` = 0.001 s for the "interior_hash" run — no detector was
+  ever called — against 4.3 s for the "chain-boxes" run, which called DINO per step.
+
+Fixed by `test_launcher_forwarding_cpu.py`, which derives the required flag set from the
+SUFFIX block instead of trusting a hand-kept list: anything that changes the run's *name*
+is by definition something that changes the experiment, so it must survive the hop. It
+reports exactly these three as dropped when run against `e8265ed`.
+
+**What the accidental runs are still worth.** Each is a same-recipe replicate of an arm
+that did run, with only `--w-overlap` changed, so together they measure the run-to-run
+floor these comparisons are read against — 0.005–0.006 on `bench/natural/mean` and
+0.005–0.015 on `bench/nonnatural/mean`. The `rect-frac` w0.40 / "rect-placement" w0.32
+pair also gives the only dose–response in the family: identical reward, identical seed and
+GPU layout, and `val/val_nonnatural/accuracy` turns over after ~1600 steps at w0.40 and
+does not at w0.32.
+
+Re-run both, either after this fix or with `--direct`, which is how the `rect_frac` and
+`question_boxes` arms were launched and why they are intact.
+
 ## The two flags, and only two runs
 
 ```fish
