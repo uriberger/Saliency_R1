@@ -126,8 +126,13 @@ def scope_of(args):
 # ---------------------------------------------------------------------------
 # generation
 # ---------------------------------------------------------------------------
-def greedy(processor, model, image, question, max_new_tokens, device):
-    """One greedy completion, at batch size 1 -- which is what the edit requires."""
+def generate_one(processor, model, image, question, max_new_tokens, device,
+                 temperature=0.0):
+    """One completion, at batch size 1 -- which is what the edit requires.
+
+    Batch 1 because `sink_shift` locates the picture from the prompt's own token ids and
+    refuses anything wider; left padding would move every image column.
+    """
     import torch
 
     text = PROBE.build_prompt(processor, question)
@@ -135,11 +140,45 @@ def greedy(processor, model, image, question, max_new_tokens, device):
                        padding=True, padding_side="left",
                        add_special_tokens=False).to(device)
     prompt_len = inputs["input_ids"].shape[1]
+    kw = ({"do_sample": False} if temperature <= 0 else
+          {"do_sample": True, "temperature": temperature, "top_p": 1.0, "top_k": 0})
     with torch.no_grad():
-        out = model.generate(**inputs, do_sample=False, max_new_tokens=max_new_tokens,
-                             pad_token_id=processor.tokenizer.pad_token_id)
+        out = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                             pad_token_id=processor.tokenizer.pad_token_id, **kw)
     ids = out[0][prompt_len:].tolist()
     return processor.tokenizer.decode(ids, skip_special_tokens=True), ids
+
+
+def greedy(processor, model, image, question, max_new_tokens, device):
+    return generate_one(processor, model, image, question, max_new_tokens, device, 0.0)
+
+
+def selector_scores(smap, rect_frac):
+    """The best-of-N selectors, from one completion's own attention map.
+
+    `mean_in` is the reward's own statistic on the centred rectangle: the mean of the
+    map inside it, divided by the map's single largest patch. `flatness` is the same
+    thing with no rectangle at all -- the box-blind half of `mean_in`, and the statistic
+    `--maskfree flatness` rewards. `low_frame` is minus the share of the map's mass on
+    the border, which is the quantity the edit in this file moves directly.
+
+    Returns None for a map that is all zeros: there is nothing to divide by, and a
+    silent zero would rank as confidently as a real score.
+    """
+    if smap is None or float(smap.max()) <= 0 or float(smap.sum()) <= 0:
+        return None
+    gh, gw = smap.shape
+    rect = SS.rect_set(gh, gw, rect_frac).numpy()
+    frame = SS.frame_set(gh, gw).numpy()
+    norm = smap / float(smap.max())
+    return {
+        "mean_in": float(norm[rect].mean()),
+        "flatness": float(norm.mean()),
+        "low_frame": float(-smap[frame].sum() / smap.sum()),
+    }
+
+
+SELECTORS = ("mean_in", "flatness", "low_frame")
 
 
 def grade(text, solution):
@@ -167,19 +206,25 @@ def load_rows(args):
     return out
 
 
-def done_keys(path):
-    """Every unit already in the results file. Resume is by KEY, not by line count."""
-    seen = set()
+def done_keys(path, want=1):
+    """Units already finished in the results file. Resume is by KEY, not by line count.
+
+    `want` is the number of samples a unit needs. Under --best-of N a row that was
+    interrupted after three of eight samples is NOT done; counting it as done would
+    leave the group short and quietly change what best-of-N means for that prompt.
+    """
+    counts = {}
     if not path.exists():
-        return seen
+        return set()
     with open(path) as fh:
         for line in fh:
             try:
                 r = json.loads(line)
             except json.JSONDecodeError:
                 continue          # a torn last line from a killed job is not a result
-            seen.add(unit_key(r["split"], r["arm"], r["alpha"], r["row_index"]))
-    return seen
+            k = unit_key(r["split"], r["arm"], r["alpha"], r["row_index"])
+            counts[k] = counts.get(k, 0) + 1
+    return {k for k, n in counts.items() if n >= max(1, want)}
 
 
 def run_shard(args):
@@ -188,7 +233,7 @@ def run_shard(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     results = out_dir / f"results_shard{args.shard}.jsonl"
-    seen = done_keys(results)
+    seen = done_keys(results, args.best_of)
 
     rows_by_split = load_rows(args)
     units = build_units(args)
@@ -223,24 +268,38 @@ def run_shard(args):
                     ss = SS.install(model, arm=arm, alpha=alpha, layers=layers,
                                     heads=heads, rows=args.rows,
                                     rect_frac=args.rect_frac)
+                if args.best_of > 1 and ss is None:
+                    # Best-of-N needs the map even when nothing is being edited, so the
+                    # hook goes on with alpha=0 -- which is the identity, checked by the
+                    # selftest -- purely to collect it.
+                    ss = SS.install(model, arm="centre", alpha=0.0, layers=layers,
+                                    heads=heads, rows=args.rows, rect_frac=args.rect_frac)
+                if ss is not None and args.best_of > 1:
+                    ss.collect(args.collect_layer, args.collect_heads)
                 try:
                     for r in pending:
-                        t0 = time.time()
-                        if ss is not None:
-                            ss.reset_diagnostics()
-                        text, ids = greedy(processor, model, r["image"], r["question"],
-                                           args.max_new_tokens, device)
-                        acc, fmt = grade(text, r["gt_answer"])
-                        rec = {
-                            "split": split, "arm": arm, "alpha": alpha,
-                            "row_index": r["row_index"], "scope": scope_name,
-                            "accuracy": acc, "format_valid": fmt,
-                            "n_tokens": len(ids), "seconds": time.time() - t0,
-                            "diag": (ss.diagnostics() if ss is not None else None),
-                            "text": text if args.store_text else None,
-                        }
-                        fh.write(json.dumps(rec) + "\n")
-                        fh.flush()
+                        for s in range(max(1, args.best_of)):
+                            t0 = time.time()
+                            if ss is not None:
+                                ss.reset_diagnostics()
+                            temp = 0.0 if args.best_of <= 1 else args.temperature
+                            text, ids = generate_one(
+                                processor, model, r["image"], r["question"],
+                                args.max_new_tokens, device, temp)
+                            acc, fmt = grade(text, r["gt_answer"])
+                            sel = (selector_scores(SS.collected_map(ss), args.rect_frac)
+                                   if (ss is not None and args.best_of > 1) else None)
+                            rec = {
+                                "split": split, "arm": arm, "alpha": alpha,
+                                "row_index": r["row_index"], "scope": scope_name,
+                                "sample": s, "accuracy": acc, "format_valid": fmt,
+                                "n_tokens": len(ids), "seconds": time.time() - t0,
+                                "selectors": sel,
+                                "diag": (ss.diagnostics() if alpha > 0 else None),
+                                "text": text if args.store_text else None,
+                            }
+                            fh.write(json.dumps(rec) + "\n")
+                            fh.flush()
                         prog.tick()
                 finally:
                     if ss is not None:
@@ -405,6 +464,20 @@ def paired_delta(cell, base, n_boot=2000, seed=20260907):
             float(np.percentile(means, 97.5)), int(d.size))
 
 
+def row_accuracy(recs):
+    """{row_index: accuracy}, averaging when a row was sampled more than once.
+
+    Under --best-of N a row has N graded answers. The mean over them is the accuracy of
+    "sample once", which is what the arm table is about; keeping only one of them would
+    make the paired comparison depend on which sample happened to be written last.
+    """
+    per = {}
+    for r in recs:
+        if r["accuracy"] is not None:
+            per.setdefault(r["row_index"], []).append(float(r["accuracy"]))
+    return {i: float(np.mean(v)) for i, v in per.items()}
+
+
 def report(args):
     recs = read_results(args.out_dir)
     if not recs:
@@ -422,19 +495,21 @@ def report(args):
         if not base:
             print(f"\n=== {split}: no alpha=0 baseline, nothing to pair against")
             continue
-        b_acc = {r["row_index"]: r["accuracy"] for r in base
-                 if r["accuracy"] is not None}
+        b_acc = row_accuracy(base)
+        n_samp = len(base) / max(1, len(b_acc))
+        note = ("" if n_samp < 1.5 else
+                f", averaged over {n_samp:.1f} samples per row -- this table is "
+                "'sample once', the best-of-N table is below")
         print(f"\n=== {split}   baseline (alpha=0): "
               f"accuracy {np.mean(list(b_acc.values())):.4f} over {len(b_acc)} rows, "
               f"format valid {np.mean([r['format_valid'] for r in base]):.3f}, "
-              f"mean length {np.mean([r['n_tokens'] for r in base]):.0f}")
+              f"mean length {np.mean([r['n_tokens'] for r in base]):.0f}{note}")
         print(f"    {'arm':<9} {'alpha':>5} {'acc':>7} {'-base':>8} {'95% CI':>20} "
               f"{'n':>4} {'fmt':>6} {'len':>6} {'ungr':>6} {'border':>15} {'moved':>8}")
         for (sp, arm, alpha), rs in sorted(by.items()):
             if sp != split or arm == BASELINE_ARM:
                 continue
-            acc = {r["row_index"]: r["accuracy"] for r in rs
-                   if r["accuracy"] is not None}
+            acc = row_accuracy(rs)
             m, lo, hi, n = paired_delta(acc, b_acc, args.n_boot, args.seed)
             ungraded = np.mean([r["accuracy"] is None for r in rs])
             fmt = np.mean([r["format_valid"] for r in rs])
@@ -451,10 +526,8 @@ def report(args):
 
         print("\n    the result is centre - outward at matched alpha, not centre alone:")
         for alpha in sorted({k[2] for k in by if k[0] == split and k[2] > 0}):
-            c = {r["row_index"]: r["accuracy"]
-                 for r in by.get((split, "centre", alpha), []) if r["accuracy"] is not None}
-            o = {r["row_index"]: r["accuracy"]
-                 for r in by.get((split, "outward", alpha), []) if r["accuracy"] is not None}
+            c = row_accuracy(by.get((split, "centre", alpha), []))
+            o = row_accuracy(by.get((split, "outward", alpha), []))
             if not c or not o:
                 continue
             m, lo, hi, n = paired_delta(c, o, args.n_boot, args.seed)
@@ -463,7 +536,74 @@ def report(args):
     print(f"\n  A cell whose format-valid rate fell below {args.min_format} is off the "
           "manifold,\n  not an effect: the model stopped writing answers in the shape "
           "the grader reads.")
+    report_best_of_n(by, args)
     return 0
+
+
+def picked_value(scores, values):
+    """Expected accuracy of the argmax under a uniform tie-break.
+
+    Averaging over ties is what makes a selector that never discriminates score exactly
+    `random` instead of inheriting whichever answer the generator happened to emit first.
+    """
+    top = scores == scores.max()
+    return float(values[top].mean())
+
+
+def report_best_of_n(by, args):
+    """Idea 2: sample N answers, keep the one whose map scores best.
+
+    `random` is the group's mean accuracy, which is the exact expectation of keeping one
+    answer at random -- i.e. of plain sampling. `oracle` is its max, the ceiling any
+    selector could reach. `picked - random` is the whole result, and `oracle - random`
+    says whether there was anything to pick from in the first place.
+    """
+    groups = {}
+    for (split, arm, alpha), rs in by.items():
+        by_row = {}
+        for r in rs:
+            by_row.setdefault(r["row_index"], []).append(r)
+        multi = {i: v for i, v in by_row.items() if len(v) > 1}
+        if multi:
+            groups[(split, arm, alpha)] = multi
+    if not groups:
+        return
+    print("\n" + "=" * 78)
+    print("BEST-OF-N -- sample N answers, keep the one whose own map scores highest")
+    for (split, arm, alpha), rows in sorted(groups.items()):
+        sizes = [len(v) for v in rows.values()]
+        cell = f"{split}  {arm} alpha={alpha:g}"
+        rand, orac, wors, per_sel = [], [], [], {s: [] for s in SELECTORS}
+        for _i, samples in rows.items():
+            acc = np.asarray([s["accuracy"] for s in samples], float)
+            ok = np.isfinite(acc)
+            if ok.sum() < 2:
+                continue
+            acc = acc[ok]
+            rand.append(acc.mean()); orac.append(acc.max()); wors.append(acc.min())
+            for sel in SELECTORS:
+                sc = np.asarray([(s.get("selectors") or {}).get(sel, np.nan)
+                                 for s in samples], float)[ok]
+                per_sel[sel].append(picked_value(sc, acc) if np.isfinite(sc).all()
+                                    else float("nan"))
+        if not rand:
+            continue
+        rand = np.asarray(rand)
+        print(f"\n  {cell}   {len(rand)} prompts x {np.mean(sizes):.1f} samples")
+        print(f"    random {rand.mean():.4f}   oracle {np.mean(orac):.4f}   "
+              f"worst {np.mean(wors):.4f}   headroom "
+              f"{np.mean(orac) - rand.mean():+.4f}")
+        print(f"      {'selector':<10} {'picked':>8} {'-random':>9} {'95% CI':>20}")
+        for sel in SELECTORS:
+            v = np.asarray(per_sel[sel], float)
+            m, lo, hi, n = paired_delta(dict(enumerate(v)), dict(enumerate(rand)),
+                                        args.n_boot, args.seed)
+            print(f"      {sel:<10} {np.nanmean(v):>8.4f} {m:>+9.4f} "
+                  f"{f'[{lo:+.4f}, {hi:+.4f}]':>20}")
+    print("\n  Already answered offline, on 11 checkpoints x 30 questions x 8 answers:\n"
+          "  no saliency selector beat a deterministic NOISE selector, median "
+          "`picked - random`\n  between -0.013 and +0.003 against the noise selector's "
+          "+0.008. See\n  outputs/best_of_n/crossrun_val_natural.txt.")
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +631,17 @@ def main():
                     help="which query positions are edited")
     ap.add_argument("--rect-frac", type=float, default=SS.RECT_FRAC)
     ap.add_argument("--max-new-tokens", type=int, default=1024)
+    ap.add_argument("--best-of", type=int, default=1,
+                    help="idea 2: sample N answers per prompt and keep the one whose own "
+                         "attention map scores highest. 1 = off (greedy, one answer). "
+                         "Costs N generations per row and forces temperature sampling, "
+                         "so the alpha=0 cell is no longer the greedy baseline")
+    ap.add_argument("--temperature", type=float, default=1.0,
+                    help="only used when --best-of > 1")
+    ap.add_argument("--collect-layer", type=int, default=TRAINED_LAYER,
+                    help="the layer whose map scores the samples")
+    ap.add_argument("--collect-heads", default=",".join(str(h) for h in TRAINED_HEADS),
+                    help="heads merged by mean for that map; empty means all of them")
     ap.add_argument("--store-text", action="store_true",
                     help="keep every completion in the results file (large)")
     ap.add_argument("--shard", type=int, default=0)
@@ -509,9 +660,18 @@ def main():
     args.splits = [s for s in args.splits.split(",") if s]
     args.arms = [a for a in args.arms.split(",") if a]
     args.alphas = [float(a) for a in args.alphas.split(",") if a]
+    args.collect_heads = ([int(h) for h in args.collect_heads.split(",") if h.strip()]
+                          or None)
     bad = [a for a in args.arms if a not in SS.ARMS]
     if bad:
         raise SystemExit(f"unknown arm(s) {bad}; have {sorted(SS.ARMS)}")
+    if args.best_of > 1 and args.scope == "all":
+        # Collecting needs the weights at one layer; editing every layer already
+        # materialises them everywhere. The combination is allowed, but it is slow and it
+        # is not the first experiment either idea calls for, so say so rather than let it
+        # be discovered from the wall clock.
+        print("[note] --best-of with --scope all runs the explicit softmax on every "
+              "layer AND N generations per row; expect ~N x the broad arm's cost.")
 
     if args.stage == "report":
         return report(args)

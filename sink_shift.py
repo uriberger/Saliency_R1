@@ -305,6 +305,13 @@ class SinkShift:
         # null cannot be told apart from having moved nothing.
         self.survey = bool(survey)
         self._survey = {}
+        # Map collection, for best-of-N. One attention row per GENERATED token, at one
+        # layer, averaged over the chosen heads -- exactly the readout the reward used
+        # (layer 22, heads 28/31, merged by mean). It costs nothing extra: the weights
+        # already exist inside this function, and a 300-token answer is 300 x 160 floats.
+        self.collect_layer = None
+        self.collect_heads = None
+        self._maps = []
         # per-prompt, set by the pre-hook
         self.img_cols = None          # [n_img] long, absolute key positions
         self.src_cols = None          # [n_img] bool over img_cols
@@ -319,7 +326,15 @@ class SinkShift:
         self.reset_diagnostics()
 
     # -- diagnostics ------------------------------------------------------
+    def collect(self, layer, heads=None):
+        """Keep the per-token attention map at one layer. `heads=None` merges them all."""
+        self.collect_layer = None if layer is None else int(layer)
+        self.collect_heads = None if heads is None else sorted(int(h) for h in heads)
+        self._maps = []
+        return self
+
     def reset_diagnostics(self):
+        self._maps = []
         self._d = {"rows_edited": 0, "forwards": 0, "layers_touched": set(),
                    "frame_before": 0.0, "frame_after": 0.0, "rect_before": 0.0,
                    "rect_after": 0.0, "image_mass": 0.0, "moved": 0.0, "n": 0}
@@ -392,6 +407,9 @@ class SinkShift:
         # COUNT and different grid shapes, so the cache is keyed on the shapes and not on
         # the count, and is dropped outright here rather than being checked for staleness.
         self._sets = {}
+        # A forward carrying image tokens is the start of a generation, so any map kept
+        # from the previous one belongs to a different picture.
+        self._maps = []
         self.prompt_len = int(input_ids.shape[1])
         self.first_row = (int(self.img_cols.max()) + 1 if self.rows == "after_image"
                           else self.prompt_len if self.rows == "generated" else 0)
@@ -488,9 +506,10 @@ def _make_attention(state: SinkShift):
                                      dropout=0.0, scaling=None, is_causal=None, **kwargs):
         layer_idx = getattr(module, "layer_idx", -1)
         editing = state.alpha > 0.0 and state.edits_layer(layer_idx)
-        # Layers this arm does not touch never leave the fused kernel. Survey mode is the
-        # exception: it needs the weights from every layer, and edits none of them.
-        if state.img_cols is None or not (editing or state.survey):
+        collecting = state.collect_layer == layer_idx
+        # Layers this arm does not touch never leave the fused kernel. Survey and collect
+        # are the exceptions: they need the weights, and they edit nothing.
+        if state.img_cols is None or not (editing or state.survey or collecting):
             return _sdpa(module, query, key, value, attention_mask, dropout, scaling,
                          is_causal, **kwargs)
 
@@ -523,11 +542,51 @@ def _make_attention(state: SinkShift):
             _record_survey(state, a, rows, layer_idx)
         if editing:
             a = _apply_edit(state, a, rows, allowed_row, module)
+        if collecting:
+            # After the edit, not before: the selector should see the map the model
+            # actually used, so that best-of-N and the edit can be run together.
+            _collect_maps(state, a, rows, q_start)
 
         out = torch.matmul(a.to(v.dtype), v).transpose(1, 2).contiguous()
         return out, None
 
     return sink_shift_attention_forward
+
+
+def _collect_maps(state: SinkShift, a, rows, q_start):
+    """Keep one image-attention row per GENERATED token, merged over the chosen heads.
+
+    Prompt positions are skipped: the reward is computed over the tokens the model
+    WROTE, and a map averaged over the question's own tokens would be a different
+    statistic wearing the same name.
+    """
+    pos = rows + q_start
+    keep = pos >= state.prompt_len
+    if not bool(keep.any()):
+        return
+    rows, pos = rows[keep], pos[keep]
+    heads = (slice(None) if state.collect_heads is None
+             else torch.tensor(state.collect_heads, device=a.device, dtype=torch.long))
+    w = a[:, heads][:, :, rows, :][..., state.img_cols]          # [1, H', R, n_img]
+    merged = w.mean(dim=1)[0].detach().float().cpu()             # [R, n_img]
+    for i, p in enumerate(pos.tolist()):
+        state._maps.append((int(p), merged[i]))
+
+
+def collected_map(state: SinkShift):
+    """The completion's map: the mean over every generated token's attention row.
+
+    Returned on the patch grid of the FIRST picture, which is the only shape a single
+    map can have. A prompt carrying two pictures returns None rather than a map that
+    silently concatenates two grids.
+    """
+    if not state._maps or len(state.grids) != 1:
+        return None
+    t, gh, gw = state.grids[0]
+    if t != 1:
+        return None
+    rows = torch.stack([m for _p, m in state._maps])             # [n_tok, n_img]
+    return rows.mean(0).clamp_min(0).reshape(gh, gw).numpy()
 
 
 def _record_survey(state: SinkShift, a, rows, layer_idx):
