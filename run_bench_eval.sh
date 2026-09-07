@@ -406,8 +406,14 @@ run_unit() {
     # the model directory name contains the tag of whichever job merged it.
     echo "[step $STEP] unit $tag: starting ($tasks), ${left}min left, budgeted $need" >&2
 
+    # BENCH_MODEL_TYPE overrides the lmms-eval wrapper the launcher would infer from the
+    # checkpoint path. It exists for `qwen3_vl_sinkshift`, which is `qwen3_vl` plus the
+    # inference-time attention edit (docs/inference-intervention.md) and is configured
+    # through SINK_SHIFT_* in the environment, since the launcher builds --model_args
+    # itself and has no passthrough. Unset, nothing about this script changes.
     local -a common=(--model "$model" --tasks "$tasks" --max-new-tokens 4096
                      --num-gpus "$NUM_GPUS" --direct --r1-mode --tag "r1_$tag" "$@")
+    [[ -n "${BENCH_MODEL_TYPE:-}" ]] && common+=(--model-type "$BENCH_MODEL_TYPE")
     local out_dir
     out_dir=$(bash "$VLM_REASONING/scripts/slurm/launch_lmms_eval_job.sh" \
         "${common[@]}" --print-output-dir) || return 1

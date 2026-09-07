@@ -22,3 +22,6 @@ outputs
 
 # Claude Code project settings (permissions, hooks) -- not tracked
 .claude
+
+# Validation sets, so a worktree can run the val probes without an absolute path.
+cold_data/grpo_sets
