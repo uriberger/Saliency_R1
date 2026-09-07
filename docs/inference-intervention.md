@@ -228,7 +228,61 @@ unchanged. Read the result against the measured **~0.013** seed floor, and again
 `--w-overlap 0` control rather than `baseline/grpo-no-saliency`, which starts from a
 different model.
 
-## 6. What would falsify what
+## 6. First result: the narrow arm is a null, 2026-09-07
+
+Job 6642260, cold-start model, `--scope trained`, 128 rows per split, 4 arms x 2 alphas,
+8 GPUs, 50 minutes. `outputs/sink_shift/sinkshift_coldstart_trained/report.txt`.
+
+The edit landed exactly as designed — the border's share of the picture's attention goes
+0.579 -> 0.000 at alpha=1 for `centre` and `outward`, and 0.580 -> 0.897 for `reverse` —
+and **nothing moved**. On val_natural, against a 0.4219 baseline:
+
+| arm | alpha=0.5 | alpha=1.0 |
+|---|---|---|
+| `centre` | −0.0156 [−0.047, +0.016] | −0.0078 [−0.039, +0.023] |
+| `outward` | −0.0312 [−0.070, +0.008] | −0.0156 [−0.047, +0.016] |
+| `flat` | −0.0078 | −0.0156 |
+| `reverse` | −0.0156 | +0.0000 |
+
+`centre − outward` is +0.0156 [−0.016, +0.047] at alpha 0.5 and +0.0078 [−0.016, +0.031]
+at alpha 1.0. val_nonnatural is flat to the resolution of a 128-row split (its baseline is
+0.0703, so one row is 0.0078).
+
+**This is the expected outcome and it is not evidence about the idea.** The `moved` column
+says the edit shifted **0.0015 of an attention row** — section 3 predicted 0.002 — because
+that is all there is at those two heads. What the run does establish is that the machinery
+works end to end: alpha=0 reproduced the un-hooked generation token for token, the border
+emptied exactly, and answers changed on 3 of 4 selftest prompts, so the edit does reach the
+words.
+
+### The survey is the actionable result
+
+Same job, `outputs/sink_shift/sinkshift_coldstart_trained/survey.json`. `movable` = image
+mass x border share for the best head of each layer, i.e. the largest fraction of one
+attention row the edit could shift there at alpha=1:
+
+| layer | best head | movable |
+|---|---|---|
+| **0** | 27 | **0.244** |
+| 12 | 18 | 0.196 |
+| 5 | 2 | 0.115 |
+| 17 | 24 | 0.106 |
+| ... | | |
+| **22 (rewarded), head 28** | | **0.0019** |
+| **22 (rewarded), head 31** | | **0.0041** |
+| 32 (weakest layer) | 0 | 0.012 |
+
+**Layer 0 has 60x to 130x the leverage of the pair the reward trained**, and layer 12
+nearly as much. The reward was applied where there was almost nothing to move. Run
+`--scope all` next; that is where any effect has to come from, and the survey now says the
+leverage is real rather than assumed.
+
+Layer 0 being the strongest is also the third open question in
+[HANDOFF.md](HANDOFF.md) arriving by a different route — it was already the strongest
+`auroc` layer, with the caveat that it sits near raw embeddings and may be measuring image
+statistics rather than grounding. An edit there would test that directly.
+
+## 7. What would falsify what
 
 - `centre ≈ outward` at every α → the magnitude, not the direction. Inference-time steering
   is a dead end and the training result is not "the middle".
@@ -240,11 +294,11 @@ different model.
   distribution over the picture does not carry the effect, which would agree with results 4
   and 5 in [probe-results.md](probe-results.md) and disagree with the rect-frac reading.
 
-Read no cell whose format-valid rate fell below `--min-format` (default 0.9). That is broken
-generation, not an effect — `flow_intervene_probe.py` at α=1 had box and roll agreeing to
+Read no cell whose format-valid rate fell more than `--max-format-drop` (default 0.05)
+below ITS OWN BASELINE. That is broken generation, not an effect — `flow_intervene_probe.py` at α=1 had box and roll agreeing to
 0.0003 nats for exactly that reason.
 
-## 7. Files
+## 8. Files
 
 | file | what |
 |---|---|
@@ -255,7 +309,7 @@ generation, not an effect — `flow_intervene_probe.py` at α=1 had box and roll
 | `test_sink_shift_model_cpu.py` | 18 integration checks against a randomly-initialised tiny Qwen3-VL, CPU only, ~10 s. This is what `install()` is tested by: the module tree, the config plumbing, the vision tower staying on its own kernel, and `generate`'s KV cache |
 | `best_of_n_probe.py` | idea 2, offline, from the stored probes |
 
-## 8. Caveats
+## 9. Caveats
 
 - **Nothing here has been run on a GPU yet.** Every number in section 3 and section 4 comes
   from files already on disk; sections 1, 2 and 5 describe code that passes its CPU tests

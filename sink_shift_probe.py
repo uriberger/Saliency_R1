@@ -496,6 +496,7 @@ def report(args):
             print(f"\n=== {split}: no alpha=0 baseline, nothing to pair against")
             continue
         b_acc = row_accuracy(base)
+        b_fmt = float(np.mean([r["format_valid"] for r in base]))
         n_samp = len(base) / max(1, len(b_acc))
         note = ("" if n_samp < 1.5 else
                 f", averaged over {n_samp:.1f} samples per row -- this table is "
@@ -519,7 +520,11 @@ def report(args):
                       f"->{np.mean([x['frame_share_after'] for x in d]):.3f}"
                       if d else "-")
             moved = f"{np.mean([x['row_mass_moved'] for x in d]):.5f}" if d else "-"
-            flag = "" if fmt >= args.min_format else "  <- BROKEN, do not read"
+            # Against the BASELINE's rate, not an absolute floor. This model writes
+            # 81.2% well-formed answers on val_nonnatural before anything is edited, so a
+            # fixed threshold called every cell of that split broken -- including cells
+            # scoring better than the unedited model.
+            flag = "" if fmt >= b_fmt - args.max_format_drop else "  <- BROKEN, do not read"
             print(f"    {arm:<9} {alpha:>5.2f} {np.mean(list(acc.values())):>7.4f} "
                   f"{m:>+8.4f} {f'[{lo:+.4f}, {hi:+.4f}]':>20} {n:>4} {fmt:>6.3f} "
                   f"{ln:>6.0f} {ungraded:>6.3f} {border:>15} {moved:>8}{flag}")
@@ -533,9 +538,11 @@ def report(args):
             m, lo, hi, n = paired_delta(c, o, args.n_boot, args.seed)
             print(f"      alpha={alpha:.2f}   centre - outward = {m:+.4f} "
                   f"[{lo:+.4f}, {hi:+.4f}]   over {n} rows")
-    print(f"\n  A cell whose format-valid rate fell below {args.min_format} is off the "
-          "manifold,\n  not an effect: the model stopped writing answers in the shape "
-          "the grader reads.")
+    print(f"\n  A cell whose format-valid rate fell more than {args.max_format_drop} "
+          "BELOW ITS OWN BASELINE\n  is off the manifold, not an effect: the edit stopped "
+          "the model writing answers in\n  the shape the grader reads. The baseline rate "
+          "is a property of the model and the\n  split -- 0.98 on val_natural, 0.81 on "
+          "val_nonnatural -- not of any arm.")
     report_best_of_n(by, args)
     return 0
 
@@ -652,8 +659,9 @@ def main():
     ap.add_argument("--survey-rows", type=int, default=4)
     ap.add_argument("--survey-tokens", type=int, default=8)
     ap.add_argument("--n-boot", type=int, default=2000)
-    ap.add_argument("--min-format", type=float, default=0.9,
-                    help="below this a cell is broken generation, not a result")
+    ap.add_argument("--max-format-drop", type=float, default=0.05,
+                    help="how far a cell's format-valid rate may fall BELOW ITS BASELINE "
+                         "before it is called broken generation rather than a result")
     ap.add_argument("--interval", type=float, default=30.0, help="monitor poll seconds")
     ap.add_argument("--once", action="store_true", help="monitor: print once and exit")
     args = ap.parse_args()
