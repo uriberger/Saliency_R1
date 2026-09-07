@@ -120,14 +120,21 @@ RECT_FRAC = 0.565                # the fraction --overlap_rect_frac is launched 
 ROWS_CHOICES = ("after_image", "generated", "all")
 TARGETS = ("shape", "uniform")
 
-# arm -> (source set, destination set, how the gift is split, matched-mass control?)
+# arm -> (source, destination, how the gift is split, matched-mass control?, disjoint?)
+#
+# `disjoint` forces the destination to exclude the source. It is not cosmetic. On the
+# modal 10x16 grid the centred rectangle is rows 1-8 and misses the border entirely, but
+# on a smaller or squarer picture -- 6x8, say -- the rectangle rounds to rows 0-4 and
+# TOUCHES the border. Without this, `centre` at alpha=1 drains the sink and then hands
+# 22% of it straight back to the same patches, and the arm quietly stops being the arm.
+# `flat` and `text` are deliberately self-overlapping and are exempt.
 ARMS = {
-    "centre":  ("frame", "rect",  "shape",   False),
-    "core":    ("frame", "core",  "shape",   False),
-    "outward": ("frame", "ring2", "shape",   False),
-    "flat":    ("all",   "all",   "uniform", False),
-    "reverse": ("rect",  "frame", "shape",   False),
-    "text":    ("frame", "rect",  "shape",   True),
+    "centre":  ("frame", "rect",  "shape",   False, True),
+    "core":    ("frame", "core",  "shape",   False, True),
+    "outward": ("frame", "ring2", "shape",   False, True),
+    "flat":    ("all",   "all",   "uniform", False, False),
+    "reverse": ("rect",  "frame", "shape",   False, True),
+    "text":    ("frame", "rect",  "shape",   True,  False),
 }
 
 
@@ -291,7 +298,7 @@ class SinkShift:
             raise ValueError(f"alpha must be in [0, 1], got {alpha}")
         self.model = model
         self.arm, self.alpha, self.rows, self.rect_frac = arm, float(alpha), rows, rect_frac
-        src, dst, tgt, self.mass_matched = ARMS[arm]
+        src, dst, tgt, self.mass_matched, self.disjoint = ARMS[arm]
         self.src_name, self.dst_name = src, dst
         self.target = target or tgt
         if self.target not in TARGETS:
@@ -348,6 +355,8 @@ class SinkShift:
         n = max(1, self._d["n"])
         return {
             "arm": self.arm, "alpha": self.alpha,
+            "n_src": (0 if self.src_cols is None else int(self.src_cols.sum())),
+            "n_dst": (0 if self.dst_cols is None else int(self.dst_cols.sum())),
             "rows_edited": self._d["rows_edited"],
             "forwards": self._d["forwards"],
             "layers_touched": sorted(self._d["layers_touched"]),
@@ -393,6 +402,14 @@ class SinkShift:
                     "the patch merge assumption is wrong for this model")
             s = patch_set(self.src_name, gh, gw, self.rect_frac).reshape(-1)
             d = patch_set(self.dst_name, gh, gw, self.rect_frac).reshape(-1)
+            if self.disjoint:
+                d = d & ~s
+                if not bool(d.any()):
+                    raise RuntimeError(
+                        f"arm {self.arm!r} has no destination left on a {gh}x{gw} grid "
+                        f"once the source is excluded: the picture is too small for this "
+                        "arm, and giving the sink's mass back to the sink is not an "
+                        "experiment")
             cols.append(run)
             src.append(s.repeat(t))
             dst.append(d.repeat(t))
@@ -579,6 +596,9 @@ def collected_map(state: SinkShift):
     Returned on the patch grid of the FIRST picture, which is the only shape a single
     map can have. A prompt carrying two pictures returns None rather than a map that
     silently concatenates two grids.
+
+    Note that N generated tokens give N-1 rows: the last token is never a query, because
+    nothing follows it. That is a property of causal generation, not a dropped row.
     """
     if not state._maps or len(state.grids) != 1:
         return None

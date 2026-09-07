@@ -384,6 +384,31 @@ def test_locate():
     for arm in SS.ARMS:
         SS.SinkShift(torch.nn.Module(), arm=arm, alpha=0.5)
     check("every arm constructs", True)
+
+    # Disjointness. On 10x16 the rectangle misses the border anyway, so this is invisible;
+    # on 6x8 it rounds onto row 0 and the arm would give the sink's mass back to the sink.
+    bad = []
+    for arm, (_s, _d, _t, _m, disjoint) in SS.ARMS.items():
+        if not disjoint:
+            continue
+        for gh, gw in ((10, 16), (6, 8), (5, 5), (12, 12)):
+            st = SS.SinkShift(torch.nn.Module(), arm=arm, alpha=1.0)
+            ids = torch.zeros(1, gh * gw + 4, dtype=torch.long)
+            ids[0, 2:2 + gh * gw] = SS.IMAGE_TOKEN_ID
+            try:
+                st._locate_images(ids, torch.tensor([[1, gh * 2, gw * 2]]))
+            except RuntimeError:
+                continue                 # too small for the arm, and it said so
+            if bool((st.src_cols & st.dst_cols).any()):
+                bad.append((arm, gh, gw))
+    check("no disjoint arm ever gives back to its own source", not bad, str(bad[:4]))
+
+    st_f = SS.SinkShift(torch.nn.Module(), arm="flat", alpha=1.0)
+    ids = torch.zeros(1, 164, dtype=torch.long)
+    ids[0, 2:162] = SS.IMAGE_TOKEN_ID
+    st_f._locate_images(ids, torch.tensor([[1, 20, 32]]))
+    check("flat is still allowed to overlap itself",
+          int(st_f.src_cols.sum()) == 160 and int(st_f.dst_cols.sum()) == 160)
     for bad in ({"arm": "nope"}, {"alpha": 1.5}, {"rows": "nope"}, {"target": "nope"}):
         try:
             SS.SinkShift(torch.nn.Module(), **bad)

@@ -36,6 +36,11 @@ w'_src = w_src − α · w_src
 w'_dst = w_dst + α · (Σ over src of w) · t_dst        t sums to 1 over dst
 ```
 
+The destination always excludes the source. On the modal 10x16 grid the rectangle misses
+the border anyway, but on a smaller picture it rounds onto row 0, and without this `centre`
+would drain the sink and hand ~22% of it straight back — caught by the integration test on
+a 6x8 grid, which is why that grid is the one it uses.
+
 The row still sums to 1, the image/text split is unchanged, and no weight on a text token,
 a BOS token or any other sink outside the picture is touched. `α = 0` is exactly the
 identity. `t` is proportional to what the destination already had, so the edit removes the
@@ -246,7 +251,8 @@ generation, not an effect — `flow_intervene_probe.py` at α=1 had box and roll
 | `sink_shift.py` | the edit, the patch sets, and the attention implementation it registers. `install(model, arm=..., alpha=...)` |
 | `sink_shift_probe.py` | `selftest` / `survey` / `run` / `report` / `monitor`, plus `--best-of N` |
 | `launch_sink_shift.sh` | shards `run` over a node's GPUs; refuses to start without a passing selftest |
-| `test_sink_shift_cpu.py` | 87 CPU checks. Includes that `rect` agrees with `overlap_rewards._centre_rect_mask` patch for patch on every grid from 4x4 to 21x25, so the intervention and the training arm cannot drift into different experiments |
+| `test_sink_shift_cpu.py` | 89 CPU checks. Includes that `rect` agrees with `overlap_rewards._centre_rect_mask` patch for patch on every grid from 4x4 to 21x25, so the intervention and the training arm cannot drift into different experiments |
+| `test_sink_shift_model_cpu.py` | 18 integration checks against a randomly-initialised tiny Qwen3-VL, CPU only, ~10 s. This is what `install()` is tested by: the module tree, the config plumbing, the vision tower staying on its own kernel, and `generate`'s KV cache |
 | `best_of_n_probe.py` | idea 2, offline, from the stored probes |
 
 ## 8. Caveats
