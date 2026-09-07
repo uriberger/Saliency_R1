@@ -282,7 +282,7 @@ class SinkShift:
     """
 
     def __init__(self, model, arm="centre", alpha=0.5, layers=None, heads=None,
-                 rows="after_image", rect_frac=RECT_FRAC, target=None):
+                 rows="after_image", rect_frac=RECT_FRAC, target=None, survey=False):
         if arm not in ARMS:
             raise ValueError(f"unknown arm {arm!r}; have {sorted(ARMS)}")
         if rows not in ROWS_CHOICES:
@@ -298,6 +298,13 @@ class SinkShift:
             raise ValueError(f"unknown target {self.target!r}; have {TARGETS}")
         self.layers = None if layers is None else set(int(x) for x in layers)
         self.heads = None if heads is None else sorted(int(x) for x in heads)
+        # Survey mode takes the explicit path on EVERY layer and edits nothing. It exists
+        # because the edit's leverage is bounded by how much of an attention row lands on
+        # the picture at all, which is 0.4-1.4% at the two heads the reward trained. That
+        # number has to be known per layer and per head before the broad arm is run, or a
+        # null cannot be told apart from having moved nothing.
+        self.survey = bool(survey)
+        self._survey = {}
         # per-prompt, set by the pre-hook
         self.img_cols = None          # [n_img] long, absolute key positions
         self.src_cols = None          # [n_img] bool over img_cols
@@ -479,9 +486,11 @@ def _make_attention(state: SinkShift):
 
     def sink_shift_attention_forward(module, query, key, value, attention_mask,
                                      dropout=0.0, scaling=None, is_causal=None, **kwargs):
-        # Layers this arm does not touch never leave the fused kernel.
-        if not (state.edits_layer(getattr(module, "layer_idx", -1))
-                and state.img_cols is not None and state.alpha > 0.0):
+        layer_idx = getattr(module, "layer_idx", -1)
+        editing = state.alpha > 0.0 and state.edits_layer(layer_idx)
+        # Layers this arm does not touch never leave the fused kernel. Survey mode is the
+        # exception: it needs the weights from every layer, and edits none of them.
+        if state.img_cols is None or not (editing or state.survey):
             return _sdpa(module, query, key, value, attention_mask, dropout, scaling,
                          is_causal, **kwargs)
 
@@ -510,12 +519,48 @@ def _make_attention(state: SinkShift):
             allowed_row = causal[None, None]
         a = torch.softmax(logits, dim=-1)
 
-        a = _apply_edit(state, a, rows, allowed_row, module)
+        if state.survey:
+            _record_survey(state, a, rows, layer_idx)
+        if editing:
+            a = _apply_edit(state, a, rows, allowed_row, module)
 
         out = torch.matmul(a.to(v.dtype), v).transpose(1, 2).contiguous()
         return out, None
 
     return sink_shift_attention_forward
+
+
+def _record_survey(state: SinkShift, a, rows, layer_idx):
+    """Per HEAD of this layer: how much of the row lands on the picture, and where.
+
+    Reduced to three numbers per head as soon as the weights exist, so no layer's
+    [heads, q, kv] tensor is ever held past its own forward.
+    """
+    sub = a[:, :, rows, :]                                       # [1, H, R, kv]
+    w = sub[..., state.img_cols]
+    tot = sub.sum(-1).clamp_min(1e-30)                           # [1, H, R]
+    img = w.sum(-1)
+    denom = img.clamp_min(1e-30)
+    frame, rect = _cached_set(state, "frame"), _cached_set(state, "rect")
+    got = {
+        "image_mass": (img / tot).mean(dim=(0, 2)),
+        "frame_share": (w[..., frame].sum(-1) / denom).mean(dim=(0, 2)),
+        "rect_share": (w[..., rect].sum(-1) / denom).mean(dim=(0, 2)),
+    }
+    slot = state._survey.setdefault(int(layer_idx), {"n": 0})
+    slot["n"] += 1
+    for key, val in got.items():
+        prev = slot.get(key)
+        slot[key] = val.detach().float().cpu() if prev is None else prev + val.detach().float().cpu()
+
+
+def survey_table(state: SinkShift):
+    """-> {layer: {stat: [per-head mean]}} over every forward recorded so far."""
+    out = {}
+    for layer, slot in sorted(state._survey.items()):
+        n = max(1, slot["n"])
+        out[layer] = {k: (v / n).tolist() for k, v in slot.items() if k != "n"}
+    return out
 
 
 def _sdpa(module, query, key, value, attention_mask, dropout, scaling, is_causal, **kw):

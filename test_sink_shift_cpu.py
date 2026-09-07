@@ -26,6 +26,7 @@ What each group is for:
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -292,6 +293,27 @@ def test_attention():
           abs((d8["frame_share_after"] - d8["frame_share_before"])
               - 0.5 * d8["rect_share_before"]) < 1e-6)
 
+    # Survey mode: every layer measured, none edited.
+    st_s = SS.SinkShift(torch.nn.Module(), arm="centre", alpha=0.0, layers=[22],
+                        survey=True)
+    ids = torch.zeros(1, 167, dtype=torch.long)
+    ids[0, 3:163] = SS.IMAGE_TOKEN_ID
+    st_s._locate_images(ids, torch.tensor([[1, 20, 32]]))
+    fs = SS._make_attention(st_s)
+    qs, ks, vs = _qkv(1, 4, 2, 167, 167, 8, 19)
+    for li in (0, 21, 22):
+        got, _ = fs(FakeAttn(layer_idx=li), qs, ks, vs, None, scaling=None)
+        ref_l, _ = SS._sdpa(FakeAttn(layer_idx=li), qs, ks, vs, None, 0.0, None, True)
+        if li == 0:
+            check("survey edits nothing", torch.allclose(got, ref_l, atol=1e-5),
+                  f"max |diff| {float((got - ref_l).abs().max()):.2e}")
+    tab = SS.survey_table(st_s)
+    check("survey records every layer it saw", sorted(tab) == [0, 21, 22])
+    check("survey reports one number per head",
+          all(len(v["image_mass"]) == 4 for v in tab.values()))
+    check("survey shares are in [0, 1]",
+          all(0.0 <= x <= 1.0 for v in tab.values() for x in v["frame_share"]))
+
     # `text` must leave the picture exactly as it found it.
     st9, n9 = _state(arm="text", alpha=1.0)
     f9 = SS._make_attention(st9)
@@ -370,12 +392,57 @@ def test_locate():
             check(f"{bad} is refused", True)
 
 
+def test_probe():
+    """The harness's own bookkeeping: the grid, resume, and the paired statistic."""
+    print("\nprobe")
+    import types as _t
+
+    import sink_shift_probe as SP
+
+    args = _t.SimpleNamespace(arms=["centre", "outward"], alphas=[0.0, 0.5, 1.0],
+                              scope="trained", layers=None, heads=None)
+    units = SP.build_units(args)
+    check("the baseline appears exactly once",
+          sum(1 for a, al in units if al == 0.0) == 1)
+    check("no arm is run at alpha=0", all(al > 0 for a, al in units if a != SP.BASELINE_ARM))
+    check("the grid is baseline + arms x non-zero alphas", len(units) == 1 + 2 * 2,
+          f"got {len(units)}: {units}")
+
+    layers, heads, name = SP.scope_of(args)
+    check("scope=trained is layer 22 heads 28/31",
+          layers == [22] and heads == [28, 31], f"got {layers} {heads} {name}")
+    args.scope = "all"
+    check("scope=all confines nothing", SP.scope_of(args)[:2] == (None, None))
+    args.scope, args.layers, args.heads = "custom", "0-3", "1,2"
+    check("scope=custom parses its ranges", SP.scope_of(args)[:2] == ([0, 1, 2, 3], [1, 2]))
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "r.jsonl")
+        with open(p, "w") as fh:
+            fh.write(json.dumps({"split": "v", "arm": "centre", "alpha": 0.5,
+                                 "row_index": 7}) + "\n")
+            fh.write("{ half a line\n")
+        seen = SP.done_keys(__import__("pathlib").Path(p))
+        check("resume reads finished units", SP.unit_key("v", "centre", 0.5, 7) in seen)
+        check("resume survives a torn last line", len(seen) == 1)
+
+    cell = {i: 1.0 for i in range(20)}
+    base = {i: 0.0 for i in range(20)}
+    m, lo, hi, n = SP.paired_delta(cell, base, n_boot=200)
+    check("paired_delta on a constant gap", abs(m - 1.0) < 1e-12 and n == 20)
+    base_short = {i: 0.0 for i in range(5)}
+    _m, _lo, _hi, n2 = SP.paired_delta(cell, base_short, n_boot=200)
+    check("paired_delta uses only the rows both ran", n2 == 5, f"got {n2}")
+
+
 def main():
     print("sink_shift CPU checks")
     test_geometry()
     test_algebra()
     test_attention()
     test_locate()
+    test_probe()
     print(f"\n{'ALL PASS' if not FAILURES else f'{len(FAILURES)} FAILED: {FAILURES}'}")
     return 1 if FAILURES else 0
 
