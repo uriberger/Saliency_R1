@@ -155,14 +155,27 @@ if [[ -z "$SPAN" ]]; then
     SPAN=$(ls "$SPAN_DIR"/step-*.json 2>/dev/null | sed 's|.*/step-||; s|\.json$||' | sort -n | tail -1)
     [[ -n "$SPAN" ]] && echo "note: $SPAN_RUN has no $PROFILE curve yet; spanning to its 100-document one (x-extent only)" >&2
 fi
-[[ -n "$SPAN" ]] || { echo "error: $SPAN_RUN has no scored checkpoints to span" >&2; exit 2; }
+# The span is ONLY the x-extent of a WandB reference line. Requiring it in order to SCORE
+# was a hard failure for something scoring does not use: on the A100 cluster, which has
+# its own filesystem and none of this run's checkpoints, --no-publish still died here
+# before a single benchmark ran.
+if [[ -z "$SPAN" ]]; then
+    if $PUBLISH; then
+        echo "error: $SPAN_RUN has no scored checkpoints to span." >&2
+        echo "       The span only sets the x-extent of the WandB line, so --no-publish" >&2
+        echo "       scores without it. To publish, set SPAN_RUN to a run scored here." >&2
+        exit 2
+    fi
+    echo "note: $SPAN_RUN has no scored checkpoints here -- not needed, --no-publish" >&2
+    SPAN=0
+fi
 
 mkdir -p "$ROOT/_models"
 
 echo "=========================================================================="
 echo "Baselines: $( (( ${#ONLY[@]} > 0 )) && echo "${#ONLY[@]} of ${#BASELINES[@]}   (${ONLY[*]})" || echo "${#BASELINES[@]}")"
 echo "Sample:    $PROFILE   (natural=$NATURAL_N, non-natural=$NONNATURAL_N per benchmark)"
-echo "Span:      0..$SPAN   (from $SPAN_RUN)"
+if $PUBLISH; then echo "Span:      0..$SPAN   (from $SPAN_RUN)"; fi
 echo "GPUs:      $NUM_GPUS   (serial, one baseline at a time)"
 echo "Results:   $(profile_dir_of "$ROOT/<label>")/step-0.json"
 $SCORE   || echo "Mode:      --publish-only, nothing will be evaluated"
