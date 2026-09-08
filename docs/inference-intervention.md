@@ -282,7 +282,101 @@ Layer 0 being the strongest is also the third open question in
 `auroc` layer, with the caveat that it sits near raw embeddings and may be measuring image
 statistics rather than grounding. An edit there would test that directly.
 
-## 7. What would falsify what
+## 7. Second result: the broad arm answers it, and the answer is no — 2026-09-08
+
+`--scope all`, every layer and every head, cold-start model, 128 rows per split, 4 arms x
+2 alphas. `outputs/sink_shift/sinkshift_coldstart_all/report.txt`.
+
+The manipulation is 11x the narrow arm's: the picture takes **5.8%** of an attention row
+averaged over all 36 layers against 0.40% at the rewarded pair, and at alpha=1 the edit
+shifts **1.7%** of a row against 0.15%. Border share 0.416 -> 0.000, exactly on contract,
+and the selftest's answers changed on 4 of 4 prompts. This is the actuator working.
+
+### The pre-registered test returns zero
+
+`centre - outward` — same source, same mass moved (they agree to 0.5-4.5%), opposite
+destinations:
+
+| split | alpha=0.5 | alpha=1.0 |
+|---|---|---|
+| val_natural | −0.0156 [−0.047, +0.016] | +0.0000 [−0.047, +0.047] |
+| val_nonnatural | −0.0156 [−0.039, +0.000] | −0.0078 [−0.023, +0.000] |
+
+Four cells, four intervals containing zero, and the point estimates are negative in three
+of them. **Where the attention goes does not matter.** That is this page's first
+falsification condition, fired: *"centre ≈ outward at every alpha ⇒ the magnitude, not the
+direction."*
+
+### What DOES move accuracy is how much you disturb, and it moves it down
+
+Sort the eight arms by the mass they actually shifted and the ordering is the accuracy
+ordering, reversed:
+
+| val_natural | moved | Δ accuracy |   | val_nonnatural | moved | Δ accuracy |
+|---|---|---|---|---|---|---|
+| `flat` a=1.0 | 0.0316 | **−0.1250** [−0.203, −0.047] | | `flat` a=1.0 | 0.0307 | **−0.0625** [−0.109, −0.023] |
+| `reverse` a=1.0 | 0.0177 | +0.0156 | | `flat` a=0.5 | 0.0158 | −0.0391 |
+| `flat` a=0.5 | 0.0171 | +0.0156 | | `reverse` a=1.0 | 0.0150 | −0.0469 |
+| `outward` a=1.0 | 0.0110 | +0.0078 | | `centre` a=1.0 | 0.0109 | −0.0156 |
+| `centre` a=1.0 | 0.0107 | +0.0078 | | `outward` a=1.0 | 0.0104 | −0.0078 |
+| `reverse` a=0.5 | 0.0090 | +0.0469 | | `reverse` a=0.5 | 0.0079 | −0.0234 |
+| `centre` a=0.5 | 0.0053 | −0.0234 | | `centre` a=0.5 | 0.0053 | −0.0312 |
+| `outward` a=0.5 | 0.0053 | −0.0078 | | `outward` a=0.5 | 0.0052 | −0.0156 |
+
+r(mass moved, accuracy change) = **−0.683** on natural and **−0.805** on nonnatural. The
+only cell whose interval clears zero on natural is `flat` at alpha=1, the largest
+perturbation in the grid by 3x, and it **costs 12.5 points**. Disturbing the attention
+hurts in proportion to how hard you disturb it. Nothing here is about the middle.
+
+### The sign check fails too
+
+`reverse` pushes attention ONTO the border — share 0.426 -> 0.881 — which the "middle
+helps" reading says must hurt. On val_natural it is the **best cell in the grid**
+(+0.0469 [+0.000, +0.094] at alpha=0.5, +0.0156 at alpha=1.0). On val_nonnatural it hurts,
+but so does every other arm on that split.
+
+### What this does and does not settle
+
+It settles the question this page was written to ask: **you cannot get the rect-frac gain
+by moving attention to the middle at inference.** Both halves of the idea are now null —
+selection (section 4) and steering (here).
+
+It does **not** show the training result is wrong. GRPO changes weights; this changes one
+activation and leaves the weights alone, and result 2 in [HANDOFF.md](HANDOFF.md) already
+says the reward's only channel is the text. What it removes is the *mechanism* that made
+"moving attention to the middle improves accuracy" attractive: at inference, moving
+attention to the middle does nothing, and the model does not care where on the picture its
+attention sits.
+
+Caveats, all of which bound the claim rather than soften it:
+
+- **128 rows a split; one row is 0.0078.** An effect of ±0.02 would not be reliably seen.
+  The claim is that `centre - outward` is not large, not that it is exactly zero.
+- **val_nonnatural sits at 0.0703**, near the floor, so it can fall much more easily than
+  it can rise. Read val_natural for anything positive.
+- **16 cells**, so ~1 nominal hit is expected by chance. `flat` at alpha=1 on natural is
+  well past that; the borderline nonnatural cells are not.
+- **One model, greedy, one rectangle fraction.** The cold start is the right subject — the
+  question was whether training can be skipped — but a rect-frac-trained checkpoint has not
+  been put through this.
+- `centre` at alpha=1 on val_nonnatural lost 4.6 points of format validity against its
+  baseline's 0.812, just inside the 0.05 threshold. Borderline, and it is the only cell
+  close to the guard.
+
+### The one arm left unrun, and it would close the argument
+
+`text` moves the *same mass* among the text tokens and never touches the picture. If it
+also costs accuracy in proportion to the mass it shifts, then "disturbing attention hurts"
+is the whole story and the picture is not special in it. Two cells, ~15 minutes:
+
+```fish
+bash launch_sink_shift.sh --stage run --gpus 8 --out-dir $OUT --model $M \
+    --scope all --arms text --alphas 0.5,1.0 --rows-per-split 128
+```
+
+Same out-dir; the run is keyed by (split, arm, alpha, row) so it adds to what is there.
+
+## 8. What would falsify what
 
 - `centre ≈ outward` at every α → the magnitude, not the direction. Inference-time steering
   is a dead end and the training result is not "the middle".
@@ -298,7 +392,7 @@ Read no cell whose format-valid rate fell more than `--max-format-drop` (default
 below ITS OWN BASELINE. That is broken generation, not an effect — `flow_intervene_probe.py` at α=1 had box and roll agreeing to
 0.0003 nats for exactly that reason.
 
-## 8. Files
+## 9. Files
 
 | file | what |
 |---|---|
@@ -309,7 +403,7 @@ below ITS OWN BASELINE. That is broken generation, not an effect — `flow_inter
 | `test_sink_shift_model_cpu.py` | 18 integration checks against a randomly-initialised tiny Qwen3-VL, CPU only, ~10 s. This is what `install()` is tested by: the module tree, the config plumbing, the vision tower staying on its own kernel, and `generate`'s KV cache |
 | `best_of_n_probe.py` | idea 2, offline, from the stored probes |
 
-## 9. Caveats
+## 10. Caveats
 
 - **Nothing here has been run on a GPU yet.** Every number in section 3 and section 4 comes
   from files already on disk; sections 1, 2 and 5 describe code that passes its CPU tests
