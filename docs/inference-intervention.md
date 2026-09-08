@@ -198,30 +198,37 @@ null with a flat manipulation check says nothing.
 
 ### On the benchmark
 
-Two files outside this repo, both additive, chosen so that **no concurrent evaluation can
-notice they exist**:
-
-- `lmms-eval/lmms_eval/models/chat/qwen3_vl_sinkshift.py` — new file, subclasses the chat
-  `Qwen3_VL` and installs the edit. lmms-eval imports only the model actually requested,
-  so `--model qwen3_vl` never opens it.
-- `lmms-eval/lmms_eval/models/__init__.py` — **one added key** in
-  `AVAILABLE_CHAT_TEMPLATE_MODELS`. Adding a key cannot change what another key resolves
-  to; verified afterwards that `qwen3_vl` still resolves to the identical class. Written by
-  atomic rename, so a process reading it mid-write sees the old whole file or the new whole
-  file. Both are left uncommitted in that fork, on `main`.
-
-No conda environment was modified. `SINK_SHIFT_ALPHA` defaults to **0**, which is the
-identity, so selecting this model type without configuring it evaluates the stock model and
-says so loudly in the log.
+The model wrapper lives in **this** repo, at `lmms_eval_plugin/qwen3_vl_sinkshift.py`,
+and `install_lmms_sinkshift.sh` wires an lmms-eval checkout up to it:
 
 ```fish
-set -x BENCH_MODEL_TYPE qwen3_vl_sinkshift
-set -x SINK_SHIFT_ALPHA 0.5
-set -x SINK_SHIFT_ARM centre
-set -x SINK_SHIFT_LAYERS all
-set -x SINK_SHIFT_HEADS all
-bash run_bench_eval.sh --run-dir <dir> ...
+bash install_lmms_sinkshift.sh                      # this cluster's checkout
+bash install_lmms_sinkshift.sh --lmms-eval-dir DIR  # any other
+bash install_lmms_sinkshift.sh --check              # verify without changing anything
+bash install_lmms_sinkshift.sh --uninstall
 ```
+
+It went in by hand the first time, into one clone, uncommitted. That held until the A100
+cluster turned out to have its own checkout on its own filesystem — `/lustre/fs12`, which
+the H100 cluster cannot see — and `--model-type qwen3_vl_sinkshift` died there with "not
+found in available models". A change that lives only in an untracked clone exists on
+exactly one machine.
+
+The installer does two additive things and nothing else: it symlinks the wrapper into
+`lmms_eval/models/chat/` (a symlink, so the clusters cannot drift), and adds **one key**
+to `AVAILABLE_CHAT_TEMPLATE_MODELS`. lmms-eval imports only the model it is asked for, so
+`--model qwen3_vl` never opens the new file, and adding a dict key cannot change what
+another key resolves to. The registry edit is renamed into place, so a concurrent eval
+reads the old whole file or the new whole file. `--check` then re-verifies that `qwen3_vl`
+still resolves to the identical class and that the variant subclasses it.
+
+It links to the CENTRAL tree, never to a worktree, and refuses to run from an unmerged
+one — a symlink into a directory that `./worktree.sh done` deletes would break every eval
+on every cluster, long after the change that caused it.
+
+No conda environment is modified. `SINK_SHIFT_ALPHA` defaults to **0**, the identity, so a
+checkout that is wired up but not configured evaluates the stock model and says so loudly
+in the log.
 
 `BENCH_MODEL_TYPE` is a new passthrough in `run_bench_eval.sh`; unset, that script is
 unchanged. Read the result against the measured **~0.013** seed floor, and against Uri's
