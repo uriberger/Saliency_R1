@@ -402,6 +402,24 @@ ACCOUNT=nvr_israel_rlop
 # Resolved after argument parsing, not here: the set of partitions that can hold this job
 # depends on DURATION, and --duration is not known yet. See RESOLVED_PARTITION below.
 PARTITION=${PARTITION:-}
+# Nodes to keep the scheduler off, comma separated. Forwarded to submit_job as
+# --exclude_hosts, which becomes sbatch --exclude=, so it also survives every
+# --autoresume_uninstrumented requeue of the same job.
+#
+# Why this exists: a node whose local /raid is full fails the job in ~20s, before any
+# Python runs, with `pyxis: failed to create container filesystem` and `unsquashfs: write
+# failed`. SLURM cannot route around it -- every node here reports TmpDisk=0, so free
+# local scratch is invisible to the scheduler, and the only correction is FACT draining
+# the node reactively after 3 such failures. By 2026-09-08 that had already eaten four of
+# the eight nodes in batch_singlenode (0010, 0075, 0079, 2092), which is what makes the
+# survivors worth naming by hand: with the pool that small, a blind resubmit is a coin
+# flip onto the node that just failed, and three of those flips drain it too.
+#
+# Scheduling only. It does not reach the training script and is deliberately absent from
+# SUFFIX -- excluding a node changes where a run lands, never what it computes, so two
+# runs that differ only here must keep the same name. Ignored under --direct, which never
+# calls submit_job.
+EXCLUDE_HOSTS=${EXCLUDE_HOSTS:-}
 # 1 hour. The long-lived pools here cap at MaxTime=4:00:00, so a 4h request is the one
 # length that can ONLY start on a fully idle node -- backfill needs a hole at least as
 # long as the job, and a 4h hole exists only when something ran to the wall.
@@ -648,6 +666,10 @@ while [[ $# -gt 0 ]]; do
         --num-gpus)               NUM_GPUS="$2";                shift 2 ;;
         --output-dir)             OUTPUT_DIR="$2";              shift 2 ;;
         --partition)              PARTITION="$2";               shift 2 ;;
+        # Accumulates, so `--exclude-hosts a --exclude-hosts b` and `--exclude-hosts a,b`
+        # mean the same thing and a second bad node can be added without restating the first.
+        --exclude-hosts|--exclude_hosts)
+            EXCLUDE_HOSTS="${EXCLUDE_HOSTS:+$EXCLUDE_HOSTS,}$2"; shift 2 ;;
         --duration)               DURATION="$2";                shift 2 ;;
         --nvidia-api-key)         NVIDIA_API_KEY="$2";          shift 2 ;;
         --openai-api-key)         OPENAI_API_KEY="$2";          shift 2 ;;
@@ -1747,6 +1769,9 @@ echo "T5 step clf:      $OVERLAP_STEPS_DEVICE  ckpt=$OVERLAP_STEPS_CKPT"
 echo "Run name:         $RUN_NAME"
 echo "Output dir:       $OUTPUT_DIR"
 echo "Mode:             $($DIRECT && echo 'direct (no SLURM)' || echo "SLURM ($PARTITION, ${DURATION}h)")"
+# Printed only when set, and flagged as ignored under --direct so a stale --exclude-hosts
+# in a saved command line cannot look like it is still protecting the run.
+[[ -n "$EXCLUDE_HOSTS" ]] && echo "Excluded nodes:   $EXCLUDE_HOSTS$($DIRECT && echo '  (ignored: --direct does not use submit_job)')"
 echo "Judge key:        $([[ -n "${NVIDIA_API_KEY:-}${OPENAI_API_KEY:-}" ]] && echo '(set)' || echo '(MISSING - openai_reward will fail)')"
 echo "WandB:            $([[ -n "${WANDB_API_KEY:-}" ]] && echo '(online)' || echo '(offline)')"
 [[ -n "$EXTRA_ARGS" ]] && echo "Extra args:       $EXTRA_ARGS"
@@ -1795,6 +1820,7 @@ if ! $DIRECT; then
         --gpu "$NUM_GPUS" \
         --duration "$DURATION" \
         --autoresume_uninstrumented \
+        ${EXCLUDE_HOSTS:+--exclude_hosts $EXCLUDE_HOSTS} \
         --outfile "$LOG_ROOT/${RUN_NAME}.%j.out" \
         --logroot "$LOG_ROOT" \
         -c "bash -c '
