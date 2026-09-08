@@ -350,8 +350,38 @@ def build_inputs(processor, images, question, device):
                      add_special_tokens=False).to(device)
 
 
+def generate_then_teacher_force(model, processor, images, question, device, scan,
+                                max_new_tokens):
+    """Write an answer at full speed, then measure ONE forward over prompt ++ answer.
+
+    Not 256 decode steps with the explicit softmax on every layer: the scan is paused for
+    the generation, so it runs through the fused kernel, and the whole completion is then
+    measured in a single teacher-forced pass. That pass is `overlap_probe.teacher_forced_case`
+    -- the same construction `grpo_trainer_qwen3.py` uses to compute the reward -- so the
+    `generated` query set here is the reward's own view and not an approximation of it.
+
+    Returns (inputs, prompt_len, completion ids) or None if nothing was generated.
+    """
+    import torch
+
+    inputs = build_inputs(processor, images, question, device)
+    prompt_len = int(inputs["input_ids"].shape[1])
+    scan.paused = True
+    try:
+        with torch.no_grad():
+            out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                                 pad_token_id=processor.tokenizer.pad_token_id)
+    finally:
+        scan.paused = False
+    comp = out[0][prompt_len:].tolist()
+    eos = processor.tokenizer.eos_token_id
+    if eos in comp:
+        comp = comp[: comp.index(eos) + 1]
+    return (inputs, prompt_len, comp) if comp else None
+
+
 def measure(model, processor, images, question, device, scan, tap=None,
-            want_hidden=True):
+            want_hidden=True, max_new_tokens=0):
     """One prefill. -> the reduced cells, the maps, the norms, and the geometry.
 
     Everything this experiment reads comes out of this single forward: the column view at
@@ -360,10 +390,23 @@ def measure(model, processor, images, question, device, scan, tap=None,
     """
     import torch
 
-    inputs = build_inputs(processor, images, question, device)
+    gen = None
+    if max_new_tokens > 0:
+        gen = generate_then_teacher_force(model, processor, images, question, device,
+                                          scan, max_new_tokens)
+    if gen is None:
+        inputs = build_inputs(processor, images, question, device)
+        case, scan.prompt_len_override = inputs, None
+    else:
+        inputs, prompt_len, comp = gen
+        case = PROBE.teacher_forced_case(inputs, comp, device)
+        scan.prompt_len_override = prompt_len
     scan.reset()
-    with torch.no_grad():
-        out = model(**inputs, output_hidden_states=bool(want_hidden), use_cache=False)
+    try:
+        with torch.no_grad():
+            out = model(**case, output_hidden_states=bool(want_hidden), use_cache=False)
+    finally:
+        scan.prompt_len_override = None
     res = scan.result()
     if res is None or not res["grids"]:
         return None
@@ -392,6 +435,22 @@ def measure(model, processor, images, question, device, scan, tap=None,
         s2, p2 = SL.reduce_cells(sec["col_sum"], None, sec["n_rows"], sec["row_total"],
                                  gh, gw, res["kv_len"], col_null=sec["col_null"])
         got["stats_img_q"], got["peak_img_q"] = s2, p2
+
+    # The tokens the model WROTE, and the union of those with the question's tokens.
+    # Column sums are additive and the row totals are sums over the same rows, so `all` is
+    # the exact union rather than an average of two averages -- which would silently
+    # re-weight a 12-token question against a 250-token answer.
+    gq = res.get("generated")
+    if gq is not None and gq["n_rows"] > 0:
+        got["n_generated"] = int(gq["n_rows"])
+        sg, pg = SL.reduce_cells(gq["col_sum"][..., :n_first], None, gq["n_rows"],
+                                 gq["row_total"], gh, gw, res["kv_len"])
+        got["stats_gen"], got["peak_gen"] = sg, pg
+        sa, pa = SL.reduce_cells(
+            prim["col_sum"][..., :n_first] + gq["col_sum"][..., :n_first], None,
+            prim["n_rows"] + gq["n_rows"], prim["row_total"] + gq["row_total"],
+            gh, gw, res["kv_len"])
+        got["stats_all"], got["peak_all"] = sa, pa
 
     # the layer-mean map, which is what the per-patch regression and the radial profiles
     # are fitted on. Head-mean per layer: 36 x N floats, not 36 x 32 x N.
@@ -463,7 +522,7 @@ class Sink:
     #: stored as integers, because they are LABELS on a grid. float16 is exact to 2048
     #: and the grids here are far smaller, but a patch index that rounds is a patch index
     #: that points at the wrong patch, and nothing downstream could tell.
-    INT_FIELDS = ("peak", "peak_img_q", "perm")
+    INT_FIELDS = ("peak", "peak_img_q", "peak_gen", "peak_all", "perm")
 
     def flush(self):
         """One encoding for every field: flat values, per-unit shapes, per-unit indices.
@@ -503,7 +562,8 @@ def arrays_of(got):
     follow the patch embedding it was sitting on" needs to know where each embedding went,
     and that is the one question no pixel-space transform can answer.
     """
-    keep = ("stats", "peak", "maps", "spans", "hnorm", "vnorm", "stats_img_q", "perm")
+    keep = ("stats", "peak", "maps", "spans", "hnorm", "vnorm", "stats_img_q", "perm",
+            "stats_gen", "peak_gen", "stats_all", "peak_all")
     return {k: np.asarray(got[k]) for k in keep if got.get(k) is not None}
 
 
@@ -535,6 +595,12 @@ def stage_scan(args):
     import torch
 
     rows = read_manifest(args.out_dir, args.types)
+    if args.scan_rows_per_type:
+        by_type = {}
+        for r in rows:
+            by_type.setdefault(r["type"], []).append(r)
+        rows = [r for t in sorted(by_type)
+                for r in by_type[t][: args.scan_rows_per_type]]
     mine = rows[args.shard::args.num_shards]
     sink = Sink(args.out_dir, "scan", args.shard, args.flush_every)
     seen = sink.done()
@@ -551,7 +617,8 @@ def stage_scan(args):
         for r in todo:
             im = Image.open(r["path"]).convert("RGB")
             got = measure(model, processor, [im], r["question"], device, scan, tap,
-                          want_hidden=not args.no_hidden)
+                          want_hidden=not args.no_hidden,
+                          max_new_tokens=args.max_new_tokens)
             if got is None:
                 print(f"[scan] {r['key']}: no picture located, skipped", flush=True)
                 prog.tick()
@@ -559,8 +626,8 @@ def stage_scan(args):
             gh, gw = got["grid"]
             cs = SL.content_stats(im, gh, gw)
             got["content"] = np.stack([cs[k] for k in CONTENT_KEYS])
-            sink.write(r["key"], meta_of(got, r), dict(arrays_of(got),
-                                                       content=got["content"]))
+            sink.write(r["key"], meta_of(got, r, {"n_generated": got.get("n_generated")}),
+                       dict(arrays_of(got), content=got["content"]))
             prog.tick()
     finally:
         sink.close()
@@ -1813,6 +1880,104 @@ def report_verdict(facts):
     print("  falsifiable form so the next model, or the next resolution, can fail them.")
 
 
+#: The grid the question is actually about: which heads, and which tokens were asking.
+HEAD_SETS = (("all heads", None),
+             ("trained L22 h28,31", [(TRAINED_LAYER, h) for h in TRAINED_HEADS]))
+TOKEN_SETS = (("query tokens", "stats"),
+              ("generated tokens", "stats_gen"),
+              ("all tokens", "stats_all"))
+LOCATIONS = (("ring", "ring_share", "ring"), ("depth1", "depth1_share", "depth1"),
+             ("middle", "deep_share", "deep"), ("top", "top_share", "top"),
+             ("bottom", "bottom_share", "bottom"), ("left", "left_share", "left"),
+             ("right", "right_share", "right"),
+             ("topleft", "first_patch_share", None),
+             ("botright", "last_patch_share", None))
+
+
+def _enrich(stats, field_cells, stat, area, min_mass):
+    """One picture's enrichment for one location. NaN when nothing is measurable.
+
+    `field_cells` is None for "every head that clears the image-mass floor", or a list of
+    (layer, head). The floor matters only for the all-head average: a head that puts no
+    weight on the picture still has a ring share, and it is noise wearing a statistic's
+    name. The two trained cells are never floored -- they are named, not selected.
+    """
+    a = np.asarray(stats, dtype=float)
+    idx = SL.STAT_INDEX[stat]
+    if field_cells is not None:
+        v = np.asarray([a[l, h, idx] for l, h in field_cells if l < a.shape[0]])
+    else:
+        live = a[..., SL.STAT_INDEX["image_mass"]] >= min_mass
+        v = np.where(live, a[..., idx], np.nan).reshape(-1)
+    if not np.isfinite(v).any() or not area:
+        return float("nan")
+    return float(np.nanmean(v)) / area
+
+
+def report_grid(meta, arrays, args):
+    """Every location, per image type, for each (head set) x (token set).
+
+    This is the table the question was asked in. Nothing here is head-SELECTED: the two
+    blocks are "every head in the model" and "the two heads the reward trained", so no
+    number in it was picked for being large.
+    """
+    types = sorted({m["type"] for m in meta})
+    have_gen = any("stats_gen" in arrays.get(m["unit"], {}) for m in meta)
+    n_gen = [m.get("n_generated") for m in meta if m.get("n_generated")]
+    print("\n" + "=" * 78)
+    print("12. THE GRID -- head set x token set, every location, per type")
+    print("   Enrichment: that location's share of the picture's attention divided by its")
+    print("   share of the patches. 1.00 = its fair share. `topleft`/`botright` are single")
+    print("   patches against a flat map's 1/N. `middle` is depth 3 or more from the edge.")
+    if have_gen:
+        print(f"   `generated tokens` comes from one teacher-forced forward over prompt ++ "
+              f"answer,\n   the same construction the reward used; median answer length "
+              f"{int(np.median(n_gen)) if n_gen else 0} tokens.")
+    else:
+        print("   NO GENERATED TOKENS in this run (--max-new-tokens was 0), so two of the")
+        print("   three token sets are empty. Re-run the scan with --max-new-tokens > 0.")
+    summary = {}
+    for tok_name, field in TOKEN_SETS:
+        for head_name, head_cells in HEAD_SETS:
+            rows = []
+            for t in types:
+                vals = {loc: [] for loc, _s, _k in LOCATIONS}
+                for m in meta:
+                    if m["type"] != t:
+                        continue
+                    a = arrays.get(m["unit"], {}).get(field)
+                    if a is None:
+                        continue
+                    gh, gw = m["grid"]
+                    sets = SL.named_sets(gh, gw)
+                    for loc, stat, key in LOCATIONS:
+                        area = 1.0 / (gh * gw) if key is None else sets[key].mean()
+                        vals[loc].append(_enrich(a, head_cells, stat, area, args.min_mass))
+                n = max(len(v) for v in vals.values())
+                if n:
+                    rows.append((t, n, {k: float(np.nanmean(v)) if v else float("nan")
+                                        for k, v in vals.items()}))
+            if not rows:
+                continue
+            print(f"\n  --- {tok_name}, {head_name} ---")
+            print(f"    {'type':<18} {'n':>4} " +
+                  " ".join(f"{loc:>8}" for loc, _s, _k in LOCATIONS))
+            for t, n, v in rows:
+                print(f"    {t:<18} {n:>4} " +
+                      " ".join(f"{v[loc]:>8.2f}" for loc, _s, _k in LOCATIONS))
+            summary[(tok_name, head_name)] = {
+                loc: float(np.nanmean([r[2][loc] for r in rows])) for loc, _s, _k in LOCATIONS}
+
+    if summary:
+        print("\n  Pooled over the twelve types:")
+        print(f"    {'token set':<18} {'head set':<20} " +
+              " ".join(f"{loc:>8}" for loc, _s, _k in LOCATIONS))
+        for (tok, head), v in summary.items():
+            print(f"    {tok:<18} {head:<20} " +
+                  " ".join(f"{v[loc]:>8.2f}" for loc, _s, _k in LOCATIONS))
+    return summary
+
+
 def stage_report(args):
     meta, arrays = read_stage(args.out_dir, "scan")
     if not meta:
@@ -1843,6 +2008,7 @@ def stage_report(args):
     facts["keys"] = report_key_split(meta, arrays, cells, args) or {}
     facts["arms"] = report_arms(args.out_dir, cells, args) or {}
     report_verdict(facts)
+    report_grid(meta, arrays, args)
 
     print("\n" + "=" * 78)
     print("Read section 1 before anything else. If the picture's share of a row is a")
@@ -1862,6 +2028,14 @@ def main():
     ap.add_argument("--adapter", default=None)
     ap.add_argument("--types", default="", help="comma-separated subset of the corpus")
     ap.add_argument("--per-type", type=int, default=150)
+    ap.add_argument("--scan-rows-per-type", type=int, default=0,
+                    help="scan only the first N pictures of each type (0 = all). Use it "
+                         "with --max-new-tokens, which costs a generation per picture")
+    ap.add_argument("--max-new-tokens", type=int, default=0,
+                    help="0 = prefill only, and the `generated` query set is empty. Above "
+                         "0 the model writes an answer at full speed and ONE teacher-forced "
+                         "forward over prompt ++ answer is measured, which is the same "
+                         "construction the training reward used")
     ap.add_argument("--val-only", action="store_true",
                     help="never top up from set_a/set_b. Required for any checkpoint "
                          "that was GRPO-trained on them")

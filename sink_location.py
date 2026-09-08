@@ -58,12 +58,22 @@ VISION_START_ID = 151652
 VISION_END_ID = 151653
 IMPL_NAME = "sink_scan"
 
-# Query sets, both accumulated from the SAME forward. `text` is the primary: every prompt
-# position after the last image token -- the question and the assistant header, which is
-# what a reader of the picture is. `image` is the picture attending to itself, kept because
-# a sink that only exists in the image->image block is a vision-tower artefact wearing a
-# language model's clothes.
-Q_SETS = ("text", "image")
+# Query sets, all accumulated from the SAME forward.
+#
+#   text        every prompt position after the last image token -- the question and the
+#               assistant header. The primary, and the only one a prefill-only run has.
+#   generated   the tokens the model WROTE. Present only when the forward is teacher-forced
+#               over prompt ++ completion, which is exactly how the training reward read
+#               its maps (grpo_trainer_qwen3.py, overlap_layer=22, overlap_heads=(28, 31)),
+#               so this is not an approximation of the reward's view -- it is the reward's
+#               view.
+#   image       the picture attending to itself, kept because a sink that exists only in
+#               the image->image block is a vision-tower artefact wearing a language
+#               model's clothes. Needs the causal correction; the other two do not.
+#
+# "all tokens" is not a fourth accumulator: column sums are additive, so text + generated
+# with the row counts added is exactly the union, and deriving it costs nothing.
+Q_SETS = ("text", "generated", "image")
 PRIMARY_Q = "text"
 
 SPANS = ("first", "pre_image", "vision_start", "image", "vision_end", "post_image")
@@ -432,6 +442,14 @@ class SinkScan:
         self.model = model
         self.want_key_stats = bool(want_key_stats)
         self.q_sets = tuple(q_sets)
+        # `paused` lets the caller generate at full speed through the fused kernel and then
+        # measure one teacher-forced forward, instead of paying the explicit softmax on
+        # every layer of every decode step.
+        self.paused = False
+        # A teacher-forced forward carries prompt ++ completion, so the prompt length the
+        # pre-hook would infer is the WHOLE thing and `generated` would come back empty.
+        # The caller sets this to the real prompt length before that forward.
+        self.prompt_len_override = None
         self.img_cols = None
         self.grids = []
         self.runs = []
@@ -470,6 +488,8 @@ class SinkScan:
         if name == "text":
             lo = int(self.img_cols.max()) + 1
             sel = (pos >= lo) & (pos < self.prompt_len)
+        elif name == "generated":
+            sel = pos >= self.prompt_len
         elif name == "image":
             sel = torch.isin(pos, self.img_cols)
         else:
@@ -548,7 +568,7 @@ class SinkScan:
         self.runs, self.grids = runs, grids
         self.img_cols = torch.cat(runs).to(input_ids.device)
         self.spans = span_index(input_ids, runs)
-        self.prompt_len = int(input_ids.shape[1])
+        self.prompt_len = int(self.prompt_len_override or input_ids.shape[1])
         self.reset()
         return True
 
@@ -602,7 +622,7 @@ def _make_scan_attention(state: SinkScan):
 
     def sink_scan_attention_forward(module, query, key, value, attention_mask,
                                     dropout=0.0, scaling=None, is_causal=None, **kwargs):
-        if state.img_cols is None:
+        if state.img_cols is None or state.paused:
             return SS._sdpa(module, query, key, value, attention_mask, dropout, scaling,
                             is_causal, **kwargs)
         layer_idx = int(getattr(module, "layer_idx", -1))
