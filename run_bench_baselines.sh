@@ -30,14 +30,39 @@
 # a training job on the same node. Roughly two hours per baseline on 8 GPUs.
 set -uo pipefail
 
-# label|model -- the label is the legend entry, the model is a directory or a HF
-# repo id. Labels must be unique: the WandB run id is derived from them.
+# label|model[|ENV=v ENV=v ...] -- the label is the legend entry, the model is a
+# directory or a HF repo id, and the optional third field is environment set for
+# THAT BASELINE ONLY while it is scored.
+#
+# The third field exists for CONFIG VARIANTS: the same weights evaluated under a
+# different inference-time setting, such as the attention edit in sink_shift.py.
+# Two things make that safe, and both are load-bearing:
+#
+#   * The variant is symlinked under its own LABEL and scored through that path.
+#     lmms-eval derives its results directory AND its --use_cache response cache
+#     from the model path's basename, so two variants of one checkpoint scored
+#     through the same path would share a cache -- and the second would be handed
+#     the first's answers and score identically to it, silently. The symlink is
+#     what keeps them apart. Do not remove it to "simplify" this.
+#   * The environment is exported in a subshell around the scoring call, so it
+#     cannot leak into the next baseline in the list.
+#
+# Labels must be unique: the WandB run id, the shadow directory and now the model
+# path are all derived from them.
 BASELINES=(
     "sft-coldstart|checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged"
     "saliency-r1|checkpoint/grpo-coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged-saliency-r1-qwen3_merged"
     "grpo-no-saliency|checkpoint/grpo-qwen3-vl-8b-instruct-no-sal_merged"
     "overlap-8k|checkpoint/grpo-coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged-overlap__wov0.4_2head_trmean_merged"
     "qwen3-vl-8b-instruct|Qwen/Qwen3-VL-8B-Instruct"
+    # The inference-time attention edit, on the cold start, at alpha 0.5 over every
+    # layer and head. Same source (the border), same mass moved; the only difference
+    # between the two is WHERE it lands -- the middle rectangle against the ring just
+    # inside the border. Their difference is the result; either one alone is not.
+    # docs/inference-intervention.md. Read both against the `sft-coldstart` line,
+    # which is the same weights with no edit at all.
+    "sinkshift-centre-a05|checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged|BENCH_MODEL_TYPE=qwen3_vl_sinkshift SINK_SHIFT_ALPHA=0.5 SINK_SHIFT_ARM=centre SINK_SHIFT_LAYERS=all SINK_SHIFT_HEADS=all"
+    "sinkshift-outward-a05|checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged|BENCH_MODEL_TYPE=qwen3_vl_sinkshift SINK_SHIFT_ALPHA=0.5 SINK_SHIFT_ARM=outward SINK_SHIFT_LAYERS=all SINK_SHIFT_HEADS=all"
 )
 
 # The run whose bench panels these lines are drawn on. Only its x-range is read:
@@ -151,8 +176,8 @@ echo "==========================================================================
 declare -a DONE=() SKIPPED=() FAILED=()
 
 for ENTRY in "${BASELINES[@]}"; do
-    LABEL=${ENTRY%%|*}
-    MODEL=${ENTRY#*|}
+    IFS='|' read -r LABEL MODEL ENVS <<< "$ENTRY"
+    ENVS=${ENVS:-}
     # --only, when given, is the whole list. Matched exactly rather than as a
     # substring: the labels are short and a loose match on "saliency-r1" would
     # also take "grpo-no-saliency".
@@ -164,6 +189,7 @@ for ENTRY in "${BASELINES[@]}"; do
     echo ""
     echo "--------------------------------------------------------------------------"
     echo "Baseline: $LABEL"
+    [[ -n "$ENVS" ]] && echo "  config: $ENVS"
 
     # A relative path is relative to the repo, not to wherever this was invoked.
     # Tested by existence, not by shape, so that a HF repo id -- which is also a
@@ -194,6 +220,19 @@ print(snapshot_download(sys.argv[1]))" "$MODEL" 2>/dev/null)
             MODEL="$ROOT/_models/${MODEL##*/}"
         fi
     fi
+    # A config variant is scored through a per-LABEL symlink, so its results
+    # directory and its response cache are its own. Without this the two sink-shift
+    # arms would share both with each other, and with `sft-coldstart`, which is the
+    # very same checkpoint -- and the cache would hand every one of them the first
+    # one's answers. See the comment on BASELINES.
+    if [[ -n "$ENVS" ]]; then
+        if $DRY_RUN; then
+            echo "  would link $ROOT/_models/$LABEL -> $MODEL (own results dir and cache)"
+        else
+            ln -sfn "$MODEL" "$ROOT/_models/$LABEL"
+        fi
+        MODEL="$ROOT/_models/$LABEL"
+    fi
     echo "  model:  $MODEL"
 
     SHADOW="$ROOT/$LABEL"
@@ -211,8 +250,14 @@ print(snapshot_download(sys.argv[1]))" "$MODEL" 2>/dev/null)
             # from the presence of this file. Removing it is how it is asked again.
             $FORCE && rm -f "$RESULT"
 
-            bash "$SCRIPT_DIR/run_bench_eval.sh" --run-dir "$SHADOW" \
-                --num-gpus "$NUM_GPUS" --min-minutes 0 --bank "$BANK" "${SIZE_ARGS[@]}"
+            # A subshell, so this baseline's config cannot leak into the next one.
+            (
+                if [[ -n "$ENVS" ]]; then
+                    for kv in $ENVS; do export "${kv?}"; done
+                fi
+                bash "$SCRIPT_DIR/run_bench_eval.sh" --run-dir "$SHADOW" \
+                    --num-gpus "$NUM_GPUS" --min-minutes 0 --bank "$BANK" "${SIZE_ARGS[@]}"
+            )
 
             # run_bench_eval.sh reports a suite that failed and moves on, so its exit
             # status does not say whether this model was scored. The step file does.
