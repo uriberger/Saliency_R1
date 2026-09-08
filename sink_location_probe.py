@@ -1288,38 +1288,70 @@ def report_cells(meta, arrays, args):
 
 
 def report_s3(meta, arrays, cells, args):
-    """Is there a SINK, or only a peak? Magnitude and query-invariance, together."""
-    mag, cv, ent = [], [], []
+    """Is there a SINK, or only a peak? Magnitude and query-invariance, together.
+
+    Reported twice. At the dev-selected cells, which is where every other table is read --
+    and at the cell with the LARGEST column anywhere in the model, which is the fair place
+    to look for a sink. The selected cells maximise ring enrichment, not magnitude, so
+    finding no sink there would say nothing about whether the model has one.
+    """
+    rows = {"at the ring cells": [[], [], []], "at the strongest cell anywhere": [[], [], []]}
+    mass_i, mag_i, cv_i = (SL.STAT_INDEX["image_mass"], SL.STAT_INDEX["peak_uniform_x"],
+                           SL.STAT_INDEX["peak_cv"])
+    best_cells = []
     for m in meta:
         if m.get("dev"):
             continue
         a = arrays.get(m["unit"], {}).get("stats")
         if a is None:
             continue
-        mag.append(at_cells(a, "peak_uniform_x", cells))
-        cv.append(at_cells(a, "peak_cv", cells))
-        ent.append(at_cells(a, "entropy_norm", cells))
-    if not mag:
+        sel = rows["at the ring cells"]
+        for lst, stat in zip(sel, ("peak_uniform_x", "peak_cv", "entropy_norm")):
+            lst.append(at_cells(a, stat, cells))
+        mag = np.where(np.asarray(a[..., mass_i], dtype=float) >= args.min_mass,
+                       np.asarray(a[..., mag_i], dtype=float), np.nan)
+        if not np.isfinite(mag).any():
+            continue
+        flat = int(np.nanargmax(mag))
+        l, h = divmod(flat, a.shape[1])
+        best_cells.append((l, h))
+        alt = rows["at the strongest cell anywhere"]
+        alt[0].append(float(a[l, h, mag_i]))
+        alt[1].append(float(a[l, h, cv_i]))
+        alt[2].append(float(a[l, h, SL.STAT_INDEX["entropy_norm"]]))
+    if not rows["at the ring cells"][0]:
         return
     print("\n" + "=" * 78)
     print("5. IS IT A SINK, OR ONLY A PEAK")
-    for name, vals, note in (
-            ("peak / uniform", mag, "how many times uniform the top image column is"),
-            ("peak CV across queries", cv, "small = the same column for every query"),
-            ("normalised entropy", ent, "1.0 = the picture's attention is flat")):
-        m, lo, hi, n = boot_mean(vals, args.n_boot)
-        print(f"    {name:<24} {m:>8.3f}  [{lo:.3f}, {hi:.3f}]  n={n}   {note}")
-    m = boot_mean(mag, args.n_boot)[0]
-    c = boot_mean(cv, args.n_boot)[0]
-    verdict = ("a sink by both legs" if m >= args.sink_x and c <= args.sink_cv else
-               "a peak, not a sink" if m < args.sink_x else
-               "large but query-dependent -- a peak that moves")
+    verdicts = {}
+    for where, (mag, cv, ent) in rows.items():
+        if not mag:
+            continue
+        print(f"\n  {where}:")
+        for name, vals, note in (
+                ("peak / uniform", mag, "times uniform the top image column is"),
+                ("peak CV across queries", cv, "small = the same column for every query"),
+                ("normalised entropy", ent, "1.0 = the picture's attention is flat")):
+            mm, lo, hi, n = boot_mean(vals, args.n_boot)
+            print(f"    {name:<24} {mm:>8.3f}  [{lo:.3f}, {hi:.3f}]  n={n}   {note}")
+        mm, c = boot_mean(mag, args.n_boot)[0], boot_mean(cv, args.n_boot)[0]
+        verdicts[where] = ("a sink by both legs" if mm >= args.sink_x and c <= args.sink_cv
+                           else "a peak, not a sink" if mm < args.sink_x
+                           else "large but query-DEPENDENT -- a peak that moves")
+    if best_cells:
+        top = sorted({c: best_cells.count(c) for c in set(best_cells)}.items(),
+                     key=lambda kv: -kv[1])[:5]
+        print(f"\n    the strongest cell is {top[0][0]} on {top[0][1]}/{len(best_cells)} "
+              f"pictures; the top five are {[c for c, _n in top]}")
     print(f"\n  Verdict at the pre-registered thresholds (>= {args.sink_x}x uniform and "
-          f"CV <= {args.sink_cv}): {verdict}.")
-    if "sink" not in verdict:
-        print("  The word 'sink' should then be dropped from the claim even if every "
-              "ring number\n  above is high. That is a real result about wording, not a "
-              "null.")
+          f"CV <= {args.sink_cv}):")
+    for where, v in verdicts.items():
+        print(f"    {where:<32} {v}")
+    if not any("sink by both" in v for v in verdicts.values()):
+        print("\n  Then the word 'sink' should be dropped from the claim even if every ring")
+        print("  number above is high: what is on the border is a PEAK, and a peak that")
+        print("  moves with the query is not what the sink literature is describing. That")
+        print("  is a real result about wording, not a null.")
 
 
 def report_blank(meta, arrays, cells, args):
@@ -1449,8 +1481,12 @@ def report_norms(meta, arrays, args):
         r = boot_mean(np.asarray(v_ring) / np.maximum(np.asarray(v_int), 1e-9), args.n_boot)
         print(f"    vision tower output (before ANY text token): {r[0]:.3f} "
               f"[{r[1]:.3f}, {r[2]:.3f}]")
-        print("    Above 1 here means the encoder decided it and the language model "
-              "inherited it.")
+        print("    ABOVE 1: the border patches are norm outliers before a single text")
+        print("      token exists, so the encoder decided it and the LLM inherited it --")
+        print("      the register story (Darcet et al.; Sun et al.).")
+        print("    AT OR BELOW 1: the border's pull is NOT a big-feature effect. Whatever")
+        print("      makes those columns attractive, it is not that they arrive large, and")
+        print("      section 9 is then the place the mechanism has to come from.")
     if h_by_layer:
         print(f"\n    {'LLM layer':>10} {'ring/interior norm':>20}")
         for l in sorted(h_by_layer)[:: max(1, len(h_by_layer) // 12)]:
