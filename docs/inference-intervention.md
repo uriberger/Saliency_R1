@@ -337,9 +337,31 @@ but so does every other arm on that split.
 
 ### What this does and does not settle
 
-It settles the question this page was written to ask: **you cannot get the rect-frac gain
-by moving attention to the middle at inference.** Both halves of the idea are now null —
-selection (section 4) and steering (here).
+**On the validation sets, moving attention to the middle at inference does nothing.** Both
+halves of the idea are null there — selection (section 4) and steering (here).
+
+It is not yet settled on the axis that matters most, and that is a real limitation rather
+than a formality. `--overlap_rect_frac` was judged by `bench/natural/mean`; this was
+measured on the held-out validation sets, which are a different and weaker instrument:
+
+| | benchmark | validation set used here |
+|---|---|---|
+| natural | 0.7177 | 0.4219 |
+| non-natural | 0.5150 | **0.0703** |
+
+`val_nonnatural` sits near the floor. It can register damage — and every arm on it is
+negative — but it can barely register an improvement at all, so read the non-natural half
+of this section as "no gain was detectable", not as "no gain exists". `val_natural` at
+0.42 is in a usable range and is where `centre - outward` came out at −0.016 / +0.000.
+
+Two benchmark runs are in flight to close this, at the 100-sample profile that
+`sft-coldstart`'s 0.7177 / 0.5150 was measured at: `sinkshift-centre-a05` and
+`sinkshift-outward-a05`, both alpha 0.5 over every layer and head, in
+`outputs/bench_baselines/`. Their difference is the same contrast on the benchmark's own
+terms. Note the benchmark cannot resolve below the measured ~0.013 seed floor, and
+`centre - outward` on validation was −0.016 to +0.000 — so it is being asked to resolve a
+difference right at the edge of what it can see, and a null there will bound the effect
+rather than eliminate it.
 
 It does **not** show the training result is wrong. GRPO changes weights; this changes one
 activation and leaves the weights alone, and result 2 in [HANDOFF.md](HANDOFF.md) already
