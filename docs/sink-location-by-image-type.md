@@ -551,3 +551,86 @@ resolution, can fail them.
 - The permutation destroys the model's answer. That is fine — the readout is where
   attention goes, not whether the answer is right — but it means `permute` says nothing
   about behaviour.
+
+---
+
+# 17. Base Qwen3-VL-8B, and the tokens the model wrote — 2026-09-08
+
+Two changes: the **vanilla `Qwen/Qwen3-VL-8B-Instruct`** instead of the cold start, and the
+attention from **generated** tokens as well as from the question's. 360 pictures, 30 per
+type, one greedy answer each capped at 256 tokens, then one teacher-forced forward over
+prompt ++ answer. That is the same construction `grpo_trainer_qwen3.py` uses to compute the
+reward (`overlap_layer=22`, `overlap_heads=(28, 31)`, mean over heads — verified), so the
+`generated` column is the reward's own view rather than a proxy for it. Selftest passed.
+`outputs/sink_location/base_qwen3vl/report.txt`.
+
+Pooled over the twelve types. Enrichment: the location's share of the picture's attention ÷
+its share of the patches; `topleft`/`botright` are single patches against 1/N.
+
+| tokens asking | heads | ring | one in | middle | top | bottom | left | right | top-left | bottom-right |
+|---|---|---|---|---|---|---|---|---|---|---|
+| question | all 1,152 | 1.53 | 0.81 | 0.71 | 2.48 | 1.26 | 2.18 | 1.47 | 12.9 | 3.14 |
+| question | L22 h28,31 | 2.02 | 0.62 | 0.43 | 4.65 | 0.86 | 4.17 | 1.32 | 36.9 | 1.11 |
+| **generated** | all 1,152 | **1.29** | 0.90 | 0.85 | 1.86 | 1.10 | 1.65 | 1.20 | 8.0 | 2.09 |
+| **generated** | **L22 h28,31** | **1.61** | 0.83 | 0.61 | 2.68 | 1.02 | 2.09 | 1.74 | 14.7 | 1.34 |
+| both | all 1,152 | 1.39 | 0.86 | 0.79 | 2.11 | 1.17 | 1.86 | 1.33 | 9.9 | 2.63 |
+| both | L22 h28,31 | 1.73 | 0.76 | 0.56 | 3.29 | 0.96 | 2.76 | 1.57 | 21.6 | 1.21 |
+
+## 17.1 The base model and the cold start are the same model here
+
+Query tokens, the only column both runs have:
+
+| | ring, all heads | ring, L22 h28,31 | top-left, all heads | top-left, L22 h28,31 |
+|---|---|---|---|---|
+| base Qwen3-VL-8B (n=30/type) | 1.53 | 2.02 | 12.9 | 36.9 |
+| cold start (n=150/type) | 1.51 | 1.97 | 12.2 | 28.6 |
+
+**The SFT did not create the border bias.** It is in the released model, and §16's whole
+argument — twelve types, the rotation, the permutation — is about the base model too.
+
+## 17.2 The effect is smaller on the tokens the model writes
+
+Ring enrichment drops from 1.53 to **1.29** over all heads, and from 2.02 to **1.61** at the
+trained pair. The top-left patch drops from 12.9 to 8.0, and from 36.9 to **14.7**. Roughly
+two thirds the size, in both head sets and in every type.
+
+Two consequences.
+
+- **Every prefill-only number in §16 is an upper bound on what the reward saw**, not an
+  estimate of it. The direction and the ordering hold, the magnitudes do not. §16.10's
+  caveat about the missing tie-back is now settled in the direction that costs us: the
+  proxy is biased upward by about a third.
+- It **does not vanish**. Even the reward's exact readout — the two trained heads, the
+  generated tokens, the teacher-forced pass — puts 1.61× on the border and 14.7× on the
+  single top-left patch. What `--overlap_rect_frac` was scoring against really is a map
+  with a lit corner in it.
+
+## 17.3 The trained pair is not a typical pair
+
+L22 h28,31 leans on the border **harder than the model's average head does**, on every
+token set: 2.02 vs 1.53 on the question's tokens, 1.61 vs 1.29 on the generated ones, and
+the top-left patch at 36.9 vs 12.9. Its interior is correspondingly starved — `middle` 0.43
+against the model-wide 0.71.
+
+So the pair the reward reads is a border-biased pair, chosen (for other reasons) from the
+more border-biased end of the distribution. That is worth knowing whenever `mean_in` is
+described as measuring "where the model looks": it measures where two unusually
+edge-leaning heads look.
+
+## 17.4 Still not a sink, more so
+
+At the strongest cell anywhere in the base model the top column takes **51×** uniform
+(cold start: 33×) but its across-query CV is **1.21** — still far above the pre-registered
+0.5. The strongest cell is L0 h27 on 103 of 260 pictures. The picture's share of a row is
+0.089, essentially identical to the cold start's 0.087.
+
+## 17.5 Caveats specific to this run
+
+- **30 pictures per type**, against 150 in §16. Enough for these effect sizes; the CIs are
+  wider and per-type orderings should not be read closely.
+- **Answers were capped at 256 tokens and the median hit the cap**, so `generated` means
+  the first 256 tokens of an answer that was still going. The base model was given the
+  cold start's `<think>` system prompt, which it was never trained to follow.
+- The arms (rotation, permutation, zoom) were **not** re-run on the base model. §16's
+  causal claims rest on the cold start; §17.1 is the reason to expect they carry over, not
+  evidence that they do.
