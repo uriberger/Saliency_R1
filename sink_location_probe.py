@@ -1222,6 +1222,7 @@ def report_shape(meta, arrays, cells, args):
              ("right_share", "right"), ("corner_share", "corner"),
              ("first_patch_share", "first"), ("last_patch_share", "last"),
              ("ctrl_block_share", "ctrl_int")]
+    pooled = {}
     print(f"\n    {'type':<18} " + " ".join(f"{n:>8}" for _s, n in names))
     for t in sorted({m["type"] for m in meta}):
         vals = {n: [] for _s, n in names}
@@ -1243,6 +1244,8 @@ def report_shape(meta, arrays, cells, args):
         print(f"    {t:<18} " + " ".join(
             f"{np.nanmean(vals[n]) if vals[n] else float('nan'):>8.2f}"
             for _s, n in names))
+        for _s, n in names:
+            pooled.setdefault(n, []).extend(vals[n])
     print("\n  `first` and `last` are single patches -- the top-left and bottom-right")
     print("  corners -- priced against a flat map's 1/N. `corner` averages all four, so a")
     print("  `first` far above `corner` says the sink is ONE token and not the geometry.")
@@ -1251,6 +1254,7 @@ def report_shape(meta, arrays, cells, args):
     print("  a depleted interior is the same fact as an enriched ring, stated twice. The")
     print("  metric's own check is the selftest, which runs it on a SHUFFLED map, where the")
     print("  answer must be 1.00 and nothing else.")
+    return {k: float(np.nanmean(v)) if v else float("nan") for k, v in pooled.items()}
 
 
 def report_cells(meta, arrays, args):
@@ -1402,6 +1406,9 @@ def report_blank(meta, arrays, cells, args):
         d = boot_mean([r[1] - r[2] for r in sub], args.n_boot)
         print(f"    {t:<18} {len(sub):>4} {b[0]:>17.3f} {e[0]:>9.3f} "
               f"{d[0]:>+14.3f}  [{d[1]:+.3f}, {d[2]:+.3f}]")
+    all_d = boot_mean([r[1] - r[2] for r in rows], args.n_boot)
+    return {"blank_minus_ring": all_d[0], "blank_minus_ring_lo": all_d[1],
+            "blank_minus_ring_hi": all_d[2], "n": len(rows)}
 
 
 def report_content(meta, arrays, args):
@@ -1418,6 +1425,7 @@ def report_content(meta, arrays, args):
     print("   response: the patch's share of the picture's attention x N (1.0 = its "
           "share of\n   a flat map). Covariates standardised within picture; unit of "
           "analysis is the patch.")
+    got = []
     print(f"\n    {'type':<18} {'n_pix':>7} {'b_ring':>8} {'b_blank':>9} {'b_edge':>8} "
           f"{'b_pixvar':>9} {'R2 all':>7} {'R2 no ring':>11}")
     for t in sorted({m["type"] for m in meta}):
@@ -1451,9 +1459,14 @@ def report_content(meta, arrays, args):
         _b2, r2_noring = _ols(X[:, 1:], y)
         print(f"    {t:<18} {len(y):>7} {b[0]:>8.3f} {b[1]:>9.3f} {b[2]:>8.3f} "
               f"{b[3]:>9.3f} {r2:>7.3f} {r2_noring:>11.3f}")
+        got.append((b[0], r2 - r2_noring))
     print("\n  b_ring is the ring's partial effect AFTER blankness, edge energy, pixel")
     print("  variance and radial depth. A b_ring that stays large with a small R2 gap is")
     print("  'the border, not the background'; a b_ring that collapses is the opposite.")
+    return {"b_ring": float(np.mean([g[0] for g in got])) if got else float("nan"),
+            "r2_gap": float(np.mean([g[1] for g in got])) if got else float("nan"),
+            "b_ring_positive": (float(np.mean([g[0] > 0 for g in got])) if got
+                                else float("nan"))}
 
 
 def _z(x):
@@ -1481,8 +1494,9 @@ def report_norms(meta, arrays, args):
             for l in range(hn.shape[0]):
                 h_by_layer.setdefault(l, []).append(float(hn[l, 0]) / max(float(hn[l, 1]),
                                                                           1e-9))
+    facts = {}
     if not v_ring and not h_by_layer:
-        return
+        return facts
     print("\n" + "=" * 78)
     print("8. MASSIVE ACTIVATIONS -- ||h|| on the border over ||h|| in the interior")
     if v_ring:
@@ -1495,10 +1509,14 @@ def report_norms(meta, arrays, args):
         print("    AT OR BELOW 1: the border's pull is NOT a big-feature effect. Whatever")
         print("      makes those columns attractive, it is not that they arrive large, and")
         print("      section 9 is then the place the mechanism has to come from.")
+        facts["vision_ring_over_interior"] = r[0]
     if h_by_layer:
         print(f"\n    {'LLM layer':>10} {'ring/interior norm':>20}")
         for l in sorted(h_by_layer)[:: max(1, len(h_by_layer) // 12)]:
             print(f"    {l:>10} {float(np.mean(h_by_layer[l])):>20.3f}")
+        facts["llm_ring_over_interior_max"] = max(
+            float(np.mean(v)) for v in h_by_layer.values())
+    return facts
 
 
 def report_key_split(meta, arrays, cells, args):
@@ -1518,7 +1536,7 @@ def report_key_split(meta, arrays, cells, args):
             if np.isfinite(a1) and np.isfinite(a2):
                 ka.append(float(a1 - a2))
     if not kr:
-        return
+        return {}
     print("\n" + "=" * 78)
     print("9. WHERE THE LOGIT COMES FROM  (mean logit = scaling * ||k|| * alignment)")
     k = boot_mean(kr, args.n_boot)
@@ -1528,17 +1546,18 @@ def report_key_split(meta, arrays, cells, args):
     print("    A ratio near 1 with a positive alignment gap is the sink-direction story;")
     print("    a large ratio with no alignment gap is the register story. They have")
     print("    different fixes, which is why they are split rather than summed.")
+    return {"knorm_ratio": k[0], "align_gap": al[0], "align_gap_lo": al[1]}
 
 
 def report_arms(out_dir, cells, args):
     """The causal half. Every arm is paired against the same picture's own baseline."""
     meta, arrays = read_stage(out_dir, "arms")
     if not meta:
-        return
+        return {}
     base = {m["key"]: m for m in meta if m.get("arm") == "identity"}
     if not base:
         print("\n(arms: no `identity` baseline was run, so nothing can be paired)")
-        return
+        return {}
     print("\n" + "=" * 78)
     print("10. THE ARMS -- same picture, one thing changed, paired against its own "
           "baseline")
@@ -1551,7 +1570,7 @@ def report_arms(out_dir, cells, args):
     print("    columns are the same question asked twice and neither discriminates.")
     print(f"\n    {'arm':<20} {'n':>4} {'dE_ring':>9} {'95% CI':>18} {'dE_top':>8} "
           f"{'dE_bottom':>10} {'follow content':>15} {'follow slot':>12}")
-    by_arm = {}
+    by_arm, out = {}, {}
     for m in meta:
         by_arm.setdefault(m.get("arm"), []).append(m)
     for arm in sorted(by_arm):
@@ -1594,6 +1613,12 @@ def report_arms(out_dir, cells, args):
             if (gh, gw) == (gh0, gw0):
                 fs.append(float(pa == pb))
         d = boot_paired(e_arm, e_base, args.n_boot)
+        out[arm] = {"dE_ring": d[0], "dE_ring_lo": d[1], "dE_ring_hi": d[2],
+                    "dE_top": float(np.mean(tops)) if tops else float("nan"),
+                    "dE_bottom": float(np.mean(bots)) if bots else float("nan"),
+                    "follow_content": float(np.mean(fc)) if fc else float("nan"),
+                    "follow_slot": float(np.mean(fs)) if fs else float("nan"),
+                    "identity_frame": _identity_frame(arm), "n": d[3]}
         tag = arm + (" (=)" if _identity_frame(arm) else "")
         print(f"    {tag:<20} {d[3]:>4} {d[0]:>+9.3f} "
               f"{f'[{d[1]:+.3f}, {d[2]:+.3f}]':>18} "
@@ -1603,6 +1628,7 @@ def report_arms(out_dir, cells, args):
               f"{np.mean(fs) if fs else float('nan'):>12.3f}")
     print("\n  `permute` is the one that cannot be answered with 'your transform changed")
     print("  the content'. It moves nothing but which slot holds which patch embedding.")
+    return out
 
 
 def _identity_frame(arm):
@@ -1647,6 +1673,146 @@ def _arm_correspondence(arm, gh, gw, gh0, gw0, size=None):
     return SL.patch_correspondence(inv, gh, gw, gh0, gw0)
 
 
+#: Each entry is (hypothesis, what it would mean, [(prediction, reader) ...]) where the
+#: reader takes the collected facts and returns (verdict, evidence string) or None when
+#: the arm or table it needs was not run. Written as a table rather than as prose so the
+#: conclusion is a function of the numbers and not of whoever is reading them.
+HYPOTHESES = (
+    ("H1  sequence position",
+     "the picture is raster-ordered, so its early tokens are the sequence's early keys;\n"
+     "     the first patch also sits immediately after <|vision_start|>",
+     (("the FIRST patch beats the average corner",
+       lambda f: _cmp(f["shape"].get("first"), f["shape"].get("corner"), ">", 1.5)),
+      ("top and left beat bottom and right",
+       lambda f: _cmp(_avg(f["shape"], "top", "left"),
+                      _avg(f["shape"], "bottom", "right"), ">", 2.0)),
+      ("rot180 does NOT move the border's share",
+       lambda f: _near(f["arms"].get("rot180", {}).get("dE_ring"), 0.0, 0.1)),
+      ("rot180 does NOT move the top row's share",
+       lambda f: _near(f["arms"].get("rot180", {}).get("dE_top"), 0.0, 0.5)),
+      # The prediction this hypothesis lives or dies by, and the one it was originally
+      # not given. If the sink is held by the LLM's own position -- the slot, its
+      # M-RoPE coordinates, its distance from <|vision_start|> -- then permuting which
+      # embedding sits in which slot must leave the peak exactly where it was. Scoring
+      # H1 without this is the selective reading this whole section exists to prevent.
+      ("the peak stays in its SLOT when the EMBEDDINGS are permuted",
+       lambda f: _cmp(f["arms"].get("permute", {}).get("follow_slot"), 0.8, ">", 0.0)))),
+
+    ("H2  background content",
+     "sinks go where there is nothing to look at, and in a photograph that is the edge",
+     (("a blank INTERIOR region beats the border",
+       lambda f: _cmp(f["blank"].get("blank_minus_ring"), 0.0, ">", 0.0)),
+      ("zooming in, so the border becomes foreground, weakens it",
+       lambda f: _cmp(f["arms"].get("zoom60", {}).get("dE_ring"), -0.2, "<", 0.0)),
+      ("a NOISY pad does not attract what a blank pad does",
+       lambda f: _cmp(f["arms"].get("pad_noise_1", {}).get("dE_ring"),
+                      f["arms"].get("pad_grey_1", {}).get("dE_ring"), ">", 0.1)),
+      ("`ring` does not survive the content covariates",
+       lambda f: _cmp(f["content"].get("b_ring"), 0.2, "<", 0.0)))),
+
+    ("H3  2D border geometry",
+     "the ViT's position embeddings and the LLM's 2D M-RoPE put the border at extremal\n"
+     "     coordinates, and border patches are built from a truncated neighbourhood",
+     (("the border is enriched at all",
+       lambda f: _cmp(f["shape"].get("ring"), 1.5, ">", 0.0)),
+      ("the peak stays in its SLOT when the pixels move",
+       lambda f: _cmp(_follow(f["arms"], "follow_slot"), 0.8, ">", 0.0)),
+      ("the four edges are roughly symmetric",
+       lambda f: _cmp(_avg(f["shape"], "top", "left"),
+                      _avg(f["shape"], "bottom", "right"), "<", 2.0)))),
+
+    ("H4  registers / massive activations",
+     "some tokens carry outlier-norm states used as scratch space, and they are\n"
+     "     allocated to low-information patches",
+     (("the border arrives with a bigger norm from the vision tower",
+       lambda f: _cmp(f["norms"].get("vision_ring_over_interior"), 1.05, ">", 0.0)),
+      ("the border's keys are bigger",
+       lambda f: _cmp(f["keys"].get("knorm_ratio"), 1.05, ">", 0.0)))),
+
+    # H5 was not in the design document. It is what H1 and H3 turn into once the
+    # permutation arm is read, and it is written here in the same before-the-fact form so
+    # a later run can fail it: the mark is IN THE EMBEDDING, put there by the vision
+    # tower's own position embedding, and the language model attends to the mark rather
+    # than to the slot or to the pixels.
+    ("H5  the vision tower's positional signature  (post hoc -- see the caveat)",
+     "the ViT stamps its border patches, the stamp travels inside the embedding, and\n"
+     "     the LLM attends to the stamp. Neither the pixels nor the slot hold it",
+     (("rotating the pixels does NOT move it -- so not content",
+       lambda f: _near(f["arms"].get("rot180", {}).get("dE_ring"), 0.0, 0.1)),
+      ("permuting the embeddings DOES move it -- so not the slot",
+       lambda f: _cmp(f["arms"].get("permute", {}).get("follow_slot"), 0.2, "<", 0.0)),
+      ("...and the peak follows the EMBEDDING it was sitting on",
+       lambda f: _cmp(f["arms"].get("permute", {}).get("follow_content"), 0.8, ">", 0.0)),
+      ("the stamp is not a big norm (that would be H4)",
+       lambda f: _cmp(f["norms"].get("vision_ring_over_interior"), 1.05, "<", 0.0)),
+      ("it is an alignment with what the queries look for",
+       lambda f: _cmp(f["keys"].get("align_gap_lo"), 0.0, ">", 0.0)))),
+)
+
+
+def _avg(d, *keys):
+    v = [d.get(k) for k in keys]
+    v = [x for x in v if x is not None and np.isfinite(x)]
+    return float(np.mean(v)) if v else None
+
+
+def _follow(arms, key):
+    """The mean of one follow-rate over the arms that actually move pixels around.
+
+    Restricted to arms whose grid correspondence is NOT the identity: for `donut` and the
+    resolution ladder the content never leaves its patch, so their follow rates are 1.0
+    by construction and would drown the arms that carry information.
+    """
+    v = [a[key] for name, a in arms.items()
+         if not a.get("identity_frame") and name not in SL.SPECIAL_ARMS
+         and a.get(key) is not None and np.isfinite(a[key])]
+    return float(np.mean(v)) if v else None
+
+
+def _cmp(got, want, op, margin):
+    if got is None or want is None or not np.isfinite(got) or not np.isfinite(want):
+        return None
+    ok = got > want + margin if op == ">" else got < want - margin
+    return ok, f"{got:+.3f} vs {want:+.3f}"
+
+
+def _near(got, want, tol):
+    if got is None or not np.isfinite(got):
+        return None
+    return abs(got - want) <= tol, f"{got:+.3f} (within {tol} of {want:+.0f}?)"
+
+
+def report_verdict(facts):
+    """Score the four hypotheses against what was measured. Mechanically, from the table.
+
+    This is not a substitute for reading sections 1 to 10. It is a guard against reading
+    them selectively: the predictions were written down in the design document before the
+    run, they are evaluated here in the order they were written, and a hypothesis that
+    passes on one leg and fails on three says so out loud.
+    """
+    print("\n" + "=" * 78)
+    print("11. WHAT IT SAYS -- the pre-registered predictions, scored")
+    for name, why, preds in HYPOTHESES:
+        rows = [(text, reader(facts)) for text, reader in preds]
+        live = [r for _t, r in rows if r is not None]
+        score = sum(1 for r in live if r[0])
+        print(f"\n  {name}   {score}/{len(live)} predictions met"
+              + ("" if len(live) == len(rows) else
+                 f"  ({len(rows) - len(live)} not measurable from this run)"))
+        print(f"     {why}")
+        for text, r in rows:
+            mark = "not run" if r is None else ("  MET  " if r[0] else "  no   ")
+            print(f"       [{mark}] {text:<52} {'' if r is None else r[1]}")
+    print("\n  A hypothesis is not chosen by having the most ticks. Read which prediction")
+    print("  failed: `rot180 does not move it` and `the peak follows the embedding under")
+    print("  permutation` are the two that separate content, slot and stamp, and no amount")
+    print("  of agreement on the others substitutes for them.")
+    print("\n  H1 to H4 were written before the run. H5 was NOT -- it is what H1 and H3")
+    print("  become once the permutation arm is read, so it is a hypothesis this run")
+    print("  GENERATED and cannot also confirm. Its predictions are written in the same")
+    print("  falsifiable form so the next model, or the next resolution, can fail them.")
+
+
 def stage_report(args):
     meta, arrays = read_stage(args.out_dir, "scan")
     if not meta:
@@ -1668,14 +1834,15 @@ def stage_report(args):
 
     report_budget(meta, arrays)
     report_types(meta, arrays, cells, args)
-    report_shape(meta, arrays, cells, args)
+    facts = {"shape": report_shape(meta, arrays, cells, args) or {}}
     report_cells(meta, arrays, args)
     report_s3(meta, arrays, cells, args)
-    report_blank(meta, arrays, cells, args)
-    report_content(meta, arrays, args)
-    report_norms(meta, arrays, args)
-    report_key_split(meta, arrays, cells, args)
-    report_arms(args.out_dir, cells, args)
+    facts["blank"] = report_blank(meta, arrays, cells, args) or {}
+    facts["content"] = report_content(meta, arrays, args) or {}
+    facts["norms"] = report_norms(meta, arrays, args) or {}
+    facts["keys"] = report_key_split(meta, arrays, cells, args) or {}
+    facts["arms"] = report_arms(args.out_dir, cells, args) or {}
+    report_verdict(facts)
 
     print("\n" + "=" * 78)
     print("Read section 1 before anything else. If the picture's share of a row is a")

@@ -1,4 +1,21 @@
-# Is the sink in the outer ring, or is the outer ring just the background? — plan, 2026-09-07
+# Is the sink in the outer ring, or is the outer ring just the background? — 2026-09-08
+
+**Answered, on 1,800 pictures across twelve image types, at the cold start.** Full output
+in `outputs/sink_location/coldstart/report.txt`. Sections 1–15 below are the design, which
+was written before the run and is unchanged except where marked; **section 16 is the
+result.** Read section 16 first if you want the answer, and section 1 before believing any
+percentage in it.
+
+Three sentences: **the border is enriched in every one of the twelve types, including the
+ones where the blank region is in the middle** — so it is not the background. **Turning the
+picture upside down does not move it** — so it is not the content either. **Permuting which
+patch embedding sits in which grid slot moves it, and the peak follows the embedding** — so
+it is not the language model's own position: the mark is stamped into the patch vector by
+the vision tower, and the language model attends to the mark.
+
+---
+
+# The design, as written on 2026-09-07
 
 [peak-location-results.md](peak-location-results.md) says, of the cold start on `val_natural`:
 
@@ -317,3 +334,220 @@ that answer the question. Stages 4 and 5 are only worth buying once 2 and 3 have
 - **Prefill queries are not what the reward saw.** The training signal was computed on
   generated tokens. Stage 1b is what licenses the substitution, and if it fails the cost
   goes up tenfold rather than the conclusion changing.
+
+---
+
+# 16. The result — 2026-09-08
+
+Cold start (`coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged`), 1,800 pictures,
+150 per type, 12 types. 457 dev / 1,343 test. All 36 layers × 32 heads. Headline cells are
+the 16 with the largest ring enrichment **on the dev split**, reported on the test split.
+Selftest passed on the real corpus, including every transform's pixel→patch mapping at
+every picture size in it. `outputs/sink_location/coldstart/report.txt`.
+
+Total cost: **under 15 GPU-minutes.** The scan is 74 s per shard on 8 GPUs; the arms are
+about 4 minutes. No generation, no Grounding-DINO, no judge.
+
+## 16.1 The budget — read this before any percentage
+
+| span | share of an attention row, over all 1,152 cells |
+|---|---|
+| first token | 0.470 |
+| everything before the picture | 0.609 |
+| `<\|vision_start\|>` | 0.0044 |
+| **the picture** | **0.087** |
+| `<\|vision_end\|>` | 0.015 |
+| the question and the assistant header | 0.285 |
+
+The picture receives **8.7% of a row** — far more than the 0.4–1.4% that
+[inference-intervention.md §3](inference-intervention.md) measured at L22 h28/31, which is
+a statement about those two heads and not about the model. But the first token alone takes
+47%, so the real sink is where the sink literature says it is, outside the image. Every
+number below is about **how the model divides up its 8.7%**.
+
+## 16.2 The ring, per image type — the claim holds everywhere
+
+`E_ring` = the border's share of the picture's attention ÷ the border's share of the
+patches. 1.0 is no effect. `L_ring` = P(peak on the border) − that same chance level.
+CIs are a 10,000-resample bootstrap over pictures; p is Holm-adjusted across the twelve.
+
+| type | n | modal grid | ring area | E_ring | 95% CI | L_ring |
+|---|---|---|---|---|---|---|
+| synthetic pop-out (P3) | 107 | 16x16 | 0.234 | **3.58** | [3.55, 3.60] | +0.764 |
+| puzzle, board (AlgoPuzzleVQA) | 110 | 16x16 | 0.262 | 3.10 | [3.04, 3.16] | +0.738 |
+| photographs (GQA/A-OKVQA/…) | 114 | 12x16 | 0.283 | 2.81 | [2.77, 2.84] | +0.707 |
+| photographs, aerial (VisDrone) | 114 | 9x16 | 0.300 | 2.74 | [2.70, 2.78] | +0.699 |
+| scanned documents | 119 | 16x12 | 0.278 | 2.62 | [2.58, 2.66] | +0.710 |
+| illusions | 110 | 8x16 | 0.344 | 2.58 | [2.57, 2.59] | +0.656 |
+| charts and tables | 113 | 14x14 | 0.348 | 2.52 | [2.42, 2.62] | +0.650 |
+| puzzle, abstract (VisuLogic) | 117 | 7x16 | 0.347 | 2.49 | [2.41, 2.57] | +0.652 |
+| exam pages (MMMU-Pro) | 109 | 10x16 | 0.360 | 2.48 | [2.37, 2.58] | +0.639 |
+| math & geometry figures | 108 | 8x9 | 0.400 | 2.20 | [2.12, 2.29] | +0.600 |
+| infographics | 117 | 16x11 | 0.376 | 2.11 | [2.03, 2.19] | +0.604 |
+| science diagrams | 105 | 7x10 | 0.410 | 2.10 | [2.02, 2.19] | +0.585 |
+
+**Twelve of twelve clear the pre-registered 1.5, p < 0.002 after Holm.** The spread is
+real but small: 2.1 to 3.6, and it does not line up with "how much background is at the
+edge". The *highest* enrichment is on P3, the synthetic pop-out field where the picture is
+a homogeneous array of distractors and "background" is not a place. The *lowest* are the
+science diagrams and math figures, which are the types with the most white space — the
+opposite of what a background account predicts.
+
+It is not a cell either: **99.7% of the 1,147 cells that clear the image-mass floor have
+E_ring > 1**, 40% above 1.5. The rewarded pair sits at E_ring 2.33 (h28) and 1.84 (h31).
+
+## 16.3 The shape — and this is where the answer starts
+
+Enrichment by set, pooled over types (each column is that set's share ÷ its area share;
+`first` and `last` are single patches priced against a flat map's 1/N):
+
+| ring | depth 1 | deep | top | bottom | left | right | corner (mean of 4) | **first patch** | last patch |
+|---|---|---|---|---|---|---|---|---|---|
+| 2.61 | 0.32 | 0.24 | 7.39 | 0.74 | 7.38 | 1.56 | 21.6 | **72.5** | 3.1 |
+
+Two things a 2-D border effect cannot explain:
+
+- **top 7.4× and left 7.4×, against bottom 0.74× and right 1.56×.** The border is not
+  enriched; its *early* half is. The bottom row is *below* chance.
+- **the single top-left patch is at 72×**, more than three times the four-corner average
+  and twenty-three times the last patch. Per type it runs from 46.6 (math figures) to
+  118.4 (P3).
+
+That is the raster-order signature, and it made H1 (sequence position) the leading account
+right up until the permutation arm.
+
+## 16.4 Is it a sink at all — no
+
+| | at the ring cells | at the strongest cell anywhere |
+|---|---|---|
+| peak ÷ uniform | 4.9 | 33.4 |
+| peak CV across queries | 2.55 | 1.39 |
+| normalised entropy | 0.50 | 0.52 |
+
+Pre-registered: a sink needs ≥10× uniform **and** CV ≤ 0.5. Nothing meets both. At the
+strongest cell in the whole model — which is L2 h17 on 524 of 1,343 pictures — the top
+column is 33× uniform and still moves with the query (CV 1.39).
+
+**So "attention sinks are located in the outer ring" is the wrong sentence even though
+every number in §16.2 is high.** What sits on the border is a *peak*, and a peak whose
+location depends on the query is not what the sink literature describes. The accurate
+sentence is: *within the picture, attention concentrates on the border, especially its
+first row and column.*
+
+## 16.5 Background, tested four ways — it loses all four
+
+1. **Interior blank regions.** On pictures whose blank *interior* region covers ≥15% of the
+   grid (n = 6–99 per type), `E_blank_interior` is 0.79–1.19 while `E_ring` on the same
+   pictures is 1.23–1.73. The gap is negative in **all eleven** types with data, from
+   −0.30 to −0.58, every CI excluding 0. Where the blank is in the middle, the attention
+   does not go there.
+2. **Zoom.** Cropping to the central 60% and rescaling makes the border foreground.
+   `dE_ring = +0.020` [+0.008, +0.032] — it goes *up*.
+3. **Padding.** A grey pad costs 0.032, a white pad 0.001, a **noisy** pad 0.118. Blankness
+   is worth something at the margin, and it is an order of magnitude smaller than the
+   effect itself.
+4. **The regression.** With blankness, edge energy, pixel variance and radial depth in the
+   model, `b_ring` stays **positive in 12 of 12 types**, mean +0.49 (0.14 documents to 0.83
+   P3). Dropping `ring` costs R² in every type.
+
+## 16.6 Not registers either
+
+The vision tower's border patches arrive with **smaller** norms than the interior:
+ring/interior = **0.895** [0.889, 0.902], before a single text token exists. The LLM
+hidden-state ratio never exceeds 1.01 at any layer. And the border's keys are not bigger:
+‖k‖ ring/interior = **1.012**. So this is not a massive-activation or register story.
+
+The logit gap is **alignment**: `align_ring − align_interior = +0.542` [+0.537, +0.547]
+against a key-norm ratio of 1.012. The border's keys point where the queries look. They
+are not large; they are *aimed*.
+
+## 16.7 The arms — position beats content, then the permutation moves the goalposts
+
+Paired against each picture's own baseline, at the dev-selected cells. `follow content` is
+the share of pictures whose peak patch shows the baseline's peak patch; `follow slot` is
+the share whose peak sits at the same grid position.
+
+| arm | ΔE_ring | ΔE_top | follow content | follow slot |
+|---|---|---|---|---|
+| `rot180` | −0.008 [−0.017, +0.000] | −0.055 | 0.000 | **1.000** |
+| `rot90` | +0.007 [−0.002, +0.015] | +1.662 | 0.000 | 0.989 |
+| `hflip` | −0.013 | −0.081 | 0.000 | 0.998 |
+| `zoom60` | +0.020 | +0.105 | 0.000 | 0.998 |
+| `canvas4` (object shrunk onto a blank field) | −0.210 | −0.393 | 0.000 | 0.996 |
+| `pad_white_1` | −0.001 | +0.062 | 0.000 | 0.998 |
+| `pad_noise_1` | −0.118 | −0.242 | 0.000 | 0.991 |
+| `two_images` | −0.054 | −0.204 | — | 0.994 |
+| `prompt_swap` | +0.074 | +0.333 | — | 0.996 |
+| **`permute`** | **−1.644** [−1.708, −1.581] | **−5.998** | **0.981** | **0.000** |
+| `permute_identity` (control) | +0.000 | +0.000 | 1.000 | 1.000 |
+
+**`rot180` is the sky confound's obituary.** Turn a photograph upside down and the peak
+does not move a patch (`follow slot` 1.000, ΔE_top −0.055). The 7.4× top row is not the
+sky, not the horizon and not the photographer.
+
+**`permute` is the result.** It touches no pixel: the vision tower runs on the unmodified
+picture and its output rows are shuffled, so position ids, the grid, the prompt and the
+token count are all identical and only *which slot holds which vector* changes. The peak
+leaves its slot completely (0.000) and **follows the embedding it was sitting on (0.981)**.
+
+`permute_identity` returns +0.000 exactly on every column, which is what says the machinery
+is not inventing this.
+
+## 16.8 The hypothesis
+
+Scored mechanically against the predictions written down beforehand:
+
+| | | |
+|---|---|---|
+| H1 sequence position | 4/5 | dies on the permutation: if the LLM's slot held the mark, shuffling embeddings would not move it |
+| H2 background content | **0/4** | every leg fails, including its own home turf |
+| H3 2-D border geometry | 2/3 | right that it is positional, cannot explain top ≫ bottom |
+| H4 registers / massive activations | **0/2** | the border arrives *smaller*, and its keys are not bigger |
+| **H5 the vision tower's positional signature** | **5/5** | post hoc — see the caveat |
+
+**H5, stated so it can be killed.** The vision tower stamps its border patches — most
+strongly the first one — with a direction in feature space. The stamp is not a big norm
+(§16.6), it rides *inside the patch embedding*, and the language model's queries are
+aligned with it (§16.6). That is why rotating the picture does nothing (the ViT re-stamps
+the new border, which is the same border), why permuting the embeddings moves the peak
+with the vector (the stamp travels with it), why no pixel statistic predicts it (§16.5),
+and why it is strongest at the top-left (the ViT's own position embedding is most extremal
+there, and it is also the first token of the run).
+
+**H5 was not pre-registered.** It is what H1 and H3 turn into once the permutation arm is
+read, so this run generated it and cannot also confirm it. Its five predictions are written
+in the probe's `HYPOTHESES` table in falsifiable form so another model, or another
+resolution, can fail them.
+
+## 16.9 What this changes for the rest of the project
+
+- The sentence in [peak-location-results.md](peak-location-results.md) generalises across
+  imagery — but the word **"sink" does not survive §16.4**, and "background" is refuted
+  outright rather than merely unsupported.
+- **`frame` remains the right source set** for `sink_shift.py`'s edit: the border really
+  does hold 2.6× its share in every image type, so the intervention is aimed at something
+  real. What it is draining is a *vision-encoder positional stamp*, not a background prior.
+- The **8.7% figure** in §16.1 says the broad arm has ~20x more to move than the two
+  rewarded heads suggested, which strengthens the case for running `--scope all` in
+  [inference-intervention.md §3](inference-intervention.md) before reading any null.
+- **`prompt_swap` at +0.074** is the closest thing here to an intervention that *increases*
+  ring enrichment, and it is a reminder the effect has a query-dependent component.
+
+## 16.10 Caveats on the result
+
+- **One model.** The cold start, on Qwen3-VL-8B. Stage 5 (2B/4B/32B, Qwen2.5-VL,
+  InternVL3.5) is built and not run; H5 is a claim about vision encoders and is currently
+  evidenced on one.
+- **`MAX_IMAGE_SIDE = 512`**, so the grids are at most 16 patches on the long side and the
+  ring is 23%–41% of the picture. The resolution ladder is the only handle on this and it
+  does not reach past 512 — and it moves the number (`res256` costs 0.656), so resolution
+  is not neutral.
+- **Prefill, not generation.** `--tie-back` implements the check that licenses this and was
+  not run; the reported cells' agreement with the generated-token readout is unmeasured.
+- **The types are corpora.** Within-picture arms carry the causal weight; the type sweep
+  says where the phenomenon is, not why.
+- Six types are topped up from `set_a`/`set_b`, which the cold start never trained on. Any
+  GRPO-trained checkpoint must be run with `--val-only`.
+- The permutation destroys the model's answer. That is fine — the readout is where
+  attention goes, not whether the answer is right — but it means `permute` says nothing
+  about behaviour.
