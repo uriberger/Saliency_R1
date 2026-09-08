@@ -65,6 +65,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -132,10 +133,12 @@ CORPUS = {
         note="labelled diagrams"),
     "puzzle_abstract": dict(
         kind="jsonl_images", repo="VisuLogic/VisuLogic", file="data.jsonl",
-        image_key="image_path", question_key="question",
+        # the pictures live inside images.zip, never unpacked; lmms-eval reads them the
+        # same way (eval_mini/benchmarks.py's `local_data`)
+        zip="images.zip", image_key="image_path", question_key="question",
         note="Raven-style grids: content is uniformly tiled, including the border"),
     "puzzle_board": dict(
-        kind="hf", repo="declare-lab/AlgoPuzzleVQA", split="train",
+        kind="hf", repo="declare-lab/AlgoPuzzleVQA", split="data",
         question_key="question", image_key="image",
         note="boards fill the frame, so the border is a board edge and is informative"),
     "synthetic_popout": dict(
@@ -144,7 +147,7 @@ CORPUS = {
         note="homogeneous distractor field: 'background' is not a place, so H2 has "
              "nowhere to point"),
     "exam_page": dict(
-        kind="hf", repo="MMMU/MMMU_Pro", config="standard", split="test",
+        kind="hf", repo="MMMU/MMMU_Pro", config="standard (10 options)", split="test",
         question_key="question", image_key="image_1",
         note="mixed text and figure layout"),
     "illusion": dict(
@@ -216,17 +219,30 @@ def _load_generic(spec, want, seed):
         files = sorted(str(p) for p in _snapshot(spec["repo"]).glob(spec["glob"]))
         ds = load_dataset("parquet", data_files=files, split="train")
     elif kind == "jsonl_images":
+        import zipfile
+        from PIL import Image
         snap = _snapshot(spec["repo"])
         rows = [json.loads(l) for l in (snap / spec["file"]).read_text().splitlines() if l]
         rng.shuffle(rows)
-        from PIL import Image
+        zf = zipfile.ZipFile(snap / spec["zip"]) if spec.get("zip") else None
+        names = set(zf.namelist()) if zf else set()
         out = []
         for r in rows:
-            p = snap / r[spec["image_key"]]
-            if not p.exists() or len(out) >= want:
-                continue
-            out.append(dict(image=Image.open(p), question=r.get(spec["question_key"]) or
-                            DEFAULT_QUESTION, source=spec["repo"], ref=str(r.get("id"))))
+            if len(out) >= want:
+                break
+            rel = r[spec["image_key"]]
+            if zf is not None:
+                if rel not in names:
+                    continue
+                im = Image.open(io.BytesIO(zf.read(rel)))
+            else:
+                p = snap / rel
+                if not p.exists():
+                    continue
+                im = Image.open(p)
+            out.append(dict(image=im, question=r.get(spec["question_key"])
+                            or DEFAULT_QUESTION, source=spec["repo"],
+                            ref=str(r.get("id"))))
         return out
     else:
         ds = load_dataset(spec["repo"], spec.get("config"), split=spec.get("split", "test"))
