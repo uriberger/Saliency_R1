@@ -468,6 +468,15 @@ def test_probe():
     check("ci_excludes reads a CI the way the verdicts do",
           SP.ci_excludes(1.6, 1.9, 1.5) and not SP.ci_excludes(1.4, 1.6, 1.5))
 
+    # THE COORDINATE FRAME, on a stand-in for the processor's grid. The GPU selftest runs
+    # the identical function against the real one; this is what makes a mistake in it cost
+    # a second rather than a queued job.
+    grid_fn = lambda im: (max(1, im.size[1] // 32), max(1, im.size[0] // 32))  # noqa: E731
+    for size in ((512, 320), (320, 512), (352, 224)):
+        bad, n = SP.frame_check(grid_fn, size)
+        check(f"every transform decodes where it claims, at {size}", not bad,
+              ", ".join(bad) if bad else f"{n} arms")
+
     check("every corpus type declares a loader and a note",
           all({"kind", "note"} <= set(v) for v in SP.CORPUS.values()),
           f"{len(SP.CORPUS)} types")

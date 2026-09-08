@@ -690,48 +690,87 @@ def bright_patch_image(size, grid, where):
     return Image.fromarray(a, "RGB")
 
 
-def content_peak(image, gh, gw):
-    return int(np.argmax(SL.content_stats(image, gh, gw)["mean_grey"]))
+def _within(flat_idx, gh, gw, radius):
+    """Flat boolean mask of the patches within `radius` Chebyshev of one patch."""
+    r, c = divmod(int(flat_idx), gw)
+    rr = np.abs(np.arange(gh)[:, None] - r)
+    cc = np.abs(np.arange(gw)[None, :] - c)
+    return (np.maximum(rr, cc) <= radius).reshape(-1)
 
 
-def frame_check(processor, device, size, tol=1):
-    """Every transform's pixel->patch mapping, against a picture with one bright patch.
+def content_response(image, blank, gh, gw):
+    """Edge energy of the probe minus edge energy of the SAME transform on a flat field.
+
+    Brightness will not do. `pad_white` paints a border brighter than the marker, `canvas`
+    lays a mid-grey field over most of the picture, and both would win an argmax over
+    grey levels while telling us nothing about where the marker went. Differencing
+    against the transform's own blank cancels every edge the transform itself introduced
+    and leaves only the marker.
+    """
+    return (SL.content_stats(image, gh, gw)["edge"]
+            - SL.content_stats(blank, gh, gw)["edge"])
+
+
+def frame_check(grid_fn, size, tol=1, min_response=1e-3, ratio=3.0):
+    """Every transform's pixel->patch mapping, against a picture with one marked patch.
 
     The check runs BACKWARDS, which is the only way one probe picture can serve every
     arm: pick a patch of the TRANSFORMED grid, ask `patch_correspondence` which baseline
-    patch it claims to show, put the bright square there, and see whether the transformed
-    picture's brightest patch is the one we picked. Forwards -- one fixed square, every
-    arm -- cannot work: `zoom60` crops the border away and `donut` paints the middle out,
-    so no single placement survives them all.
+    patch it claims to show, put the marker there, and see whether the transformed
+    picture's marker lands on the patch we picked. Forwards -- one fixed marker, every
+    arm -- cannot work, and finding out why was worth the failed run: `zoom60` crops the
+    border away, `donut` paints the middle out, and `canvas` shrinks the marker until a
+    flat grey field outscores it. No single placement survives them all.
 
-    `tol` is Chebyshev patches. Resampling spreads a one-patch square over its neighbours
-    under `zoom` and `pad`, so 1 is the honest tolerance -- and it is still far tighter
-    than any rotation error, which lands the peak on the wrong side of the picture.
+    Nor does one target patch per arm. A central target is the right choice for `zoom`
+    and the wrong one for `donut`, which erases exactly that. So the candidates are tried
+    in order of centrality and the first one whose marker SURVIVES the transform -- a
+    response above `min_response` and `ratio` times the rest of the grid -- is the one
+    the assertion is made on. An arm where no candidate survives is a failure, not a skip.
+
+    `tol` is Chebyshev patches. Resampling spreads a one-patch marker over its neighbours
+    under `zoom`, `pad` and `canvas`, so 1 is the honest tolerance -- and it is still far
+    tighter than any rotation error, which lands the marker on the wrong side entirely.
     """
+    from PIL import Image
+
     failures, checked = [], 0
+    flat = Image.new("RGB", size, (40, 40, 40))
+    gh0, gw0 = grid_fn(flat)
     for arm in SL.ARMS:
-        probe0 = bright_patch_image(size, (1, 1), (0, 0))     # geometry only, for the grid
-        gh0, gw0 = _grid_of(processor, probe0, device)
-        tim, inv, tmeta = SL.transform(arm, probe0)
-        if tim is None:
+        blank, inv, _meta = SL.transform(arm, flat)
+        if blank is None:
             continue
-        gh, gw = _grid_of(processor, tim, device)
+        gh, gw = grid_fn(blank)
         corr = SL.patch_correspondence(inv, gh, gw, gh0, gw0)
-        # a target patch of the transformed grid that shows something real, as central as
-        # possible so resampling has room on every side
         order = sorted(range(gh * gw),
                        key=lambda i: abs(i // gw - (gh - 1) / 2) + abs(i % gw - (gw - 1) / 2))
-        target = next((i for i in order if corr[i] >= 0), None)
-        if target is None:
-            failures.append(f"{arm}(no patch shows the source)")
-            continue
-        base = int(corr[target])
-        probe = bright_patch_image(size, (gh0, gw0), (base // gw0, base % gw0))
-        got = content_peak(SL.transform(arm, probe)[0], gh, gw)
-        d = max(abs(got // gw - target // gw), abs(got % gw - target % gw))
         checked += 1
-        if d > tol:
-            failures.append(f"{arm}(peak at {got}, correspondence says {target})")
+        for target in order:
+            if corr[target] < 0:
+                continue
+            base = int(corr[target])
+            probe = bright_patch_image(size, (gh0, gw0), (base // gw0, base % gw0))
+            resp = content_response(SL.transform(arm, probe)[0], blank, gh, gw)
+            peak = int(np.argmax(resp))
+            # "Localised" has to mean localised to a NEIGHBOURHOOD, not to one patch.
+            # `zoom60` magnifies the marker by 1/0.6 and `res384` resamples the grid, so
+            # in both the marker legitimately straddles two patches and its immediate
+            # neighbour scores nearly as high. Comparing against the best OTHER patch
+            # rejected those two arms as "not surviving" when they had survived perfectly
+            # well; comparing against everything outside the peak's own neighbourhood is
+            # the test that was meant.
+            near = _within(peak, gh, gw, tol)
+            far = resp[~near]
+            if resp[peak] < min_response or (far.size
+                                             and resp[peak] < ratio * max(far.max(), 1e-12)):
+                continue                       # this patch does not survive the transform
+            d = max(abs(peak // gw - target // gw), abs(peak % gw - target % gw))
+            if d > tol:
+                failures.append(f"{arm}(marker at {peak}, correspondence says {target})")
+            break
+        else:
+            failures.append(f"{arm}(no patch survives the transform at all)")
     return failures, checked
 
 
@@ -754,22 +793,38 @@ def stage_selftest(args):
     print(f"\nselftest  model={args.model}  {len(rows)} pictures", flush=True)
 
     # 1. the scan edits nothing -----------------------------------------------
+    # Not against zero. The scan takes the explicit float32 softmax where the fused kernel
+    # works in bfloat16, so it CANNOT be bit-identical, and an absolute threshold on the
+    # logits is a guess about how much bf16 drifts over 36 layers. The reference is
+    # transformers' OWN eager path, which differs from SDPA for exactly the same reason
+    # and is not under test: the scan has to be no further from the fused kernel than
+    # stock unfused attention already is.
     im0 = Image.open(rows[0]["path"]).convert("RGB")
     inputs = build_inputs(processor, [im0], rows[0]["question"], device)
-    with torch.no_grad():
-        base_logits = model(**inputs, use_cache=False).logits[0, -1].float().cpu()
-        base_ids = model.generate(**inputs, max_new_tokens=args.selftest_tokens,
+
+    def last_logits():
+        with torch.no_grad():
+            return model(**inputs, use_cache=False).logits[0, -1].float().cpu()
+
+    def greedy_ids():
+        with torch.no_grad():
+            return model.generate(**inputs, max_new_tokens=args.selftest_tokens,
                                   do_sample=False,
                                   pad_token_id=processor.tokenizer.pad_token_id)[0].tolist()
+
+    base_logits, base_ids = last_logits(), greedy_ids()
+    with _attn_impl(model, "eager"):
+        eager_logits = last_logits()
     scan = SL.install(model)
     try:
-        with torch.no_grad():
-            scan_logits = model(**inputs, use_cache=False).logits[0, -1].float().cpu()
-            scan_ids = model.generate(**inputs, max_new_tokens=args.selftest_tokens,
-                                      do_sample=False,
-                                      pad_token_id=processor.tokenizer.pad_token_id)[0].tolist()
-        d = float((scan_logits - base_logits).abs().max())
-        check("the scan reproduces stock SDPA (logits)", d < 5e-2, f"max |dlogit| {d:.2e}")
+        scan_logits, scan_ids = last_logits(), greedy_ids()
+        d_scan = float((scan_logits - base_logits).abs().max())
+        d_eager = float((eager_logits - base_logits).abs().max())
+        check("the scan is no further from the fused kernel than stock eager is",
+              d_scan <= 2 * d_eager + 1e-4,
+              f"scan {d_scan:.2e} vs eager {d_eager:.2e} (both against sdpa)")
+        check("the scan picks the same next token",
+              int(scan_logits.argmax()) == int(base_logits.argmax()))
         check("the scan reproduces stock SDPA (greedy tokens)", scan_ids == base_ids,
               f"{sum(a == b for a, b in zip(scan_ids, base_ids))}/{len(base_ids)} equal")
 
@@ -795,7 +850,7 @@ def stage_selftest(args):
         # grid, and a size where the rounding is benign proves nothing about the corpus.
         bad, checked = [], 0
         for size in sorted({tuple(r["size"]) for r in rows}):
-            f, n = frame_check(processor, device, size)
+            f, n = frame_check(lambda im: _grid_of(processor, im, device), size)
             bad += [f"{size}:{x}" for x in f]
             checked += n
         check("every transform's pixel->patch mapping decodes where it claims",
@@ -852,6 +907,34 @@ def stage_selftest(args):
 
     print(f"\n  {'SELFTEST PASS' if ok else 'SELFTEST FAIL'}")
     return 0 if ok else 1
+
+
+class _attn_impl:
+    """Swap the text decoder's attention implementation for the length of a `with`.
+
+    The same two-place switch `SinkScan.install` makes -- the text config AND every
+    attention module's own config -- because relying on them being one object is how a
+    reference measurement quietly becomes a second measurement of the thing under test.
+    """
+
+    def __init__(self, model, impl):
+        self.model, self.impl, self.prev = model, impl, None
+
+    def __enter__(self):
+        cfg = getattr(self.model.config, "text_config", None) or self.model.config
+        self.cfg, self.prev = cfg, cfg._attn_implementation
+        self._set(self.impl)
+        return self
+
+    def __exit__(self, *exc):
+        self._set(self.prev)
+        return False
+
+    def _set(self, impl):
+        self.cfg._attn_implementation = impl
+        for m in self.model.modules():
+            if type(m).__name__ == "Qwen3VLTextAttention":
+                m.config._attn_implementation = impl
 
 
 def _grid_of(processor, image, device):
