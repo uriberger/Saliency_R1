@@ -49,13 +49,21 @@ done
 
 [[ -n "$NAME"    ]] || { echo "ERROR: --name is required (it names the job and the log)." >&2; exit 2; }
 [[ -n "$OUT_DIR" ]] || { echo "ERROR: --out-dir is required." >&2; exit 2; }
-case "$STAGE" in
-    corpus|selftest|scan|arms|report) ;;
-    *) echo "ERROR: --stage $STAGE is not a stage." >&2; exit 2 ;;
-esac
-if [[ "$STAGE" != "corpus" && "$STAGE" != "report" ]]; then
-    [[ -n "$MODEL" ]] || { echo "ERROR: --model is required for stage $STAGE." >&2; exit 2; }
-fi
+# --stage takes a comma-separated LIST, run in order inside one allocation. The whole
+# experiment is selftest,scan,arms and all three together are minutes, so paying the queue
+# and the model load three times over would be most of the cost.
+IFS=',' read -r -a STAGES <<< "$STAGE"
+for s in "${STAGES[@]}"; do
+    case "$s" in
+        corpus|selftest|scan|arms|report) ;;
+        *) echo "ERROR: --stage $s is not a stage." >&2; exit 2 ;;
+    esac
+done
+for s in "${STAGES[@]}"; do
+    if [[ "$s" != "corpus" && "$s" != "report" && -z "$MODEL" ]]; then
+        echo "ERROR: --model is required for stage $s." >&2; exit 2
+    fi
+done
 [[ "$OUT_DIR" = /* ]] || OUT_DIR="$REPO/$OUT_DIR"
 
 # shellcheck source=/dev/null
@@ -88,12 +96,17 @@ RUNNER="$LOG_ROOT/$NAME.runner.sh"
     echo "export HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}"
     echo "export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}"
     # The inner launcher activates conda itself and gates scan/arms on the selftest log,
-    # so what runs inside the allocation is exactly what runs on an interactive node.
-    printf 'bash launch_sink_location.sh --stage %q --gpus %q --out-dir %q' \
-        "$STAGE" "$GPUS" "$OUT_DIR"
-    [[ -n "$MODEL" ]] && printf ' --model %q' "$MODEL"
-    for a in ${EXTRA[@]+"${EXTRA[@]}"}; do printf ' %q' "$a"; done
-    echo
+    # so what runs inside the allocation is exactly what runs on an interactive node --
+    # and a failing selftest stops the stages after it, because `set -e` is what makes the
+    # gate a gate rather than a log line.
+    for s in "${STAGES[@]}"; do
+        printf 'bash launch_sink_location.sh --stage %q --gpus %q --out-dir %q' \
+            "$s" "$([[ $s == selftest || $s == corpus ]] && echo 1 || echo "$GPUS")" \
+            "$OUT_DIR"
+        [[ -n "$MODEL" && "$s" != "corpus" && "$s" != "report" ]] && printf ' --model %q' "$MODEL"
+        for a in ${EXTRA[@]+"${EXTRA[@]}"}; do printf ' %q' "$a"; done
+        echo
+    done
 } > "$RUNNER"
 chmod +x "$RUNNER"
 
