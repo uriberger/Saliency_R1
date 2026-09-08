@@ -1203,13 +1203,17 @@ def _boot_p(vals, null, n_boot, seed=20260907):
 def report_shape(meta, arrays, cells, args):
     """The radial profile and the four edges: where on the border, and is it symmetric."""
     print("\n" + "=" * 78)
-    print("3. THE SHAPE OF IT -- radial profile and the four edges, per type")
+    print("3. THE SHAPE OF IT -- radial profile, the four edges, and the two end patches")
     print("   Each column is enrichment: that set's share of the picture's attention over")
-    print("   its share of the patches. A 2D border effect has no reason to prefer the top.")
-    names = [("ring_share", "ring"), ("depth1_share", "depth1"), ("depth2_share", "depth2"),
-             ("deep_share", "deep"), ("top_share", "top"), ("bottom_share", "bottom"),
-             ("left_share", "left"), ("right_share", "right"),
-             ("corner_share", "corner"), ("ctrl_block_share", "CONTROL")]
+    print("   its share of the patches. A 2D BORDER effect has no reason to prefer the top")
+    print("   over the bottom, or the first corner over the other three. A SEQUENCE effect")
+    print("   has every reason to: the picture is raster-ordered, so `top` and `left` are")
+    print("   its early tokens and `first` is the token right after <|vision_start|>.")
+    names = [("ring_share", "ring"), ("depth1_share", "depth1"), ("deep_share", "deep"),
+             ("top_share", "top"), ("bottom_share", "bottom"), ("left_share", "left"),
+             ("right_share", "right"), ("corner_share", "corner"),
+             ("first_patch_share", "first"), ("last_patch_share", "last"),
+             ("ctrl_block_share", "ctrl_int")]
     print(f"\n    {'type':<18} " + " ".join(f"{n:>8}" for _s, n in names))
     for t in sorted({m["type"] for m in meta}):
         vals = {n: [] for _s, n in names}
@@ -1221,23 +1225,24 @@ def report_shape(meta, arrays, cells, args):
                 continue
             gh, gw = m["grid"]
             sets = SL.named_sets(gh, gw)
-            frac = {"ring": sets["ring"].mean(), "depth1": sets["depth1"].mean(),
-                    "depth2": sets["depth2"].mean(), "deep": sets["deep"].mean(),
-                    "top": sets["top"].mean(), "bottom": sets["bottom"].mean(),
-                    "left": sets["left"].mean(), "right": sets["right"].mean(),
-                    "corner": sets["corner"].mean(),
-                    "CONTROL": sets["ctrl_block"].mean()}
+            one = 1.0 / (gh * gw)
+            frac = {k: sets[k].mean() for k in
+                    ("ring", "depth1", "deep", "top", "bottom", "left", "right", "corner")}
+            frac.update(first=one, last=one, ctrl_int=sets["ctrl_block"].mean())
             for s, n in names:
-                f = frac[n]
-                if f <= 0:
-                    continue
-                vals[n].append(at_cells(a, s, cells) / f)
+                if frac[n] > 0:
+                    vals[n].append(at_cells(a, s, cells) / frac[n])
         print(f"    {t:<18} " + " ".join(
             f"{np.nanmean(vals[n]) if vals[n] else float('nan'):>8.2f}"
             for _s, n in names))
-    print("\n  CONTROL is a contiguous block the same size as the ring, placed at random.")
-    print("  It must sit near 1.00. If it does not, the normalisation is wrong and no")
-    print("  other column in this table means anything.")
+    print("\n  `first` and `last` are single patches -- the top-left and bottom-right")
+    print("  corners -- priced against a flat map's 1/N. `corner` averages all four, so a")
+    print("  `first` far above `corner` says the sink is ONE token and not the geometry.")
+    print("\n  `ctrl_int` is a contiguous ring-sized block placed at random, which lands in")
+    print("  the INTERIOR. On a real map it should read like `depth1`/`deep`, not like 1.00:")
+    print("  a depleted interior is the same fact as an enriched ring, stated twice. The")
+    print("  metric's own check is the selftest, which runs it on a SHUFFLED map, where the")
+    print("  answer must be 1.00 and nothing else.")
 
 
 def report_cells(meta, arrays, args):

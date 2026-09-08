@@ -167,6 +167,11 @@ STAT_NAMES = (
     "peak_col_frac",
     "ring_share",        # S2's numerator: the border's share of the image's mass
     "top_share", "bottom_share", "left_share", "right_share", "corner_share",
+    # The FIRST and LAST image tokens, on their own. H1's sharpest readout: the first
+    # patch is top-left in raster order and sits immediately after <|vision_start|>, so a
+    # sequence-position sink lands on it and a 2D border effect has no reason to prefer it
+    # over the other three corners.
+    "first_patch_share", "last_patch_share",
     "depth1_share", "depth2_share", "deep_share",
     "ctrl_block_share",  # the negative control, same size as the ring
     "ring2_ctrl_share",
@@ -268,6 +273,8 @@ def reduce_cells(col_sum, col_sq, n_rows, row_total, gh, gw, kv_len,
                       ("deep", "deep_share"), ("ctrl_block", "ctrl_block_share"),
                       ("ring2_ctrl", "ring2_ctrl_share")):
         out[..., STAT_INDEX[stat]] = keep(np.nansum(p[..., sets[key]], axis=-1))
+    out[..., STAT_INDEX["first_patch_share"]] = keep(p[..., 0])
+    out[..., STAT_INDEX["last_patch_share"]] = keep(p[..., -1])
 
     with np.errstate(divide="ignore", invalid="ignore"):
         safe = np.where(np.isfinite(p) & (p > 0), p, 1.0)
