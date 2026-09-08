@@ -460,24 +460,32 @@ class Sink:
         if len(self.buf) >= self.flush_every:
             self.flush()
 
+    #: stored as integers, because they are LABELS on a grid. float16 is exact to 2048
+    #: and the grids here are far smaller, but a patch index that rounds is a patch index
+    #: that points at the wrong patch, and nothing downstream could tell.
+    INT_FIELDS = ("peak", "peak_img_q", "perm")
+
     def flush(self):
+        """One encoding for every field: flat values, per-unit shapes, per-unit indices.
+
+        Fields are both ragged AND optional -- `maps` has a different N per grid, and
+        `perm` exists only for the permutation arms. An earlier version stacked
+        fixed-shape fields and skipped any field some unit lacked, which silently dropped
+        `perm` from every part it shared with a non-permutation arm, i.e. all of them.
+        Carrying the unit indices costs a few bytes and removes the whole class of bug.
+        """
         if not self.buf:
             return
         packed = {"units": np.asarray([u for u, _ in self.buf])}
-        names = sorted({k for _u, a in self.buf for k in a})
-        for name in names:
-            vals = [a.get(name) for _u, a in self.buf]
-            if any(v is None for v in vals):
-                continue          # a field only some units have is not stackable
-            shapes = {v.shape for v in vals}
-            if len(shapes) == 1:
-                packed[name] = np.stack(vals).astype(np.float16 if name != "peak"
-                                                     else np.int32)
-            else:                 # ragged (the maps, whose N depends on the grid)
-                flat = np.concatenate([v.reshape(-1) for v in vals])
-                packed[name] = flat.astype(np.float16)
-                packed[name + "__shapes"] = np.asarray(
-                    [v.shape for v in vals], dtype=np.int64)
+        for name in sorted({k for _u, a in self.buf for k in a}):
+            have = [(i, a[name]) for i, (_u, a) in enumerate(self.buf) if a.get(name) is not None]
+            if not have:
+                continue
+            dtype = np.int32 if name in self.INT_FIELDS else np.float16
+            packed[name] = np.concatenate([v.reshape(-1) for _i, v in have]).astype(dtype)
+            packed[name + "__shapes"] = np.asarray([v.shape for _i, v in have],
+                                                   dtype=np.int64)
+            packed[name + "__idx"] = np.asarray([i for i, _v in have], dtype=np.int64)
         np.savez_compressed(self.dir / f"{self.stage}_shard{self.shard}_part{self.part}.npz",
                             **packed)
         self.part += 1
@@ -489,8 +497,13 @@ class Sink:
 
 
 def arrays_of(got):
-    """The bulk fields of one measurement, as the npz stores them."""
-    keep = ("stats", "peak", "maps", "spans", "hnorm", "vnorm", "stats_img_q")
+    """The bulk fields of one measurement, as the npz stores them.
+
+    `perm` is here because without it the permutation arm cannot be read: "did the peak
+    follow the patch embedding it was sitting on" needs to know where each embedding went,
+    and that is the one question no pixel-space transform can answer.
+    """
+    keep = ("stats", "peak", "maps", "spans", "hnorm", "vnorm", "stats_img_q", "perm")
     return {k: np.asarray(got[k]) for k in keep if got.get(k) is not None}
 
 
@@ -1021,18 +1034,13 @@ def read_stage(out_dir, stage):
         with np.load(p, allow_pickle=False) as z:
             units = [str(u) for u in z["units"]]
             for name in z.files:
-                if name == "units" or name.endswith("__shapes"):
+                if name == "units" or name.endswith(("__shapes", "__idx")):
                     continue
-                if name + "__shapes" in z.files:      # ragged: N depends on the grid
-                    flat, off = z[name], 0
-                    for u, sh in zip(units, z[name + "__shapes"]):
-                        n = int(np.prod(sh))
-                        arrays.setdefault(u, {})[name] = flat[off:off + n].reshape(sh)
-                        off += n
-                else:
-                    block = z[name]
-                    for i, u in enumerate(units):
-                        arrays.setdefault(u, {})[name] = block[i]
+                flat, off = z[name], 0
+                for i, sh in zip(z[name + "__idx"], z[name + "__shapes"]):
+                    n = int(np.prod(sh))
+                    arrays.setdefault(units[int(i)], {})[name] = flat[off:off + n].reshape(sh)
+                    off += n
     return meta, arrays
 
 
@@ -1538,7 +1546,10 @@ def report_arms(out_dir, cells, args):
     print("    of pictures whose peak patch SHOWS the baseline's peak patch; `follow slot`")
     print("    is the share whose peak sits at the same grid position. For a positional")
     print("    sink the second is high and the first is at chance.")
-    print(f"\n    {'arm':<16} {'n':>4} {'dE_ring':>9} {'95% CI':>18} {'dE_top':>8} "
+    print("    An arm marked (=) leaves every patch showing what it showed -- `donut`")
+    print("    repaints in place, the resolution ladder only rescales -- so for those two")
+    print("    columns are the same question asked twice and neither discriminates.")
+    print(f"\n    {'arm':<20} {'n':>4} {'dE_ring':>9} {'95% CI':>18} {'dE_top':>8} "
           f"{'dE_bottom':>10} {'follow content':>15} {'follow slot':>12}")
     by_arm = {}
     for m in meta:
@@ -1572,13 +1583,19 @@ def report_arms(out_dir, cells, args):
             # a grid, and the median of two corners is a patch neither head chose.
             pa = _mode([int(pk_a[l, h]) for l, h in cells])
             pb = _mode([int(pk_b[l, h]) for l, h in cells])
-            corr = _arm_correspondence(arm, gh, gw, gh0, gw0, b.get("size"))
+            # The permutation is its own correspondence: slot i now holds the embedding
+            # that was at perm[i]. Nothing else in this table can ask "did the peak follow
+            # the VECTOR" without also having moved pixels around.
+            corr = (np.asarray(arrays[m["unit"]]["perm"], dtype=np.int64)
+                    if arm.startswith("permute") and "perm" in arrays.get(m["unit"], {})
+                    else _arm_correspondence(arm, gh, gw, gh0, gw0, b.get("size")))
             if corr is not None and 0 <= pa < corr.size:
                 fc.append(float(corr[pa] == pb))
             if (gh, gw) == (gh0, gw0):
                 fs.append(float(pa == pb))
         d = boot_paired(e_arm, e_base, args.n_boot)
-        print(f"    {arm:<16} {d[3]:>4} {d[0]:>+9.3f} "
+        tag = arm + (" (=)" if _identity_frame(arm) else "")
+        print(f"    {tag:<20} {d[3]:>4} {d[0]:>+9.3f} "
               f"{f'[{d[1]:+.3f}, {d[2]:+.3f}]':>18} "
               f"{np.mean(tops) if tops else float('nan'):>+8.3f} "
               f"{np.mean(bots) if bots else float('nan'):>+10.3f} "
@@ -1586,6 +1603,22 @@ def report_arms(out_dir, cells, args):
               f"{np.mean(fs) if fs else float('nan'):>12.3f}")
     print("\n  `permute` is the one that cannot be answered with 'your transform changed")
     print("  the content'. It moves nothing but which slot holds which patch embedding.")
+
+
+def _identity_frame(arm):
+    """True when the arm's grid correspondence is the identity, so `follow content` and
+    `follow slot` are the same measurement and their contrast says nothing."""
+    if arm in SL.SPECIAL_ARMS:
+        return False
+    from PIL import Image
+    try:
+        _im, inv, _meta = SL.transform(arm, Image.new("RGB", (320, 224)))
+    except Exception:
+        return False
+    if inv is None:
+        return False
+    corr = SL.patch_correspondence(inv, 7, 10, 7, 10)
+    return bool(np.array_equal(corr, np.arange(70)))
 
 
 def _mode(values):

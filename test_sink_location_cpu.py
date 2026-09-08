@@ -435,10 +435,16 @@ def test_probe():
     with tempfile.TemporaryDirectory() as td:
         sink = SP.Sink(td, "scan", 0, flush_every=2)
         for i in range(3):
+            arr = {"stats": np.full((2, 3, len(SL.STAT_NAMES)), float(i)),
+                   "maps": np.full((2, 20 + i), float(i))}
+            # An OPTIONAL field, present on one unit of a flushed part and absent from the
+            # other. `perm` is exactly this in the real run -- only the permutation arms
+            # have one -- and an earlier encoding dropped it from every part it shared
+            # with another arm, which was all of them.
+            if i == 1:
+                arr["perm"] = np.arange(20 + i)[::-1].copy()
             sink.write(f"k{i}", {"key": f"k{i}", "type": "t", "grid": [4, 5],
-                                 "ring_area_frac": SL.ring_area_frac(4, 5)},
-                       {"stats": np.full((2, 3, len(SL.STAT_NAMES)), float(i)),
-                        "maps": np.full((2, 20 + i), float(i))})
+                                 "ring_area_frac": SL.ring_area_frac(4, 5)}, arr)
         sink.close()
         meta, arrays = SP.read_stage(td, "scan")
         check("the storage round-trips every unit", len(meta) == 3 and len(arrays) == 3)
@@ -447,6 +453,13 @@ def test_probe():
         check("...and ragged fields sliced back to their own shapes",
               arrays["k0"]["maps"].shape == (2, 20)
               and arrays["k2"]["maps"].shape == (2, 22))
+        check("...and a field only ONE unit in a part has survives, on that unit alone",
+              "perm" in arrays["k1"] and "perm" not in arrays["k0"]
+              and "perm" not in arrays["k2"],
+              f"perm on {[k for k in arrays if 'perm' in arrays[k]]}")
+        check("...and an index field comes back as exact integers, not rounded floats",
+              np.array_equal(arrays["k1"]["perm"], np.arange(21)[::-1]),
+              str(arrays["k1"]["perm"][:4]))
 
         with open(os.path.join(td, "scan_shard0.jsonl"), "a") as fh:
             fh.write("{ half a line\n")
