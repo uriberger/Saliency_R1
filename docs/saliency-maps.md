@@ -482,6 +482,8 @@ re-seed in the wrong place.
 | `trl/grad_maps.py` | 5b — the training-time pixel gradient, shared with `saliency_viz.py` |
 | `trl/rewards/grad_rewards.py` | the `logratio` roll-null scoring, and the reward built on it |
 | `saliency_viz.py` | 6, and the pictures of 1, 2, 3 and 5b — the only place any of them is drawn rather than scored |
+| `launch_saliency_viz_job.sh` | submits the above to SLURM, one `--model NAME=BASE[+ADAPTER]` per checkpoint, all into one allocation |
+| `saliency_viz_compare.py` | re-lays several of those runs as one page, chain-level maps of every model in a row per sample |
 | `flow_intervene_probe.py` | 7 |
 | `intervene_probe.py` | the *direct* intervention (not a map — edits step→image attention at one layer) |
 | `test_flow_correlation_cpu.py`, `test_flow_intervene_cpu.py`, `test_glimpse_cpu.py` | the algebra, against naive references |

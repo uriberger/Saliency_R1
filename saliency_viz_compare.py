@@ -52,9 +52,15 @@ def load_run(tag: str, root: Path):
 
 
 def pick_map(runs, want: str) -> str:
-    """The map to put in the chain-level row: the requested one if every run has it."""
-    have = [{m for m in MAP_ORDER if (rec["dir"] / f"sal_{m}.png").exists()}
-            for r in runs for rec in r["samples"].values()]
+    """The map to put in the chain-level row: the requested one if every run has it.
+
+    Per RUN, the maps any of its samples drew -- not per sample. A sample the segmenter
+    dropped has a meta.json and no PNGs at all, so intersecting over samples would make
+    one such row empty the whole set and report that no map exists anywhere.
+    """
+    have = [{m for m in MAP_ORDER
+             for rec in r["samples"].values() if (rec["dir"] / f"sal_{m}.png").exists()}
+            for r in runs]
     common = set.intersection(*have) if have else set()
     if want in common:
         return want
