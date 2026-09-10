@@ -41,4 +41,5 @@ wandb/
 
 # Read-only upstream checkouts kept beside trl_repo (see docs/laser-go-no-go.md)
 laser_repo
+laser_fork
 ease_repo

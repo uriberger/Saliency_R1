@@ -30,3 +30,8 @@ cold_data/grpo_sets
 # because it is 3.7 MB of someone else's git history and every worktree wants the
 # same copy.
 laser_repo
+
+# Our fork of LASER's verl repo, on branch qwen3-vl -- the copy that actually
+# executes, patched by patch_laser_qwen3.sh. Shared like trl_repo, which means
+# re-patching it from a worktree re-patches it for every session.
+laser_fork
