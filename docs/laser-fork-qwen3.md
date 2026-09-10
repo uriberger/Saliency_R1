@@ -120,13 +120,19 @@ on each.
 - **`cupy-cuda12x` also appears in that warning, and is an orphan.** Nothing in
   `requirements_laser.txt` asks for it and `pip show` reports no dependents. Its import
   failure on a login node is "no GPU", not "wrong numpy".
-- **flash-attn 2.8.1 is not installed and is not required.** pip has no matching prebuilt
-  wheel here and falls back to a source build; the build script tries it last, with a
-  timeout, and treats failure as non-fatal. verl runs on SDPA without it, and the
-  attention capture is backend-agnostic by construction — it wraps whichever
-  `ALL_ATTENTION_FUNCTIONS` entry the model is configured with, so it captures the same
-  Q/K whether the kernel underneath is SDPA or FlashAttention. If the smoke run wants
-  FlashAttention for speed, build it from source on a GPU node with `nvcc` available.
+- **flash-attn is REQUIRED, and this page said otherwise until a smoke run proved it.**
+  `dp_actor.py:52` does a top-level
+  `from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input`
+  — unconditionally, in the very module that holds LASER's rewards, so it is imported
+  before any attention backend choice is made. Job 6717726 died in `ref_init_model` at
+  2:51 with `ModuleNotFoundError: No module named 'flash_attn'`.
+- **The installed version is 2.8.3, not their 2.8.1 — a recorded deviation.** Upstream
+  publishes no torch-2.8 wheel for the 2.8.1 tag (their "prebuilt CUDA 12.8 wheel" note
+  means they built it in their container); v2.8.3 is the earliest tag carrying a
+  `cu12torch2.8cxx11abiTRUE-cp310` wheel. `bert_padding` is pure PyTorch with no CUDA
+  kernels and is stable across 2.8.x, so the import verl actually makes is unaffected —
+  but a 2.8.1/2.8.3 difference could still surface wherever the *kernels* are used, which
+  is not this import. Building 2.8.1 from source needs `nvcc` and an hour or two.
 
 Then in `train.sh`: `MODEL_PATH` to
 `checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged`, `EXP_NAME` to

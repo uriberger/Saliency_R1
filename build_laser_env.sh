@@ -20,12 +20,23 @@
 # transformers *5.x*; LASER's env is on 4.x, which is what that vllm was built against.
 # Do not run it against this env.
 #
-# FLASH-ATTN IS OPTIONAL AND IS NOT ALLOWED TO FAIL THE BUILD. requirements_laser.txt
-# pins flash-attn==2.8.1 as "prebuilt CUDA 12.8 wheel", and pip will fall back to a
-# source build that needs nvcc and the better part of an hour on a login node. verl runs
-# on SDPA without it; the attention capture is backend-agnostic by construction (it wraps
-# whatever ALL_ATTENTION_FUNCTIONS entry the model is configured with). So it is tried
-# last, with a short timeout, and a failure is reported rather than fatal.
+# FLASH-ATTN IS REQUIRED. An earlier version of this script called it optional on the
+# theory that verl falls back to SDPA. It does not: `dp_actor.py:52` does a TOP-LEVEL
+# `from flash_attn.bert_padding import index_first_axis, pad_input, rearrange,
+# unpad_input`, unconditionally, in the very module that holds LASER's rewards. Without
+# it the job dies in `ref_init_model` about three minutes in, which cost one smoke run to
+# discover.
+#
+# THE VERSION IS A DEVIATION. requirements_laser.txt pins flash-attn==2.8.1, and upstream
+# publishes no torch-2.8 wheel for that tag -- which is exactly what their "compiled in
+# the container" note means. v2.8.3 is the earliest tag with a
+# cu12torch2.8cxx11abiTRUE-cp310 wheel, so that is what gets installed. The alternative
+# is a source build of 2.8.1 needing nvcc and an hour or two.
+#
+# The risk is small and worth stating: `bert_padding` is pure PyTorch -- no CUDA kernels
+# -- and stable across 2.8.x, so the import verl actually makes is unaffected. A 2.8.1
+# vs 2.8.3 difference could still show up wherever the KERNELS are used (transformers'
+# flash_attention_2 backend), which is not this import.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -153,16 +164,21 @@ echo "[3/4] pip install -e $FORK"
 python -m pip install -e "$FORK" --no-build-isolation || \
     python -m pip install -e "$FORK" || exit 1
 
-# 4. flash-attn, best effort. See the header: not required, and not allowed to fail the
-#    build. --no-build-isolation lets it see the torch we just installed if it does have
-#    to compile, which is the difference between "slow" and "impossible".
-echo "[4/4] flash-attn 2.8.1 (optional)"
-if timeout 900 python -m pip install flash-attn==2.8.1 --no-build-isolation 2>&1 | tail -3; then
-    echo "      flash-attn installed"
-else
-    echo "      flash-attn NOT installed -- this is fine. verl runs on SDPA, and the"
-    echo "      attention capture wraps whichever backend the model is configured with."
-fi
+# 4. flash-attn, from a PREBUILT WHEEL and not from source. See the header: required by
+#    dp_actor.py's top-level import, and pinned to a version with no torch-2.8 build, so
+#    2.8.3 is the substitute. Installing `flash-attn==2.8.1` here instead would silently
+#    start a one-to-two-hour nvcc compile on whatever node this runs on.
+FA_WHEEL=${FA_WHEEL:-https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl}
+echo "[4/4] flash-attn (prebuilt wheel; 2.8.3 substituting for their unbuildable 2.8.1)"
+python -m pip install "$FA_WHEEL" || {
+    echo "FAILED to install flash-attn. It is NOT optional -- dp_actor.py imports" >&2
+    echo "flash_attn.bert_padding at module level and the job will die in" >&2
+    echo "ref_init_model. Check torch's cxx11abi / python version against the wheel:" >&2
+    python -c "import sys,torch;print(' torch',torch.__version__,'abi',torch._C._GLIBCXX_USE_CXX11_ABI,'py',sys.version_info[:2])" >&2
+    exit 1
+}
+python -c "from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input" \
+    && echo "      bert_padding imports -- the four names dp_actor.py:52 needs"
 
 echo
 echo "=========================================================================="

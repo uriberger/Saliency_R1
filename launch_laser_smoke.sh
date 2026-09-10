@@ -70,9 +70,13 @@ done
 # worktree that is then merged and deleted would otherwise reference paths that no longer
 # exist by the time it reaches the front of the queue -- and it would fail at model load,
 # an hour later, looking like an environment problem.
-FORK=$(readlink -f "$FORK")
-DATA=$(readlink -f "$DATA")
-OUT_DIR=$(readlink -f "$OUT_DIR" 2>/dev/null || echo "$OUT_DIR")
+# `|| true` is load-bearing: readlink -f exits non-zero on a path that does not exist,
+# and under `set -e` that kills the script before any of the checks below can say WHY.
+# It cost a silent no-op submission to find out.
+resolve() { readlink -f "$1" 2>/dev/null || true; }
+FORK=$(resolve "$FORK"); [ -n "$FORK" ] || FORK="$REPO/laser_fork"
+DATA=$(resolve "$DATA"); [ -n "$DATA" ] || DATA="$REPO/cold_data/laser/verl"
+OUT_DIR=$(resolve "$OUT_DIR"); [ -n "$OUT_DIR" ] || OUT_DIR="$REPO/outputs/laser/smoke"
 
 TRAIN_FILE="$DATA/train_smoke64.parquet"
 VAL_FILE="$DATA/val_smoke64.parquet"
