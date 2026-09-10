@@ -25,3 +25,8 @@ outputs
 
 # Validation sets, so a worktree can run the val probes without an absolute path.
 cold_data/grpo_sets
+
+# LASER's released fork, read-only reference for docs/laser-go-no-go.md. Shared
+# because it is 3.7 MB of someone else's git history and every worktree wants the
+# same copy.
+laser_repo

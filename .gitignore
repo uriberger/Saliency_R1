@@ -38,3 +38,7 @@ logs/
 
 # wandb keeps a local mirror of every run it syncs, wherever it is invoked from
 wandb/
+
+# Read-only upstream checkouts kept beside trl_repo (see docs/laser-go-no-go.md)
+laser_repo
+ease_repo
