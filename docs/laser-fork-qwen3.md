@@ -78,10 +78,55 @@ bash patch_laser_qwen3.sh                    # installs the one file, checks the
 python test_laser_capture_cpu.py             # CPU, no GPU, no checkpoint
 ```
 
-The env is **separate on purpose** — `requirements_laser.txt` pins torch 2.8.0,
-transformers 4.57.6 and vllm 0.11.0, none of which match `saliency_r1_qwen3_vllm`.
-Build it as its own conda env; do not `pip install` into a shared one
-([CLAUDE.md](../CLAUDE.md): the envs are global, not worktree-local).
+The env is **separate on purpose** — `requirements_laser.txt` pins transformers 4.57.6
+where `saliency_r1_qwen3_vllm` runs 5.13.0.dev0, and moving transformers is the whole
+reason their capture was pinned in the first place. Do not `pip install` into a shared
+env ([CLAUDE.md](../CLAUDE.md): the envs are global, not worktree-local).
+
+```fish
+bash build_laser_env.sh                      # creates the `laser` env, ~25 min
+bash build_laser_env.sh --check              # report what is installed, change nothing
+conda activate laser; and python test_laser_capture_cpu.py
+```
+
+**Built and verified 2026-09-10** (`build_laser_env.sh --check`):
+
+| | |
+|---|---|
+| python | 3.10.21 |
+| torch | 2.8.0+cu128, cuda 12.8 |
+| transformers | 4.57.6 |
+| vllm | 0.11.0 |
+| verl | 0.7.0.dev (editable, `laser_fork/`) |
+| ray | 2.50.0 · datasets 4.0.0 · numpy 1.26.4 · cv2 4.12.0 |
+| flash-attn | **not installed** — optional, see below |
+| attention capture | imports from the installed verl, targets `Qwen3VLTextAttention` |
+
+`test_laser_capture_cpu.py` passes in **both** envs — 4.57.6 (the fork's target, where
+the forward dispatches with `ALL_ATTENTION_FUNCTIONS[impl]`) and 5.13.0.dev0 (where it
+uses `get_interface`) — reproducing transformers' own attention at `max |delta| 0.00e+00`
+on each.
+
+### Three things about this env worth knowing before something looks broken
+
+- **`requirements_laser.txt` cannot be resolved as written.** It pins `numpy==1.26.4`
+  alongside `opencv-python-headless==4.12.0.88`, whose metadata demands `numpy>=2`; pip
+  refuses the file outright. numpy 1.26.4 is the *right* side — verl's own `setup.py:32`
+  and `requirements.txt:8` both say `numpy<2.0.0` — so the build defers the pin, lets
+  `pip install -e laser_fork` restore it, and leaves opencv's metadata unsatisfied.
+  **`import cv2` works fine at 4.12.0.88 against numpy 1.26.4**, which the `--check`
+  report re-verifies on every build. The pip warning at the end of the install is
+  expected and cosmetic.
+- **`cupy-cuda12x` also appears in that warning, and is an orphan.** Nothing in
+  `requirements_laser.txt` asks for it and `pip show` reports no dependents. Its import
+  failure on a login node is "no GPU", not "wrong numpy".
+- **flash-attn 2.8.1 is not installed and is not required.** pip has no matching prebuilt
+  wheel here and falls back to a source build; the build script tries it last, with a
+  timeout, and treats failure as non-fatal. verl runs on SDPA without it, and the
+  attention capture is backend-agnostic by construction — it wraps whichever
+  `ALL_ATTENTION_FUNCTIONS` entry the model is configured with, so it captures the same
+  Q/K whether the kernel underneath is SDPA or FlashAttention. If the smoke run wants
+  FlashAttention for speed, build it from source on a GPU node with `nvcc` available.
 
 Then in `train.sh`: `MODEL_PATH` to
 `checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged`, `EXP_NAME` to

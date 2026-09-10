@@ -61,11 +61,20 @@ def tiny_text_model(impl="sdpa"):
     from transformers import Qwen3VLTextConfig
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
 
+    # `mrope_section` must be given explicitly: transformers 4.57.6 -- the version the
+    # fork pins -- does `config.rope_scaling.get("mrope_section", ...)` in
+    # Qwen3VLTextRotaryEmbedding.__init__ and raises on a None rope_scaling, where 5.x
+    # tolerates it. The three sections are half-dimensions and must sum to head_dim // 2
+    # (the real model is [24, 20, 20] against head_dim 128).
+    half = 16 // 2
     cfg = Qwen3VLTextConfig(
         hidden_size=64, num_hidden_layers=3, num_attention_heads=4,
         num_key_value_heads=2, head_dim=16, intermediate_size=128,
         vocab_size=256, max_position_embeddings=256,
+        rope_scaling={"rope_type": "default",
+                      "mrope_section": [half // 2, half // 4, half // 4]},
     )
+    assert sum(cfg.rope_scaling["mrope_section"]) == half
     cfg._attn_implementation = impl
     torch.manual_seed(0)
     model = Qwen3VLTextModel(cfg).eval()
