@@ -1,13 +1,22 @@
 # Replicating EASE from our cold-start checkpoint
 
-> **Status 2026-09-10: in progress on branch `feat/ease-replication`.**
-> Source corpora are downloaded (47 GB). The `ease` conda env is building. The
-> annotation pipeline, the parquet converter and the training launcher are not
-> written yet. **Blocked on a `GOOGLE_API_KEY`** for annotation Step 3.
+> **Status 2026-09-10: runnable, on branch `feat/ease-replication`.**
+> The route taken is **their framework on *our* corpus** — saliency-r1-8k already
+> ships evidence boxes, so EASE's unreleased annotation pipeline is off the critical
+> path entirely and the `GOOGLE_API_KEY` block is gone. Data is built (7,984 train /
+> 95 val), the `ease` env works, the cold-start checkpoint is staged for
+> transformers 4.57, and both training arms have launchers. **Nothing has been
+> trained yet.** See [Running EASE on saliency-r1-8k](#running-ease-on-saliency-r1-8k).
+>
+> The original plan — rebuilding their five source corpora and re-running their
+> three-step annotation pipeline — is still documented below and still valid, but it
+> is now the *slower alternative*, not the next step. The 47 GB of corpora are
+> downloaded and keep.
 
 The plan of record for running [EASE](https://arxiv.org/abs/2605.30912) in *their*
-framework on *their* data, changed in exactly one place: it starts from our SFT
-cold-start checkpoint instead of stock Qwen3-VL.
+framework, changed in exactly two places: it starts from our SFT cold-start
+checkpoint instead of stock Qwen3-VL, and it trains on saliency-r1-8k instead of
+their evidence pools.
 
 ## What EASE is
 
@@ -58,14 +67,169 @@ Everything else differs from upstream EasyR1 by ≤17 lines.
 |---|---|
 | Framework | **Theirs** (EasyR1 fork), in a separate conda env. Not ported to our TRL stack. |
 | Base model | **Ours**: `checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged` |
-| Training data | **Theirs** — rebuild the pools from the five named source corpora |
-| Step 3 validator | **Gemini 2.5 Flash-Lite**, as in the paper |
+| Training data | **Ours**: `peterant330/saliency-r1-8k`, which already carries boxes |
+| Reward | Their rule matcher with **our gpt-4o-mini judge** behind it |
+| Step 3 validator | **Gemini 2.5 Flash-Lite**, if the five-corpus rebuild is ever run |
 
 The framework choice was deliberate. Porting the ~570 lines into our GRPOTrainer was
 the cheaper option, but running their code unmodified is what makes the result
 attributable to EASE rather than to our reimplementation of it.
 
-## The data
+The data choice was revised on 2026-09-10. Training on *our* corpus rather than a
+reconstruction of theirs makes EASE and our overlap runs differ in exactly one
+thing — where the box signal enters, an auxiliary attention loss versus the reward
+— on the same 8k rows from the same cold start. That is a sharper contrast than
+matching their data could have given, and it deletes the annotation pipeline, the
+Gemini validation, the ZwZ subset rule and the `GOOGLE_API_KEY` block along with it.
+
+## Running EASE on saliency-r1-8k
+
+### Why this works at all
+
+`peterant330/saliency-r1-8k` ships a `bbox` column. Every one of its 8,080 rows has
+a box — measured, not assumed: 0 empty, 0 unparseable, 0 degenerate, across all ten
+source corpora. The corpus *is* an evidence-box corpus, so EASE's Steps 1–3 have
+nothing to do.
+
+The box is a JSON string of four floats normalized to `[0, 1]`, and it is a **union**
+of whatever boxes the source corpus carried (`union_bbox` in `build_grpo_sets.py`).
+So every row is single-evidence, K=1. The 1:1 single/multi mixture the paper samples
+has no counterpart here, and the per-entity Gaussian mixture EASE builds for its
+multi-evidence pool degenerates to one component. That is the largest fidelity cost
+of this route and it should be stated in any writeup.
+
+### The four commands
+
+```fish
+bash patch_ease_repo.sh                                   # once, additive
+bash stage_ease_checkpoint.sh                             # once, ~seconds
+sbatch --cpus-per-task=32 --time=03:00:00 prepare_ease_saliency_data.sh
+env NVIDIA_API_KEY=$NVIDIA_API_KEY bash launch_ease_train_job.sh --arm ease --exp ease_8k
+env NVIDIA_API_KEY=$NVIDIA_API_KEY bash launch_ease_train_job.sh --arm dapo --exp dapo_8k
+```
+
+Both arms, always. `(EASE − DAPO)` inside EasyR1 is the only quantity comparable to
+`(overlap − placebo)` inside ours; a lone EASE number confounds method with framework.
+
+### What the data build produced
+
+| | |
+|---|---|
+| rows exported | 8,079 of 8,080 |
+| train / val | **7,984 / 95** |
+| distinct images | 6,713 (1.20 questions/image) |
+| boxes per row | 1, for every row |
+| boxes clamped into [0,1] | 31 |
+| rows dropped | 1 |
+| prompt_length | median ~343, max ~360, against `max_prompt_length` 2048 |
+
+The 31 clamps and the 1 drop are the same phenomenon at two magnitudes. Upstream
+`round(x, 3)` at the image edge pushes a coordinate slightly past 1.0 (max 1.002–1.005),
+and their `box_to_pixels` decides normalized-vs-pixel by `max(abs(coords)) <= 1.0` —
+so an unclamped 1.002 would be read as *pixels* and collapse into a sub-pixel box in
+the top-left corner, silently, because the result is still a valid non-degenerate box.
+The single drop is `gqa` question 249365, whose box is `[1.064, 0.48, 1.334, 0.749]`:
+genuinely off the right edge of its image, not a rounding artifact, and zero-width
+after clamping. Their converter would have kept it as a 0.27-pixel box.
+
+Prompt lengths land at ~343 tokens against a 2048 cap, so `filter_overlong_prompts`
+never fires and `truncation: error` cannot trigger. Worth knowing, because
+`data.min_pixels` is 262144 and saliency-r1-8k ships images at a long side of ≤512 —
+their loader **upscales** nearly every picture. Both arms see that, but our overlap
+runs did not.
+
+### The reward, and why it is not theirs
+
+`ease/reward_function/judged_perception.py` runs their `perception.py` matcher first
+(imported from `ease_repo/`, not copied) and falls through to our gpt-4o-mini judge
+only when the rule scores 0. `accuracy = max(rule, judge)`, so it is ≥ their reward
+on every sample and never below it.
+
+The reason is flickr30k: 2,715 of the 8,080 rows, and **exactly one** of those 2,715
+has a gold answer of ≤3 words. Under a rule-only reward a third of the corpus scores 0
+on essentially every rollout, which costs twice — the GRPO group has no advantage
+spread, *and* the sample never clears EASE's τ=0.5 gate, so it contributes no
+attention supervision either. A third of the corpus would burn rollout compute to
+teach nothing.
+
+Per source, share of rows whose gold answer is ≤3 words:
+
+| source | rows | ≤3 words |
+|---|---|---|
+| flickr30k | 2,715 | 0% |
+| gqa | 1,765 | 100% |
+| openimages | 860 | 100% |
+| docvqa | 670 | 84% |
+| textcap | 640 | 96% |
+| v7w | 610 | 86% |
+| textvqa | 370 | 92% |
+| infographicsvqa | 300 | 94% |
+| cub | 80 | 100% |
+| vsr | 70 | 100% |
+| **total** | **8,080** | **63%** |
+
+`--no-judge` gives their reward byte-for-byte. Pass it to **both** arms or neither.
+
+### The one change to their code
+
+`patch_ease_repo.sh` adds `question` and `data_source` to the dicts
+`AutoRewardManager` hands the reward function. Their interface passes only
+`{response, response_length, ground_truth}`, which is all a rule matcher needs and
+not enough for a judge. The edit is additive, so their own `perception.py` is
+unaffected and the DAPO arm runs on unmodified behaviour. **`verl/workers/actor/` is
+untouched** — `evidence_mask.py`, `trainable_attention.py` and `dp_actor.py` are the
+EASE method itself.
+
+### The checkpoint had to be restaged
+
+Our merged checkpoints are written by transformers 5.13.0.dev0; the `ease` env is
+pinned to exactly 4.57.0. Three metadata files changed schema between them and the
+model will not load without fixing all three:
+
+| file | 5.x | 4.57 |
+|---|---|---|
+| `config.json` | `text_config.rope_parameters{rope_theta,…}` | `text_config.rope_scaling` + `rope_theta` |
+| `config.json` | `vision_config.model_type: qwen3_vl_vision` | `qwen3_vl` |
+| `tokenizer_config.json` | `extra_special_tokens` is a list | must be a dict — 4.57 calls `.keys()` |
+| `processor_config.json` | nests image/video processors | separate `preprocessor_config.json`, `video_preprocessor_config.json` |
+
+Without the first, 4.57 dies in `Qwen3VLTextRotaryEmbedding` with
+`'NoneType' object has no attribute 'get'`.
+
+All three are metadata; the weights are unaffected. `stage_ease_checkpoint.sh` takes
+the stock `Qwen/Qwen3-VL-8B-Instruct` 4.x metadata, symlinks our 17 GB of weights
+beside it, and refuses to stage unless the stock chat template is byte-identical to
+ours, the tokenizer vocab/merges/added-tokens match, and all **750** tensors line up
+by name and shape. All four checks pass for the cold start.
+
+One more 4.57 quirk, worked around inside that script: `AutoModelForImageTextToText`
+cannot resolve `Qwen3VLForConditionalGeneration` out of the lazy module until
+`transformers.models.qwen3_vl.modeling_qwen3_vl` has actually been imported. verl hits
+the same path at `fsdp_workers.py:205`, so if a run dies there, that is why.
+
+### Deviations from their recipe, in full
+
+| | |
+|---|---|
+| data | saliency-r1-8k, all single-evidence (K=1) |
+| base model | our SFT cold start, staged for 4.57 |
+| reward | their matcher + our judge (`--no-judge` for theirs) |
+| rollout batch | **128**, not 512 |
+| val ratio | 0.0124 (~95 rows), not 0.1 (808), to match our TRL runs' held-out 100 |
+
+Everything else is `examples/config.yaml` and `train_ease_dapo_qwen3vl.sh`: lr 1e-6,
+2 epochs, n=5, clip 0.2/0.3, KL off, λ_attn 0.001, background α 0.1, σ scale 0.25,
+layer ⌊2L/3⌋, τ 0.5, ≤64 response tokens for the aux loss, `padding_free: false`.
+
+**The rollout-batch change is not an optimizer change.** At 512, our 8,080 rows give
+31 steps over two epochs against the ≤~158 their own run had. But EasyR1 multiplies
+`worker.actor.global_batch_size` by `rollout.n` internally
+(`fsdp_workers.py:143`), so with `global_batch_size=64` the update sees 64 prompts ×
+5 rollouts either way and the run takes **252 optimizer steps** at 512 or at 128.
+What 128 buys is reporting granularity: 126 steps to checkpoint and log against
+instead of 31. Gradient noise per update is unchanged.
+
+## Their data (the slower alternative)
 
 Appendix B.4, Table 5 — the annotated **pool**, before training sampling:
 
@@ -204,13 +368,26 @@ it points apt and pip at Tsinghua mirrors.
 | Path | |
 |---|---|
 | `ease_repo/` | the EasyR1 fork that actually executes; shared + gitignored like `trl_repo` |
-| `cold_data/ease/raw/` | downloaded corpora as published |
-| `cold_data/ease/images/` | extracted image trees |
-| `download_ease_sources.sh` | sbatch, `cpu_datamover` — pulls and extracts the three HF corpora |
 | `setup_ease_env.sh` | sbatch, `cpu` — builds the `ease` conda env |
+| `patch_ease_repo.sh` | the one additive edit to their reward interface; idempotent |
+| `stage_ease_checkpoint.sh` | 5.x checkpoint → 4.57-loadable, weights symlinked, four checks |
+| **the saliency-r1-8k route** | |
+| `export_saliency_r1_8k_for_ease.py` | corpus → raw parquet + content-hashed images |
+| `add_ease_prompt_length.py` | their `prompt_length`, in a process pool |
+| `prepare_ease_saliency_data.sh` | sbatch, `cpu` — the three data steps end to end |
+| `ease/reward_function/judged_perception.py` | their matcher + our judge |
+| `launch_ease_train.sh` | one arm, inside an allocation |
+| `launch_ease_train_job.sh` | asks SLURM for the allocation |
+| `cold_data/ease/saliency_r1_8k/` | `raw/`, `images/`, `parquet/{train,val}.parquet` |
+| **the five-corpus route (not on the critical path)** | |
+| `download_ease_sources.sh` | sbatch, `cpu_datamover` — pulls and extracts the three HF corpora |
+| `cold_data/ease/raw/`, `cold_data/ease/images/` | downloaded corpora as published |
 
 Both `ease_repo` and `cold_data/ease` are symlinked from the central tree via
 `.worktree-links`, so deleting the worktree never takes 47 GB of downloads with it.
+`stage_ease_checkpoint.sh` resolves with `pwd -P` for the same reason: a logical path
+would point the staged weight symlinks through `.worktrees/<branch>/`, and
+`worktree.sh done` would break a checkpoint that outlives the branch.
 
 ## Gotchas already paid for
 
@@ -242,21 +419,35 @@ Both `ease_repo` and `cold_data/ease` are symlinked from the central tree via
    MathVerse-V, MathVista, WeMath, MMK12, LogicVista, Geo3K. So score the EASE
    checkpoint with **our** harness and compare to **our** runs; their published table
    is not a reference point.
-3. **The 1:1 mixture caps the training set at ~40.5k** and their actual size is
-   unpublished. Decide and record ours.
-4. **The ZwZ 74k subset rule is unknown.** Ours must be stated explicitly.
-5. **Porting caution, if we ever move this into TRL:** `trainable_attention.py`
+3. ~~**The 1:1 mixture caps the training set at ~40.5k**~~ — moot on the
+   saliency-r1-8k route. Ours is **7,984 train / 95 val**, all single-evidence.
+4. ~~**The ZwZ 74k subset rule is unknown.**~~ — moot; we do not use ZwZ.
+5. **Every row is K=1**, so EASE's multi-evidence Gaussian mixture never mixes. The
+   paper's own ablations treat single-vs-multi as a real axis, and this route can only
+   ever exercise one side of it. If the mixture turns out to be where the method's
+   gain lives, that has to come from the five-corpus route.
+6. **Porting caution, if we ever move this into TRL:** `trainable_attention.py`
    captures Q/K *pre-RoPE* off `q_norm`/`k_norm` and reads `position_embeddings` from
    self_attn kwargs with an `args[7]` positional fallback. That signature was written
    against transformers 4.5x and would need checking against our patched 5.x file.
 
 ## Next steps
 
-1. Annotation pipeline, Steps 1–3 — **needs `GOOGLE_API_KEY` for Step 3**.
-2. Source CLEVR and SuperCLEVR and derive boxes from their scene graphs.
-3. Parquet converter into the schema `scripts/prepare_ease_dataset.py` expects
-   (question, answer, image path, `evidence_bboxes` in pixel coords).
-4. Slurm launcher for `verl.trainer.main` on 8 GPUs, `MODEL_PATH` pointed at our
-   cold-start merged checkpoint.
-5. The DAPO baseline arm, per open question 1.
-6. Score with `run_bench_eval.sh` and compare against our overlap runs.
+1. **A short smoke run first.** Nothing has touched a GPU yet. Two things are
+   untested end to end and both fail late: whether verl's FSDP + vLLM path loads the
+   staged checkpoint, and whether the judge keeps up inside a Ray reward actor at
+   640 completions per step. Run a handful of steps before committing 8 GPUs for
+   hours — `--rollout-batch 16 --epochs 1 -- trainer.max_steps=3`.
+2. **Both arms**, `--arm ease` and `--arm dapo`, same data, same staged checkpoint,
+   same reward. Resubmit the same `--exp` to resume; do not restart.
+3. **Score with our harness**, `run_bench_eval.sh`, and report
+   (EASE − DAPO) against (overlap − placebo). Their published table is not a
+   reference point — benchmark overlap with `eval_mini/benchmarks.py` is POPE alone.
+4. **Sanity-check the gate.** They report 47.4% of rollouts reward-positive and 92.3%
+   of groups with at least one gate-passer. Our judged reward is graded rather than
+   binary, so the τ=0.5 gate admits a 3-of-5 judge score; the logged
+   `judge_called` / `rule_accuracy` metrics are there to tell how the two halves of
+   the reward split.
+5. The five-corpus route stays available if the K=1 limitation turns out to matter
+   (open question 5). It needs `GOOGLE_API_KEY`, CLEVR/SuperCLEVR scene graphs, and
+   a ZwZ subset rule.

@@ -34,7 +34,11 @@
 #                     126 reported steps to checkpoint and log against.
 #   reward            ease/reward_function/judged_perception.py: their rule
 #                     matcher with our gpt-4o-mini judge behind it. See that
-#                     file for why. Pass --no-judge for their reward exactly.
+#                     file for why. Pass --no-judge for their reward exactly --
+#                     but pass it to BOTH arms or NEITHER. A judged EASE arm
+#                     against a rule-scored DAPO arm confounds the attention
+#                     loss with the reward, which is the one thing the paired
+#                     design exists to prevent.
 #
 # Every other hyperparameter comes from examples/config.yaml and their
 # train_ease_dapo_qwen3vl.sh: lr 1e-6, 2 epochs, n=5, clip 0.2/0.3, KL off,
@@ -136,7 +140,6 @@ export JUDGE_MAX_WORKERS=${JUDGE_MAX_WORKERS:-32}
 
 if [[ $JUDGE -eq 1 ]]; then
     REWARD_FUNCTION="$REWARD_FILE:compute_score"
-    REWARD_KWARGS="{}"
     if [[ -z "${NVIDIA_API_KEY:-}${OPENAI_API_KEY:-}" ]]; then
         echo "WARNING: no NVIDIA_API_KEY/OPENAI_API_KEY. Every judged row falls back to" >&2
         echo "         the rule score, which on flickr30k means 0. Pass --no-judge if" >&2
@@ -146,7 +149,6 @@ else
     # Their reward, byte for byte -- not our file with the judge switched off,
     # so that --no-judge is a real control rather than a near-copy of one.
     REWARD_FUNCTION="$EASE_REPO/examples/reward_function/perception.py:compute_score"
-    REWARD_KWARGS="{}"
 fi
 
 SAVE_PATH="$OUT_ROOT/$EXP/checkpoints"
@@ -211,7 +213,6 @@ CMD=(
     worker.rollout.val_override_config.n=1
     worker.rollout.tensor_parallel_size="$TP"
     worker.reward.reward_function="$REWARD_FUNCTION"
-    worker.reward.reward_function_kwargs="$REWARD_KWARGS"
     # The reward manager is one Ray actor and the judge fans out inside it;
     # their default of 1 CPU would serialise 640 HTTP calls per step.
     worker.reward.num_cpus=8
