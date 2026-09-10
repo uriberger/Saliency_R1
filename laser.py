@@ -264,8 +264,15 @@ class LaserScan:
 
     # -- arming -----------------------------------------------------------
     def arm(self, prompt_len):
-        """Declare the prompt/response boundary and clear the accumulators."""
+        """Declare the prompt/response boundary and clear the accumulators.
+
+        `img_cols` is cleared too, so a forward whose pre-hook never located a picture
+        produces a `None` result rather than silently reusing the PREVIOUS prompt's
+        columns -- which, on a picture with a different grid, would put every column
+        statistic on the wrong patch and leave nothing downstream able to tell.
+        """
         self.prompt_len = int(prompt_len)
+        self.img_cols, self.grid = None, None
         self.reset()
         return self
 
@@ -300,6 +307,12 @@ class LaserScan:
         return True
 
     def _pre_hook(self, module, args, kwargs):
+        # `paused` has to be honoured HERE and not only in the attention function.
+        # Sampling G rollouts uses `num_return_sequences=G`, which expands the batch to G
+        # before the first forward, and a batch guard that fires while the collector is
+        # deliberately asleep would refuse the generation it exists to let run at speed.
+        if self.paused:
+            return None
         ids = kwargs.get("input_ids")
         if ids is None and args:
             ids = args[0]
@@ -308,7 +321,7 @@ class LaserScan:
         if ids.shape[0] != 1:
             raise RuntimeError(
                 f"batch of {ids.shape[0]}: the sink set is per picture and this collector "
-                "is only correct at batch size 1")
+                "is only correct at batch size 1. Set `paused` around `generate`.")
         if bool((ids == IMAGE_TOKEN_ID).any()):
             self._locate(ids, kwargs.get("image_grid_thw"))
         return None

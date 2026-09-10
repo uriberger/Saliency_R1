@@ -391,10 +391,14 @@ def stage_selftest(args):
         # beside it, so the only admissible answer is equality.
         scan.arm(prompt_len)
         scan_logits = logits_of()
-        with torch.no_grad():
-            scan_ids = model.generate(**inputs, max_new_tokens=args.selftest_tokens,
-                                      do_sample=False,
-                                      pad_token_id=processor.tokenizer.pad_token_id)[0].tolist()
+        scan.paused = True
+        try:
+            with torch.no_grad():
+                scan_ids = model.generate(
+                    **inputs, max_new_tokens=args.selftest_tokens, do_sample=False,
+                    pad_token_id=processor.tokenizer.pad_token_id)[0].tolist()
+        finally:
+            scan.paused = False
         d = float((scan_logits - base_logits).abs().max())
         check("the collector leaves the forward bit-identical", d == 0.0, f"max|dlogit| {d:.3e}")
         check("the collector picks the same greedy tokens", scan_ids == base_ids,
@@ -470,12 +474,22 @@ def stage_selftest(args):
         # different completion must leave it untouched to the last bit. If it does not,
         # `prompt_len` is wrong and every sink set in the report is drawn from the wrong
         # query.
+        # Sampled with `num_return_sequences`, which is how `collect` draws its group and
+        # which expands the batch to G before the first forward. Running it here is also
+        # the check that the collector's batch guard does not fire on the generation it is
+        # asleep for -- the failure mode that killed the first run of this selftest.
         bos_list = []
-        with torch.no_grad():
-            alt = model.generate(**inputs, max_new_tokens=args.selftest_tokens,
-                                 do_sample=True, temperature=1.5, top_p=1.0, top_k=0,
-                                 num_return_sequences=2,
-                                 pad_token_id=processor.tokenizer.pad_token_id)
+        scan.paused = True
+        try:
+            with torch.no_grad():
+                alt = model.generate(**inputs, max_new_tokens=args.selftest_tokens,
+                                     do_sample=True, temperature=1.5, top_p=1.0, top_k=0,
+                                     num_return_sequences=3,
+                                     pad_token_id=processor.tokenizer.pad_token_id)
+        finally:
+            scan.paused = False
+        check("a paused collector lets a batched `generate` through",
+              alt.shape[0] == 3, f"{alt.shape[0]} rollouts sampled at once")
         for r_i in range(alt.shape[0]):
             ids = alt[r_i][prompt_len:].tolist()
             scan.arm(prompt_len)
