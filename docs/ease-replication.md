@@ -104,6 +104,7 @@ of this route and it should be stated in any writeup.
 bash patch_ease_repo.sh                                   # once, additive
 bash stage_ease_checkpoint.sh                             # once, ~seconds
 sbatch --cpus-per-task=32 --time=03:00:00 prepare_ease_saliency_data.sh
+bash launch_ease_train.sh --arm ease --exp preflight --preflight   # CPU, ~2 min
 env NVIDIA_API_KEY=$NVIDIA_API_KEY bash launch_ease_train_job.sh --arm ease --exp ease_8k
 env NVIDIA_API_KEY=$NVIDIA_API_KEY bash launch_ease_train_job.sh --arm dapo --exp dapo_8k
 ```
@@ -170,15 +171,43 @@ Per source, share of rows whose gold answer is ≤3 words:
 
 `--no-judge` gives their reward byte-for-byte. Pass it to **both** arms or neither.
 
-### The one change to their code
+### The two changes to their code
 
-`patch_ease_repo.sh` adds `question` and `data_source` to the dicts
-`AutoRewardManager` hands the reward function. Their interface passes only
-`{response, response_length, ground_truth}`, which is all a rule matcher needs and
-not enough for a judge. The edit is additive, so their own `perception.py` is
-unaffected and the DAPO arm runs on unmodified behaviour. **`verl/workers/actor/` is
-untouched** — `evidence_mask.py`, `trainable_attention.py` and `dp_actor.py` are the
-EASE method itself.
+`patch_ease_repo.sh` makes both, and neither is in the EASE method.
+**`verl/workers/actor/` is untouched** — `evidence_mask.py`,
+`trainable_attention.py` and `dp_actor.py` are the method itself.
+
+1. **`verl/workers/reward/function.py`** — add `question` and `data_source` to the
+   dicts `AutoRewardManager` hands the reward function. Their interface passes only
+   `{response, response_length, ground_truth}`, which is all a rule matcher needs and
+   not enough for a judge. Additive, so their own `perception.py` is unaffected and
+   the DAPO arm runs on unmodified behaviour.
+
+2. **`verl/utils/vllm_utils.py`** — `from vllm.lora.lora_model import LoRAModel` does
+   not resolve under **vllm 0.11.0, the version their own Dockerfile pins**: 0.11.0
+   keeps `LoRAModel` in `vllm.lora.models`, and only a later refactor split it out.
+   The import is unconditional and sits under `verl/workers/rollout/__init__.py`, so
+   the trainer dies on `import verl` — before any config is read, and whether or not
+   LoRA is used (it is not; `lora.rank` is 0). Replaced with a `try`/`except` that
+   accepts either path. **Their repo as published cannot start under its own pin.**
+
+### Preflight
+
+`launch_ease_train.sh --preflight` runs `verify_ease_setup.py` against the exact
+override list the real command would use, on CPU, in about two minutes: verl
+imports, the config parses through `deep_post_init()` (OmegaConf rejects unknown
+keys, so a mistyped override is caught here rather than 20 minutes into an
+allocation), the `RLHFDataset` builds against the staged checkpoint, and EASE's own
+`get_attention_target_distribution` runs on real rows.
+
+That last check is the one worth having. If `bbox`, `image_height` or `image_width`
+failed to survive the parquet → dataset → actor path, the target silently falls back
+to uniform over vision tokens and the aux loss trains toward nothing. Measured on
+our val rows: 252 vision tokens per image, all mass inside the vision span, and the
+peak token carries 28–149× uniform for boxes covering 0.2–4.9% of the image (5.8× for
+a box covering 40.7%). The target concentrates where the box is.
+
+It exercises neither FSDP, vLLM, nor the judge.
 
 ### The checkpoint had to be restaged
 

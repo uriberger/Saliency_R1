@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Apply our one change to ease_repo/ (their EasyR1 fork, gitignored and shared).
+# Apply our changes to ease_repo/ (their EasyR1 fork, gitignored and shared).
 #
-# ONE change, and it is deliberately not in the EASE method:
+# TWO changes, and neither is in the EASE method:
 #
 #   verl/workers/reward/function.py
 #     -- Add `question` and `data_source` to the dicts handed to the reward
@@ -11,6 +11,16 @@
 #        Purely additive: extra dict keys are invisible to their own
 #        examples/reward_function/perception.py, so the DAPO baseline arm runs
 #        on unmodified behaviour.
+#
+#   verl/utils/vllm_utils.py
+#     -- `from vllm.lora.lora_model import LoRAModel` does not resolve under
+#        vllm 0.11.0, which is the version their own Dockerfile pins: 0.11.0
+#        keeps LoRAModel in vllm.lora.models and only a later refactor split it
+#        out. The import is unconditional and sits under
+#        verl/workers/rollout/__init__.py, so the trainer dies on `import verl`
+#        -- before any config is read, and whether or not LoRA is used (it is
+#        not; config.yaml sets lora.rank 0). Replaced with a try/except that
+#        accepts either module path.
 #
 # Nothing under verl/workers/actor/ is touched -- evidence_mask.py,
 # trainable_attention.py and dp_actor.py are the EASE method itself and stay
@@ -47,22 +57,54 @@ while [[ $# -gt 0 ]]; do
 done
 
 TARGET="$EASE_REPO/verl/workers/reward/function.py"
-[ -f "$TARGET" ] || { echo "MISSING: $TARGET -- is ease_repo/ cloned?" >&2; exit 1; }
+VLLM_UTILS="$EASE_REPO/verl/utils/vllm_utils.py"
+for f in "$TARGET" "$VLLM_UTILS"; do
+    [ -f "$f" ] || { echo "MISSING: $f -- is ease_repo/ cloned?" >&2; exit 1; }
+done
 
 echo "=== patch_ease_repo.sh: ease_repo=$EASE_REPO ==="
 
 if [[ "$REVERT" == 1 ]]; then
-    if [ -f "$TARGET.orig" ]; then
-        mv "$TARGET.orig" "$TARGET"
-        echo "  reverted $TARGET"
-    else
-        echo "  nothing to revert (no $TARGET.orig)"
-    fi
+    for f in "$TARGET" "$VLLM_UTILS"; do
+        if [ -f "$f.orig" ]; then
+            mv "$f.orig" "$f"
+            echo "  reverted $f"
+        else
+            echo "  nothing to revert for $f"
+        fi
+    done
     exit 0
 fi
 
+# ── 2. vllm_utils.py: LoRAModel moved between vllm versions ─────────────────
+if grep -q 'vllm.lora.models import LoRAModel' "$VLLM_UTILS"; then
+    echo "  (vllm_utils.py already patched - skipping)"
+else
+    [ -f "$VLLM_UTILS.orig" ] || cp "$VLLM_UTILS" "$VLLM_UTILS.orig"
+    python3 - "$VLLM_UTILS" <<'PYEOF2'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+OLD = "from vllm.lora.lora_model import LoRAModel\n"
+NEW = """try:
+    from vllm.lora.lora_model import LoRAModel
+except ImportError:  # vllm <= 0.11.x keeps LoRAModel in vllm.lora.models
+    from vllm.lora.models import LoRAModel
+"""
+if OLD not in src:
+    sys.exit(f"anchor not found in {path}: {OLD!r}")
+open(path, "w").write(src.replace(OLD, NEW, 1))
+print(f"  patched {path}")
+PYEOF2
+    python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" "$VLLM_UTILS"
+fi
+
+# ── 1. function.py: widen the reward-function interface ─────────────────────
 if grep -q '_extra_reward_field' "$TARGET"; then
     echo "  (function.py already patched - skipping)"
+    echo "=== done ==="
     exit 0
 fi
 

@@ -73,6 +73,7 @@ SAVE_FREQ=25
 SAVE_LIMIT=-1
 SAVE_MODEL_ONLY=true
 DRY_RUN=0
+PREFLIGHT=0
 EXTRA=()
 
 while [[ $# -gt 0 ]]; do
@@ -95,6 +96,7 @@ while [[ $# -gt 0 ]]; do
         --full-checkpoints) SAVE_MODEL_ONLY=false; shift ;;
         --no-judge)         JUDGE=0;            shift ;;
         --dry-run)          DRY_RUN=1;          shift ;;
+        --preflight)        PREFLIGHT=1;        shift ;;
         --) shift; EXTRA+=("$@"); break ;;
         -h|--help) sed -n '2,45p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) EXTRA+=("$1"); shift ;;
@@ -237,6 +239,14 @@ CMD+=(${EXTRA[@]+"${EXTRA[@]}"})
 
 printf '%q ' "${CMD[@]}"; echo
 [[ $DRY_RUN -eq 1 ]] && { echo "[dry-run] not running."; exit 0; }
+
+if [[ $PREFLIGHT -eq 1 ]]; then
+    # Hand the checker the same overrides the trainer would get, so what is
+    # verified is this command and not a paraphrase of it. Everything after
+    # `config=...` is a key=value dotlist.
+    echo
+    exec python3 "$REPO/verify_ease_setup.py" --ease-repo "$EASE_REPO" -- "${CMD[@]:4}"
+fi
 
 cd "$EASE_REPO"
 # Not exec: `set -o pipefail` is what makes the trainer's exit status survive
