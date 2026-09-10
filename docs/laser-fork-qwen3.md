@@ -172,17 +172,35 @@ heads so grouped-query attention is genuinely exercised:
 **It needs GPUs** — FSDP plus a vLLM rollout of an 8B VLM; there is no CPU version of
 this rung. What CPU buys you is §4, which is the part most likely to be silently wrong.
 
-Smallest thing that proves the port:
-
 ```fish
-# 1 node, 2 GPUs, a handful of steps, tiny batches
-env ATTENTION_START_STEP=1 APPLY_HOOK_ATTENTION=True \
-    APPLY_EARLY_WEIGHTED_STABILITY=True \
-    MODEL_PATH=... TRAIN_FILES=... bash train.sh
+bash launch_laser_smoke.sh --name laser-smoke          # 4 GPUs, 2h, 3 steps
+bash launch_laser_smoke.sh --name laser-smoke --dry-run
 ```
 
-`ATTENTION_START_STEP=1` matters: at its default of 20 the first twenty steps are plain
-GRPO, so a broken capture would look like a working run for twenty steps and then fail.
+**4 GPUs, not 2** — an earlier draft of this page said 2 and that was a guess. Their
+config sets `param_offload=False` and `optimizer_offload=False`, so ~105–140 GB of
+params + grads + Adam state stays resident and FSDP-sharded, while
+`gpu_memory_utilization=0.4` gives vLLM ~32 GB of each 80 GB card. 4 ranks puts training
+at 26–35 GB/GPU, which fits; 2 ranks would need 53–70 GB and OOM. 4 is also the shape the
+paper ran, so a failure is about the port rather than a rank count nobody has tried.
+
+**8 would not help here.** It halves the step work, but the step is 128 sequences total
+and ~20 of the ~40 minutes is fixed startup that 8 ranks make *worse* — eight readers
+pulling the same 17 GB checkpoint, four vLLM engines to initialise instead of two — before
+counting the longer queue. Save 8 GPUs for the real 45K run, where generation dominates
+and genuinely scales.
+
+Four overrides make it a smoke run, and one of them is the whole point:
+
+| | |
+|---|---|
+| `TRAIN_BATCH_SIZE=16`, `PPO_MINI_BATCH_SIZE=16` | their 512 cannot form a step from 61 usable rows |
+| **`ATTENTION_START_STEP=1`** | at their default of 20, **a broken capture looks like a healthy run for twenty steps** |
+| `SAVE_FREQ=-1`, `TEST_FREQ=-1`, `VAL_BEFORE_TRAIN=False` | pure cost for a mechanical check |
+| `trainer.logger=["console"]` | hardcoded to include wandb in `train.sh` and *not* an env var; without a key it blocks on auth, which on a batch node is an invisible hang |
+
+`MAX_RESPONSE_LENGTH` stays at their 2048: shrinking it cuts the window count, and the
+windowed reward is the mechanism under test.
 
 Watch, in this order: the job reaches step 1 without an `AttentionSliceCapturer` import or
 discovery error; `attention_score` and `suppression_attention_score` appear in the reward
