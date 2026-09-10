@@ -721,12 +721,21 @@ def report_vis(rr, groups, correct, args):
               f"x omega {LZ.OMEGA_VIS} -> {sd * LZ.OMEGA_VIS:.6f} reward units")
     sd_acc, _ = LZ.within_group_sd([r["acc"] for r in rr], [r["group"] for r in rr])
     print(f"\n    for scale: within-group sd of the ACCURACY term is {sd_acc:.5f}")
-    flat_n = sum(1 for g in _groups_of(rr)
-                 if len({(r["acc"], r["format"]) for r in g}) == 1)
+    gs = _groups_of(rr)
+    flat_n = sum(1 for g in gs if len({(r["acc"], r["format"]) for r in g}) == 1)
     print(f"    groups where accuracy AND format are constant across all rollouts: "
-          f"{flat_n}/{len(_groups_of(rr))} = {flat_n / max(1, len(_groups_of(rr))):.3f}")
+          f"{flat_n}/{len(gs)} = {flat_n / max(1, len(gs)):.3f}")
     print("      In those, the attention terms are the ENTIRE advantage. That is the")
     print("      mechanism docs/overlap-reward-hack-set-a.md measured at 240x amplification.")
+    # The other side of the same coin, and the real denominator behind T3 and T6. The
+    # gate is multiplicative, so the attention terms can only RANK rollouts against each
+    # other inside a group that has at least two gated ones. A group with one correct
+    # rollout still has its advantage nudged, but there is nothing there for the reward to
+    # discriminate between, which is what "learnable" was supposed to mean.
+    rankable = sum(1 for g in gs if sum(1 for r in g if r["acc"] > 0 and r["format"] > 0) >= 2)
+    print(f"\n    groups with >= 2 GATED rollouts -- the only ones in which an attention")
+    print(f"    term can re-rank anything: {rankable}/{len(gs)} = "
+          f"{rankable / max(1, len(gs)):.3f}")
 
     r_len = pearson([r["r_vis"] for r in rr], [r["n_response"] for r in rr])
     r_alpha = pearson([r["r_vis"] for r in rr], [r["mean_alpha"] for r in rr])
@@ -844,11 +853,32 @@ def report_verdict(facts):
         print(f"    {'PASS' if good else ('n/a ' if not estimated else 'FAIL')}  "
               f"{tag}  {claim}")
         print(f"           {detail}")
+    def _arm(tags):
+        bad = [t for t in tags if verdict[t] is False]
+        return "GO" if not bad else f"NO-GO (failed {', '.join(bad)})"
+
     vis_ok = all(verdict[t] for t in ("T1", "T3", "T4"))
     supp_ok = all(verdict[t] for t in ("T5", "T6", "T7"))
     unmeasured = [t for t, v in verdict.items() if v is None]
-    print("\n    R_vis  ->", "GO" if vis_ok else "NO-GO (T1/T3/T4)")
-    print("    R_supp ->", "GO" if supp_ok else "NO-GO (T5/T6/T7)")
+    print("\n    R_vis  ->", _arm(("T1", "T3", "T4")))
+    print("    R_supp ->", _arm(("T5", "T6", "T7")))
+    # T8 as pre-registered asks its question with the wrong statistic, and saying so is
+    # not the same as moving it. Jaccard is held down by a SIZE mismatch: if S is a
+    # handful of patches and the ring is a third of the grid, S can sit entirely on the
+    # border and still score near zero. The containment number is what answers "is S the
+    # border", it was collected, and it is reported here beside the verdict rather than
+    # instead of it. The threshold stands as written.
+    on_ring = facts["border"].get("on_ring", float("nan"))
+    if verdict["T8"] and np.isfinite(on_ring) and on_ring >= 0.9:
+        print("\n    T8 PASSES ON A STATISTIC THAT DOES NOT ANSWER ITS OWN QUESTION.")
+        print(f"    {on_ring:.3f} of S sits on the border ring, at "
+              f"{facts['border']['enrichment']:.2f}x its area share, so S IS the")
+        print(f"    border -- a strict subset of it. Jaccard is only "
+              f"{facts['border']['jaccard']:.3f} because S is far")
+        print("    smaller than the ring, and Jaccard charges for that size mismatch.")
+        print("    The pre-registered verdict is left as recorded; the substantive")
+        print("    reading is the opposite of it, and T8 should be containment rather")
+        print("    than Jaccard if this is ever run again.")
     if unmeasured:
         print(f"    NOT ESTIMATED: {', '.join(unmeasured)} -- a GO/NO-GO that leans on "
               f"one of these\n    is not supported by this run.")
@@ -881,8 +911,12 @@ def stage_report(args):
     report_verdict(facts)
 
     print("\n" + "=" * 78)
-    print("Read section 1 first. A reward that scores zero on a third of the rollouts by")
-    print("short-circuit is not the reward its authors describe, whatever section 7 says.")
+    short = np.mean([r["short"] for r in rr])
+    gated = np.mean([r["acc"] > 0 and r["format"] > 0 for r in rr])
+    print(f"Read section 1 first. {short:.1%} of rollouts score R_vis = 0 by the "
+          f"short-circuit,\nand only {gated:.1%} clear the accuracy-and-format gate that "
+          f"lets either attention term\nreach the reward at all. Both bound everything "
+          f"section 7 says.")
     return 0
 
 
