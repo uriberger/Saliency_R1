@@ -63,12 +63,16 @@ RUNNER="$LOG_ROOT/$NAME.runner.sh"
     printf 'cd %q\n' "$REPO"
     echo "export HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}"
     echo "export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}"
-    # The judge key travels with the job or the judged rows all fall back to
-    # the rule score, which is exactly the failure this reward exists to avoid.
+    # Every judge setting has to be written into the runner explicitly. submit_job
+    # does not carry the submitting shell's environment into the allocation, so a
+    # variable that is merely exported here is silently dropped -- and the failure
+    # is quiet: a missing key makes every judged row fall back to its rule score,
+    # which on flickr30k means 0.
     [[ -n "${NVIDIA_API_KEY:-}" ]] && printf 'export NVIDIA_API_KEY=%q\n' "$NVIDIA_API_KEY"
     [[ -n "${OPENAI_API_KEY:-}"  ]] && printf 'export OPENAI_API_KEY=%q\n' "$OPENAI_API_KEY"
     [[ -n "${OPENAI_BASE_URL:-}" ]] && printf 'export OPENAI_BASE_URL=%q\n' "$OPENAI_BASE_URL"
-    [[ -n "${JUDGE_MODEL:-}"     ]] && printf 'export JUDGE_MODEL=%q\n' "$JUDGE_MODEL"
+    [[ -n "${JUDGE_MODEL:-}"       ]] && printf 'export JUDGE_MODEL=%q\n' "$JUDGE_MODEL"
+    [[ -n "${JUDGE_MAX_WORKERS:-}" ]] && printf 'export JUDGE_MAX_WORKERS=%q\n' "$JUDGE_MAX_WORKERS"
     printf 'bash launch_ease_train.sh --arm %q --exp %q --gpus %q' "$ARM" "$EXP" "$GPUS"
     for a in ${EXTRA[@]+"${EXTRA[@]}"}; do printf ' %q' "$a"; done
     echo

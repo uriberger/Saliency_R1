@@ -236,6 +236,39 @@ cannot resolve `Qwen3VLForConditionalGeneration` out of the lazy module until
 `transformers.models.qwen3_vl.modeling_qwen3_vl` has actually been imported. verl hits
 the same path at `fsdp_workers.py:205`, so if a run dies there, that is why.
 
+### Smoke run, 2026-09-10 (3 steps, 8 GPUs, rollout batch 16)
+
+Clean. The whole path runs: FSDP + vLLM load the staged checkpoint, the aux loss
+fires, the judge answers.
+
+**The judge decision is confirmed by the gate, not just by the reward.**
+
+| step | rule alone | with judge | gate passed | `attn_mask_loss` |
+|---|---|---|---|---|
+| 1 | 0.125 | **0.447** | 41/80 (51%) | 3.422 |
+| 2 | 0.275 | **0.572** | 52/80 (65%) | 3.385 |
+| 3 | 0.100 | **0.469** | 40/80 (50%) | 2.937 |
+
+`judge_failed: 0.0` throughout; `judge_called` 0.73–0.90. The paper reports **47.4%**
+of rollouts reward-positive, so the judged reward lands in their regime while
+rule-only would have gated on ~a quarter of rollouts and starved the attention loss
+of exactly the trajectories it exists to shape. `attn_mask_loss` falls across the
+three steps, so the KL to the evidence target moves.
+
+Resource facts: **26–29 GB allocated of 80** per GPU (large headroom at 8 GPUs /
+TP 4), 301 GB host RAM of 2 TB, steps 39.0 / 27.9 / 27.3 s at rollout batch 16.
+`format: 0.95` — the cold start adapts to their `<answer>` template. 3.8% of
+responses hit the 1024 cap.
+
+Scaling 16 → 128 puts the real run near **3 min/step, ~6 h per arm**, so 2–3
+resubmits each against 4 h allocations. Four model-only checkpoints per arm, ~68 GB.
+
+**`JUDGE_MAX_WORKERS` defaults to 64 because of this run.** At rollout batch 128 a
+step judges ~480 completions; 32 workers is ~15 sequential rounds. Note that
+`launch_ease_train_job.sh` must write every judge setting into the runner explicitly
+— submit_job does not carry the submitting shell's environment into the allocation,
+and the failure mode is quiet.
+
 ### Deviations from their recipe, in full
 
 | | |

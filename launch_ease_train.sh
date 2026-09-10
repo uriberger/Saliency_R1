@@ -135,7 +135,11 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 # judged_perception.py imports their perception.py through this.
 export EASE_REPO
 export JUDGE_MODEL=${JUDGE_MODEL:-azure/openai/gpt-4o-mini}
-export JUDGE_MAX_WORKERS=${JUDGE_MAX_WORKERS:-32}
+# 64, not 32. At rollout batch 128 a step judges ~480 completions (measured:
+# judge_called runs 0.73-0.90), and the reward actor fans out inside one Ray
+# actor. 32 workers is ~15 sequential rounds; 64 halves that, keeping the judge
+# inside the advantage step rather than adding to the step time.
+export JUDGE_MAX_WORKERS=${JUDGE_MAX_WORKERS:-64}
 [[ -n "${NVIDIA_API_KEY:-}" ]] && export NVIDIA_API_KEY
 [[ -n "${OPENAI_API_KEY:-}"  ]] && export OPENAI_API_KEY
 [[ -n "${OPENAI_BASE_URL:-}" ]] && export OPENAI_BASE_URL
