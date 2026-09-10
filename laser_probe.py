@@ -659,6 +659,12 @@ def report_counts(rr, args):
           f"{int(np.median([r['n_windows'] for r in rr]))}")
     print("\n    The window is 10 with stride 5 -- the CALL SITE's value. The wiki page's")
     print("    20/10 would have doubled the share above and is not what the code runs.")
+    print("\n    THE GATED SHARE IS A LOWER BOUND. Our trainer's reward_funcs are")
+    print("    [think_format_reward, think_overlap_reward, accuracy_reward, openai_reward]")
+    print("    and the last is an LLM judge, which is what credits an answer that is right")
+    print("    but does not parse. This probe gates on `accuracy_reward` alone, so every")
+    print("    judge-only-correct rollout is counted as ungated here. That understates the")
+    print("    denominator behind T3 and T6 and cannot inflate them.")
     return groups, correct
 
 

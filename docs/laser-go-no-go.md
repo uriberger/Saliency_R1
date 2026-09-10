@@ -234,3 +234,10 @@ Grounding-DINO, no judge, no training.
 - **`S` is defined from one query position.** That is upstream's choice, kept deliberately.
   Averaging over the question's tokens would be a better estimator and a different method;
   §3.3 reports both so the difference is visible rather than assumed away.
+- **The correctness gate here is `accuracy_reward` alone.** Our trainer's `reward_funcs`
+  are `[think_format_reward, think_overlap_reward, accuracy_reward, openai_reward]`, and
+  the last is an LLM judge that credits an answer which is right but does not parse.
+  Running it needs a key and a per-rollout API call, which is out of proportion to a
+  go/no-go, so it is omitted. The effect is one-directional: judge-only-correct rollouts
+  are counted as ungated, which shrinks the pool T3 and T6 are estimated on and cannot
+  make either threshold look better than it is.
