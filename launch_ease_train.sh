@@ -45,6 +45,13 @@
 # lambda_attn 0.001, background alpha 0.1, sigma scale 0.25, layer floor(2L/3),
 # tau 0.5, <=64 response tokens for the aux loss, padding_free false.
 #
+# CHECKPOINTS ARE FULL, not model-only, because this run will be interrupted.
+# 124 steps is ~6 h against 4 h allocations, and save_model_only=true writes no
+# optimizer state, no LR scheduler and no RNG (fsdp_checkpoint_manager.py:100) --
+# every resume would restart AdamW's moments from zero, at whatever step each arm
+# happened to be cut at. ~48 GB a checkpoint against ~16; take the disk.
+# --model-only-checkpoints for the other trade.
+#
 # The judge needs a key: NVIDIA_API_KEY=... bash launch_ease_train.sh ...
 set -euo pipefail
 
@@ -71,7 +78,7 @@ JUDGE=1
 VAL_FREQ=10
 SAVE_FREQ=25
 SAVE_LIMIT=-1
-SAVE_MODEL_ONLY=true
+SAVE_MODEL_ONLY=false
 DRY_RUN=0
 PREFLIGHT=0
 EXTRA=()
@@ -93,7 +100,7 @@ while [[ $# -gt 0 ]]; do
         --val-freq)         VAL_FREQ="$2";      shift 2 ;;
         --save-freq)        SAVE_FREQ="$2";     shift 2 ;;
         --save-limit)       SAVE_LIMIT="$2";    shift 2 ;;
-        --full-checkpoints) SAVE_MODEL_ONLY=false; shift ;;
+        --model-only-checkpoints) SAVE_MODEL_ONLY=true; shift ;;
         --no-judge)         JUDGE=0;            shift ;;
         --dry-run)          DRY_RUN=1;          shift ;;
         --preflight)        PREFLIGHT=1;        shift ;;
