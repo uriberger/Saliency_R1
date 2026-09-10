@@ -403,11 +403,14 @@ Enrichment by set, pooled over types (each column is that set's share ÷ its are
 
 | ring | depth 1 | deep | top | bottom | left | right | corner (mean of 4) | **first patch** | last patch |
 |---|---|---|---|---|---|---|---|---|---|
-| 2.61 | 0.32 | 0.24 | 7.39 | 0.74 | 7.38 | 1.56 | 21.6 | **72.5** | 3.1 |
+| 2.61 | 0.32 | 0.24 | 7.48 | 0.75 | 7.29 | 1.59 | 21.6 | **72.5** | 3.4 |
+
+(Pooled over pictures, not over type means — the two differ in the second decimal and the
+picture-weighted form is what every other number here uses.)
 
 Two things a 2-D border effect cannot explain:
 
-- **top 7.4× and left 7.4×, against bottom 0.74× and right 1.56×.** The border is not
+- **top 7.5× and left 7.3×, against bottom 0.75× and right 1.59×.** The border is not
   enriched; its *early* half is. The bottom row is *below* chance.
 - **the single top-left patch is at 72×**, more than three times the four-corner average
   and twenty-three times the last patch. Per type it runs from 46.6 (math figures) to
@@ -634,3 +637,36 @@ At the strongest cell anywhere in the base model the top column takes **51×** u
 - The arms (rotation, permutation, zoom) were **not** re-run on the base model. §16's
   causal claims rest on the cold start; §17.1 is the reason to expect they carry over, not
   evidence that they do.
+
+
+---
+
+# 18. The interactive page — 2026-09-09
+
+`docs/sink-location.html` is the whole result as one self-contained page: nine figures, a
+table view behind every one of them, hover tooltips, and a selected dark mode. No CDN, no
+fonts to fetch, no build step — it opens from a file:// URL on a machine with no network,
+which is what the eval nodes and a laptop on a plane have in common.
+
+```fish
+python sink_location_html.py                       # -> docs/sink-location.html
+node assets/check_sink_location_html.js docs/sink-location.html
+```
+
+It **reads the same npz and JSONL the report reads** and calls the report's own functions
+with stdout swallowed, so no number on it is retyped and a figure cannot drift away from
+§16–17. Regenerate it after any new run rather than editing the HTML.
+
+The layout check exists because there is no browser on this cluster. It runs the page's own
+drawing code against a DOM stub and measures what came out — every coordinate finite, every
+mark inside its own viewBox, every label with room for its text, every figure non-empty.
+That is most of what looking at a screenshot would have caught, and it caught two real
+things: figure 3 was indexing location names the report exposes under different keys and
+was emitting `NaN` for all six bars, and the negative bars were positive bars pushed left by
+a transform, which put the rounded end at the baseline instead of at the data end.
+
+The palette is the documented default, validated rather than eyeballed:
+`node scripts/validate_palette.js "#2a78d6,#eb6834,#1baf7a" --mode light` and the dark
+steps `"#3987e5,#d95926,#199e70" --mode dark` both pass every gate. Light-mode aqua sits
+below 3:1 on the surface, so the relief rule applies — hence the direct labels on every bar
+and a table view on every figure.
