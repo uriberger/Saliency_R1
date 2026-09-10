@@ -16,12 +16,16 @@ __pycache__/
 # Nested HuggingFace TRL clone — tracked as its own git repo, not a submodule.
 trl_repo
 
+# Nested EASE (EasyR1/verl fork) clone — same deal as trl_repo.
+ease_repo
+
 # Cold-start downloaded/derived data (keep only the prep scripts in cold_data/)
 cold_data/laser
 cold_data/LLaVA-CoT-100k
 cold_data/Mulberry-SFT
 cold_data/Saliency-R1-cold
 cold_data/grpo_sets
+cold_data/ease
 cold_data/_verify_out*/
 checkpoint
 outputs

@@ -10,10 +10,19 @@
 # which also means patch_trl_qwen3.sh from a worktree patches it for everyone.
 trl_repo
 
+# The EASE (EasyR1/verl fork) clone that actually executes, shared the same way.
+# Upstream is github.com/Nrich-sunny/Attend-to-Evidence; ease/ holds our source
+# copy of anything we change on top of it.
+ease_repo
+
 # Downloaded / derived cold-start data
 cold_data/LLaVA-CoT-100k
 cold_data/Mulberry-SFT
 cold_data/Saliency-R1-cold
+
+# EASE source corpora and the evidence-annotated parquet built from them.
+# ~51 GB of downloads; shared so a worktree deletion never takes them with it.
+cold_data/ease
 
 # Training artifacts. Point run scripts at a per-branch subdirectory so two
 # sessions don't clobber each other's checkpoints and logs.
