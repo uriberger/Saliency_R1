@@ -26,6 +26,10 @@ outputs
 # Validation sets, so a worktree can run the val probes without an absolute path.
 cold_data/grpo_sets
 
+# LASER's RL corpora (MMR1-RL + ReVisual-R1) and the verl parquet built from
+# them by build_laser_data.py. ~2 GB; one copy is enough.
+cold_data/laser
+
 # LASER's released fork, read-only reference for docs/laser-go-no-go.md. Shared
 # because it is 3.7 MB of someone else's git history and every worktree wants the
 # same copy.

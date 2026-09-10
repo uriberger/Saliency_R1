@@ -17,6 +17,7 @@ __pycache__/
 trl_repo
 
 # Cold-start downloaded/derived data (keep only the prep scripts in cold_data/)
+cold_data/laser
 cold_data/LLaVA-CoT-100k
 cold_data/Mulberry-SFT
 cold_data/Saliency-R1-cold
