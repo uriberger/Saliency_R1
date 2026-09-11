@@ -1,0 +1,79 @@
+### LASER Stage 1 -- ReVisual-R1's cold start, on Qwen3-VL-8B-Instruct.
+#
+# Mirrors CSfufu/Revisual-R1's cold_start/examples/train_full/revisual_cold_start.yaml.
+# Differences from theirs are marked DEVIATION and there are four; everything else is
+# their value.
+#
+# THE POINT OF THIS RUN is `new_special_tokens` + `resize_vocab` below. LASER's reward
+# demands <think></think><answer></answer> with one \boxed{} inside, and
+# Qwen3-VL-8B-Instruct scores format 0.000 -- zero <think> tags in 64 rollouts across four
+# prompt placements (jobs 6722516, 6722589). The format is not promptable on this model;
+# their config TEACHES it, as four added tokens. That is why Stage 1 is not optional here
+# even though their README calls it optional.
+
+### model
+model_name_or_path: Qwen/Qwen3-VL-8B-Instruct   # DEVIATION 1: theirs is Qwen2.5-VL-3B-Instruct
+                                                # (LASER itself cold-starts the 7B)
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: /home/uberger/scratch/research/LLaMA-Factory/examples/deepspeed/ds_z2_config.json
+
+### the four tags, added to the vocabulary rather than asked for in a prompt
+new_special_tokens: <think>,</think>,<answer>,</answer>
+resize_vocab: true
+
+### dataset
+# DEVIATION 2: theirs is `GRAMMAR`, which is NOT RELEASED -- their repo says it "will
+# open source the GRAMMAR dataset within the next two weeks" and has not, and nothing
+# matching exists on the hub. This is 40K verified text-only reasoning traces from
+# OpenR1-Math-220k, reformatted to the four-tag target by build_coldstart_data.py and
+# checked against the fork's own format_reward before being written. Matched to GRAMMAR
+# in modality (text-only), size (~40K) and shape (explicit reasoning paths); NOT matched
+# in mixture -- GRAMMAR is described as "diverse", this is maths-weighted. See
+# build_coldstart_data.py for why OpenThoughts, the more diverse candidate, was rejected
+# (0 of 400 sampled rows carry a \boxed{} answer).
+dataset: laser_coldstart_text
+dataset_dir: /home/uberger/scratch/research/saliency_r1/cold_data/laser/coldstart
+template: qwen3_vl_nothink   # DEVIATION 3: theirs is qwen2_vl, for a Qwen2.5 model.
+                             # Same role: the non-reasoning template, so the literal
+                             # <think> tags come from the TARGETS and are not injected
+                             # twice by a thinking template.
+cutoff_len: 32768
+overwrite_cache: true
+preprocessing_num_workers: 128
+
+### output
+output_dir: /home/uberger/scratch/research/saliency_r1/checkpoint/laser_coldstart_qwen3_vl_8b_revisual
+logging_steps: 1
+save_steps: 150
+save_total_limit: 10
+# Resumability across the wall limit, as launch_coldstart_job.sh's autoresume expects:
+# keep full trainer state and do not wipe the output dir.
+save_only_model: false
+save_strategy: 'steps'
+plot_loss: true
+overwrite_output_dir: false
+report_to: none      # DEVIATION 4: theirs is wandb. No key on these nodes, and a blocked
+                     # auth prompt on a batch node is an invisible hang.
+run_name: laser_coldstart_qwen3_vl_8b_revisual
+
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-5      # their YAML. The paper's Table 5 says 2e-5; same paper-vs-code
+                           # drift as LASER's own window size, and the code wins.
+num_train_epochs: 5
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+weight_decay: 1.0e-2
+bf16: true
+ddp_timeout: 540000000
+
+### eval
+val_size: 0
+per_device_eval_batch_size: 4
+eval_strategy: 'no'
+eval_steps: 10000000
