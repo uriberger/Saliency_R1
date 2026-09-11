@@ -21,14 +21,45 @@ stacks' accuracy curves mean the same thing.
 
 ## What it computes
 
+  span      = a WELL-FORMED answer span, or nothing (see below)
   rule      = their perception.py accuracy, verbatim (imported, not copied)
-  judge     = gpt-4o-mini, 1-5, mapped to (s-1)/4  -- only when rule == 0
+  judge     = gpt-4o-mini on `span`, 1-5, mapped to (s-1)/4 -- only when rule == 0
   accuracy  = max(rule, judge)
   overall   = (1 - format_weight) * accuracy + format_weight * format
 
 The rule pass runs first and short-circuits: a row their matcher already calls
 correct never reaches the API. That is both cheaper and monotone -- this reward
 is >= theirs on every sample, never below it.
+
+## The span gate, and the run that made it necessary
+
+A first pair of runs (2026-09-10, ease_8k / dapo_8k) reward-hacked this file.
+Both arms converged on emitting
+
+    <answer> Down <answer> The direction mentioned ... <answer> Down <answer> ...
+
+repeated to the 1024-token cap and never closing the tag, and this reward scored
+it 1.0. By step ~40 `format` had fallen 0.97 -> 0.05, response length had
+saturated at the cap on 90% of rollouts, and judged accuracy read 0.88.
+
+Their perception.py is immune to that shape by accident of construction: its
+regex needs a CLOSING `</answer>`, so an unclosed tag falls through to
+`answer_text = response.strip()` and is then killed by `len(answer_text) < 300`.
+Rambling earns nothing, so rambling never pays. The first version of this file
+kept the fallback and dropped the length guard, which opened exactly the door
+their matcher closes -- and with `format_weight` at 0.0 (their default, which is
+safe only alongside their guarded matcher) nothing pushed back.
+
+So the judge is now shown a span or nothing at all:
+
+  * a CLOSED `<answer>...</answer>`, or text after `</think>` (our cold start's
+    own format), and nothing else -- never the whole response as a fallback,
+    because "the model never delimited its answer" is not an answer;
+  * at most `max_answer_chars` (300, their number) -- long enough for
+    flickr30k's sentence answers, which run 100-150 characters.
+
+Anything else scores 0 without an API call. The rule half is untouched and still
+runs their code verbatim, so the DAPO arm's reward is unchanged.
 
 `accuracy` is graded, not binary, because the judge's 1-5 scale is. EASE's gate
 is `reward_threshold: 0.5`, so a judge score of 3/5 passes it and 2/5 does not.
@@ -206,26 +237,34 @@ def _judge(question: str, ground_truth: str, prediction: str, attempts: int = 5)
 
 
 # ── answer extraction ────────────────────────────────────────────────────────
+# Both require a CLOSING delimiter. That is the whole point: an opening tag the
+# model never closed means it did not finish delimiting an answer.
 _ANSWER_TAG = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
 _AFTER_THINK = re.compile(r"</think>\s*(.*)", re.DOTALL)
 
+MAX_ANSWER_CHARS = 300  # their perception.py's own bound
 
-def extract_prediction(response: str) -> str:
-    """Pull the answer span the judge should see.
+
+def extract_prediction(response: str, max_answer_chars: int = MAX_ANSWER_CHARS) -> str:
+    """Return the answer span the judge may see, or "" if there isn't one.
 
     Their prompt template asks for `<answer>...</answer>`; our cold-start SFT
     checkpoint was trained to emit `<think>...</think>` followed by the answer.
-    Early in training the policy produces both shapes, so accept either and only
-    then fall back to the whole response -- otherwise the judge would be shown a
-    chain of thought and asked whether it matches a one-word gold answer.
+    Both shapes are accepted. Nothing else is: there is deliberately no
+    whole-response fallback, and a span longer than `max_answer_chars` is
+    rejected rather than truncated. See "The span gate" above -- the first pair
+    of runs hacked precisely the fallback this used to have.
     """
     match = _ANSWER_TAG.search(response)
     if match:
-        return match.group(1).strip()
-    match = _AFTER_THINK.search(response)
-    if match and match.group(1).strip():
-        return match.group(1).strip()
-    return response.strip()
+        span = match.group(1).strip()
+    else:
+        match = _AFTER_THINK.search(response)
+        span = match.group(1).strip() if match else ""
+
+    if not span or len(span) > max_answer_chars:
+        return ""
+    return span
 
 
 # ── the reward ───────────────────────────────────────────────────────────────
@@ -234,6 +273,7 @@ def compute_score(
     format_weight: float = 0.0,
     rule_shortcut: bool = True,
     judge_disabled: bool = False,
+    max_answer_chars: int = MAX_ANSWER_CHARS,
 ) -> list[dict[str, float]]:
     if not 0.0 <= format_weight <= 1.0:
         raise ValueError(f"format_weight must be in [0, 1], got {format_weight}")
@@ -254,8 +294,11 @@ def compute_score(
     if pending:
         def run(i: int) -> tuple[int, float | None]:
             reward_input = reward_inputs[i]
-            prediction = extract_prediction(str(reward_input.get("response", "")))
+            prediction = extract_prediction(str(reward_input.get("response", "")), max_answer_chars)
             if not prediction:
+                # No delimited answer, or one too long to be one. Score 0 and do
+                # not spend an API call asking a judge to find an answer inside a
+                # ramble -- it will, and that is the hack.
                 return i, 0.0
             # `question` is supplied by patch_ease_repo.sh; without it the judge
             # still works, but grades a bare answer against a bare gold string.
@@ -279,6 +322,12 @@ def compute_score(
                 "rule_accuracy": float(rule["accuracy"]),
                 "judge_called": 1.0 if i in judged else 0.0,
                 "judge_failed": 1.0 if (i in judged and judge_score is None) else 0.0,
+                # The canary. If this climbs, the policy is drifting back toward
+                # undelimited or over-long answers and the run is going the way
+                # ease_8k/dapo_8k went.
+                "no_answer_span": 0.0 if extract_prediction(
+                    str(reward_inputs[i].get("response", "")), max_answer_chars
+                ) else 1.0,
             }
         )
     return scores

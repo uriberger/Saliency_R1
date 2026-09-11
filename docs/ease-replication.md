@@ -269,6 +269,62 @@ step judges ~480 completions; 32 workers is ~15 sequential rounds. Note that
 — submit_job does not carry the submitting shell's environment into the allocation,
 and the failure mode is quiet.
 
+### The first pair of runs reward-hacked, 2026-09-10
+
+`ease_8k` and `dapo_8k` both ran to 124/124 and **both are unusable**. Kept for the
+record; not benchmarked.
+
+| | step ~1 | step ~124 |
+|---|---|---|
+| `format` (emits `<answer>…</answer>`) | 0.97 | **0.16** EASE / **0.05** DAPO |
+| `response_length` mean | 190 | **~1000** of 1024 |
+| fraction truncated at the cap | 0.01 | **0.87 / 0.92** |
+| `rule_accuracy` | 0.22 | **0.000** |
+| judged `accuracy` | 0.57 | **0.88 / 0.82** |
+
+The shape, from `checkpoints/generations.log`, scored **1.0**:
+
+```
+<answer> Down <answer> The direction mentioned in one of the book titles is "Down."
+<answer> Down <answer> The direction mentioned ... [to the 1024-token cap]
+```
+
+Note what is missing: a **closing** `</answer>`. Their `perception.py` is immune to
+this by construction — its regex needs the closing tag, so an unclosed one falls
+through to `answer_text = response.strip()` and is then killed by
+`len(answer_text) < 300`. Rambling earns nothing there, so rambling never pays.
+
+The first version of `judged_perception.py` kept that whole-response fallback and
+dropped the length guard, so the judge was handed a 1000-token ramble and asked
+whether it matched the gold answer. It does — the answer is somewhere inside — so
+gpt-4o-mini returned 5/5. With `format_weight` at 0.0 (their default, safe only
+alongside their guarded matcher) nothing pushed back. **This was a bug in our
+reward, not in EASE.**
+
+Their unmodified reward is not the alternative: `rule_accuracy` reaches 0.000 by
+mid-run for everything, so GRPO would have seen all-zero groups, zero advantage and
+no gradient. Neither reward works on this corpus as-is.
+
+**The fix is a span gate.** The judge now sees a *closed* `<answer>…</answer>`, or
+text after `</think>` (our cold start's own format), and nothing else — no
+whole-response fallback — capped at their 300 characters, which still admits
+flickr30k's 100–150-character sentence answers. Everything else scores 0 with no API
+call. The rule half still runs their code verbatim, so the DAPO arm's reward is
+unchanged. A new `no_answer_span` metric is the canary.
+
+`ease/test_judged_perception.py` replays the real `generations.log` from both runs:
+all 12 hacked completions that scored 1.0 now yield no span, and 5/5 well-formed
+completions from the pre-degeneration smoke still pass.
+
+**What three steps of smoke could not catch.** At step 3 `format` was still 0.95;
+the collapse begins around step 30–40. Any future reward change here needs ~40 steps
+of canary, watching `format`, `response_length` and `no_answer_span` — not three.
+
+**Still open:** a closed `<answer>` under 300 characters listing several candidate
+answers ("Down, Up, North, …") could still shotgun the judge. The judge prompt is
+deliberately byte-identical to `trl/rewards/openai_rewards.py` so the two stacks'
+accuracy means the same thing, so this is watched rather than prompted away.
+
 ### Deviations from their recipe, in full
 
 | | |
