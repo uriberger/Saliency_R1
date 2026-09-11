@@ -97,4 +97,9 @@ echo "linked : $LINK"
 du -sh "$HF"
 echo
 echo "Register it in run_bench_baselines.sh's BASELINES as:"
-echo "    \"${EXP//_/-}|checkpoint/$(basename "$LINK")\""
+echo "    \"${EXP//_/-}|checkpoint/$(basename "$LINK")|BENCH_MODEL_TYPE=qwen3_vl\""
+echo
+echo "The BENCH_MODEL_TYPE is required: launch_lmms_eval_job.sh infers the"
+echo "lmms-eval model class from a qwen3-vl substring in the model PATH, and"
+echo "these names have none. Without it every eval unit fails instantly and the"
+echo "suite banks nothing."

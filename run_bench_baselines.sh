@@ -61,8 +61,15 @@ BASELINES=(
     # attention loss, so (ease - dapo) is the method's effect, and it is what is
     # comparable to (overlap-8k - sft-coldstart) inside our own stack. Either
     # number alone confounds the method with the framework it ran in.
-    "ease-8k-v2|checkpoint/ease_8k_v2-step124_merged"
-    "dapo-8k-v2|checkpoint/dapo_8k_v2-step124_merged"
+    # BENCH_MODEL_TYPE is not optional here. launch_lmms_eval_job.sh infers the
+    # lmms-eval model class from a `qwen3-vl`/`qwen2.5-vl` substring in the MODEL
+    # PATH, and every other baseline above happens to carry `qwen3_vl` in its
+    # name. These two do not, so without this the launcher exits with "Cannot
+    # infer --model-type" -- and run_bench_eval.sh treats a failed unit as
+    # "produced nothing" and moves on, so the whole suite fails silently and
+    # banks nothing. That cost a 3.5-hour 8-GPU allocation on 2026-09-11.
+    "ease-8k-v2|checkpoint/ease_8k_v2-step124_merged|BENCH_MODEL_TYPE=qwen3_vl"
+    "dapo-8k-v2|checkpoint/dapo_8k_v2-step124_merged|BENCH_MODEL_TYPE=qwen3_vl"
     # The inference-time attention edit, on the cold start, at alpha 0.5 over every
     # layer and head. Same source (the border), same mass moved; the only difference
     # between the two is WHERE it lands -- the middle rectangle against the ring just
