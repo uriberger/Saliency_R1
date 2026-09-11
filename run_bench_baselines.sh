@@ -55,6 +55,14 @@ BASELINES=(
     "grpo-no-saliency|checkpoint/grpo-qwen3-vl-8b-instruct-no-sal_merged"
     "overlap-8k|checkpoint/grpo-coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged-overlap__wov0.4_2head_trmean_merged"
     "qwen3-vl-8b-instruct|Qwen/Qwen3-VL-8B-Instruct"
+    # The EASE replication's two arms, trained in their EasyR1 fork on
+    # saliency-r1-8k from the same cold start. docs/ease-replication.md.
+    # READ THEM AS A PAIR AND ONLY AS A PAIR: EASE is DAPO plus an auxiliary
+    # attention loss, so (ease - dapo) is the method's effect, and it is what is
+    # comparable to (overlap-8k - sft-coldstart) inside our own stack. Either
+    # number alone confounds the method with the framework it ran in.
+    "ease-8k-v2|checkpoint/ease_8k_v2-step124_merged"
+    "dapo-8k-v2|checkpoint/dapo_8k_v2-step124_merged"
     # The inference-time attention edit, on the cold start, at alpha 0.5 over every
     # layer and head. Same source (the border), same mass moved; the only difference
     # between the two is WHERE it lands -- the middle rectangle against the ring just
