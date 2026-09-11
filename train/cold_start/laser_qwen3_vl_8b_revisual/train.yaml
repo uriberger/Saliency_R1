@@ -61,10 +61,34 @@ report_to: none      # DEVIATION 4: theirs is wandb. No key on these nodes, and 
 run_name: laser_coldstart_qwen3_vl_8b_revisual
 
 ### train
-per_device_train_batch_size: 4
-gradient_accumulation_steps: 4
+# DEVIATION 5, and it changes no maths: theirs is 4 x 4. Global batch is identical at
+# 2 x 8 x 8 GPUs = 128, so the optimizer sees exactly the same updates -- but the logit
+# peak halves, and the logits are what actually blow up here. Vocab is ~152K, so a
+# micro-batch of 4 at this corpus's p99 length is 4 x 12K x 152K x 2 B = ~15 GB in bf16
+# before the fp32 softmax. Their 4 x 4 was measured on a 3B model. Drop to 1 x 16 if it
+# still OOMs; the global batch stays 128 either way.
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
 learning_rate: 1.0e-5      # their YAML. The paper's Table 5 says 2e-5; same paper-vs-code
                            # drift as LASER's own window size, and the code wins.
+
+# STAYS AT 5 EVEN THOUGH THE FIRST RUN ONLY BUYS ONE EPOCH. This is the whole trick for
+# being resumable: `lr_scheduler_type: cosine` anneals over `num_train_epochs`, so setting
+# 1 here would drive the LR to ~0 by the end of epoch 1 and "continuing to 5" afterwards
+# would be a DIFFERENT run with a fresh schedule, not a continuation. Leaving it at 5 and
+# simply stopping early keeps the real schedule; launch_coldstart_job.sh detects the
+# latest checkpoint and passes resume_from_checkpoint, which restores optimizer,
+# scheduler and RNG state, so a relaunch picks up mid-cosine exactly where it left off.
+#
+#   40,000 samples / global batch 128  =  313 steps/epoch,  1,563 steps for all 5.
+#   save_steps 150 (their value) puts checkpoints at 150, 300, 450, ...
+#   checkpoint-300 is 0.96 of an epoch -- that is the one to judge.
+#
+# THE DECISION AFTER EPOCH 1: measure the format rate on checkpoint-300 with
+#   python laser_prompt_probe.py --model <checkpoint-300> --variants
+# If it is near 1.0 the LASER run is unblocked for a fifth of the spend, and the
+# remaining four epochs are a fidelity choice rather than a requirement. If it is still
+# low, four more epochs would not have fixed it either.
 num_train_epochs: 5
 lr_scheduler_type: cosine
 warmup_ratio: 0.05
