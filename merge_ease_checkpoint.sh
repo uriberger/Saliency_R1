@@ -65,6 +65,12 @@ done
 [[ -n "$EXP" ]] || { echo "ERROR: --exp is required." >&2; exit 2; }
 
 ACTOR="$OUT_ROOT/$EXP/checkpoints/global_step_$STEP/actor"
+# Resolve physically before the symlink below is written. outputs/ and checkpoint/
+# are symlinks into the shared tree, so under a worktree $REPO is
+# .worktrees/<branch>/... -- and `worktree.sh done` would then break a merged model
+# that outlives the branch that produced it. Same reason stage_ease_checkpoint.sh
+# uses `pwd -P`.
+[[ -d "$ACTOR" ]] && ACTOR="$(cd "$ACTOR" && pwd -P)"
 HF="$ACTOR/huggingface"
 [[ -d "$ACTOR" ]] || { echo "ERROR: $ACTOR does not exist." >&2; exit 1; }
 
