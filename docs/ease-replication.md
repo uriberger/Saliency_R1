@@ -1,5 +1,9 @@
 # Replicating EASE from our cold-start checkpoint
 
+> **Status 2026-09-11: done. EASE − DAPO = +2.52 on the natural suite,**
+> inside the paper's claimed +2.5 to +3.1. See [Results](#results-2026-09-11) for
+> the three qualifications that go with that number.
+>
 > **Status 2026-09-10: runnable, on branch `feat/ease-replication`.**
 > The route taken is **their framework on *our* corpus** — saliency-r1-8k already
 > ships evidence boxes, so EASE's unreleased annotation pipeline is off the critical
@@ -346,6 +350,83 @@ layer ⌊2L/3⌋, τ 0.5, ≤64 response tokens for the aux loss, `padding_free:
 5 rollouts either way and the run takes **252 optimizer steps** at 512 or at 128.
 What 128 buys is reporting granularity: 126 steps to checkpoint and log against
 instead of 31. Gradient noise per update is unchanged.
+
+## Results, 2026-09-11
+
+Both arms trained 124 steps on saliency-r1-8k from the same cold start, in their
+EasyR1 fork, with the same judged reward, and were scored by `run_bench_baselines.sh`
+on the `n300_100` profile — the same recipe, sample and generation settings that
+produced every other baseline in that list.
+
+### The headline
+
+**EASE − DAPO = +2.52 points on the natural suite**, against the paper's claimed
+**+2.5 to +3.1** over DAPO. The effect replicates, on our corpus, in their
+framework, from our cold start.
+
+It is also close to what our own reward achieves by a different route:
+
+| contrast | natural | non-natural |
+|---|---|---|
+| **EASE − DAPO** (their method, their framework) | **+2.52** | −1.47 |
+| overlap − cold start (our reward, our framework) | +2.30 | +1.84 |
+| EASE − cold start | +2.07 | −1.50 |
+| DAPO − cold start | −0.45 | −0.04 |
+
+Two different ways of injecting the same evidence-box signal — an auxiliary
+attention loss versus a reward — land within a quarter of a point of each other on
+the suite they share. That is the comparison this whole exercise was built to make.
+
+### Per benchmark
+
+| suite | benchmark | EASE | DAPO | EASE−DAPO | cold start | EASE−cold |
+|---|---|---|---|---|---|---|
+| natural | mme | 1758.6 | 1711.8 | **+46.8** | 1646.8 | +111.8 |
+| natural | mmerealworld | 68.33 | 65.00 | **+3.33** | 65.33 | +3.00 |
+| natural | mmstar | 70.17 | 64.12 | **+6.05** | 68.11 | +2.06 |
+| natural | pope | 89.93 | 88.59 | **+1.34** | 86.71 | +3.22 |
+| natural | realworldqa | 69.33 | 70.00 | **-0.67** | 69.33 | +0.00 |
+| nonnatural | algopuzzlevqa | 34.00 | 31.00 | **+3.00** | 36.00 | -2.00 |
+| nonnatural | chartqa | 85.00 | 86.00 | **-1.00** | 85.00 | +0.00 |
+| nonnatural | illusionvqa_soft_localization | 31.00 | 34.00 | **-3.00** | 34.00 | -3.00 |
+| nonnatural | mathvision_testmini | 20.00 | 25.00 | **-5.00** | 26.00 | -6.00 |
+| nonnatural | mmmu_pro_standard | 51.00 | 44.00 | **+7.00** | 52.00 | -1.00 |
+| nonnatural | p3 | 52.96 | 59.69 | **-6.72** | 59.99 | -7.02 |
+| nonnatural | scienceqa_img | 97.00 | 97.00 | **+0.00** | 98.00 | -1.00 |
+| nonnatural | visulogic | 29.00 | 35.00 | **-6.00** | 21.00 | +8.00 |
+| **natural** | **mean** | **74.44** | **71.93** | **+2.52** | **72.37** | **+2.07** |
+| **nonnatural** | **mean** | **50.00** | **51.46** | **-1.47** | **51.50** | **-1.50** |
+
+### Three qualifications, all of which belong in any writeup
+
+**1. DAPO is a weak baseline here, and that inflates the contrast.** `DAPO − cold
+start` is **−0.45** natural and **−4.00** on MMStar: 124 steps of DAPO on this corpus
+actively *hurt* relative to doing nothing. So part of "+2.52 for EASE" is EASE
+avoiding damage DAPO did, not EASE adding value. `EASE − cold start = +2.07` is the
+more conservative reading and should be quoted alongside.
+
+**2. The gain is confined to natural images.** Non-natural goes the other way,
+−1.47, where our overlap reward is +1.84. On charts, diagrams and puzzles the
+attention loss costs: p3 −6.72, visulogic −6.00, mathvision −5.00. An evidence box
+over a natural photograph localises an object; over a chart or a logic puzzle the
+"evidence" is not a region, and pulling attention toward one appears to be actively
+wrong. This is consistent with the corpus: saliency-r1-8k's ten sources are all
+natural-image or document VQA, so the boxes never taught the model what to do with a
+diagram.
+
+**3. MMStar carries most of the natural gain** (+6.05 of a +2.52 five-benchmark
+mean). A single benchmark driving the headline is fragile, even at this suite's
+largest sample. RealWorldQA is flat (−0.67).
+
+### What the runs cost, and what they cannot say
+
+Two arms × 124 steps × ~2 h 55 m on 8 GPUs, plus ~95 min of benchmarking each.
+
+They cannot say anything about EASE's **multi-evidence** setting: every row of
+saliency-r1-8k is K=1 (see "Why this works at all"), so the paper's Gaussian mixture
+never mixed. And both policies collapsed to ~32-token answers with no chain of
+thought, so "EASE improves grounding during reasoning" was tested on a policy that
+barely reasons.
 
 ## Their data (the slower alternative)
 
