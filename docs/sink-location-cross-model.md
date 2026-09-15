@@ -338,3 +338,202 @@ bash launch_sink_location_job.sh --name slx-internvl-tiled --stage arms --gpus 8
 python sink_location_probe.py --stage crossmodel --out-dir outputs/sink_location/xmodel \
     --dirs outputs/sink_location/xmodel/qwen3vl_base,outputs/sink_location/xmodel/internvl35,outputs/sink_location/xmodel/llava15
 ```
+
+---
+
+# The result — 2026-09-15
+
+**The same 1,800 pictures through three models, 150 per type, twelve types, all layers ×
+all heads, every model on its own chat template with no system prompt.** Selftest passed
+on each. Full output in `outputs/sink_location/xmodel/{qwen3vl_base,internvl35,llava15}/report.txt`
+and the side-by-side in `outputs/sink_location/xmodel/crossmodel.txt`.
+
+Three sentences. **The ring survives the encoder swap and half-survives the family swap**
+— 1.54 on Qwen3-VL, 1.67 on InternVL-3.5, 1.29 on LLaVA-1.5, where the design's
+pre-registered bar was 1.5. **The upper-left peak does not survive at all: it is 13.1× on
+Qwen3-VL, 5.5× on InternVL, and on LLaVA-1.5 it has moved to the opposite corner** —
+bottom-right at 13.0×, with the bottom row at 2.43 against a top row at 1.02. **And the
+mark is held in different places**: shuffling the encoder's output rows moves it on
+Qwen3-VL and InternVL and leaves it where it was on LLaVA-1.5.
+
+So the answer to "is it Qwen3-VL or is it VLMs" is neither. It is a **raster-order effect
+in all three, pointing in opposite directions**, and the paper's sentence has to be split.
+
+## 1. The budget, first
+
+| model | grid | the grid covers | the picture's share of an attention row |
+|---|---|---|---|
+| Qwen3-VL-8B-Instruct | 16x16 modal, per picture | the whole picture | 0.1096 |
+| InternVL3.5-8B | 16x16 fixed | the whole picture | 0.1472 |
+| LLaVA-1.5-7B | 24x24 fixed | **a centre crop** (569 distinct boxes) | 0.1348 |
+
+Comparable across the three, and in all three the real sink is outside the picture. Every
+number below is about how each model divides up its ~12%.
+
+## 2. Where the picture's attention goes — all heads, pooled over twelve types
+
+| model | ring | depth1 | middle | top | bottom | left | right | **top-left** | **bottom-right** |
+|---|---|---|---|---|---|---|---|---|---|
+| Qwen3-VL | 1.54 | 0.81 | 0.69 | **2.44** | 1.29 | **2.18** | 1.59 | **13.13** | 3.43 |
+| InternVL-3.5 | **1.67** | 0.91 | 0.73 | **2.51** | 1.64 | 1.57 | 1.78 | 5.52 | 4.30 |
+| LLaVA-1.5 | 1.29 | 1.03 | 0.92 | 1.02 | **2.43** | 0.98 | 1.27 | 2.10 | **12.96** |
+
+Read the first and last columns together. Qwen3-VL and InternVL lean on the **early** half
+of the border — top and left, and a single blazing top-left patch. LLaVA-1.5 leans on the
+**late** half: bottom 2.43 against top 1.02, and 12.96 on the last patch. **It is the same
+raster-order signature with the sign flipped**, which is what MCA-LLaVA and VisPruner
+report for that family and what `docs/where-attention-goes.md` said to expect.
+
+**LLaVA-1.5 does not have a ring; it has a bottom edge.** Its four sides are 1.02 / 2.43 /
+0.98 / 1.27 and its interior is flat (depth1 1.03, middle 0.92). The 1.29 in the ring
+column is the bottom row carrying three edges that do nothing. Calling that "the outer
+ring" would be true arithmetic and a false picture.
+
+Per type, the ring clears the pre-registered 1.5 in **9 of 12** types on InternVL, **6 of
+12** on Qwen3-VL and **2 of 12** on LLaVA-1.5 — where it also drops *below 1.0* on maths
+figures (0.92) and board puzzles (0.97).
+
+## 3. Still not a sink — in any of the three
+
+| model | peak ÷ uniform, at the strongest cell | peak CV across queries | verdict |
+|---|---|---|---|
+| Qwen3-VL | 30.9 | 0.85 | a peak that moves |
+| InternVL-3.5 | 56.1 | 0.71 | a peak that moves |
+| LLaVA-1.5 | 66.4 | 0.54 | a peak that moves |
+
+Pre-registered: ≥10× uniform **and** CV ≤ 0.5. All three clear the magnitude leg by a wide
+margin and **all three fail the invariance leg**. §16.4's conclusion about the *word*
+generalises: what sits inside the picture is a peak, not a sink, in every family tested.
+
+## 4. Not registers either — in any of the three
+
+The border patches arrive from the vision tower with a **smaller** norm than the interior
+in all three — 0.895 / 0.942 / 0.921 — before a single text token exists, and their keys
+are not bigger (‖k‖ ring/interior 1.015 / 1.033 / 1.008). What differs is alignment with
+where the queries look: **+0.550 / +0.698 / +0.278**. The border's keys are not large; they
+are *aimed*, and they are aimed hardest in InternVL and least in LLaVA — the same ordering
+as the ring itself.
+
+## 5. Background loses twice and draws once
+
+`E_blank_interior − E_ring`, on pictures whose blank *interior* covers ≥15% of the grid:
+
+- **Qwen3-VL: negative in 11 of 11** types with data (−0.32 to −0.68), every CI excluding 0.
+- **InternVL: negative in 10 of 12**, as far as −1.54 on maths figures.
+- **LLaVA-1.5: negative in 7 of 12, and POSITIVE in three** — maths figures +0.082,
+  abstract puzzles +0.122, board puzzles +0.115. On the model with no ring, a big interior
+  blank is attended at least as much as the border.
+
+H2 is refuted on the two models that have a ring and is not refuted on the one that does
+not. That is consistent rather than convenient: there is no border effect on LLaVA-1.5 for
+a background account to lose to.
+
+## 6. The arms — and this is where the three models come apart
+
+Paired against each picture's own baseline, at each model's own dev-selected cells.
+
+| arm | Qwen3-VL | InternVL-3.5 | LLaVA-1.5 |
+|---|---|---|---|
+| `rot180` ΔE_ring | −0.023 | +0.033 | +0.034 |
+| `rot180` follow slot | 1.000 | 0.829 | 0.902 |
+| `rot180` follow content | 0.000 | 0.127 | 0.000 |
+| **`permute`** (A9) ΔE_ring | **−1.687** | **−1.113** | **−0.194** |
+| **`permute` follow content** | **0.998** | **0.652** | **0.015** |
+| **`permute` follow slot** | **0.000** | **0.010** | **0.642** |
+| `permute_identity` (control) | +0.000 / 1.000 / 1.000 | +0.000 / 1.000 / 1.000 | +0.000 / 1.000 / 1.000 |
+| **`permute_pixels`** (A10) ΔE_ring | −0.130 | +0.059 | +0.002 |
+| **`permute_pixels` follow content** | **0.000** | **0.002** | **0.000** |
+| **`permute_pixels` follow slot** | **0.998** | **0.727** | **0.900** |
+
+**`rot180` kills the content account everywhere.** Turn the picture upside down and the
+peak does not move a patch in any of the three. The sky confound is dead in three families,
+not one.
+
+**A10 rules out content everywhere, and it is the new arm.** Shuffle the pixel blocks that
+will become grid cells *before* the vision tower runs, and the peak follows the grid
+position (0.998 / 0.727 / 0.900) and never the content that moved (0.000 / 0.002 / 0.000).
+Whatever attracts attention is attached to a *place in the encoder's grid*, not to what is
+drawn there — in Qwen3-VL, in InternVL and in LLaVA-1.5 alike.
+
+**A9 is what says WHERE that place is recorded, and the three models disagree.** A10 cannot
+settle it on its own: the ViT's grid index and the language model's slot index are the same
+number, so an arm that holds both fixed cannot separate them. A9 moves one and not the
+other —
+
+- **Qwen3-VL: the mark is in the embedding.** The peak leaves its slot completely (0.000)
+  and follows the vector it was sitting on (0.998). Reproduces §16.7 (−1.644 / 0.981 /
+  0.000) on a different checkpoint and a different prompt.
+- **InternVL-3.5: the same, weaker.** Follows the vector 0.652 of the time, leaves the slot
+  0.990 of the time.
+- **LLaVA-1.5: the mark is in the slot.** Follows the vector 0.015 of the time and *stays
+  where it was* 0.642 of the time. Shuffling this model's patch embeddings costs its ring
+  0.194, against Qwen3-VL's 1.687.
+
+So: in Qwen3-VL and InternVL-3.5 the vision tower stamps a direction into the patch vector
+and the language model attends to the stamp — H5, now evidenced on two encoders instead of
+one, and with A10 narrowing "made in the encoder" to "made by the encoder's own position".
+In LLaVA-1.5 the attractor is held by the language model's position, which is the
+RoPE-decay account the LLaVA literature gives, and which A9 can distinguish and nothing
+else here can.
+
+## 7. InternVL's tiling — the ring is the ENCODER'S border, not the picture's
+
+The doc called this the trap and said a tiled arm would be a stronger result if the ring
+appeared on every tile's own border. It does. 480 pictures, tiling on, scored **per tile**
+(3,048 tiles; 13 tiles for 127 of the pictures, 1 for 119 small ones):
+
+| what was scored | n | ring | top | bottom | top-left | bottom-right |
+|---|---|---|---|---|---|---|
+| one 16x16 grid over the whole picture | 480 | 1.63 | 2.40 | 1.64 | 5.56 | 4.26 |
+| every tile, on its own 16x16 grid | 3,048 | 1.38 | 2.07 | 1.19 | 3.81 | 2.79 |
+| tile 0 (also the picture's corner) | 480 | **2.07** | **4.80** | 0.83 | 5.56 | 2.41 |
+| every tile but the last | 2,568 | 1.35 | 2.10 | 1.08 | 3.29 | 2.38 |
+| the last tile (the thumbnail) | 480 | 1.53 | 1.87 | 1.78 | 6.62 | 5.00 |
+
+**A tile's own border is enriched even when it is an interior edge of the picture** (1.35 on
+the non-thumbnail tiles) and every tile has its own lit top-left patch (3.29). The effect
+tracks the boundary of what the encoder was handed, not the boundary of the photograph.
+That is an independent confirmation of A10 from the other direction: A10 moves the content
+within a fixed encoder input, tiling moves the encoder input around fixed content, and both
+say the mark belongs to the encoder's grid.
+
+## 8. What this changes
+
+Against the outcomes written down before the run, this is the fourth: **ring without the
+upper-left peak — two mechanisms, not one, and the paper must split the claim.**
+
+1. **"Attention concentrates on the outer ring of the patch grid" is not a VLM-wide
+   statement.** It is strong on Qwen3-VL and InternVL-3.5 (1.54, 1.67) and weak on
+   LLaVA-1.5 (1.29, and below 1.0 on two image types). Scope it to the two.
+2. **The raster-order signature IS VLM-wide, and its direction is not.** All three put
+   several times their share on one end of the token sequence; Qwen3-VL and InternVL pick
+   the first token, LLaVA-1.5 the last. Any claim about "the top row" is a claim about a
+   family.
+3. **The mechanism differs by family, and A9 is the only arm that shows it.** Encoder stamp
+   in two of three, language-model position in the third. A paper that reports the border
+   effect without A9 would attribute all three to the same cause.
+4. **A10 is worth its cost.** It rules out content in every family, in one cheap arm, and
+   with the tiling result it pins the effect to the encoder's input grid.
+5. **For this project's reward**: nothing changes about Qwen3-VL — §16 and §17 reproduce
+   bit for bit — but the reason `--overlap_rect_frac` was fighting a lit corner is now
+   known to be an **encoder-architecture** property rather than a VLM one. A reward built
+   on `mean_in` would meet a differently-shaped, and on LLaVA-1.5 a weaker and inverted,
+   obstacle.
+
+## 9. Caveats
+
+- **One checkpoint per family.** InternVL3.5-8B is the flagship post-RL release, not the
+  SFT-only `-Instruct`; the cross-family contrast is about architecture, but a
+  checkpoint-level contribution is not excluded.
+- **LLaVA-1.5's grid covers a centre crop**, because that is how the model is normally run.
+  Its "ring" is the border of the crop. The bottom-heavy result is not an artefact of that
+  — a centre crop is symmetric top-to-bottom — but its per-type numbers are about a
+  different set of pixels from the other two models'.
+- **Prefill, not generation.** §17.2 measured the prefill readout as ~1.5× the
+  generated-token one on Qwen3-VL. The direction and the ordering survived that there; it
+  has not been re-measured on the other two, and `--max-new-tokens` is what would.
+- **`MAX_IMAGE_SIDE = 512`** still, so LLaVA-1.5 and InternVL both upsample most pictures to
+  their native 336/448. The resolution ladder moves the number and does not reach past 512.
+- **A10's follow-slot is 0.727 on InternVL**, against 0.990 for its own identity control —
+  so roughly a quarter of its pictures do move. The arm is clear in direction and not
+  absolute.
