@@ -42,6 +42,13 @@ border is favoured". The budget is what licenses the wording.
     model(**inputs)                              # one prefill, batch 1
     per_image = scan.result()                    # raw columns -> SL.reduce_image(...)
     scan.uninstall()
+
+WHICH MODEL. Everything below is family-agnostic and reaches the model through
+`vlm_family.py`, which holds the image token, the grid, the decoder's attention class,
+the module that emits the LLM-facing rows and -- the one that will bite you -- the VIEW
+BOX, the part of the picture the patch grid actually covers. `install(model)` picks the
+family off `config.model_type`; the module-level ids below are Qwen3-VL's and are kept
+only so a caller that predates the seam still resolves.
 """
 
 from __future__ import annotations
@@ -52,7 +59,9 @@ import numpy as np
 import torch
 
 import sink_shift as SS
+import vlm_family as VF
 
+QWEN3VL = VF.Qwen3VL()
 IMAGE_TOKEN_ID = SS.IMAGE_TOKEN_ID       # <|image_pad|>
 VISION_START_ID = 151652
 VISION_END_ID = 151653
@@ -77,6 +86,10 @@ Q_SETS = ("text", "generated", "image")
 PRIMARY_Q = "text"
 
 SPANS = ("first", "pre_image", "vision_start", "image", "vision_end", "post_image")
+
+#: The part of a picture the patch grid covers, normalised, when the processor shows the
+#: encoder all of it. See `vlm_family.Family.view_box`.
+FULL_VIEW = (0.0, 0.0, 1.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -355,17 +368,24 @@ def content_stats(image, gh, gw):
 # ---------------------------------------------------------------------------
 # locating the picture in the prompt
 # ---------------------------------------------------------------------------
-def locate_image_runs(input_ids, image_grid_thw):
-    """-> ([run positions per image], [(t, gh, gw) per image]).
+def locate_image_runs(input_ids, inputs, family=None):
+    """-> ([run positions per picture], [(t, gh, gw) per TILE, in column order]).
 
     Deliberately a second implementation of what `SinkShift._locate_images` does for its
     own purposes, in the same way `sink_shift.rect_set` is a second implementation of the
     reward's rectangle -- and `test_sink_location_cpu.py` asserts the two agree on the
     same input. A drifted locator would put every column statistic on the wrong patch and
     nothing downstream would notice.
+
+    The grids come back per TILE rather than per picture. In every family but InternVL
+    with tiling switched on those are the same thing; where they are not, a picture is up
+    to twelve 448px tiles plus a thumbnail, each its own 16x16 grid, and scoring them as
+    one grid would call a tile boundary an interior edge and produce a confident,
+    meaningless number.
     """
+    fam = family or QWEN3VL
     ids = input_ids[0]
-    is_img = ids == IMAGE_TOKEN_ID
+    is_img = ids == fam.image_token_id
     if not bool(is_img.any()):
         return [], []
     pos = torch.nonzero(is_img, as_tuple=True)[0]
@@ -373,31 +393,22 @@ def locate_image_runs(input_ids, image_grid_thw):
     starts = [0] + (brk + 1).tolist()
     ends = (brk + 1).tolist() + [pos.numel()]
     runs = [pos[a:b] for a, b in zip(starts, ends)]
-    if image_grid_thw is None or len(image_grid_thw) != len(runs):
-        raise RuntimeError(
-            f"{len(runs)} image token runs but "
-            f"{0 if image_grid_thw is None else len(image_grid_thw)} grids: refusing to "
-            "guess which picture is which")
-    grids = []
-    for run, thw in zip(runs, image_grid_thw):
-        t, h, w = (int(x) for x in thw)
-        gh, gw = h // 2, w // 2                  # Qwen3-VL merges 2x2 patches into a token
-        if run.numel() != t * gh * gw:
-            raise RuntimeError(
-                f"image run of {run.numel()} tokens against a {t}x{gh}x{gw} grid: the "
-                "patch merge assumption is wrong for this model")
-        grids.append((t, gh, gw))
-    return runs, grids
+    return runs, fam.grids_for(runs, inputs)
 
 
-def span_index(input_ids, runs):
+def span_index(input_ids, runs, family=None):
     """{span name: LongTensor of key positions}. A partition of the prompt.
 
     The picture's share of a row means nothing without the rest of the row beside it, and
     "the rest" is not one thing: the first token, the system prompt, the two vision
     delimiters and the question are four different candidate sinks with four different
     stories. `first` is a subset of `pre_image` and is reported separately.
+
+    LLaVA-1.5 has no delimiter tokens at all -- `<image>` expands in place with nothing
+    around it -- so its `vision_start`/`vision_end` spans come back empty. That is a fact
+    about the model and the budget table prints it as 0.0000 rather than hiding it.
     """
+    fam = family or QWEN3VL
     ids = input_ids[0]
     n = int(ids.numel())
     img = torch.cat(runs) if runs else torch.zeros(0, dtype=torch.long, device=ids.device)
@@ -405,8 +416,8 @@ def span_index(input_ids, runs):
     hi = int(img.max()) + 1 if img.numel() else n
     dev = ids.device
     ar = torch.arange(n, device=dev)
-    vs = torch.nonzero(ids == VISION_START_ID, as_tuple=True)[0]
-    ve = torch.nonzero(ids == VISION_END_ID, as_tuple=True)[0]
+    vs = _ids_at(ids, fam.vision_start_ids)
+    ve = _ids_at(ids, fam.vision_end_ids)
     is_img = torch.zeros(n, dtype=torch.bool, device=dev)
     is_img[img] = True
     special = is_img.clone()
@@ -420,6 +431,16 @@ def span_index(input_ids, runs):
         "vision_end": ve,
         "post_image": ar[(ar >= hi) & ~special],
     }
+
+
+def _ids_at(ids, wanted):
+    """Positions of any of `wanted` token ids. An empty `wanted` gives an empty span."""
+    if not wanted:
+        return torch.zeros(0, dtype=torch.long, device=ids.device)
+    hit = torch.zeros_like(ids, dtype=torch.bool)
+    for i in wanted:
+        hit |= ids == int(i)
+    return torch.nonzero(hit, as_tuple=True)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -438,8 +459,9 @@ class SinkScan:
     forward.
     """
 
-    def __init__(self, model, want_key_stats=True, q_sets=Q_SETS):
+    def __init__(self, model, want_key_stats=True, q_sets=Q_SETS, family=None):
         self.model = model
+        self.family = family or QWEN3VL
         self.want_key_stats = bool(want_key_stats)
         self.q_sets = tuple(q_sets)
         # `paused` lets the caller generate at full speed through the fused kernel and then
@@ -560,14 +582,14 @@ class SinkScan:
         return out
 
     # -- per-prompt layout ------------------------------------------------
-    def _locate(self, input_ids, image_grid_thw):
-        runs, grids = locate_image_runs(input_ids, image_grid_thw)
+    def _locate(self, input_ids, inputs):
+        runs, grids = locate_image_runs(input_ids, inputs, self.family)
         if not runs:
             self.img_cols = None
             return False
         self.runs, self.grids = runs, grids
         self.img_cols = torch.cat(runs).to(input_ids.device)
-        self.spans = span_index(input_ids, runs)
+        self.spans = span_index(input_ids, runs, self.family)
         self.prompt_len = int(self.prompt_len_override or input_ids.shape[1])
         self.reset()
         return True
@@ -582,8 +604,8 @@ class SinkScan:
             raise RuntimeError(
                 f"batch of {ids.shape[0]}: sink_location locates the picture per prompt "
                 "and is only correct at batch size 1")
-        if bool((ids == IMAGE_TOKEN_ID).any()):
-            self._locate(ids, kwargs.get("image_grid_thw"))
+        if bool((ids == self.family.image_token_id).any()):
+            self._locate(ids, kwargs)
         return None
 
     # -- install ----------------------------------------------------------
@@ -595,7 +617,7 @@ class SinkScan:
         self._prev_impl = cfg._attn_implementation
         cfg._attn_implementation = IMPL_NAME
         for m in self.model.modules():
-            if type(m).__name__ == "Qwen3VLTextAttention" and hasattr(m, "layer_idx"):
+            if type(m).__name__ in self.family.attn_classes and hasattr(m, "layer_idx"):
                 m.config._attn_implementation = IMPL_NAME
         self._handles.append(self.model.register_forward_pre_hook(self._pre_hook,
                                                                   with_kwargs=True))
@@ -608,13 +630,13 @@ class SinkScan:
         if self._text_cfg is not None and self._prev_impl is not None:
             self._text_cfg._attn_implementation = self._prev_impl
             for m in self.model.modules():
-                if type(m).__name__ == "Qwen3VLTextAttention":
+                if type(m).__name__ in self.family.attn_classes:
                     m.config._attn_implementation = self._prev_impl
         self._prev_impl = None
 
 
-def install(model, **kwargs):
-    return SinkScan(model, **kwargs).install()
+def install(model, family=None, **kwargs):
+    return SinkScan(model, family=family or VF.family_for(model), **kwargs).install()
 
 
 def _make_scan_attention(state: SinkScan):
@@ -707,16 +729,14 @@ class PatchPermute:
     span, and silently mixing two pictures' patches is a different experiment.
     """
 
-    def __init__(self, model, mode="shuffle", seed=0):
+    def __init__(self, model, mode="shuffle", seed=0, family=None):
         self.model, self.mode, self.seed = model, mode, seed
+        self.family = family or VF.family_for(model)
         self.perm = None
         self._handles = []
 
     def _visual(self):
-        for m in self.model.modules():
-            if type(m).__name__ in ("Qwen3VLVisionModel", "Qwen3VLVisionTransformerPretrainedModel"):
-                return m
-        raise RuntimeError("no Qwen3-VL vision tower found on this model")
+        return self.family.row_module(self.model)
 
     def _permutation(self, n, device):
         g = torch.Generator(device="cpu").manual_seed(int(self.seed))
@@ -731,16 +751,9 @@ class PatchPermute:
         return p.to(device)
 
     def _hook(self, module, args, out):
-        pool = getattr(out, "pooler_output", None)
-        if pool is None or not torch.is_tensor(pool):
-            return out
-        n = pool.shape[0]
-        self.perm = self._permutation(n, pool.device)
-        out.pooler_output = pool[self.perm]
-        feats = getattr(out, "deepstack_features", None)
-        if feats:
-            out.deepstack_features = [f[self.perm] for f in feats]
-        return out
+        got, perm = self.family.permute_rows(out, self._permutation)
+        self.perm = perm
+        return got
 
     def install(self):
         self._handles.append(self._visual().register_forward_hook(self._hook))
@@ -758,28 +771,28 @@ class VisionTap:
     M1: if border patches are norm outliers HERE -- before a single text token exists --
     then the sink was decided by the encoder and the language model inherited it. The
     three deepstack features are kept too, because those are injected into the LLM's early
-    layers and are a second way the encoder can plant one.
+    layers and are a second way the encoder can plant one. Only Qwen3-VL has them; the
+    other two families run a single projector, which is one fewer place a mark can be
+    planted and makes any difference in the result interpretable.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, family=None):
         self.model = model
+        self.family = family or VF.family_for(model)
         self.norms = None
         self.deepstack_norms = None
         self._handles = []
 
     def _hook(self, module, args, out):
-        pool = getattr(out, "pooler_output", None)
-        if torch.is_tensor(pool):
-            self.norms = pool.detach().float().norm(dim=-1).cpu().numpy()
-        feats = getattr(out, "deepstack_features", None)
-        if feats:
-            self.deepstack_norms = [f.detach().float().norm(dim=-1).cpu().numpy()
-                                    for f in feats]
+        got = self.family.row_norms(out)
+        if got is not None:
+            self.norms = got
+        self.deepstack_norms = self.family.deepstack_norms(out)
         return out
 
     def install(self):
-        vis = PatchPermute(self.model)._visual()
-        self._handles.append(vis.register_forward_hook(self._hook))
+        self._handles.append(
+            self.family.row_module(self.model).register_forward_hook(self._hook))
         return self
 
     def uninstall(self):
@@ -929,11 +942,26 @@ ARMS = (
     "res256", "res384",                             # A7  the resolution ladder
 )
 #: Arms handled outside `transform()`: A6 needs a second picture in the prompt, A8 needs a
-#: different question, A9 is an embedding permutation. The probe owns those three.
-SPECIAL_ARMS = ("two_images", "prompt_swap", "permute", "permute_identity")
+#: different question, A9 is an embedding permutation, A10 needs the grid to cut the
+#: picture on, and `tiled` needs a different processor setting. The probe owns those.
+SPECIAL_ARMS = ("two_images", "prompt_swap", "permute", "permute_identity",
+                "permute_pixels", "permute_pixels_identity", "tiled")
+
+#: What `--arms` runs when it is not given one. `tiled` is left out on purpose: it is
+#: InternVL-only, it costs one forward per tile, and it answers a different question --
+#: whether the ring tracks the ENCODER'S INPUT BOUNDARY rather than the picture -- which
+#: deserves to be asked deliberately.
+DEFAULT_ARMS = ARMS + ("two_images", "prompt_swap", "permute", "permute_identity",
+                       "permute_pixels", "permute_pixels_identity")
+
+#: An arm whose baseline is not `identity`. A10 has to resize the picture so the grid
+#: divides it exactly before it can shuffle whole cells, and that resize is not free, so
+#: its control is the SAME resize with the identity permutation. Pairing it against
+#: `identity` would price the resize as part of the result.
+ARM_BASELINE = {"permute_pixels": "permute_pixels_identity"}
 
 
-def patch_correspondence(inv, gh, gw, gh0, gw0):
+def patch_correspondence(inv, gh, gw, gh0, gw0, view=FULL_VIEW, view0=FULL_VIEW):
     """For each patch of the transformed grid, the baseline patch it shows. -> [gh*gw] int.
 
     -1 where the output shows something the input never had. This is the only thing that
@@ -941,17 +969,29 @@ def patch_correspondence(inv, gh, gw, gh0, gw0):
     dangerous piece of arithmetic in the experiment: an off-by-one here decodes the wrong
     coordinate frame and answers the question confidently and wrongly. `--stage selftest`
     checks it against a picture with one bright patch at a known place.
+
+    THREE FRAMES, NOT TWO. A patch is a cell of the grid; `inv` speaks in normalised
+    PICTURE coordinates; and the grid only covers the picture where the processor hands
+    the whole thing to the encoder. LLaVA-1.5's does not -- it resizes the short side and
+    centre-crops -- so `view` and `view0` are the sub-rectangles the two grids cover, and
+    the walk is grid -> picture -> (inv) -> baseline picture -> baseline grid. Both
+    default to the whole picture, which is what Qwen3-VL and InternVL do and what every
+    published number was computed under.
     """
+    u0v, v0v, u1v, v1v = view
+    u0b, v0b, u1b, v1b = view0
+    dw, dh = (u1v - u0v), (v1v - v0v)
+    bw, bh = (u1b - u0b), (v1b - v0b)
     out = np.full(gh * gw, -1, dtype=np.int64)
     for r in range(gh):
         for c in range(gw):
-            p = inv(((c + 0.5) / gw, (r + 0.5) / gh))
+            p = inv((u0v + ((c + 0.5) / gw) * dw, v0v + ((r + 0.5) / gh) * dh))
             if p is None:
                 continue
             u0, v0 = p
-            if not (0.0 <= u0 < 1.0 and 0.0 <= v0 < 1.0):
+            if not (u0b <= u0 < u1b and v0b <= v0 < v1b):
                 continue
-            r0 = min(gh0 - 1, max(0, int(v0 * gh0)))
-            c0 = min(gw0 - 1, max(0, int(u0 * gw0)))
+            r0 = min(gh0 - 1, max(0, int((v0 - v0b) / bh * gh0)))
+            c0 = min(gw0 - 1, max(0, int((u0 - u0b) / bw * gw0)))
             out[r * gw + c] = r0 * gw0 + c0
     return out

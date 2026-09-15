@@ -90,10 +90,14 @@ IV = _load_module("_sl_intervene", "intervene_probe.py")
 sys.path.insert(0, str(REPO))
 import sink_location as SL  # noqa: E402
 import sink_shift as SS  # noqa: E402
+import vlm_family as VF  # noqa: E402
 
 # The pair the reward trained, kept as a named cell so every table can carry the
-# "and what does it say at the cell the whole project is built on" column.
+# "and what does it say at the cell the whole project is built on" column. It is a fact
+# about Qwen3-VL-8B and about this project's reward; on any other family the same two
+# indices name two arbitrary heads, so the report prints that block only for `qwen3_vl`.
 TRAINED_LAYER, TRAINED_HEADS = 22, (28, 31)
+TRAINED_FAMILY = "qwen3_vl"
 
 DEV_FRAC = 0.25          # share of each type reserved for choosing heads
 
@@ -334,20 +338,26 @@ def read_manifest(out_dir, types=None):
 # ---------------------------------------------------------------------------
 # one measured picture
 # ---------------------------------------------------------------------------
-def build_inputs(processor, images, question, device):
-    """The prompt this project always uses, at batch size 1, with one or two pictures."""
-    if len(images) == 1:
-        text = PROBE.build_prompt(processor, question)
-    else:
-        content = [{"type": "image"} for _ in images]
-        content.append({"type": "text", "text": question})
-        text = processor.apply_chat_template(
-            [{"role": "system", "content": PROBE.SYSTEM_PROMPT},
-             {"role": "user", "content": content}],
-            tokenize=False, add_generation_prompt=True)
-    return processor(text=[text], images=[list(images)], return_tensors="pt",
-                     padding=True, padding_side="left",
-                     add_special_tokens=False).to(device)
+def load_family(model, processor, system_prompt="auto"):
+    """The adapter for this model, with the system prompt the run asked for.
+
+    `auto` means the family's own preference: Qwen3-VL gets the project's trainer prompt,
+    so `docs/sink-location-by-image-type.md` §16-17 reproduce, and the other two get
+    none, because putting a `<think>` system prompt in front of LLaVA-1.5 would measure
+    an off-distribution model. `none` puts every family on the same footing, which is
+    what the cross-model tables are run under.
+    """
+    fam = VF.family_for(model, processor)
+    if system_prompt == "project" or (system_prompt == "auto" and fam.uses_project_prompt):
+        fam.system_prompt = PROBE.SYSTEM_PROMPT
+    elif system_prompt not in ("auto", "none"):
+        fam.system_prompt = system_prompt
+    return fam
+
+
+def build_inputs(fam, processor, images, question, device, **kw):
+    """The prompt, at batch size 1, with one or two pictures, in the family's template."""
+    return fam.build_inputs(processor, images, question, device, **kw)
 
 
 def generate_then_teacher_force(model, processor, images, question, device, scan,
@@ -364,7 +374,7 @@ def generate_then_teacher_force(model, processor, images, question, device, scan
     """
     import torch
 
-    inputs = build_inputs(processor, images, question, device)
+    inputs = build_inputs(scan.family, processor, images, question, device)
     prompt_len = int(inputs["input_ids"].shape[1])
     scan.paused = True
     try:
@@ -381,12 +391,17 @@ def generate_then_teacher_force(model, processor, images, question, device, scan
 
 
 def measure(model, processor, images, question, device, scan, tap=None,
-            want_hidden=True, max_new_tokens=0):
+            want_hidden=True, max_new_tokens=0, tile=0, **proc_kwargs):
     """One prefill. -> the reduced cells, the maps, the norms, and the geometry.
 
     Everything this experiment reads comes out of this single forward: the column view at
     every layer and head, the span budget, the key statistics, the LLM's hidden-state
     norms and the vision tower's own patch norms. Nothing is generated.
+
+    `tile` picks which of the picture's grids to score. It is 0 everywhere except in
+    InternVL's tiled arm, where one picture becomes several 448px tiles plus a thumbnail
+    and each is its own 16x16 grid: scoring them as one grid would call a tile boundary
+    an interior edge of the picture and a border of the tile at the same time.
     """
     import torch
 
@@ -395,11 +410,12 @@ def measure(model, processor, images, question, device, scan, tap=None,
         gen = generate_then_teacher_force(model, processor, images, question, device,
                                           scan, max_new_tokens)
     if gen is None:
-        inputs = build_inputs(processor, images, question, device)
+        inputs = build_inputs(scan.family, processor, images, question, device,
+                              **proc_kwargs)
         case, scan.prompt_len_override = inputs, None
     else:
         inputs, prompt_len, comp = gen
-        case = PROBE.teacher_forced_case(inputs, comp, device)
+        case = scan.family.teacher_forced_case(inputs, comp, device)
         scan.prompt_len_override = prompt_len
     scan.reset()
     try:
@@ -410,24 +426,27 @@ def measure(model, processor, images, question, device, scan, tap=None,
     res = scan.result()
     if res is None or not res["grids"]:
         return None
-    t, gh, gw = res["grids"][0]
-    if t != 1 or len(res["grids"]) > 1:
-        # Two pictures share one column axis, so a single grid cannot describe them. The
-        # two-image arm reads only the FIRST picture's block, which is sliced below.
-        pass
-
+    if tile >= len(res["grids"]):
+        return None
+    # Every grid shares one column axis -- two pictures, or one picture's tiles, are laid
+    # out end to end -- so the block being scored is an offset and a length, not a slice
+    # from zero. `lo` is 0 for the single-grid case, which is every family's default.
+    sizes = [t * gh * gw for t, gh, gw in res["grids"]]
+    lo = int(sum(sizes[:tile]))
+    t, gh, gw = res["grids"][tile]
     n_first = gh * gw
-    got = {"grid": [gh, gw], "kv_len": res["kv_len"], "n_images": len(res["grids"]),
-           "n_image_tokens": res["n_image_tokens"]}
+    cut = lambda a: None if a is None else a[..., lo:lo + n_first]   # noqa: E731
+
+    got = {"grid": [gh, gw], "kv_len": res["kv_len"], "n_grids": len(res["grids"]),
+           "tile": int(tile), "n_image_tokens": res["n_image_tokens"]}
     prim = res[SL.PRIMARY_Q]
     stats, peak = SL.reduce_cells(
-        prim["col_sum"][..., :n_first], None if prim["col_sq"] is None
-        else prim["col_sq"][..., :n_first], prim["n_rows"], prim["row_total"], gh, gw,
-        res["kv_len"],
-        knorm=None if res["knorm"] is None else res["knorm"][..., :n_first],
-        logit_sum=None if res["logit_sum"] is None else res["logit_sum"][..., :n_first],
+        cut(prim["col_sum"]), cut(prim["col_sq"]), prim["n_rows"], prim["row_total"],
+        gh, gw, res["kv_len"],
+        knorm=cut(res["knorm"]), logit_sum=cut(res["logit_sum"]),
         scaling=res["scaling"], seed=0,
-        col_null=None if prim["col_null"] is None else prim["col_null"][:n_first])
+        col_null=None if prim["col_null"] is None
+        else prim["col_null"][lo:lo + n_first])
     got["stats"], got["peak"] = stats, peak
 
     sec = res.get("image")
@@ -443,18 +462,18 @@ def measure(model, processor, images, question, device, scan, tap=None,
     gq = res.get("generated")
     if gq is not None and gq["n_rows"] > 0:
         got["n_generated"] = int(gq["n_rows"])
-        sg, pg = SL.reduce_cells(gq["col_sum"][..., :n_first], None, gq["n_rows"],
+        sg, pg = SL.reduce_cells(cut(gq["col_sum"]), None, gq["n_rows"],
                                  gq["row_total"], gh, gw, res["kv_len"])
         got["stats_gen"], got["peak_gen"] = sg, pg
         sa, pa = SL.reduce_cells(
-            prim["col_sum"][..., :n_first] + gq["col_sum"][..., :n_first], None,
+            cut(prim["col_sum"]) + cut(gq["col_sum"]), None,
             prim["n_rows"] + gq["n_rows"], prim["row_total"] + gq["row_total"],
             gh, gw, res["kv_len"])
         got["stats_all"], got["peak_all"] = sa, pa
 
     # the layer-mean map, which is what the per-patch regression and the radial profiles
     # are fitted on. Head-mean per layer: 36 x N floats, not 36 x 32 x N.
-    mean = prim["col_sum"][..., :n_first].mean(1)
+    mean = cut(prim["col_sum"]).mean(1)
     got["maps"] = mean / np.maximum(mean.sum(-1, keepdims=True), 1e-30)
 
     if res["spans"] is not None:
@@ -462,7 +481,7 @@ def measure(model, processor, images, question, device, scan, tap=None,
         got["spans"] = np.stack([res["spans"][s] / denom for s in SL.SPANS], axis=-1)
 
     if want_hidden and getattr(out, "hidden_states", None) is not None:
-        cols = scan.img_cols[:n_first]
+        cols = scan.img_cols[lo:lo + n_first]
         ring = SL.ring_set(gh, gw).reshape(-1)
         rows = []
         for h in out.hidden_states:
@@ -471,7 +490,7 @@ def measure(model, processor, images, question, device, scan, tap=None,
                          float(np.argmax(nrm))])
         got["hnorm"] = np.asarray(rows, dtype=np.float32)
     if tap is not None and tap.norms is not None:
-        nrm = tap.norms[:n_first]
+        nrm = tap.norms[lo:lo + n_first]
         ring = SL.ring_set(gh, gw).reshape(-1)
         got["vnorm"] = np.asarray([nrm[ring].mean(), nrm[~ring].mean(), nrm.max(),
                                    float(np.argmax(nrm))], dtype=np.float32)
@@ -567,8 +586,14 @@ def arrays_of(got):
     return {k: np.asarray(got[k]) for k in keep if got.get(k) is not None}
 
 
-def meta_of(got, row, extra=None):
-    """The JSONL line: everything the report needs before it opens an npz."""
+def meta_of(got, row, extra=None, fam=None):
+    """The JSONL line: everything the report needs before it opens an npz.
+
+    `family` and `view` are here because the same corpus is now measured by three models
+    with three geometries. Without them a mixed output directory would pool a 24x24
+    centre crop with a 16x16 squash and a per-picture native grid, and every enrichment
+    would still look like a number.
+    """
     gh, gw = got["grid"]
     st = got["stats"]
     trained = st[TRAINED_LAYER, list(TRAINED_HEADS)].mean(0) if st.shape[0] > TRAINED_LAYER \
@@ -578,6 +603,9 @@ def meta_of(got, row, extra=None):
         "dev": bool(row.get("dev")), "grid": [gh, gw], "size": row.get("size"),
         "ring_area_frac": SL.ring_area_frac(gh, gw),
         "n_image_tokens": got["n_image_tokens"], "kv_len": got["kv_len"],
+        "family": None if fam is None else fam.name,
+        "view": list(got.get("view", SL.FULL_VIEW)),
+        "tile": got.get("tile", 0), "n_grids": got.get("n_grids", 1),
         "trained_cell": {n: _f(trained[i]) for i, n in enumerate(SL.STAT_NAMES)},
     }
     return dict(m, **(extra or {}))
@@ -610,8 +638,12 @@ def stage_scan(args):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     processor, model = PROBE.load_model(args.model, args.adapter, device, "sdpa")
-    scan = SL.install(model, want_key_stats=not args.no_key_stats)
-    tap = SL.VisionTap(model).install()
+    fam = load_family(model, processor, args.system_prompt)
+    print(f"[scan] family={fam.name}  system prompt="
+          f"{'(none)' if not fam.system_prompt else fam.system_prompt[:40] + '...'}",
+          flush=True)
+    scan = SL.install(model, family=fam, want_key_stats=not args.no_key_stats)
+    tap = SL.VisionTap(model, family=fam).install()
     try:
         from PIL import Image
         for r in todo:
@@ -624,9 +656,15 @@ def stage_scan(args):
                 prog.tick()
                 continue
             gh, gw = got["grid"]
-            cs = SL.content_stats(im, gh, gw)
+            # The covariates are read on the region the ENCODER saw. Handing them the
+            # whole picture where the processor centre-cropped it would line every
+            # covariate up against the wrong patch, silently, in the one table that puts
+            # "border" and "background" in the same units.
+            got["view"] = fam.view_box(im)
+            cs = SL.content_stats(VF.view_crop(im, got["view"]), gh, gw)
             got["content"] = np.stack([cs[k] for k in CONTENT_KEYS])
-            sink.write(r["key"], meta_of(got, r, {"n_generated": got.get("n_generated")}),
+            sink.write(r["key"],
+                       meta_of(got, r, {"n_generated": got.get("n_generated")}, fam),
                        dict(arrays_of(got), content=got["content"]))
             prog.tick()
     finally:
@@ -668,20 +706,23 @@ def stage_arms(args):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     processor, model = PROBE.load_model(args.model, args.adapter, device, "sdpa")
-    scan = SL.install(model, want_key_stats=False)
+    fam = load_family(model, processor, args.system_prompt)
+    print(f"[arms] family={fam.name}", flush=True)
+    scan = SL.install(model, family=fam, want_key_stats=False)
     partners = _partner_images(chosen)
     try:
         for r, arm in units:
             im = Image.open(r["path"]).convert("RGB")
-            got, extra = _run_arm(model, processor, im, r, arm, device, scan, partners,
-                                  args)
-            if got is None:
-                print(f"[arms] {r['key']}|{arm}: {extra.get('skipped', 'no picture')}",
-                      flush=True)
-                prog.tick()
-                continue
-            sink.write(f"{r['key']}|{arm}",
-                       meta_of(got, r, dict(extra, arm=arm)), arrays_of(got))
+            out = _run_arm(model, processor, im, r, arm, device, scan, partners, args,
+                           fam)
+            for got, extra, suffix in out:
+                if got is None:
+                    print(f"[arms] {r['key']}|{arm}: "
+                          f"{extra.get('skipped', 'no picture')}", flush=True)
+                    continue
+                got.setdefault("view", fam.view_box(im))
+                sink.write(f"{r['key']}|{arm}{suffix}",
+                           meta_of(got, r, dict(extra, arm=arm), fam), arrays_of(got))
             prog.tick()
     finally:
         sink.close()
@@ -713,60 +754,119 @@ def _partner_images(rows):
     return out
 
 
-def _run_arm(model, processor, im, row, arm, device, scan, partners, args):
-    """One (picture, arm) measurement, plus whatever the arm needs the report to know."""
+def _run_arm(model, processor, im, row, arm, device, scan, partners, args, fam):
+    """One (picture, arm) measurement. -> [(got, extra, unit suffix)].
+
+    A list because InternVL's `tiled` arm produces one measurement per tile and every
+    other arm produces exactly one. The suffix is what keeps those apart in the unit key,
+    and therefore in the resume set.
+    """
     from PIL import Image
 
     if arm in ("permute", "permute_identity"):
         mode = "shuffle" if arm == "permute" else "identity"
-        perm = SL.PatchPermute(model, mode=mode, seed=args.seed).install()
+        perm = SL.PatchPermute(model, mode=mode, seed=args.seed, family=fam).install()
         try:
             got = measure(model, processor, [im], row["question"], device, scan,
                           want_hidden=False)
         finally:
             perm.uninstall()
         if got is None:
-            return None, {}
+            return [(None, {}, "")]
         got["perm"] = (None if perm.perm is None
                        else perm.perm.detach().cpu().numpy().astype(np.int32))
-        return got, {"perm_mode": mode}
+        return [(got, {"perm_mode": mode}, "")]
+
+    if arm in ("permute_pixels", "permute_pixels_identity"):
+        # A10. The encoder's OWN position embeddings are the one thing A9 cannot rule
+        # out: A9 shuffles the rows the encoder emitted, so the stamp travels with the
+        # token either way. This shuffles the PIXELS of each grid cell before the encoder
+        # runs, so if the attractor appears at whatever content now sits at the top-left
+        # of the ViT grid, the encoder's position embedding is writing it.
+        mode = "shuffle" if arm == "permute_pixels" else "identity"
+        grid = fam.grid_of(processor, VF.view_crop(im, fam.view_box(im)))
+        src = VF.view_crop(im, fam.view_box(im))
+        tim, perm = VF.block_permute(src, grid, seed=args.seed, mode=mode)
+        got = measure(model, processor, [tim], row["question"], device, scan,
+                      want_hidden=False)
+        if got is None:
+            return [(None, {}, "")]
+        if tuple(got["grid"]) != tuple(grid):
+            # The blocks were cut on a grid the processor then did not choose, so the
+            # permutation does not describe what the encoder saw. Refuse rather than
+            # report a correspondence for a different picture.
+            return [(None, {"skipped": f"grid moved {grid} -> {tuple(got['grid'])}"}, "")]
+        got["perm"] = np.asarray(perm, dtype=np.int32)
+        got["view"] = SL.FULL_VIEW          # the cell-aligned crop IS the whole picture
+        return [(got, {"perm_mode": mode, "block_grid": list(grid)}, "")]
+
+    if arm == "tiled":
+        # InternVL only: the same picture with its dynamic tiling switched back on, so a
+        # picture becomes up to 12 tiles of 448px plus a thumbnail, each its own 16x16
+        # grid. Scored PER TILE, because "the outer ring" of a tile is an interior edge
+        # of the picture and conflating the two produces a confident, meaningless number.
+        if fam.name != "internvl":
+            return [(None, {"skipped": f"tiling is not a thing on {fam.name}"}, "")]
+        out = []
+        for k in range(args.max_tiles):
+            got = measure(model, processor, [im], row["question"], device, scan,
+                          want_hidden=False, tile=k, crop_to_patches=True)
+            if got is None:
+                break
+            out.append((got, {"tile_of": got["n_grids"]}, f"#{k}"))
+        return out or [(None, {"skipped": "no tile located"}, "")]
 
     if arm == "two_images":
         partner = partners.get(row["key"])
         if partner is None:
-            return None, {"skipped": "no partner picture"}
+            return [(None, {"skipped": "no partner picture"}, "")]
         other = Image.open(partner["path"]).convert("RGB")
         got = measure(model, processor, [im, other], row["question"], device, scan,
                       want_hidden=False)
-        return got, {"partner": partner["key"], "partner_type": partner["type"]}
+        return [(got, {"partner": partner["key"],
+                       "partner_type": partner["type"]}, "")]
 
     if arm == "prompt_swap":
         q = PROMPT_SWAPS[abs(hash(row["key"])) % len(PROMPT_SWAPS)]
         got = measure(model, processor, [im], q, device, scan, want_hidden=False)
-        return got, {"question_used": q}
+        return [(got, {"question_used": q}, "")]
 
-    tim, inv, tmeta = SL.transform(arm, im)
+    px = fam.patch_px(im)
+    tim, inv, tmeta = SL.transform(arm, im, patch_px=px)
+    tmeta = dict(tmeta, patch_px=px)
     if tim is None:
-        return None, tmeta
+        return [(None, tmeta, "")]
     got = measure(model, processor, [tim], row["question"], device, scan,
                   want_hidden=False)
     if got is None:
-        return None, tmeta
-    return got, dict(tmeta, transform=arm)
+        return [(None, tmeta, "")]
+    got["view"] = fam.view_box(tim)
+    return [(got, dict(tmeta, transform=arm), "")]
 
 
 # ---------------------------------------------------------------------------
 # stage: selftest
 # ---------------------------------------------------------------------------
-def bright_patch_image(size, grid, where):
-    """A flat dark field with one bright square, at a KNOWN patch of a known grid."""
+def bright_patch_image(size, grid, where, view=SL.FULL_VIEW):
+    """A flat dark field with one bright square, at a KNOWN patch of a known grid.
+
+    `view` is the part of the picture the grid covers. On LLaVA-1.5 the processor
+    centre-crops, so a marker painted at cell (r, c) of the PICTURE would land at a
+    different cell of the GRID -- which is the off-by-one this check exists to find, and
+    would find in the wrong place.
+    """
     from PIL import Image
 
     W, H = size
     gh, gw = grid
     r, c = where
+    u0, v0, u1, v1 = view
+    x0 = int(W * (u0 + c * (u1 - u0) / gw))
+    x1 = max(x0 + 1, int(W * (u0 + (c + 1) * (u1 - u0) / gw)))
+    y0 = int(H * (v0 + r * (v1 - v0) / gh))
+    y1 = max(y0 + 1, int(H * (v0 + (r + 1) * (v1 - v0) / gh)))
     a = np.full((H, W, 3), 40, dtype=np.uint8)
-    a[int(H * r / gh):int(H * (r + 1) / gh), int(W * c / gw):int(W * (c + 1) / gw)] = 240
+    a[y0:y1, x0:x1] = 240
     return Image.fromarray(a, "RGB")
 
 
@@ -778,7 +878,7 @@ def _within(flat_idx, gh, gw, radius):
     return (np.maximum(rr, cc) <= radius).reshape(-1)
 
 
-def content_response(image, blank, gh, gw):
+def content_response(image, blank, gh, gw, view=SL.FULL_VIEW):
     """Edge energy of the probe minus edge energy of the SAME transform on a flat field.
 
     Brightness will not do. `pad_white` paints a border brighter than the marker, `canvas`
@@ -786,12 +886,16 @@ def content_response(image, blank, gh, gw):
     grey levels while telling us nothing about where the marker went. Differencing
     against the transform's own blank cancels every edge the transform itself introduced
     and leaves only the marker.
+
+    Read on the region the encoder sees, not on the picture: outside the view there is no
+    patch for the energy to land in.
     """
-    return (SL.content_stats(image, gh, gw)["edge"]
-            - SL.content_stats(blank, gh, gw)["edge"])
+    a, b = VF.view_crop(image, view), VF.view_crop(blank, view)
+    return SL.content_stats(a, gh, gw)["edge"] - SL.content_stats(b, gh, gw)["edge"]
 
 
-def frame_check(grid_fn, size, tol=1, min_response=1e-3, ratio=3.0):
+def frame_check(grid_fn, size, view_fn=None, patch_px=32, tol=1, min_response=1e-3,
+                ratio=3.0):
     """Every transform's pixel->patch mapping, against a picture with one marked patch.
 
     The check runs BACKWARDS, which is the only way one probe picture can serve every
@@ -814,15 +918,18 @@ def frame_check(grid_fn, size, tol=1, min_response=1e-3, ratio=3.0):
     """
     from PIL import Image
 
+    view_fn = view_fn or (lambda im: SL.FULL_VIEW)
     failures, checked = [], 0
     flat = Image.new("RGB", size, (40, 40, 40))
     gh0, gw0 = grid_fn(flat)
+    view0 = view_fn(flat)
     for arm in SL.ARMS:
-        blank, inv, _meta = SL.transform(arm, flat)
+        blank, inv, _meta = SL.transform(arm, flat, patch_px=patch_px)
         if blank is None:
             continue
         gh, gw = grid_fn(blank)
-        corr = SL.patch_correspondence(inv, gh, gw, gh0, gw0)
+        view = view_fn(blank)
+        corr = SL.patch_correspondence(inv, gh, gw, gh0, gw0, view, view0)
         order = sorted(range(gh * gw),
                        key=lambda i: abs(i // gw - (gh - 1) / 2) + abs(i % gw - (gw - 1) / 2))
         checked += 1
@@ -830,8 +937,9 @@ def frame_check(grid_fn, size, tol=1, min_response=1e-3, ratio=3.0):
             if corr[target] < 0:
                 continue
             base = int(corr[target])
-            probe = bright_patch_image(size, (gh0, gw0), (base // gw0, base % gw0))
-            resp = content_response(SL.transform(arm, probe)[0], blank, gh, gw)
+            probe = bright_patch_image(size, (gh0, gw0), (base // gw0, base % gw0), view0)
+            resp = content_response(SL.transform(arm, probe, patch_px=patch_px)[0],
+                                    blank, gh, gw, view)
             peak = int(np.argmax(resp))
             # "Localised" has to mean localised to a NEIGHBOURHOOD, not to one patch.
             # `zoom60` magnifies the marker by 1/0.6 and `res384` resamples the grid, so
@@ -870,7 +978,12 @@ def stage_selftest(args):
         raise SystemExit("no corpus; run --stage corpus first")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     processor, model = PROBE.load_model(args.model, args.adapter, device, "sdpa")
-    print(f"\nselftest  model={args.model}  {len(rows)} pictures", flush=True)
+    fam = load_family(model, processor, args.system_prompt)
+    print(f"\nselftest  model={args.model}  family={fam.name}  {len(rows)} pictures")
+    print(f"          decoder attention {fam.attn_classes}, rows from "
+          f"{fam.row_classes}, image token {fam.image_token_id}, delimiters "
+          f"{fam.vision_start_ids or '(none)'}/{fam.vision_end_ids or '(none)'}",
+          flush=True)
 
     # 1. the scan edits nothing -----------------------------------------------
     # Not against zero. The scan takes the explicit float32 softmax where the fused kernel
@@ -880,7 +993,7 @@ def stage_selftest(args):
     # and is not under test: the scan has to be no further from the fused kernel than
     # stock unfused attention already is.
     im0 = Image.open(rows[0]["path"]).convert("RGB")
-    inputs = build_inputs(processor, [im0], rows[0]["question"], device)
+    inputs = build_inputs(fam, processor, [im0], rows[0]["question"], device)
 
     def last_logits():
         with torch.no_grad():
@@ -893,9 +1006,9 @@ def stage_selftest(args):
                                   pad_token_id=processor.tokenizer.pad_token_id)[0].tolist()
 
     base_logits, base_ids = last_logits(), greedy_ids()
-    with _attn_impl(model, "eager"):
+    with _attn_impl(model, "eager", fam):
         eager_logits = last_logits()
-    scan = SL.install(model)
+    scan = SL.install(model, family=fam)
     try:
         scan_logits, scan_ids = last_logits(), greedy_ids()
         d_scan = float((scan_logits - base_logits).abs().max())
@@ -928,22 +1041,30 @@ def stage_selftest(args):
         # 3. THE COORDINATE FRAME ---------------------------------------------
         # On the real pictures' own sizes, not a convenient one: the processor rounds the
         # grid, and a size where the rounding is benign proves nothing about the corpus.
+        # Each family needs its OWN frame check: the patch ordering after InternVL's
+        # pixel shuffle, and the centre crop LLaVA's processor takes, are exactly where
+        # this would go quietly wrong.
         bad, checked = [], 0
         for size in sorted({tuple(r["size"]) for r in rows}):
-            f, n = frame_check(lambda im: _grid_of(processor, im, device), size)
+            f, n = frame_check(lambda im: fam.grid_of(processor, im), size,
+                               view_fn=fam.view_box,
+                               patch_px=fam.patch_px(Image.new("RGB", size)))
             bad += [f"{size}:{x}" for x in f]
             checked += n
         check("every transform's pixel->patch mapping decodes where it claims",
               not bad, ", ".join(bad) if bad else f"{checked} (transform, size) pairs")
         probe_im = bright_patch_image(tuple(rows[0]["size"]), (1, 1), (0, 0))
-        pg = _grid_of(processor, probe_im, device)
-        tg90 = _grid_of(processor, SL.transform("rot90", probe_im)[0], device)
-        check("rot90 transposes the grid the processor chooses",
-              tuple(tg90) == (pg[1], pg[0]), f"{pg} -> {tg90}")
+        pg = fam.grid_of(processor, probe_im)
+        tg90 = fam.grid_of(processor, SL.transform("rot90", probe_im)[0])
+        want90 = (pg[1], pg[0]) if fam.fixed_grid is None else tuple(pg)
+        check("rot90 does to the grid what this family's processor does",
+              tuple(tg90) == want90,
+              f"{pg} -> {tg90}" + ("  (fixed grid: it cannot transpose)"
+                                   if fam.fixed_grid else ""))
 
         # 4. the permutation is a permutation ---------------------------------
-        tap = SL.VisionTap(model)
-        perm = SL.PatchPermute(model, mode="shuffle", seed=7).install()
+        tap = SL.VisionTap(model, family=fam)
+        perm = SL.PatchPermute(model, mode="shuffle", seed=7, family=fam).install()
         tap.install()                      # registered second, so it sees the permuted rows
         try:
             measure(model, processor, [im0], rows[0]["question"], device, scan,
@@ -952,7 +1073,7 @@ def stage_selftest(args):
             p = perm.perm.detach().cpu().numpy()
         finally:
             tap.uninstall(); perm.uninstall()
-        tap2 = SL.VisionTap(model).install()
+        tap2 = SL.VisionTap(model, family=fam).install()
         try:
             measure(model, processor, [im0], rows[0]["question"], device, scan,
                     want_hidden=False)
@@ -963,7 +1084,7 @@ def stage_selftest(args):
               np.allclose(np.sort(plain), np.sort(shuffled)) and
               np.allclose(shuffled, plain[p]),
               f"{len(p)} patches")
-        ident = SL.PatchPermute(model, mode="identity").install()
+        ident = SL.PatchPermute(model, mode="identity", family=fam).install()
         try:
             g2 = measure(model, processor, [im0], rows[0]["question"], device, scan,
                          want_hidden=False)
@@ -971,6 +1092,35 @@ def stage_selftest(args):
             ident.uninstall()
         check("permutation mode=identity is the identity",
               np.allclose(g2["maps"], got["maps"], atol=1e-6))
+
+        # 4b. A10 -- the PIXEL-BLOCK permutation, before the encoder -----------
+        # The arm that separates "the mark is in the embedding" from "the encoder's own
+        # position embedding put it there". Its correctness rests on two things: that the
+        # blocks really are a permutation of the picture's cells, and that the grid the
+        # blocks were cut on is the grid the processor then chooses -- otherwise the
+        # correspondence describes a different picture.
+        base_view = fam.view_box(im0)
+        src = VF.view_crop(im0, base_view)
+        grid0 = fam.grid_of(processor, src)
+        p_im, p_perm = VF.block_permute(src, grid0, seed=7)
+        i_im, i_perm = VF.block_permute(src, grid0, mode="identity")
+        check("A10 cuts the picture into whole grid cells and puts them all back",
+              sorted(p_perm.tolist()) == list(range(grid0[0] * grid0[1]))
+              and np.array_equal(i_perm, np.arange(grid0[0] * grid0[1]))
+              and p_im.size == i_im.size,
+              f"{grid0[0]}x{grid0[1]} blocks of {i_im.size[0] // grid0[1]}px")
+        check("A10's pixels are the same pixels, only moved",
+              np.array_equal(np.sort(np.asarray(p_im).reshape(-1)),
+                             np.sort(np.asarray(i_im).reshape(-1))))
+        g10 = measure(model, processor, [p_im], rows[0]["question"], device, scan,
+                      want_hidden=False)
+        g10i = measure(model, processor, [i_im], rows[0]["question"], device, scan,
+                       want_hidden=False)
+        check("A10 keeps the grid the blocks were cut on",
+              g10 is not None and g10i is not None
+              and tuple(g10["grid"]) == tuple(grid0) == tuple(g10i["grid"]),
+              f"cut on {tuple(grid0)}, got "
+              f"{None if g10 is None else tuple(g10['grid'])}")
 
         # 5. the causal column correction -------------------------------------
         cn = scan.column_null("image")
@@ -981,7 +1131,16 @@ def stage_selftest(args):
               scan.column_null("text") is None)
 
         if args.tie_back:
-            ok &= _tie_back(model, processor, rows, device, scan, args)
+            # `sink_shift` is this project's Qwen3-VL edit machinery, and the tie-back
+            # borrows its collector to read a generated chain. On another family the
+            # honest route is --max-new-tokens, which measures the same thing through
+            # this module's own `generated` query set.
+            if fam.name != TRAINED_FAMILY:
+                print("\n  tie-back: skipped -- it reads through sink_shift, which is "
+                      f"{TRAINED_FAMILY} only.\n  Use --max-new-tokens for the "
+                      "generated-token readout on this family.")
+            else:
+                ok &= _tie_back(model, processor, rows, device, scan, args)
     finally:
         scan.uninstall()
 
@@ -997,8 +1156,9 @@ class _attn_impl:
     reference measurement quietly becomes a second measurement of the thing under test.
     """
 
-    def __init__(self, model, impl):
+    def __init__(self, model, impl, family):
         self.model, self.impl, self.prev = model, impl, None
+        self.family = family
 
     def __enter__(self):
         cfg = getattr(self.model.config, "text_config", None) or self.model.config
@@ -1013,15 +1173,8 @@ class _attn_impl:
     def _set(self, impl):
         self.cfg._attn_implementation = impl
         for m in self.model.modules():
-            if type(m).__name__ == "Qwen3VLTextAttention":
+            if type(m).__name__ in self.family.attn_classes:
                 m.config._attn_implementation = impl
-
-
-def _grid_of(processor, image, device):
-    got = processor(text=["x"], images=[[image]], return_tensors="pt",
-                    add_special_tokens=False)
-    t, h, w = (int(x) for x in got["image_grid_thw"][0])
-    return (h // 2, w // 2)
 
 
 def _tie_back(model, processor, rows, device, scan, args):
@@ -1053,7 +1206,7 @@ def _tie_back(model, processor, rows, device, scan, args):
                         heads=list(TRAINED_HEADS)).collect(TRAINED_LAYER,
                                                            list(TRAINED_HEADS))
         try:
-            inputs = build_inputs(processor, [im], r["question"], device)
+            inputs = build_inputs(scan.family, processor, [im], r["question"], device)
             with torch.no_grad():
                 model.generate(**inputs, max_new_tokens=args.tieback_tokens,
                                do_sample=False,
@@ -1359,7 +1512,7 @@ def report_cells(meta, arrays, args):
         h = int(np.nanargmax(row))
         print(f"    {l:>5} {np.nanmean(row):>12.3f} {h:>10} {row[h]:>10.3f} "
               f"{mass[l].mean():>11.5f}")
-    if acc.shape[0] > TRAINED_LAYER:
+    if acc.shape[0] > TRAINED_LAYER and _family_of(meta) == TRAINED_FAMILY:
         for h in TRAINED_HEADS:
             print(f"    the rewarded cell L{TRAINED_LAYER}h{h}: E_ring "
                   f"{acc[TRAINED_LAYER, h]:.3f}, image mass "
@@ -1621,8 +1774,14 @@ def report_arms(out_dir, cells, args):
     meta, arrays = read_stage(out_dir, "arms")
     if not meta:
         return {}
-    base = {m["key"]: m for m in meta if m.get("arm") == "identity"}
-    if not base:
+    by_arm = {}
+    for m in meta:
+        by_arm.setdefault(m.get("arm"), []).append(m)
+    # Most arms are paired against `identity`. A10 is not: it has to resize the picture
+    # so the grid divides it exactly before it can move whole cells, and that resize is
+    # not free, so its baseline is the SAME resize with the identity permutation.
+    bases = {a: {m["key"]: m for m in rows} for a, rows in by_arm.items()}
+    if "identity" not in bases:
         print("\n(arms: no `identity` baseline was run, so nothing can be paired)")
         return {}
     print("\n" + "=" * 78)
@@ -1637,12 +1796,11 @@ def report_arms(out_dir, cells, args):
     print("    columns are the same question asked twice and neither discriminates.")
     print(f"\n    {'arm':<20} {'n':>4} {'dE_ring':>9} {'95% CI':>18} {'dE_top':>8} "
           f"{'dE_bottom':>10} {'follow content':>15} {'follow slot':>12}")
-    by_arm, out = {}, {}
-    for m in meta:
-        by_arm.setdefault(m.get("arm"), []).append(m)
+    out = {}
     for arm in sorted(by_arm):
         if arm == "identity":
             continue
+        base = bases.get(SL.ARM_BASELINE.get(arm, "identity"), {})
         e_arm, e_base, tops, bots, fc, fs = {}, {}, [], [], [], []
         for m in by_arm[arm]:
             b = base.get(m["key"])
@@ -1655,8 +1813,12 @@ def report_arms(out_dir, cells, args):
             gh, gw = m["grid"]
             gh0, gw0 = b["grid"]
             f_arm, f_base = SL.named_sets(gh, gw), SL.named_sets(gh0, gw0)
-            e_arm[m["key"]] = at_cells(a_arm, "ring_share", cells) / f_arm["ring"].mean()
-            e_base[m["key"]] = at_cells(a_base, "ring_share", cells) / f_base["ring"].mean()
+            # Keyed by UNIT, not by picture: the tiled arm produces one unit per tile and
+            # they all pair against the same picture's baseline, which is what "paired by
+            # common random numbers" means when one side is finer than the other.
+            u = m["unit"]
+            e_arm[u] = at_cells(a_arm, "ring_share", cells) / f_arm["ring"].mean()
+            e_base[u] = at_cells(a_base, "ring_share", cells) / f_base["ring"].mean()
             for lst, name in ((tops, "top"), (bots, "bottom")):
                 stat = f"{name}_share"
                 lst.append(at_cells(a_arm, stat, cells) / f_arm[name].mean()
@@ -1670,17 +1832,21 @@ def report_arms(out_dir, cells, args):
             pa = _mode([int(pk_a[l, h]) for l, h in cells])
             pb = _mode([int(pk_b[l, h]) for l, h in cells])
             # The permutation is its own correspondence: slot i now holds the embedding
-            # that was at perm[i]. Nothing else in this table can ask "did the peak follow
-            # the VECTOR" without also having moved pixels around.
+            # (A9) or the pixel block (A10) that was at perm[i]. Nothing else in this
+            # table can ask "did the peak follow the VECTOR" without also having moved
+            # pixels around.
             corr = (np.asarray(arrays[m["unit"]]["perm"], dtype=np.int64)
                     if arm.startswith("permute") and "perm" in arrays.get(m["unit"], {})
-                    else _arm_correspondence(arm, gh, gw, gh0, gw0, b.get("size")))
+                    else _arm_correspondence(arm, gh, gw, gh0, gw0, b.get("size"),
+                                             m.get("view"), b.get("view"),
+                                             m.get("patch_px")))
             if corr is not None and 0 <= pa < corr.size:
                 fc.append(float(corr[pa] == pb))
             if (gh, gw) == (gh0, gw0):
                 fs.append(float(pa == pb))
         d = boot_paired(e_arm, e_base, args.n_boot)
-        out[arm] = {"dE_ring": d[0], "dE_ring_lo": d[1], "dE_ring_hi": d[2],
+        out[arm] = {"baseline": SL.ARM_BASELINE.get(arm, "identity"),
+                    "dE_ring": d[0], "dE_ring_lo": d[1], "dE_ring_hi": d[2],
                     "dE_top": float(np.mean(tops)) if tops else float("nan"),
                     "dE_bottom": float(np.mean(bots)) if bots else float("nan"),
                     "follow_content": float(np.mean(fc)) if fc else float("nan"),
@@ -1719,12 +1885,15 @@ def _mode(values):
     return int(vals[int(np.argmax(counts))])
 
 
-def _arm_correspondence(arm, gh, gw, gh0, gw0, size=None):
+def _arm_correspondence(arm, gh, gw, gh0, gw0, size=None, view=None, view0=None,
+                        patch_px=None):
     """The transform's grid mapping, rebuilt from the BASELINE PICTURE'S OWN pixel size.
 
-    `pad_*` derives its border fraction from the picture's width and height, so a
-    correspondence built on a guessed size is a correspondence for a different transform.
-    The manifest carries the real size and the report passes it through.
+    `pad_*` derives its border fraction from the picture's width and height AND from one
+    patch's width, so a correspondence built on a guessed size -- or on Qwen3-VL's 32px
+    patch when the run was LLaVA's 14px one -- is a correspondence for a different
+    transform. The manifest carries the real size, the view and the patch width, and the
+    report passes all three through rather than reconstructing any of them.
     """
     if arm in SL.SPECIAL_ARMS:
         return None
@@ -1732,12 +1901,15 @@ def _arm_correspondence(arm, gh, gw, gh0, gw0, size=None):
     w, h = (size if size else (gw0 * 32, gh0 * 32))
     try:
         _im, inv, _meta = SL.transform(arm, Image.new("RGB", (int(w), int(h)),
-                                                      (128, 128, 128)))
+                                                      (128, 128, 128)),
+                                       patch_px=int(patch_px or 32))
     except Exception:
         return None
     if inv is None:
         return None
-    return SL.patch_correspondence(inv, gh, gw, gh0, gw0)
+    return SL.patch_correspondence(inv, gh, gw, gh0, gw0,
+                                   tuple(view or SL.FULL_VIEW),
+                                   tuple(view0 or SL.FULL_VIEW))
 
 
 #: Each entry is (hypothesis, what it would mean, [(prediction, reader) ...]) where the
@@ -1881,8 +2053,17 @@ def report_verdict(facts):
 
 
 #: The grid the question is actually about: which heads, and which tokens were asking.
-HEAD_SETS = (("all heads", None),
-             ("trained L22 h28,31", [(TRAINED_LAYER, h) for h in TRAINED_HEADS]))
+def head_sets(family):
+    """Every head, and -- on Qwen3-VL only -- the pair this project's reward trained.
+
+    On another family L22 h28/31 names two arbitrary heads. Printing them beside the
+    Qwen3-VL row under the same label is how a table invents a cross-model comparison
+    that was never made.
+    """
+    sets = [("all heads", None)]
+    if family == TRAINED_FAMILY:
+        sets.append(("trained L22 h28,31", [(TRAINED_LAYER, h) for h in TRAINED_HEADS]))
+    return tuple(sets)
 TOKEN_SETS = (("query tokens", "stats"),
               ("generated tokens", "stats_gen"),
               ("all tokens", "stats_all"))
@@ -1938,7 +2119,7 @@ def report_grid(meta, arrays, args):
         print("   three token sets are empty. Re-run the scan with --max-new-tokens > 0.")
     summary = {}
     for tok_name, field in TOKEN_SETS:
-        for head_name, head_cells in HEAD_SETS:
+        for head_name, head_cells in head_sets(_family_of(meta)):
             rows = []
             for t in types:
                 vals = {loc: [] for loc, _s, _k in LOCATIONS}
@@ -1978,14 +2159,105 @@ def report_grid(meta, arrays, args):
     return summary
 
 
+def _family_of(meta):
+    """The one family this output directory holds, or a hard stop.
+
+    Two families in one directory would be pooled by every table below into an average
+    over two geometries, and the average of a 24x24 centre crop and a native-resolution
+    grid is not a quantity. One output directory per model is the contract; this is what
+    enforces it.
+    """
+    fams = sorted({m.get("family") or "(unrecorded)" for m in meta})
+    if len(fams) > 1:
+        raise SystemExit(
+            f"results from {fams} are mixed in one output directory. Every table here "
+            "pools over pictures, and pooling two geometries produces a number with no "
+            "referent. Run one model per --out-dir.")
+    return fams[0] if fams else "(unrecorded)"
+
+
+def stage_verify(args):
+    """Did the refactor move the baseline? Compare two scan directories, unit by unit.
+
+    Porting this experiment to a second and a third model meant putting an adapter under
+    the one place it knew it was talking to Qwen3-VL. A refactor that silently changes
+    what the Qwen3-VL scan measures would invalidate the comparison the port exists to
+    make, and it would do so invisibly: every table would still print, and every number
+    would still look like a number. So the port is gated on reproducing the published run
+    on the SAME pictures, and this is the gate.
+
+    Reported per statistic: the largest absolute difference over shared units, and the
+    share of units whose peak patch is unchanged. The stats are stored as float16, so
+    exact equality is the expectation and anything above the float16 step is a change.
+    """
+    meta_a, arr_a = read_stage(args.out_dir, "scan")
+    meta_b, arr_b = read_stage(args.against, "scan")
+    if not meta_a or not meta_b:
+        print(f"nothing to compare: {len(meta_a)} units here, {len(meta_b)} there")
+        return 1
+    by_b = {m["unit"]: m for m in meta_b}
+    shared = [m for m in meta_a if m["unit"] in by_b]
+    print(f"{len(shared)} shared units ({len(meta_a)} here, {len(meta_b)} in "
+          f"{args.against})")
+    if not shared:
+        return 1
+    bad_grid = [m["unit"] for m in shared if m["grid"] != by_b[m["unit"]]["grid"]]
+    print(f"grids identical on {len(shared) - len(bad_grid)}/{len(shared)} units"
+          + (f"   MISMATCHED: {bad_grid[:5]}" if bad_grid else ""))
+    worst = {n: 0.0 for n in SL.STAT_NAMES}
+    peak_same, peak_n, map_worst = 0, 0, 0.0
+    for m in shared:
+        a = arr_a.get(m["unit"], {}).get("stats")
+        b = arr_b.get(by_b[m["unit"]]["unit"], {}).get("stats")
+        if a is None or b is None or a.shape != b.shape:
+            continue
+        d = np.abs(np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64))
+        d = np.where(np.isfinite(d), d, 0.0)
+        for i, n in enumerate(SL.STAT_NAMES):
+            worst[n] = max(worst[n], float(d[..., i].max()))
+        pa, pb = arr_a[m["unit"]].get("peak"), arr_b[m["unit"]].get("peak")
+        if pa is not None and pb is not None and pa.shape == pb.shape:
+            peak_same += int((pa == pb).sum())
+            peak_n += int(pa.size)
+        ma, mb = arr_a[m["unit"]].get("maps"), arr_b[m["unit"]].get("maps")
+        if ma is not None and mb is not None and ma.shape == mb.shape:
+            map_worst = max(map_worst, float(np.nanmax(np.abs(
+                np.asarray(ma, dtype=np.float64) - np.asarray(mb, dtype=np.float64)))))
+    print(f"\n    {'statistic':<22} {'largest |difference|':>22}")
+    for n in SL.STAT_NAMES:
+        print(f"    {n:<22} {worst[n]:>22.3e}")
+    print(f"\n    peak patch identical in {peak_same}/{peak_n} cells "
+          f"({peak_same / max(1, peak_n):.6f})")
+    print(f"    largest |difference| in the layer-mean maps: {map_worst:.3e}")
+    ok = (not bad_grid and max(worst.values()) <= args.verify_tol
+          and peak_same == peak_n)
+    print(f"\n  {'VERIFY PASS' if ok else 'VERIFY FAIL'}  "
+          f"(tolerance {args.verify_tol:g} on every statistic, and every peak identical)")
+    if not ok:
+        print("  The refactored scan is not measuring what the published run measured.")
+        print("  Fix that before reading a single cross-model number: the whole point of")
+        print("  the port is a comparison, and a comparison needs a fixed reference.")
+    return 0 if ok else 1
+
+
 def stage_report(args):
     meta, arrays = read_stage(args.out_dir, "scan")
     if not meta:
         print(f"no scan results under {args.out_dir}")
         return 1
     n_dev = sum(1 for m in meta if m.get("dev"))
+    fam_name = _family_of(meta)
+    grids = sorted({tuple(m["grid"]) for m in meta})
+    views = sorted({tuple(round(x, 4) for x in (m.get("view") or SL.FULL_VIEW))
+                    for m in meta})
     print(f"{len(meta)} pictures from {args.out_dir}   "
           f"({n_dev} dev, {len(meta) - n_dev} test)")
+    print(f"family {fam_name}   {len(grids)} distinct grid shape(s), modal "
+          f"{max(grids, key=lambda g: sum(tuple(m['grid']) == g for m in meta))}")
+    if views != [(0.0, 0.0, 1.0, 1.0)]:
+        print(f"the grid covers a SUB-RECTANGLE of the picture ({len(views)} distinct "
+              "view boxes): every 'ring' below\nis the border of what the encoder saw, "
+              "which on this family is a centre crop of the picture.")
     types = sorted({m["type"] for m in meta})
     thin = [t for t in types
             if sum(1 for m in meta if m["type"] == t and not m.get("dev")) < 60]
@@ -2022,8 +2294,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stage", required=True,
-                    choices=["corpus", "selftest", "scan", "arms", "report", "monitor"])
+                    choices=["corpus", "selftest", "scan", "arms", "report", "monitor",
+                             "verify"])
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--against", default=None,
+                    help="verify: the scan directory this one must reproduce")
+    ap.add_argument("--verify-tol", type=float, default=1e-3,
+                    help="verify: the largest difference any statistic may show. The "
+                         "stats are float16, so this is loose on purpose and a real "
+                         "change clears it by orders of magnitude")
     ap.add_argument("--model", default=None)
     ap.add_argument("--adapter", default=None)
     ap.add_argument("--types", default="", help="comma-separated subset of the corpus")
@@ -2036,12 +2315,21 @@ def main():
                          "0 the model writes an answer at full speed and ONE teacher-forced "
                          "forward over prompt ++ answer is measured, which is the same "
                          "construction the training reward used")
+    ap.add_argument("--system-prompt", default="auto",
+                    help="auto = each family's own (Qwen3-VL gets the project's trainer "
+                         "prompt, so the published numbers reproduce; the others get "
+                         "none). `none` puts every family on the same footing and is "
+                         "what the cross-model tables are run under. Anything else is "
+                         "used verbatim")
+    ap.add_argument("--max-tiles", type=int, default=13,
+                    help="the `tiled` arm: how many of a picture's tiles to score. "
+                         "InternVL's max_dynamic_patch is 12 plus a thumbnail")
     ap.add_argument("--val-only", action="store_true",
                     help="never top up from set_a/set_b. Required for any checkpoint "
                          "that was GRPO-trained on them")
     ap.add_argument("--rebuild", action="store_true", help="corpus: ignore what exists")
-    ap.add_argument("--arms", default=",".join(("identity",) + SL.ARMS[1:] +
-                                               SL.SPECIAL_ARMS))
+    ap.add_argument("--arms", default=",".join(SL.DEFAULT_ARMS),
+                    help=f"any of {','.join(SL.ARMS + SL.SPECIAL_ARMS)}")
     ap.add_argument("--arm-rows-per-type", type=int, default=40)
     ap.add_argument("--no-hidden", action="store_true",
                     help="skip the hidden-state norms (M1); saves memory on a big model")
@@ -2085,6 +2373,10 @@ def main():
         return stage_corpus(args)
     if args.stage == "report":
         return stage_report(args)
+    if args.stage == "verify":
+        if not args.against:
+            raise SystemExit("--stage verify needs --against DIR")
+        return stage_verify(args)
     if args.stage == "monitor":
         IV.monitor(Path(args.out_dir), args.interval, args.once, "")
         return 0
