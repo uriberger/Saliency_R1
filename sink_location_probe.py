@@ -2199,6 +2199,183 @@ def _family_of(meta):
     return fams[0] if fams else "(unrecorded)"
 
 
+def _pooled_locations(meta, arrays, min_mass, field="stats"):
+    """Every location's enrichment, pooled over pictures, over all heads. -> dict.
+
+    All heads, never a selected set: the cross-model table must not be allowed to pick
+    each model's most border-leaning cells and then report that all three lean on the
+    border. The image-mass floor is the only filter, and it removes heads that put no
+    weight on the picture at all.
+    """
+    vals = {loc: [] for loc, _s, _k in LOCATIONS}
+    for m in meta:
+        a = arrays.get(m["unit"], {}).get(field)
+        if a is None:
+            continue
+        gh, gw = m["grid"]
+        sets = SL.named_sets(gh, gw)
+        for loc, stat, key in LOCATIONS:
+            area = 1.0 / (gh * gw) if key is None else sets[key].mean()
+            vals[loc].append(_enrich(a, None, stat, area, min_mass))
+    return {k: float(np.nanmean(v)) if v else float("nan") for k, v in vals.items()}
+
+
+def stage_crossmodel(args):
+    """The table the port exists to produce: the same corpus, three models, side by side.
+
+    `docs/sink-location-cross-model.md` asks whether the one-patch outer ring and the
+    upper-left peak are a property of Qwen3-VL or of VLMs. That is not a question any one
+    output directory can answer, and it is not a question that survives pooling them --
+    the grids differ, and on LLaVA-1.5 the grid covers a centre crop rather than the
+    picture. So every directory is reduced on its own geometry first, and only the
+    dimensionless enrichments are put beside each other.
+    """
+    dirs = [d for d in (args.dirs or "").split(",") if d]
+    if len(dirs) < 2:
+        raise SystemExit("--stage crossmodel needs --dirs a,b[,c]")
+    runs = []
+    for d in dirs:
+        meta, arrays = read_stage(d, "scan")
+        if not meta:
+            print(f"(skipping {d}: no scan results)")
+            continue
+        runs.append({"dir": d, "meta": meta, "arrays": arrays,
+                     "family": _family_of(meta), "n": len(meta)})
+    if len(runs) < 2:
+        raise SystemExit("fewer than two directories have results")
+
+    print("=" * 78)
+    print("0. WHAT IS BEING COMPARED")
+    print("   The same pictures through three models. Nothing below is a raw percentage:")
+    print("   the ring is 23% of a 16x16 grid and 16% of a 24x24 one, so every number is")
+    print("   an enrichment -- that location's share of the picture's attention over its")
+    print("   share of the patches. 1.00 is no effect, in every column.")
+    print(f"\n    {'family':<12} {'n':>5} {'modal grid':>11} {'ring area':>10} "
+          f"{'grid covers':>28} {chr(34) + 'the picture' + chr(34) + ' of a row':>26}")
+    for r in runs:
+        grids = [tuple(m["grid"]) for m in r["meta"]]
+        modal = max(set(grids), key=grids.count)
+        views = {tuple(round(x, 3) for x in (m.get("view") or SL.FULL_VIEW))
+                 for m in r["meta"]}
+        cover = ("the whole picture" if views == {(0.0, 0.0, 1.0, 1.0)}
+                 else f"a centre crop ({len(views)} boxes)")
+        img = [float(np.nanmean(a[..., SL.SPANS.index("image")]))
+               for m in r["meta"] if (a := r["arrays"].get(m["unit"], {}).get("spans")) is not None]
+        r["image_share"] = float(np.mean(img)) if img else float("nan")
+        print(f"    {r['family']:<12} {r['n']:>5} {f'{modal[0]}x{modal[1]}':>11} "
+              f"{SL.ring_area_frac(*modal):>10.3f} {cover:>28} {r['image_share']:>26.4f}")
+    print("\n  The picture's share of a row is the budget every ring number is a division")
+    print("  of. A model that gives the picture 1% of a row and one that gives it 15% are")
+    print("  not making the same claim with the same enrichment.")
+
+    print("\n" + "=" * 78)
+    print("1. WHERE THE PICTURE'S ATTENTION GOES -- pooled over the twelve types, ALL HEADS")
+    for r in runs:
+        r["loc"] = _pooled_locations(r["meta"], r["arrays"], args.min_mass)
+    print(f"\n    {'family':<12} " + " ".join(f"{loc:>8}" for loc, _s, _k in LOCATIONS))
+    for r in runs:
+        print(f"    {r['family']:<12} " +
+              " ".join(f"{r['loc'][loc]:>8.2f}" for loc, _s, _k in LOCATIONS))
+    print("\n  `topleft`/`botright` are SINGLE patches against a flat map's 1/N, so they")
+    print("  run on a different scale from the block columns beside them. A ring above 1")
+    print("  with top >> bottom and left >> right is the raster-order signature; a ring")
+    print("  above 1 with the four edges level is a 2-D border effect and a different")
+    print("  claim. Read those two together or neither.")
+
+    print("\n" + "=" * 78)
+    print("2. THE RING, PER IMAGE TYPE")
+    types = sorted({m["type"] for r in runs for m in r["meta"]})
+    print(f"\n    {'type':<18} " + " ".join(f"{r['family']:>12}" for r in runs))
+    for t in types:
+        cells = []
+        for r in runs:
+            sub = [m for m in r["meta"] if m["type"] == t]
+            cells.append(_pooled_locations(sub, r["arrays"], args.min_mass)["ring"]
+                         if sub else float("nan"))
+        print(f"    {t:<18} " + " ".join(f"{c:>12.2f}" for c in cells))
+    print(f"\n    {'ALL':<18} " +
+          " ".join(f"{r['loc']['ring']:>12.2f}" for r in runs))
+    print("\n  Pre-registered in the original design: E_ring >= 1.5 is 'the sink")
+    print("  concentrates on the ring', 1.2-1.5 is weak, below 1.2 is a failure for that")
+    print("  type. The same thresholds are applied here, to every model.")
+
+    print("\n" + "=" * 78)
+    print("3. IS IT A SINK, OR ONLY A PEAK -- at the strongest cell in each model")
+    print(f"\n    {'family':<12} {'peak / uniform':>16} {'peak CV across queries':>24} "
+          f"{'verdict':>28}")
+    for r in runs:
+        mag, cv = [], []
+        mass_i = SL.STAT_INDEX["image_mass"]
+        mag_i, cv_i = SL.STAT_INDEX["peak_uniform_x"], SL.STAT_INDEX["peak_cv"]
+        for m in r["meta"]:
+            a = r["arrays"].get(m["unit"], {}).get("stats")
+            if a is None:
+                continue
+            v = np.where(np.asarray(a[..., mass_i], dtype=float) >= args.min_mass,
+                         np.asarray(a[..., mag_i], dtype=float), np.nan)
+            if not np.isfinite(v).any():
+                continue
+            l, h = divmod(int(np.nanargmax(v)), a.shape[1])
+            mag.append(float(a[l, h, mag_i]))
+            cv.append(float(a[l, h, cv_i]))
+        mm = float(np.nanmean(mag)) if mag else float("nan")
+        cc = float(np.nanmean(cv)) if cv else float("nan")
+        verdict = ("a sink by both legs" if mm >= args.sink_x and cc <= args.sink_cv
+                   else "a peak, not a sink" if mm < args.sink_x
+                   else "large but query-DEPENDENT")
+        print(f"    {r['family']:<12} {mm:>16.1f} {cc:>24.2f} {verdict:>28}")
+    print(f"\n  Pre-registered: >= {args.sink_x}x uniform AND CV <= {args.sink_cv}. A model")
+    print("  that fails the CV leg has a peak that moves with the query, which is not what")
+    print("  the sink literature describes, however large the peak is.")
+
+    print("\n" + "=" * 78)
+    print("4. THE ARMS -- the causal half, per model")
+    print("   `follow content` is the share of pictures whose peak patch SHOWS the")
+    print("   baseline's peak patch; `follow slot` is the share whose peak sits at the")
+    print("   same grid position. `permute` moves the encoder's OUTPUT rows and says")
+    print("   whether the mark is in the embedding or in the language model's slot;")
+    print("   `permute_pixels` (A10) moves the pixels BEFORE the encoder and says whether")
+    print("   the encoder's own position embedding is what writes it.")
+    want = ("rot180", "permute", "permute_identity", "permute_pixels", "tiled")
+    for r in runs:
+        cells, _n = choose_cells(r["meta"], r["arrays"], args.n_cells, args.min_mass)
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            r["arms"] = report_arms(r["dir"], cells, args) or {}
+    print(f"\n    {'arm':<20} " +
+          " ".join(f"{r['family'] + ' dE_ring':>20}" for r in runs))
+    for arm in want:
+        if not any(arm in r["arms"] for r in runs):
+            continue
+        print(f"    {arm:<20} " + " ".join(
+            f"{r['arms'].get(arm, {}).get('dE_ring', float('nan')):>+20.3f}" for r in runs))
+    for col, label in (("follow_content", "follow content"), ("follow_slot", "follow slot")):
+        print(f"\n    {label:<20} " +
+              " ".join(f"{r['family']:>20}" for r in runs))
+        for arm in want:
+            if not any(arm in r["arms"] for r in runs):
+                continue
+            print(f"      {arm:<18} " + " ".join(
+                f"{r['arms'].get(arm, {}).get(col, float('nan')):>20.3f}" for r in runs))
+
+    print("\n" + "=" * 78)
+    print("5. HOW TO READ IT  (written before the run, in docs/sink-location-cross-model.md)")
+    print("   ring + upper-left peak in all three   a VLM-wide property, and A10 is what")
+    print("                                         has to explain it")
+    print("   holds in InternVL, fails in LLaVA     tie it to native-resolution encoders;")
+    print("                                         scope the claim and cite the LLaVA")
+    print("                                         bottom-bias literature as the contrast")
+    print("   fails in both                         a Qwen3-VL property -- still")
+    print("                                         publishable, and it makes the")
+    print("                                         reward-design conclusion MORE")
+    print("                                         interesting, not less")
+    print("   ring without the upper-left peak      two mechanisms, not one. Split the")
+    print("     (or the other way round)            claim")
+    return 0
+
+
 def stage_verify(args):
     """Did the refactor move the baseline? Compare two scan directories, unit by unit.
 
@@ -2318,8 +2495,10 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stage", required=True,
                     choices=["corpus", "selftest", "scan", "arms", "report", "monitor",
-                             "verify"])
+                             "verify", "crossmodel"])
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--dirs", default=None,
+                    help="crossmodel: the scan directories to put side by side")
     ap.add_argument("--against", default=None,
                     help="verify: the scan directory this one must reproduce")
     ap.add_argument("--verify-tol", type=float, default=1e-3,
@@ -2396,6 +2575,8 @@ def main():
         return stage_corpus(args)
     if args.stage == "report":
         return stage_report(args)
+    if args.stage == "crossmodel":
+        return stage_crossmodel(args)
     if args.stage == "verify":
         if not args.against:
             raise SystemExit("--stage verify needs --against DIR")
