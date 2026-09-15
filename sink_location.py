@@ -954,6 +954,13 @@ SPECIAL_ARMS = ("two_images", "prompt_swap", "permute", "permute_identity",
 DEFAULT_ARMS = ARMS + ("two_images", "prompt_swap", "permute", "permute_identity",
                        "permute_pixels", "permute_pixels_identity")
 
+#: Arms for which "did the peak follow the content / the slot" is not a question. Both
+#: columns compare a patch index in the arm's grid against one in the baseline's, which
+#: means something only when the two grids frame the same thing. A TILE's grid does not:
+#: slot 0 of tile 3 and slot 0 of the whole picture are different places, and the two
+#: numbers would read as a follow rate while measuring a coincidence.
+NO_FOLLOW = ("tiled",)
+
 #: An arm whose baseline is not `identity`. A10 has to resize the picture so the grid
 #: divides it exactly before it can shuffle whole cells, and that resize is not free, so
 #: its control is the SAME resize with the identity permutation. Pairing it against

@@ -1845,7 +1845,7 @@ def report_arms(out_dir, cells, args):
                            - at_cells(a_base, stat, cells) / f_base[name].mean())
             pk_a = arrays.get(m["unit"], {}).get("peak")
             pk_b = arrays.get(b["unit"], {}).get("peak")
-            if pk_a is None or pk_b is None:
+            if pk_a is None or pk_b is None or arm in SL.NO_FOLLOW:
                 continue
             # The MODE over the selected cells, not the median: peak indices are labels on
             # a grid, and the median of two corners is a patch neither head chose.
