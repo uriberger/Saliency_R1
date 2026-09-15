@@ -202,3 +202,139 @@ anything beyond Qwen3-VL.
   full scan. `Reason=QOSGrpGRES` while queueing is churn — poll, do not resubmit.
 - Do not run DINO or any heavy CPU work on the login node; it is heavily contended and a
   188-pair detector pass did not finish in 45 minutes there, against ~55 s on one GPU.
+
+---
+
+# The port, as built — 2026-09-14
+
+Everything above is the plan. This section is what exists, and the decisions that were
+made where the plan left a choice open. The results are in the section after it.
+
+## The seam: `vlm_family.py`
+
+One class per family, selected off `config.model_type`, holding the six things
+`sink_location.py` used to know about Qwen3-VL:
+
+| | Qwen3-VL-8B | InternVL3.5-8B | LLaVA-1.5-7B |
+|---|---|---|---|
+| decoder attention | `Qwen3VLTextAttention` | `Qwen3Attention` | `LlamaAttention` |
+| rows the LLM consumes | `Qwen3VLVisionModel`'s `pooler_output` | `InternVLMultiModalProjector` | `LlavaMultiModalProjector` |
+| image token | 151655 | 151671 | 32000 |
+| delimiters | `<\|vision_start\|>` / `<\|vision_end\|>` | `<img>` / `</img>` | **none** |
+| grid | per picture, from `image_grid_thw` | fixed 16x16 | fixed 24x24 |
+| one grid cell, encoder pixels | 32 | 28 | 14 |
+| extra injection points | DeepStack at ViT 8/16/24 | none | none |
+| the grid covers | the whole picture | the whole picture | **a centre crop** |
+
+`install(model)` picks the family; the module-level Qwen3-VL ids stay only so callers
+that predate the seam still resolve.
+
+### The view box, and why it is the dangerous one
+
+LLaVA-1.5's processor resizes the short side to 336 and **centre-crops** to 336x336, so
+its 24x24 grid covers a centred square of the picture and not the picture. `view_box`
+is that square in normalised picture coordinates, and `patch_correspondence` now walks
+grid → picture → (inverse transform) → baseline picture → baseline grid rather than
+assuming the two frames are the same one. Both views default to the whole picture, which
+is what Qwen3-VL and InternVL do and what every published number was computed under.
+
+The centre crop is kept because it is how LLaVA-1.5 is normally run. The consequence is
+stated wherever it matters: on that model **"the ring" is the border of what the encoder
+saw**, which is a centre crop of the picture, and the report prints that line itself
+whenever a run's view boxes are not the whole picture.
+
+Validated on CPU against the real processors, before a single GPU-second was spent: a
+marker painted at cell (r, c) of the grid, through the processor, lands at cell (r, c) of
+the 336x336 / 448x448 tensor. **48/48 on each**, over six picture sizes and eight cells.
+
+### Two traps this found
+
+- **`InternVLProcessor` tiles even though `image_processor.crop_to_patches` is `False`.**
+  The processor carries its own default and overrides the attribute, so a 500x300 picture
+  came back as seven 448px tiles. The analysis assumes one grid, so every column statistic
+  would have described the top-left corner of the picture while claiming to describe the
+  picture — and nothing downstream would have looked wrong. `Family.proc_defaults` pins it,
+  and the tiled configuration is now reachable only by asking for it.
+- **LLaVA-1.5 fails "the scan reproduces stock SDPA (greedy tokens)"** at token 10 of 16.
+  The scan and stock *eager* both take an explicit softmax where the fused kernel does not,
+  and on fp16 weights read in bf16 that drift flips a near-tie. The reference is now eager
+  — the path the scan is a copy of — and the SDPA agreement is printed rather than
+  asserted. Against eager: **609/609 tokens**, and `|scan − eager|` is below one bf16 step
+  of the logits' own magnitude.
+
+## Which checkpoints
+
+- **Qwen3-VL**: `Qwen/Qwen3-VL-8B-Instruct`, the released base model, because the other two
+  are released models too. §16's cold start and §17's base run are the prior reference.
+- **InternVL**: `OpenGVLab/InternVL3_5-8B-HF`, the **native** `InternVLForConditionalGeneration`
+  path — no remote code, a real processor, and the tiling switch is a processor argument.
+  `InternVL3_5-8B-Instruct-HF` does not exist on the Hub; the cached `-Instruct` snapshot is
+  the remote-code repo written against transformers 4.51 and this environment runs
+  5.13.0.dev0. The architecture — Qwen3, 36 layers, 32 heads, plus InternViT — is identical
+  either way, and that architecture is what the comparison is about. The checkpoint is the
+  flagship (post-RL) rather than the SFT-only one; recorded here rather than assumed away.
+- **LLaVA-1.5**: `llava-hf/llava-1.5-7b-hf`, fetched once with `HF_HUB_OFFLINE` unset.
+
+## The prompt
+
+Each model gets its own chat template. Putting Qwen3-VL's `<think>` system prompt in front
+of LLaVA-1.5 would measure an off-distribution model. `--system-prompt` controls it:
+`auto` gives Qwen3-VL the project's trainer prompt so §16–17 reproduce, and **every
+cross-model table is run under `none`**, which puts all three on the same footing. The
+`prompt_swap` arm prices what remains.
+
+## A10 — permute the pixels *before* the encoder
+
+The new arm the plan asked for. A9 shuffles the rows the encoder **emitted** and shows the
+attractor travels with the token, which rules out the language model's positional slot but
+not the **encoder's own position embeddings** — those could have stamped the token on the
+way through. A10 shuffles the pixel blocks that will become grid cells, before the vision
+tower runs. If the attractor appears at whatever content now occupies the top-left *of the
+ViT grid*, the encoder's position embedding is writing it; if it follows the original
+content, it is content-driven.
+
+The blocks are cut at the **encoder's own** pixel size (32 / 28 / 14), so the processor's
+resize is the identity and the shuffle is lossless. That crop-and-resize is still not free
+on the source side, so A10's baseline is **`permute_pixels_identity`** — the same resize
+with the identity permutation — not `identity`. `ARM_BASELINE` is what carries that, and
+the selftest checks the blocks are a permutation, that the pixels are the same multiset,
+and that the grid the blocks were cut on is the grid the processor then chose.
+
+## The gate: the refactor did not move the baseline
+
+`--stage verify --against DIR` compares two scan directories unit by unit. Against
+`outputs/sink_location/coldstart`, on 72 pictures:
+
+```
+grids identical on 72/72 units
+largest |difference|:  0.000e+00 on all 26 statistics
+peak patch identical in 82944/82944 cells (1.000000)
+largest |difference| in the layer-mean maps: 0.000e+00
+```
+
+Bit for bit. A refactor that silently changed what the Qwen3-VL scan measures would have
+invalidated the comparison the port exists to make, and it would have done so invisibly.
+
+## How to run it
+
+```fish
+# one output directory per model -- the report refuses to pool two geometries
+bash launch_sink_location_job.sh --name slx-qwen-base --stage selftest,scan,arms --gpus 8 \
+    --duration 1 --out-dir outputs/sink_location/xmodel/qwen3vl_base \
+    --model Qwen/Qwen3-VL-8B-Instruct -- --system-prompt none
+bash launch_sink_location_job.sh --name slx-llava --stage selftest,scan,arms --gpus 8 \
+    --duration 1 --out-dir outputs/sink_location/xmodel/llava15 \
+    --model llava-hf/llava-1.5-7b-hf -- --system-prompt none
+bash launch_sink_location_job.sh --name slx-internvl --stage selftest,scan,arms --gpus 8 \
+    --duration 1 --out-dir outputs/sink_location/xmodel/internvl35 \
+    --model OpenGVLab/InternVL3_5-8B-HF -- --system-prompt none
+
+# InternVL's tiled configuration, as its own labelled arm
+bash launch_sink_location_job.sh --name slx-internvl-tiled --stage arms --gpus 8 \
+    --duration 1 --out-dir outputs/sink_location/xmodel/internvl35 \
+    --model OpenGVLab/InternVL3_5-8B-HF -- --system-prompt none --arms identity,tiled
+
+# the table
+python sink_location_probe.py --stage crossmodel --out-dir outputs/sink_location/xmodel \
+    --dirs outputs/sink_location/xmodel/qwen3vl_base,outputs/sink_location/xmodel/internvl35,outputs/sink_location/xmodel/llava15
+```
