@@ -500,6 +500,83 @@ def test_probe():
               __import__("PIL.Image", fromlist=["Image"]).new("RGB", (64, 64)), 2, 2)))
 
 
+# ---------------------------------------------------------------------------
+def test_family():
+    """The seam that lets this run on three models, without loading any of them.
+
+    Three things live here and nowhere else. The VIEW BOX composition, because a grid
+    that covers a centre crop of the picture is the one way this experiment can decode
+    the wrong coordinate frame while every table still prints. A10's block permutation,
+    because a shuffle that drops or duplicates a cell would look exactly like a result.
+    And the registry, because a family this file has never heard of must fail at the seam
+    rather than be measured with Qwen3-VL's token ids.
+    """
+    print("\nfamily adapter")
+    from PIL import Image
+    import vlm_family as VF
+
+    check("every family registers a model_type and is reachable by it",
+          all(VF.family_for(model_type=t).name == cls.name
+              for t, cls in VF._REGISTRY.items()),
+          f"{sorted(VF._REGISTRY)}")
+    bad = False
+    try:
+        VF.family_for(model_type="not_a_vlm")
+    except SystemExit:
+        bad = True
+    check("an unknown model_type is refused at the seam, not guessed", bad)
+
+    # -- the view box, composed into patch_correspondence ------------------
+    gh = gw = 6
+    ident = lambda p: p                                            # noqa: E731
+    view = (0.25, 0.0, 0.75, 1.0)          # a centred half-width strip, as a crop gives
+    check("identity through the SAME view is still the identity",
+          np.array_equal(SL.patch_correspondence(ident, gh, gw, gh, gw, view, view),
+                         np.arange(gh * gw)))
+    corr = SL.patch_correspondence(SL._inv_hflip, gh, gw, gh, gw, view, view)
+    want = np.arange(gh * gw).reshape(gh, gw)[:, ::-1].reshape(-1)
+    check("a flip inside a centred view is still the flip", np.array_equal(corr, want))
+    # A view that is a strip of the picture, against a baseline that is the whole
+    # picture: the strip's columns must land in the MIDDLE of the baseline's, never at
+    # its edges. This is the direction an off-by-one would get wrong.
+    corr = SL.patch_correspondence(ident, gh, gw, gh, gw, view, SL.FULL_VIEW)
+    cols = sorted({int(c) % gw for c in corr})
+    check("a centred view reads the middle of the full-picture grid, not its border",
+          cols and min(cols) >= 1 and max(cols) <= gw - 2, f"columns {cols}")
+
+    # -- A10 ---------------------------------------------------------------
+    rng = np.random.default_rng(3)
+    im = Image.fromarray(rng.integers(0, 256, (96, 128, 3), dtype=np.uint8), "RGB")
+    grid, px = (4, 5), 16
+    shuf, perm = VF.block_permute(im, grid, px, seed=1)
+    same, iperm = VF.block_permute(im, grid, px, mode="identity")
+    check("A10 emits a picture of exactly grid x block_px",
+          shuf.size == (grid[1] * px, grid[0] * px) == same.size, f"{shuf.size}")
+    check("A10's permutation is a permutation, and identity is the identity",
+          sorted(perm.tolist()) == list(range(20))
+          and np.array_equal(iperm, np.arange(20)))
+    a, b = np.asarray(same), np.asarray(shuf)
+    moved = all(
+        np.array_equal(b[(j // grid[1]) * px:(j // grid[1] + 1) * px,
+                         (j % grid[1]) * px:(j % grid[1] + 1) * px],
+                       a[(int(perm[j]) // grid[1]) * px:(int(perm[j]) // grid[1] + 1) * px,
+                         (int(perm[j]) % grid[1]) * px:(int(perm[j]) % grid[1] + 1) * px])
+        for j in range(20))
+    check("...and cell j really holds the block that was at perm[j]", moved)
+    check("A10 moves pixels without inventing any",
+          np.array_equal(np.sort(a.reshape(-1)), np.sort(b.reshape(-1))))
+    back, _ = VF.block_permute(shuf, grid, px, perm=np.argsort(perm), mode="shuffle")
+    check("the inverse permutation puts every block back",
+          np.array_equal(np.asarray(back), a))
+
+    # -- view_crop ---------------------------------------------------------
+    cut = VF.view_crop(im, (0.25, 0.0, 0.75, 1.0))
+    check("view_crop takes the rectangle the view names", cut.size == (64, 96),
+          f"{cut.size}")
+    check("a full view is not a crop at all",
+          VF.view_crop(im, SL.FULL_VIEW) is im)
+
+
 def main():
     print("sink_location CPU checks")
     test_geometry()
@@ -507,6 +584,7 @@ def main():
     test_locate()
     test_attention()
     test_transforms()
+    test_family()
     test_probe()
     print(f"\n{'ALL PASS' if not FAILURES else f'{len(FAILURES)} FAILED: {FAILURES}'}")
     return 1 if FAILURES else 0

@@ -786,7 +786,8 @@ def _run_arm(model, processor, im, row, arm, device, scan, partners, args, fam):
         mode = "shuffle" if arm == "permute_pixels" else "identity"
         grid = fam.grid_of(processor, VF.view_crop(im, fam.view_box(im)))
         src = VF.view_crop(im, fam.view_box(im))
-        tim, perm = VF.block_permute(src, grid, seed=args.seed, mode=mode)
+        tim, perm = VF.block_permute(src, grid, fam.encoder_px, seed=args.seed,
+                                     mode=mode)
         got = measure(model, processor, [tim], row["question"], device, scan,
                       want_hidden=False)
         if got is None:
@@ -1007,19 +1008,33 @@ def stage_selftest(args):
 
     base_logits, base_ids = last_logits(), greedy_ids()
     with _attn_impl(model, "eager", fam):
-        eager_logits = last_logits()
+        eager_logits, eager_ids = last_logits(), greedy_ids()
     scan = SL.install(model, family=fam)
     try:
         scan_logits, scan_ids = last_logits(), greedy_ids()
         d_scan = float((scan_logits - base_logits).abs().max())
         d_eager = float((eager_logits - base_logits).abs().max())
+        d_pair = float((scan_logits - eager_logits).abs().max())
         check("the scan is no further from the fused kernel than stock eager is",
               d_scan <= 2 * d_eager + 1e-4,
               f"scan {d_scan:.2e} vs eager {d_eager:.2e} (both against sdpa)")
+        check("the scan IS stock unfused attention, to the last bit",
+              d_pair <= max(1e-4, 0.05 * d_eager),
+              f"|scan - eager| {d_pair:.2e} against |eager - sdpa| {d_eager:.2e}")
         check("the scan picks the same next token",
               int(scan_logits.argmax()) == int(base_logits.argmax()))
-        check("the scan reproduces stock SDPA (greedy tokens)", scan_ids == base_ids,
-              f"{sum(a == b for a, b in zip(scan_ids, base_ids))}/{len(base_ids)} equal")
+        # Against EAGER, not against SDPA. The reference has to be the path the scan is a
+        # copy of: both take an explicit softmax where the fused kernel does not, so both
+        # drift from it by the same bf16 rounding, and on a model whose greedy decode has
+        # near-ties -- LLaVA-1.5's fp16 weights read in bf16 are one -- that drift flips a
+        # token ten steps in. Asserting scan == SDPA there fails a scan that is provably
+        # doing nothing, and the number that says so is printed rather than dropped.
+        check("the scan reproduces stock unfused attention (greedy tokens)",
+              scan_ids == eager_ids,
+              f"{sum(a == b for a, b in zip(scan_ids, eager_ids))}/{len(eager_ids)} equal")
+        same_sdpa = sum(a == b for a, b in zip(eager_ids, base_ids))
+        print(f"        (unfused vs the fused kernel: {same_sdpa}/{len(base_ids)} tokens "
+              f"equal -- bf16 kernel drift, and not something the scan did)")
 
         # 2. geometry and the negative controls -------------------------------
         got = measure(model, processor, [im0], rows[0]["question"], device, scan,
@@ -1102,13 +1117,13 @@ def stage_selftest(args):
         base_view = fam.view_box(im0)
         src = VF.view_crop(im0, base_view)
         grid0 = fam.grid_of(processor, src)
-        p_im, p_perm = VF.block_permute(src, grid0, seed=7)
-        i_im, i_perm = VF.block_permute(src, grid0, mode="identity")
+        p_im, p_perm = VF.block_permute(src, grid0, fam.encoder_px, seed=7)
+        i_im, i_perm = VF.block_permute(src, grid0, fam.encoder_px, mode="identity")
         check("A10 cuts the picture into whole grid cells and puts them all back",
               sorted(p_perm.tolist()) == list(range(grid0[0] * grid0[1]))
               and np.array_equal(i_perm, np.arange(grid0[0] * grid0[1]))
               and p_im.size == i_im.size,
-              f"{grid0[0]}x{grid0[1]} blocks of {i_im.size[0] // grid0[1]}px")
+              f"{grid0[0]}x{grid0[1]} blocks of {fam.encoder_px}px")
         check("A10's pixels are the same pixels, only moved",
               np.array_equal(np.sort(np.asarray(p_im).reshape(-1)),
                              np.sort(np.asarray(i_im).reshape(-1))))

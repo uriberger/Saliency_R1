@@ -179,6 +179,9 @@ class Family:
     #: tokens per tile as (gh, gw), for families whose grid does not depend on the
     #: picture. `grids_for` uses it and never has to ask the processor.
     fixed_grid = None
+    #: one grid cell, in the ENCODER's own input pixels. A10 cuts its blocks at exactly
+    #: this size so the processor's resize is the identity and the shuffle is lossless.
+    encoder_px = 32
 
     def grids_for(self, runs, inputs):
         """-> [(t, gh, gw)] one entry per TILE, in column order.
@@ -389,6 +392,9 @@ class InternVL(Family):
             if side * side != n:
                 raise SystemExit(f"internvl: {n} tokens per tile is not a square grid")
             self.fixed_grid = (side, side)
+            vc = getattr(cfg, "vision_config", None)
+            px = getattr(vc, "image_size", 448) if vc is not None else 448
+            self.encoder_px = int((px[0] if isinstance(px, (list, tuple)) else px) / side)
         return self
 
 
@@ -423,8 +429,9 @@ class Llava15(Family):
         super().bind(model=model, processor=processor, config=config)
         vc = getattr(self.config, "vision_config", None)
         if vc is not None:
-            side = int(getattr(vc, "image_size", 336)) // int(getattr(vc, "patch_size", 14))
-            self.fixed_grid = (side, side)
+            px = int(getattr(vc, "patch_size", 14))
+            side = int(getattr(vc, "image_size", 336)) // px
+            self.fixed_grid, self.encoder_px = (side, side), px
         return self
 
     # -- the centre crop, in closed form ---------------------------------
@@ -478,7 +485,7 @@ def view_crop(image, view):
     return image.crop(box)
 
 
-def block_permute(image, grid, perm=None, seed=0, mode="shuffle"):
+def block_permute(image, grid, block_px, perm=None, seed=0, mode="shuffle"):
     """A10 -- shuffle the PIXEL BLOCKS that will become grid cells, before the encoder.
 
     A9 shuffles the encoder's OUTPUT rows and shows the attractor travels with the token,
@@ -489,9 +496,12 @@ def block_permute(image, grid, perm=None, seed=0, mode="shuffle"):
     top-left OF THE VIT GRID, the encoder's position embedding is writing it, and if it
     follows the original content instead, it is content-driven.
 
-    The picture is first resized so the grid divides it exactly, which makes the blocks
-    integer and the shuffle lossless. That resize is not free, so `mode="identity"` runs
-    it with the identity permutation and is the baseline this arm is paired against.
+    The picture is first resized to the ENCODER'S OWN input size -- `block_px` pixels per
+    grid cell -- so the blocks are integer, the shuffle is lossless, and the processor's
+    own resize is the identity rather than a second resampling that would blur every
+    block boundary. That resize is still not free on the source side, so
+    `mode="identity"` runs it with the identity permutation and is the baseline this arm
+    is paired against.
 
     -> (image, perm) where slot j of the new picture holds the block that was at perm[j].
     """
@@ -499,8 +509,7 @@ def block_permute(image, grid, perm=None, seed=0, mode="shuffle"):
 
     gh, gw = int(grid[0]), int(grid[1])
     n = gh * gw
-    W, H = image.size
-    bw, bh = max(1, int(round(W / gw))), max(1, int(round(H / gh)))
+    bw = bh = max(1, int(block_px))
     base = image.resize((bw * gw, bh * gh), Image.BICUBIC)
     if perm is None:
         if mode == "identity":
