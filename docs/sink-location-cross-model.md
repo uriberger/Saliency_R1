@@ -349,9 +349,10 @@ on each. Full output in `outputs/sink_location/xmodel/{qwen3vl_base,internvl35,l
 and the side-by-side in `outputs/sink_location/xmodel/crossmodel.txt`.
 
 Three sentences. **The ring survives the encoder swap and half-survives the family swap**
-— 1.54 on Qwen3-VL, 1.67 on InternVL-3.5, 1.29 on LLaVA-1.5, where the design's
-pre-registered bar was 1.5. **The upper-left peak does not survive at all: it is 13.1× on
-Qwen3-VL, 5.5× on InternVL, and on LLaVA-1.5 it has moved to the opposite corner** —
+— averaged over every head, 1.54 on Qwen3-VL, 1.67 on InternVL-3.5 and 1.29 on LLaVA-1.5,
+where on LLaVA-1.5 it is one edge rather than a ring. **The upper-left peak does not
+survive at all**: it is 13.1× on Qwen3-VL, 5.5× on InternVL, and on LLaVA-1.5 it has moved
+to the opposite corner —
 bottom-right at 13.0×, with the bottom row at 2.43 against a top row at 1.02. **And the
 mark is held in different places**: shuffling the encoder's output rows moves it on
 Qwen3-VL and InternVL and leaves it where it was on LLaVA-1.5.
@@ -389,9 +390,18 @@ report for that family and what `docs/where-attention-goes.md` said to expect.
 column is the bottom row carrying three edges that do nothing. Calling that "the outer
 ring" would be true arithmetic and a false picture.
 
-Per type, the ring clears the pre-registered 1.5 in **9 of 12** types on InternVL, **6 of
-12** on Qwen3-VL and **2 of 12** on LLaVA-1.5 — where it also drops *below 1.0* on maths
-figures (0.92) and board puzzles (0.97).
+Per type, the ring clears 1.5 in **9 of 12** types on InternVL, **8 of 12** on Qwen3-VL and
+**2 of 12** on LLaVA-1.5 — where it also drops *below 1.0* on maths figures (0.92) and
+board puzzles (0.97).
+
+One caution about that sentence. §16's pre-registered 1.5 was a threshold on `E_ring` **at
+the dev-selected cells**, where the cold start read 2.1–3.6 and cleared it twelve times out
+of twelve. Every number in this section is the **all-head** average instead, because a
+cross-model table must not be allowed to pick each model's most border-leaning cells and
+then report that all three lean on the border. That makes it a stricter test than the
+original, applied identically to all three, and it is the comparison between the three
+columns that carries the argument — not the distance from a threshold that was fixed for a
+different statistic.
 
 ## 3. Still not a sink — in any of the three
 
@@ -503,8 +513,9 @@ Against the outcomes written down before the run, this is the fourth: **ring wit
 upper-left peak — two mechanisms, not one, and the paper must split the claim.**
 
 1. **"Attention concentrates on the outer ring of the patch grid" is not a VLM-wide
-   statement.** It is strong on Qwen3-VL and InternVL-3.5 (1.54, 1.67) and weak on
-   LLaVA-1.5 (1.29, and below 1.0 on two image types). Scope it to the two.
+   statement.** Averaged over every head it is 1.54 on Qwen3-VL and 1.67 on InternVL-3.5,
+   against 1.29 on LLaVA-1.5 — and on LLaVA-1.5 it is one edge rather than a ring, and
+   below 1.0 on two image types. Scope it to the two.
 2. **The raster-order signature IS VLM-wide, and its direction is not.** All three put
    several times their share on one end of the token sequence; Qwen3-VL and InternVL pick
    the first token, LLaVA-1.5 the last. Any claim about "the top row" is a claim about a
