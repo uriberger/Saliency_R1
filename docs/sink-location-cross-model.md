@@ -390,6 +390,22 @@ report for that family and what `docs/where-attention-goes.md` said to expect.
 column is the bottom row carrying three edges that do nothing. Calling that "the outer
 ring" would be true arithmetic and a false picture.
 
+The number that settles it is the **border with each model's hottest edge taken out** — a
+side is a subset of the ring, so removing it is exact in both numerator and denominator:
+
+| model | ring | interior | hottest edge | ring **minus** that edge |
+|---|---|---|---|---|
+| Qwen3-VL | 1.54 | 0.75 | top (2.44) | **1.18** |
+| InternVL-3.5 | 1.67 | 0.79 | top (2.51) | **1.37** |
+| LLaVA-1.5 | 1.29 | 0.94 | bottom (2.43) | **0.89** |
+
+On Qwen3-VL and InternVL the border survives losing its best edge and the interior is
+genuinely depleted: those two have a ring, with a gradient running across it. On LLaVA-1.5
+the rest of the border falls **below chance** and the interior is not depleted at all: it
+has one lit edge and no ring. So the honest decomposition is that **the raster-order effect
+is in all three and the ring is in two of three** — LLaVA-1.5's hot row is a border row only
+because the last token of a raster scan happens to land in a corner.
+
 Per type, the ring clears 1.5 in **9 of 12** types on InternVL, **8 of 12** on Qwen3-VL and
 **2 of 12** on LLaVA-1.5 — where it also drops *below 1.0* on maths figures (0.92) and
 board puzzles (0.97).
@@ -513,9 +529,10 @@ Against the outcomes written down before the run, this is the fourth: **ring wit
 upper-left peak — two mechanisms, not one, and the paper must split the claim.**
 
 1. **"Attention concentrates on the outer ring of the patch grid" is not a VLM-wide
-   statement.** Averaged over every head it is 1.54 on Qwen3-VL and 1.67 on InternVL-3.5,
-   against 1.29 on LLaVA-1.5 — and on LLaVA-1.5 it is one edge rather than a ring, and
-   below 1.0 on two image types. Scope it to the two.
+   statement.** It holds on Qwen3-VL and InternVL-3.5 — all four edges above chance, the
+   interior depleted to 0.75/0.79, and 1.18/1.37 left after the hottest edge is removed.
+   It fails on LLaVA-1.5, where the border minus its bottom row is 0.89, below chance, and
+   the interior is flat. Two of three, not three of three.
 2. **The raster-order signature IS VLM-wide, and its direction is not.** All three put
    several times their share on one end of the token sequence; Qwen3-VL and InternVL pick
    the first token, LLaVA-1.5 the last. Any claim about "the top row" is a claim about a
