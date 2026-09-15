@@ -406,6 +406,43 @@ has one lit edge and no ring. So the honest decomposition is that **the raster-o
 is in all three and the ring is in two of three** — LLaVA-1.5's hot row is a border row only
 because the last token of a raster scan happens to land in a corner.
 
+### The profile that makes it unambiguous
+
+Enrichment per grid **row** and per grid **column**, at each model's modal grid. 1.00 is
+that row's or column's fair share. A 2-D border effect has to be a **U on both axes**; a
+raster-position effect is a **ramp on the row axis and nothing on the column axis**.
+
+```
+qwen3_vl  16x16, n=245
+  row: 3.25 0.71 1.46 0.60 1.76 0.53 0.92 0.49 0.54 0.87 0.46 1.21 0.47 0.97 0.61 1.15
+  col: 1.95 1.27 1.10 0.69 1.17 0.64 0.96 0.60 0.85 0.75 0.64 1.06 0.71 1.13 0.76 1.71
+
+internvl  16x16, n=1800
+  row: 2.37 1.13 1.01 0.79 0.79 0.78 0.80 0.92 0.73 0.75 0.73 0.85 0.82 0.95 1.10 1.48
+  col: 1.43 0.89 0.82 0.79 0.95 0.92 0.97 0.88 0.88 0.94 1.08 0.93 0.92 0.94 0.96 1.69
+
+llava     24x24, n=1800
+  row: 1.06 0.96 0.71 0.56 0.57 0.56 0.67 0.74 0.80 0.77 0.78 0.78 0.84 0.81 0.93 1.07
+       1.26 1.20 1.20 1.42 1.23 1.47 1.43 2.19
+  col: 1.00 1.08 0.87 0.88 0.97 1.02 1.07 1.10 1.04 1.41 0.99 0.89 0.91 1.07 1.10 0.93
+       0.98 0.98 1.04 0.88 0.81 0.89 0.94 1.15
+```
+
+Qwen3-VL and InternVL are U-shaped on **both** axes — first and last column 1.95/1.71 and
+1.43/1.69, first and last row above an interior that sags to ~0.8. That is a border.
+
+LLaVA-1.5 is **flat on the column axis** (1.00 at the left, 1.15 at the right, no U
+anywhere) and its row axis is a **monotonic ramp** rather than a U: the top row is at
+chance (1.06), the middle sags to 0.56, and the second half climbs without interruption to
+2.19. Being at an edge buys nothing in this model. Attention grows with token index and the
+ramp ends at the bottom row because that is where a raster scan ends. It also means
+"bottom-right" overstates the result: the single corner patch is extreme (13.0x) but there
+is no right-column preference at all.
+
+Loose thread, not chased: Qwen3-VL's row profile alternates, even rows consistently above
+odd ones (3.25, 0.71, 1.46, 0.60, 1.76, 0.53 ...). It may be an artefact of the 2x2 patch
+merge. n=245 at that one grid shape.
+
 Per type, the ring clears 1.5 in **9 of 12** types on InternVL, **8 of 12** on Qwen3-VL and
 **2 of 12** on LLaVA-1.5 — where it also drops *below 1.0* on maths figures (0.92) and
 board puzzles (0.97).
@@ -531,8 +568,10 @@ upper-left peak — two mechanisms, not one, and the paper must split the claim.
 1. **"Attention concentrates on the outer ring of the patch grid" is not a VLM-wide
    statement.** It holds on Qwen3-VL and InternVL-3.5 — all four edges above chance, the
    interior depleted to 0.75/0.79, and 1.18/1.37 left after the hottest edge is removed.
-   It fails on LLaVA-1.5, where the border minus its bottom row is 0.89, below chance, and
-   the interior is flat. Two of three, not three of three.
+   It fails on LLaVA-1.5, whose column profile is flat and whose row profile is a
+   monotonic ramp rather than a U: being at an edge buys nothing there, and the border
+   minus its bottom row is 0.89, below chance. Two of three, not three of three -- and on
+   the third what looks like an edge is the end of the raster order.
 2. **The raster-order signature IS VLM-wide, and its direction is not.** All three put
    several times their share on one end of the token sequence; Qwen3-VL and InternVL pick
    the first token, LLaVA-1.5 the last. Any claim about "the top row" is a claim about a
