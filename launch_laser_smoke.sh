@@ -154,6 +154,22 @@ RUNNER="$LOG_ROOT/$NAME.runner.sh"
     # trainer.logger is hardcoded to ["console","wandb"] in train.sh and is NOT an env
     # var. Without a key wandb blocks on auth, which on a batch node is an invisible hang.
     printf '        trainer.logger=%q \\\n' '["console"]'
+    # MUST move with MAX_RESPONSE_LENGTH. verl asserts max_token_len > max_seq_len, and
+    # max_seq_len is prompt + response = 2048 + 8192 = 10240. Their train.sh hardcodes
+    # 8192, which was fine at their 2048 response (max_seq_len 4096) and is not now:
+    #     AssertionError: max_token_len must be greater than the sequence length.
+    #     Got max_token_len=8192 and max_seq_len=10240      <- job 6851485, died at 11:25
+    #
+    # 12288 rather than verl's own default of 16384, on memory grounds. With
+    # use_remove_padding=True the fp32 cross-entropy gradient is
+    # packed_tokens x vocab(152K) x 4 bytes: 7.5 GiB at 12288, 10.0 GiB at 16384. 7.5 is
+    # the same budget that stopped the Stage 1 SFT OOMing, so it is the one with evidence.
+    #
+    # rollout and ref both inherit this via
+    # `${oc.select:actor_rollout_ref.actor.ppo_max_token_len_per_gpu,16384}`, so this one
+    # override covers all three paths -- the failure above surfaced in the LOG_PROB path,
+    # not the actor's.
+    printf '        actor_rollout_ref.actor.ppo_max_token_len_per_gpu=12288 \\\n'
     printf '        trainer.total_training_steps=%q' "$STEPS"
     for a in ${EXTRA[@]+"${EXTRA[@]}"}; do printf ' \\\n        %q' "$a"; done
     echo
