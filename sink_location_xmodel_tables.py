@@ -381,13 +381,15 @@ def main():
               "| model | median | p10 | p90 | share under 10 tokens |", "|---|---|---|---|---|"]
     print("\n=== how much each model wrote (completion length, capped at 256) ===")
     # Keyed on the DIRECTORY: the head set changes which rows of the attention matrix are
-    # read, never what the model wrote, so two panels over one scan are one row here.
+    # read, never what the model wrote, so two panels over one scan are one row here --
+    # and the row is named for the SCAN, never for the panel that happened to come first,
+    # which would print a head set into a table where the head set does not apply.
     for d in dict.fromkeys(r["dir"] for r in runs):
         r = next(x for x in runs if x["dir"] == d)
         n = np.array([m["n_generated"] for m in r["meta"] if m.get("n_generated")])
         if not n.size:
             continue
-        name = r["label"] if args.panels else r["family"]
+        name = Path(d).name if args.panels else r["family"]
         row = (f"| {name} | {np.median(n):.0f} | {np.percentile(n, 10):.0f} | "
                f"{np.percentile(n, 90):.0f} | {np.mean(n < 10):.1%} |")
         lines.append(row)
