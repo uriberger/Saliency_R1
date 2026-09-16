@@ -1279,9 +1279,25 @@ def read_stage(out_dir, stage):
                 flat, off = z[name], 0
                 for i, sh in zip(z[name + "__idx"], z[name + "__shapes"]):
                     n = int(np.prod(sh))
-                    arrays.setdefault(units[int(i)], {})[name] = flat[off:off + n].reshape(sh)
+                    a = flat[off:off + n].reshape(sh)
+                    arrays.setdefault(units[int(i)], {})[name] = _pad_stats(name, a)
                     off += n
     return meta, arrays
+
+
+def _pad_stats(name, a):
+    """Widen a stats array written before a statistic was added. -> NaN in the new slots.
+
+    `STAT_NAMES` is append-only by contract, so a run from before an append is a prefix
+    of the current layout and padding it is exact. Without this, `STAT_INDEX` would read
+    a new name out of an old array and silently return whatever float happened to sit at
+    that offset -- or, worse, index past the end only on some units.
+    """
+    if not name.startswith("stats") or a.ndim != 3 or a.shape[-1] >= len(SL.STAT_NAMES):
+        return a
+    out = np.full(a.shape[:-1] + (len(SL.STAT_NAMES),), np.nan, dtype=a.dtype)
+    out[..., :a.shape[-1]] = a
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -203,6 +203,12 @@ STAT_NAMES = (
     "knorm_interior",
     "align_ring",        # mean logit / (scaling * ||k||): the query-alignment leg of M2
     "align_interior",
+    # The four corners SEPARATELY. `corner_share` averages them, which is the right
+    # summary for "is the geometry enriched" and the wrong one for "which end of the
+    # raster order is". Top-left and bottom-right coincide with `first_patch_share` and
+    # `last_patch_share` on a single-tile grid and are carried again here so a table can
+    # name all four without the reader having to know that.
+    "corner_tl_share", "corner_tr_share", "corner_bl_share", "corner_br_share",
 )
 STAT_INDEX = {n: i for i, n in enumerate(STAT_NAMES)}
 
@@ -298,6 +304,10 @@ def reduce_cells(col_sum, col_sq, n_rows, row_total, gh, gw, kv_len,
         out[..., STAT_INDEX[stat]] = keep(np.nansum(p[..., sets[key]], axis=-1))
     out[..., STAT_INDEX["first_patch_share"]] = keep(p[..., 0])
     out[..., STAT_INDEX["last_patch_share"]] = keep(p[..., -1])
+    for stat, idx in (("corner_tl_share", 0), ("corner_tr_share", gw - 1),
+                      ("corner_bl_share", (gh - 1) * gw),
+                      ("corner_br_share", gh * gw - 1)):
+        out[..., STAT_INDEX[stat]] = keep(p[..., idx])
 
     with np.errstate(divide="ignore", invalid="ignore"):
         safe = np.where(np.isfinite(p) & (p > 0), p, 1.0)
