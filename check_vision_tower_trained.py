@@ -55,33 +55,41 @@ def snapshot(repo):
     return snaps[-1]
 
 
-def tensor_index(repo, prefixes):
-    """{tensor path inside the encoder: (file, key)} for every tensor under a prefix."""
+def load_tower(repo, prefixes):
+    """{tensor path inside the encoder: tensor} for everything under a prefix.
+
+    Reads safetensors where they exist and falls back to a pickled `pytorch_model.bin`
+    where they do not -- `openai/clip-vit-large-patch14-336` still ships only the latter,
+    and treating "no safetensors" as "no tensors" is how the control silently reported
+    nothing instead of reporting an answer. Everything is read through torch, because the
+    checkpoints are bfloat16 and numpy has no such dtype.
+    """
+    import torch
+    from safetensors.torch import load_file
+
     snap = snapshot(repo)
-    idx = os.path.join(snap, "model.safetensors.index.json")
-    if os.path.exists(idx):
-        weight_map = json.load(open(idx))["weight_map"]
+    state = {}
+    sfs = sorted(glob.glob(snap + "/*.safetensors"))
+    if sfs:
+        for f in sfs:
+            state.update(load_file(f))
     else:
-        files = [os.path.basename(f) for f in glob.glob(snap + "/*.safetensors")]
-        from safetensors import safe_open
-        weight_map = {}
-        for f in files:
-            with safe_open(os.path.join(snap, f), framework="np") as h:
-                for k in h.keys():
-                    weight_map[k] = f
+        bins = sorted(glob.glob(snap + "/*.bin"))
+        if not bins:
+            raise SystemExit(f"{repo}: no .safetensors and no .bin under {snap}")
+        for f in bins:
+            state.update(torch.load(f, map_location="cpu", weights_only=True))
     out = {}
-    for k, f in weight_map.items():
+    for k, v in state.items():
         for p in prefixes:
             if k.startswith(p):
-                out[k[len(p):]] = (os.path.join(snap, f), k)
+                out[k[len(p):]] = v
                 break
     return out
 
 
-def compare(label, vlm_repo, vlm_pref, up_repo, up_pref, sample=None):
-    from safetensors import safe_open
-
-    a, b = tensor_index(vlm_repo, vlm_pref), tensor_index(up_repo, up_pref)
+def compare(label, vlm_repo, vlm_pref, up_repo, up_pref):
+    a, b = load_tower(vlm_repo, vlm_pref), load_tower(up_repo, up_pref)
     shared = sorted(set(a) & set(b))
     print(f"\n{label}")
     print(f"   vs {up_repo}")
@@ -89,30 +97,32 @@ def compare(label, vlm_repo, vlm_pref, up_repo, up_pref, sample=None):
     if not shared:
         print("   NO MATCHED TENSORS -- the prefix mapping is wrong, not the answer")
         return
-    keys = shared if sample is None else shared[:: max(1, len(shared) // sample)]
+    # THE COMPARISON HAS TO GO THROUGH THE STORAGE DTYPE, or it answers a different
+    # question. The upstream encoders ship float32; the VLMs store float16 or bfloat16.
+    # Casting fp32 -> fp16 perturbs about a quarter of the tensors in the last bits, which
+    # a raw "are these equal" test reports as training -- it did, on the control, at a
+    # relative size of 4e-4, which is below fp16's own epsilon. So the test is: cast the
+    # upstream tensor to the dtype the VLM stored, and ask whether it reproduces the VLM's
+    # tensor EXACTLY. If it does, the tower is the upstream encoder written at lower
+    # precision, and nothing trained it.
     identical, changed, worst, shape_mismatch = 0, 0, ("", 0.0), []
-    handles = {}
-
-    def get(path, key):
-        if path not in handles:
-            handles[path] = safe_open(path, framework="np")
-        return handles[path].get_tensor(key)
-
-    for k in keys:
-        x, y = get(*a[k]), get(*b[k])
-        if x.shape != y.shape:
-            shape_mismatch.append(f"{k} {x.shape} vs {y.shape}")
+    for k in shared:
+        x, y = a[k], b[k]
+        if tuple(x.shape) != tuple(y.shape):
+            shape_mismatch.append(f"{k} {tuple(x.shape)} vs {tuple(y.shape)}")
             continue
-        xf, yf = x.astype(np.float32), y.astype(np.float32)
-        d = float(np.abs(xf - yf).max())
-        scale = float(np.abs(yf).max()) or 1.0
-        if d == 0.0:
+        if bool((x == y.to(x.dtype)).all()):
             identical += 1
-        else:
-            changed += 1
-            if d / scale > worst[1]:
-                worst = (k, d / scale)
+            continue
+        changed += 1
+        xf, yf = x.float().numpy(), y.float().numpy()
+        scale = float(np.abs(yf).max()) or 1.0
+        d = float(np.abs(xf - yf).max()) / scale
+        if d > worst[1]:
+            worst = (k, d)
     n = identical + changed
+    dts = {str(t.dtype) for t in a.values()} | {str(t.dtype) for t in b.values()}
+    print(f"   dtypes seen: {sorted(dts)}  (upstream cast to the VLM's before comparing)")
     print(f"   {identical}/{n} tensors BIT-IDENTICAL to the upstream encoder, "
           f"{changed} changed")
     if shape_mismatch:
@@ -120,9 +130,11 @@ def compare(label, vlm_repo, vlm_pref, up_repo, up_pref, sample=None):
               f"training): e.g. {shape_mismatch[0]}")
     if changed:
         print(f"   largest relative change: {worst[0]}  {worst[1]:.3e}")
-    verdict = ("FROZEN -- every matched tensor is exactly what the upstream released"
+    verdict = ("FROZEN -- every matched tensor is exactly the upstream encoder, written "
+               "at the VLM's storage precision"
                if changed == 0 else
-               "TRAINED inside the VLM -- the weights moved")
+               f"TRAINED inside the VLM -- {changed} tensors differ by more than the "
+               "storage dtype can explain")
     print(f"   -> {verdict}")
 
 
