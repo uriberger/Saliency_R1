@@ -210,16 +210,25 @@ def draw(mat, title, subtitle, path, note=""):
     # as "the maximum" -- and the four corners always, since they are the story.
     hot = np.argwhere(np.abs(z) > CLIP)
     corners = {(0, 0), (0, GW - 1), (GH - 1, 0), (GH - 1, GW - 1)}
+    # A label has to fit inside its own cell. On a 24x24 grid the cells are 2/3 the width
+    # of a 16x16 one's, so the type scales with them and values past 10 drop the decimal
+    # -- otherwise two adjacent clipped cells run their numbers together, which is what a
+    # screenshot catches and no colour validator does.
+    fs = float(np.clip(5.5 * 16.0 / GW, 3.4, 6.0))
+    fmt = lambda v: f"{v:.0f}" if abs(v) >= 10 else f"{v:.1f}"       # noqa: E731
     for r, c in sorted(corners | {tuple(x) for x in hot}):
         v = mat[r, c]
         if not np.isfinite(v):
             continue
-        ax.text(c, r, f"{v:.1f}", ha="center", va="center", fontsize=5.5,
+        ax.text(c, r, fmt(v), ha="center", va="center", fontsize=fs,
                 color="#ffffff" if abs(z[r, c]) > 1.1 else INK,
                 fontweight="bold" if abs(z[r, c]) > CLIP else "normal")
 
-    ax.set_title(title, fontsize=10, color=INK, pad=10, loc="left")
-    ax.text(0, 1.015, subtitle, transform=ax.transAxes, fontsize=7.5, color=MUTED,
+    # The title sits above the subtitle, which sits above the plot. `pad` has to clear
+    # BOTH or the two overlap -- which is exactly what a screenshot catches and no
+    # validator does.
+    ax.set_title(title, fontsize=10, color=INK, pad=26, loc="left")
+    ax.text(0, 1.018, subtitle, transform=ax.transAxes, fontsize=7.5, color=MUTED,
             va="bottom")
     cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
                       ticks=np.log2([0.25, 0.5, 1, 2, 4]))
@@ -273,6 +282,31 @@ def main():
         "`centre` is everything the", "ring is not.  TL/TR/BL/BR are single patches, so "
         "they are priced against a flat map's", "1/N and run on a different scale from "
         "the block columns beside them.", ""]
+
+    # How long the answers were, per model. The `generated` row is an average over
+    # whatever the model wrote, and the picture is the unit of analysis, so a two-token
+    # answer weighs as much as a 256-token one. On a model that answers tersely that
+    # makes the row noisier -- not biased, but it has to be visible next to the number.
+    lines += ["## How much the models wrote", "",
+              "The `generated` rows average over the tokens each model actually produced,"
+              " capped at 256.",
+              "The picture is the unit of analysis throughout, so a two-token answer"
+              " weighs as much as a",
+              "256-token one; a model that answers tersely therefore has a noisier"
+              " `generated` row.", "",
+              "| model | median | p10 | p90 | share under 10 tokens |", "|---|---|---|---|---|"]
+    print("\n=== how much each model wrote (completion length, capped at 256) ===")
+    for r in runs:
+        n = np.array([m["n_generated"] for m in r["meta"] if m.get("n_generated")])
+        if not n.size:
+            continue
+        row = (f"| {r['family']} | {np.median(n):.0f} | {np.percentile(n, 10):.0f} | "
+               f"{np.percentile(n, 90):.0f} | {np.mean(n < 10):.1%} |")
+        lines.append(row)
+        print(f"{r['family']:<12} median {np.median(n):>4.0f}  p10 "
+              f"{np.percentile(n, 10):>4.0f}  p90 {np.percentile(n, 90):>4.0f}  "
+              f"under 10 tokens {np.mean(n < 10):.1%}")
+    lines.append("")
 
     for label, field, mapfield in Q_SETS:
         lines += [f"## Query set: {label}", "",
