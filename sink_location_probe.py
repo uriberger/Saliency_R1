@@ -391,7 +391,7 @@ def generate_then_teacher_force(model, processor, images, question, device, scan
 
 
 def measure(model, processor, images, question, device, scan, tap=None,
-            want_hidden=True, max_new_tokens=0, tile=0, **proc_kwargs):
+            want_hidden=True, max_new_tokens=0, tile=0, min_mass=0.002, **proc_kwargs):
     """One prefill. -> the reduced cells, the maps, the norms, and the geometry.
 
     Everything this experiment reads comes out of this single forward: the column view at
@@ -475,6 +475,20 @@ def measure(model, processor, images, question, device, scan, tap=None,
     # are fitted on. Head-mean per layer: 36 x N floats, not 36 x 32 x N.
     mean = cut(prim["col_sum"]).mean(1)
     got["maps"] = mean / np.maximum(mean.sum(-1, keepdims=True), 1e-30)
+
+    # ... and the ALL-HEAD pooled map, once per query set. This is the per-patch
+    # decomposition of the cross-model tables -- summing it over any patch set
+    # reproduces that table's numerator -- so a heatmap drawn from it cannot disagree
+    # with the numbers printed beside it. [N] floats each.
+    got["map_q"] = SL.pooled_patch_map(cut(prim["col_sum"]), prim["row_total"],
+                                       prim["n_rows"], min_mass)
+    if gq is not None and gq["n_rows"] > 0:
+        got["map_gen"] = SL.pooled_patch_map(cut(gq["col_sum"]), gq["row_total"],
+                                             gq["n_rows"], min_mass)
+        got["map_all"] = SL.pooled_patch_map(
+            cut(prim["col_sum"]) + cut(gq["col_sum"]),
+            prim["row_total"] + gq["row_total"],
+            prim["n_rows"] + gq["n_rows"], min_mass)
 
     if res["spans"] is not None:
         denom = np.maximum(prim["row_total"], 1e-30)
@@ -582,7 +596,8 @@ def arrays_of(got):
     and that is the one question no pixel-space transform can answer.
     """
     keep = ("stats", "peak", "maps", "spans", "hnorm", "vnorm", "stats_img_q", "perm",
-            "stats_gen", "peak_gen", "stats_all", "peak_all")
+            "stats_gen", "peak_gen", "stats_all", "peak_all",
+            "map_q", "map_gen", "map_all")
     return {k: np.asarray(got[k]) for k in keep if got.get(k) is not None}
 
 
@@ -650,7 +665,7 @@ def stage_scan(args):
             im = Image.open(r["path"]).convert("RGB")
             got = measure(model, processor, [im], r["question"], device, scan, tap,
                           want_hidden=not args.no_hidden,
-                          max_new_tokens=args.max_new_tokens)
+                          max_new_tokens=args.max_new_tokens, min_mass=args.min_mass)
             if got is None:
                 print(f"[scan] {r['key']}: no picture located, skipped", flush=True)
                 prog.tick()

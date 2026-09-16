@@ -260,20 +260,10 @@ def reduce_cells(col_sum, col_sq, n_rows, row_total, gh, gw, kv_len,
     if N != gh * gw:
         raise ValueError(f"{N} image columns against a {gh}x{gw} grid")
 
-    raw = col_sum / float(n_rows)                            # [L,H,N] absolute weight
-    tot = np.asarray(row_total, dtype=np.float64) / n_rows
-    img_abs = raw.sum(-1)                                    # [L,H]
-    live = img_abs > 0
+    p, raw, tot, img_abs, live, mass = _cell_distribution(col_sum, row_total, n_rows,
+                                                          col_null)
     keep = lambda x: np.where(live, x, np.nan)               # noqa: E731
-    with np.errstate(divide="ignore", invalid="ignore"):
-        out[..., STAT_INDEX["image_mass"]] = np.where(tot > 0, img_abs / tot, np.nan)
-        # the position-corrected distribution: what the picture's attention looks like
-        # once the shape a position-blind model would produce anyway is divided out
-        corr = raw if col_null is None else raw / np.maximum(
-            np.asarray(col_null, dtype=np.float64), 1e-30)
-        cimg = corr.sum(-1)
-        p = np.where(live[..., None], corr / np.where(cimg > 0, cimg, 1.0)[..., None],
-                     np.nan)
+    out[..., STAT_INDEX["image_mass"]] = mass
 
     peak = np.argmax(np.where(np.isfinite(p), p, -np.inf), axis=-1)       # [L,H]
     li, hi = np.meshgrid(np.arange(L), np.arange(H), indexing="ij")
@@ -330,6 +320,54 @@ def reduce_cells(col_sum, col_sq, n_rows, row_total, gh, gw, kv_len,
             out[..., STAT_INDEX["align_interior"]] = np.nanmean(
                 align[..., sets["interior"]], -1)
     return out, np.where(live, peak, -1).astype(np.int32)
+
+
+def _cell_distribution(col_sum, row_total, n_rows, col_null=None):
+    """One (layer, head) cell's patch distribution, and how much of its row the picture got.
+
+    Factored out of `reduce_cells` so that `pooled_patch_map` -- the per-patch
+    decomposition the figures draw -- is computed from the same arithmetic as the tables
+    rather than from a second copy of it. A drifted copy would produce a heatmap that
+    disagrees with the numbers printed beside it, in the third decimal, silently.
+
+    -> (p [L,H,N] distribution, raw weight, row total, image weight, live mask, image mass)
+    """
+    col_sum = np.asarray(col_sum, dtype=np.float64)
+    n_rows = max(1, int(n_rows))
+    raw = col_sum / float(n_rows)                            # [L,H,N] absolute weight
+    tot = np.asarray(row_total, dtype=np.float64) / n_rows
+    img_abs = raw.sum(-1)                                    # [L,H]
+    live = img_abs > 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mass = np.where(tot > 0, img_abs / tot, np.nan)
+        # the position-corrected distribution: what the picture's attention looks like
+        # once the shape a position-blind model would produce anyway is divided out
+        corr = raw if col_null is None else raw / np.maximum(
+            np.asarray(col_null, dtype=np.float64), 1e-30)
+        cimg = corr.sum(-1)
+        p = np.where(live[..., None], corr / np.where(cimg > 0, cimg, 1.0)[..., None],
+                     np.nan)
+    return p, raw, tot, img_abs, live, mass
+
+
+def pooled_patch_map(col_sum, row_total, n_rows, min_mass=0.002, col_null=None):
+    """The per-patch decomposition of the ALL-HEAD table. -> [N], sums to ~1.
+
+    Every cross-model table is "the mean, over the (layer, head) cells that clear the
+    image-mass floor, of that cell's share of the picture's attention on some patch set".
+    This is that same average taken per PATCH instead of per set, so summing it over any
+    set reproduces the table's numerator exactly. It is what the heatmaps draw, and the
+    reason they cannot drift away from the numbers printed beside them.
+
+    A head that puts no weight on the picture still has a patch distribution, and it is
+    noise wearing a statistic's name -- hence the floor, which is the report's own.
+    """
+    p, _raw, _tot, _img, _live, mass = _cell_distribution(col_sum, row_total, n_rows,
+                                                          col_null)
+    ok = np.isfinite(mass) & (mass >= float(min_mass))
+    if not ok.any():
+        return np.full(p.shape[-1], np.nan)
+    return np.nanmean(np.where(ok[..., None], p, np.nan).reshape(-1, p.shape[-1]), axis=0)
 
 
 def content_stats(image, gh, gw):
