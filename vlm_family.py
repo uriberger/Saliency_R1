@@ -63,6 +63,33 @@ def family_for(model=None, processor=None, config=None, model_type=None):
     return cls().bind(model=model, processor=processor, config=config)
 
 
+#: The decoder attention class for each text tower a connector-style VLM can be built on.
+#: Several of these architectures are SOCKETS, not models -- the same
+#: `LlavaForConditionalGeneration` holds Vicuna + CLIP in LLaVA-1.5 and Qwen2 + SigLIP in
+#: llava-interleave-qwen -- so the class has to be read off the text config rather than
+#: assumed. Guessing installs the scan on nothing, and a model that reports empty cells
+#: looks exactly like a model with no effect.
+TEXT_ATTENTION = {
+    "llama": "LlamaAttention", "qwen2": "Qwen2Attention", "qwen3": "Qwen3Attention",
+    "mistral": "MistralAttention", "gemma": "GemmaAttention",
+    "gemma2": "Gemma2Attention", "gemma3_text": "Gemma3Attention",
+    "phi3": "Phi3Attention", "olmo2": "Olmo2Attention",
+}
+
+
+def text_attention(config, default):
+    mt = getattr(getattr(config, "text_config", None), "model_type", None)
+    if not mt:
+        return default
+    cls = TEXT_ATTENTION.get(mt)
+    if cls is None:
+        raise SystemExit(
+            f"a {mt!r} text tower: add its attention class to vlm_family.TEXT_ATTENTION. "
+            "Guessing would install the scan on nothing and report empty cells as a "
+            "result.")
+    return (cls,)
+
+
 # ---------------------------------------------------------------------------
 class Family:
     """The surface `sink_location.py` is allowed to know about a model.
@@ -425,17 +452,6 @@ class Llava15(Family):
     # this model rather than a gap in the measurement.
     fixed_grid = (24, 24)                          # 336/14
 
-    #: The `llava` architecture is a socket, not a model: the same
-    #: `LlavaForConditionalGeneration` holds Vicuna + CLIP in LLaVA-1.5 and Qwen2 + SigLIP
-    #: in llava-interleave-qwen. The decoder's attention class therefore has to be read
-    #: off the TEXT config rather than assumed, or the scan installs on nothing and every
-    #: cell comes back empty -- which is exactly the pair of models that separates "the
-    #: language model's queries like the border" from "the encoder marks the border".
-    TEXT_ATTENTION = {"llama": "LlamaAttention", "qwen2": "Qwen2Attention",
-                      "qwen3": "Qwen3Attention", "mistral": "MistralAttention",
-                      "gemma": "GemmaAttention", "gemma2": "Gemma2Attention",
-                      "gemma3_text": "Gemma3Attention", "phi3": "Phi3Attention"}
-
     def bind(self, model=None, processor=None, config=None):
         super().bind(model=model, processor=processor, config=config)
         vc = getattr(self.config, "vision_config", None)
@@ -443,16 +459,7 @@ class Llava15(Family):
             px = int(getattr(vc, "patch_size", 14))
             side = int(getattr(vc, "image_size", 336)) // px
             self.fixed_grid, self.encoder_px = (side, side), px
-        tc = getattr(self.config, "text_config", None)
-        mt = getattr(tc, "model_type", None)
-        if mt:
-            cls = self.TEXT_ATTENTION.get(mt)
-            if cls is None:
-                raise SystemExit(
-                    f"llava-architecture model with a {mt!r} text tower: add its "
-                    "attention class to Llava15.TEXT_ATTENTION. Guessing would install "
-                    "the scan on nothing and report empty cells as a result.")
-            self.attn_classes = (cls,)
+        self.attn_classes = text_attention(self.config, self.attn_classes)
         return self
 
     # -- the centre crop, in closed form ---------------------------------
@@ -486,6 +493,53 @@ class Llava15(Family):
             nh, nw = short, int(short * W / H)
         left, top = (nw - cw) // 2, (nh - ch) // 2
         return (left / nw, top / nh, (left + cw) / nw, (top + ch) / nh)
+
+
+# ---------------------------------------------------------------------------
+@register
+class Idefics3(Family):
+    """A Llama-3 text tower on a SigLIP encoder -- the cell the other four do not fill.
+
+    Qwen3-VL, InternVL3.5 and llava-interleave-qwen all run a Qwen language model, and
+    LLaVA-1.5 is the only non-Qwen one, which leaves "the language model's queries favour
+    border keys" confounded with everything that differs between those checkpoints. This
+    is a second non-Qwen decoder -- Llama-3-8B, 32 layers by 32 heads -- on a SigLIP tower
+    that WAS trained inside the VLM, which is the combination none of the others has.
+
+    SPLITTING, like InternVL's tiling: `do_image_splitting` is True by default and cuts a
+    picture into sub-images plus a global view. Pinned off, so one 13x13 grid covers the
+    whole picture. The processor then resizes to 364x364 with no padding -- checked, the
+    pixel attention mask comes back fully valid -- so the view box is the whole picture
+    and the border of the grid really is the border of the image.
+    """
+
+    name = "idefics3"
+    model_types = ("idefics3", "smolvlm")
+    attn_classes = ("LlamaAttention",)
+    row_classes = ("Idefics3Connector", "SmolVLMConnector")
+    # One token is used on BOTH sides of the picture, so it is reported entirely in
+    # `vision_start` rather than counted twice by naming it as the closer as well.
+    start_tokens = ("<fake_token_around_image>",)
+    fixed_grid = (13, 13)
+    encoder_px = 28
+    proc_defaults = {"do_image_splitting": False}
+
+    def image_arg(self, images):
+        return [list(images)]
+
+    def bind(self, model=None, processor=None, config=None):
+        super().bind(model=model, processor=processor, config=config)
+        cfg = self.config
+        vc = getattr(cfg, "vision_config", None)
+        if vc is not None:
+            px = int(getattr(vc, "patch_size", 14))
+            # pixel shuffle by `scale_factor` in the connector, exactly as InternVL's
+            # 2x2 shuffle does: 26x26 patches of 14px become 13x13 tokens of 28px.
+            sf = int(getattr(cfg, "scale_factor", 2))
+            side = (int(getattr(vc, "image_size", 364)) // px) // sf
+            self.fixed_grid, self.encoder_px = (side, side), px * sf
+        self.attn_classes = text_attention(cfg, self.attn_classes)
+        return self
 
 
 # ---------------------------------------------------------------------------
