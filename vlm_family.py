@@ -425,6 +425,17 @@ class Llava15(Family):
     # this model rather than a gap in the measurement.
     fixed_grid = (24, 24)                          # 336/14
 
+    #: The `llava` architecture is a socket, not a model: the same
+    #: `LlavaForConditionalGeneration` holds Vicuna + CLIP in LLaVA-1.5 and Qwen2 + SigLIP
+    #: in llava-interleave-qwen. The decoder's attention class therefore has to be read
+    #: off the TEXT config rather than assumed, or the scan installs on nothing and every
+    #: cell comes back empty -- which is exactly the pair of models that separates "the
+    #: language model's queries like the border" from "the encoder marks the border".
+    TEXT_ATTENTION = {"llama": "LlamaAttention", "qwen2": "Qwen2Attention",
+                      "qwen3": "Qwen3Attention", "mistral": "MistralAttention",
+                      "gemma": "GemmaAttention", "gemma2": "Gemma2Attention",
+                      "gemma3_text": "Gemma3Attention", "phi3": "Phi3Attention"}
+
     def bind(self, model=None, processor=None, config=None):
         super().bind(model=model, processor=processor, config=config)
         vc = getattr(self.config, "vision_config", None)
@@ -432,31 +443,43 @@ class Llava15(Family):
             px = int(getattr(vc, "patch_size", 14))
             side = int(getattr(vc, "image_size", 336)) // px
             self.fixed_grid, self.encoder_px = (side, side), px
+        tc = getattr(self.config, "text_config", None)
+        mt = getattr(tc, "model_type", None)
+        if mt:
+            cls = self.TEXT_ATTENTION.get(mt)
+            if cls is None:
+                raise SystemExit(
+                    f"llava-architecture model with a {mt!r} text tower: add its "
+                    "attention class to Llava15.TEXT_ATTENTION. Guessing would install "
+                    "the scan on nothing and report empty cells as a result.")
+            self.attn_classes = (cls,)
         return self
 
     # -- the centre crop, in closed form ---------------------------------
-    def _crop_size(self):
-        ip = getattr(self.processor, "image_processor", None)
-        size = getattr(ip, "size", None) or {}
-        crop = getattr(ip, "crop_size", None) or {}
-        short = int(size.get("shortest_edge", 336))
-        ch = int(crop.get("height", short))
-        cw = int(crop.get("width", short))
-        return short, ch, cw
-
     def view_box(self, image):
-        """The centred square the processor keeps, in normalised picture coordinates.
+        """The part of the picture this processor's grid covers.
 
-        Reproduces `CLIPImageProcessor`'s arithmetic exactly rather than approximating
-        it: the short side goes to `shortest_edge` and the long side is TRUNCATED, then
-        `center_crop` takes `(size - crop) // 2` off the top and the left. A half-pixel
-        of slop here is harmless; getting the direction wrong is not.
+        TWO CASES, and reading the wrong one puts every patch statistic in the wrong
+        frame. `size` with a `shortest_edge` plus `do_center_crop` -- LLaVA-1.5's
+        CLIPImageProcessor -- resizes the short side and CENTRE-CROPS, so the grid covers
+        a centred square. `size` with an explicit height and width -- SigLIP's processor,
+        which llava-interleave-qwen uses -- resizes the whole picture to that square, so
+        the grid covers all of it.
+
+        The crop case reproduces `CLIPImageProcessor`'s arithmetic exactly rather than
+        approximating it: the short side goes to `shortest_edge`, the long side is
+        TRUNCATED, then `center_crop` takes `(size - crop) // 2` off the top and the
+        left. A half-pixel of slop here is harmless; getting the direction wrong is not.
         """
+        ip = getattr(self.processor, "image_processor", None)
+        size, crop = getattr(ip, "size", None), getattr(ip, "crop_size", None)
+        short = _size_get(size, "shortest_edge")
+        if short is None or not getattr(ip, "do_center_crop", False):
+            return (0.0, 0.0, 1.0, 1.0)          # resized to a square: the whole picture
+        short = int(short)
+        ch = int(_size_get(crop, "height") or short)
+        cw = int(_size_get(crop, "width") or short)
         W, H = image.size
-        short, ch, cw = self._crop_size()
-        if not getattr(getattr(self.processor, "image_processor", None),
-                       "do_center_crop", True):
-            return (0.0, 0.0, 1.0, 1.0)
         if W <= H:
             nw, nh = short, int(short * H / W)
         else:
@@ -468,6 +491,20 @@ class Llava15(Family):
 # ---------------------------------------------------------------------------
 # geometry helpers that need the view box
 # ---------------------------------------------------------------------------
+def _size_get(size, key):
+    """One field of a processor's size spec, whether it is a dict or a `SizeDict`.
+
+    transformers hands these back in both shapes depending on the processor and the
+    version, and `"shortest_edge" in size` raises on one of them. A view box read off the
+    wrong branch silently frames every patch statistic on the wrong region.
+    """
+    if size is None:
+        return None
+    if isinstance(size, dict):
+        return size.get(key)
+    return getattr(size, key, None)
+
+
 def view_crop(image, view):
     """The part of the picture the grid covers, as a picture of its own.
 
