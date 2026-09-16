@@ -202,6 +202,67 @@ def test_reducer():
           f"{st6[0, 0, SL.STAT_INDEX['peak_cv']]:.4f}")
 
 
+def test_pooled_map():
+    """The heatmap has to BE the table, not illustrate it, at both head sets."""
+    print("\npooled map")
+    gh, gw = 10, 16
+    n = gh * gw
+    ring = SL.ring_set(gh, gw).reshape(-1)
+    rng = np.random.default_rng(7)
+
+    # Five cells. The trained pair leans on the ring; a third live head does NOT, so the
+    # two head sets cannot agree by accident and the test can tell the branches apart. One
+    # head barely looks at the picture (it must fall to the floor), and the rest are dead.
+    L, H = 23, 32
+    col = np.zeros((L, H, n))
+    col[22, 28] = rng.gamma(2.0, 1.0, n) * np.where(ring, 3.0, 1.0)
+    col[22, 31] = rng.gamma(2.0, 1.0, n) * np.where(ring, 2.0, 1.0)
+    col[5, 7] = rng.gamma(2.0, 1.0, n) * np.where(ring, 0.2, 1.0)
+    col[0, 0] = rng.gamma(2.0, 1.0, n)
+    row_total = col.sum(-1) * 4.0                     # picture = 1/4 of each row...
+    row_total[0, 0] = col[0, 0].sum() * 5000.0        # ...except this one, under the floor
+    row_total[col.sum(-1) == 0] = 1.0                 # a dead cell still has a row
+
+    st, _peak = SL.reduce_cells(col, None, 1, row_total, gh, gw, 2000)
+    floor = 0.002
+
+    for name, cells in (("all heads", None), ("the trained pair", [(22, 28), (22, 31)])):
+        pm = SL.pooled_patch_map(col, row_total, 1, floor, cells=cells)
+        if cells is None:
+            live = st[..., SL.STAT_INDEX["image_mass"]] >= floor
+        else:
+            live = np.zeros((L, H), dtype=bool)
+            for layer, head in cells:
+                live[layer, head] = True
+        want = float(np.nanmean(np.where(live, st[..., SL.STAT_INDEX["ring_share"]],
+                                         np.nan)))
+        check(f"summing the pooled map over the ring reproduces ring_share -- {name}",
+              abs(float(pm[ring].sum()) - want) < 1e-9,
+              f"map {float(pm[ring].sum()):.9f} vs table {want:.9f}")
+        check(f"...and the map sums to 1 -- {name}",
+              abs(float(pm.sum()) - 1.0) < 1e-9, f"{float(pm.sum()):.9f}")
+
+    check("the two head sets are different quantities, not one at two resolutions",
+          not np.allclose(SL.pooled_patch_map(col, row_total, 1, floor),
+                          SL.pooled_patch_map(col, row_total, 1, floor,
+                                              cells=[(22, 28), (22, 31)])))
+
+    dead = SL.pooled_patch_map(col, row_total, 1, floor, cells=[(22, 29)])
+    check("a named cell that never looks at the picture is NaN, not zeros",
+          bool(np.all(np.isnan(dead))))
+    check("a named cell outside the array is ignored rather than an IndexError",
+          bool(np.allclose(SL.pooled_patch_map(col, row_total, 1, floor,
+                                               cells=[(22, 28), (99, 0)]),
+                           SL.pooled_patch_map(col, row_total, 1, floor,
+                                               cells=[(22, 28)]), equal_nan=True)))
+
+    # The floor is what separates the two treatments, and it has to bite: the all-head map
+    # must EXCLUDE (0,0), which is live but below it.
+    low = SL.pooled_patch_map(col, row_total, 1, 0.0)
+    check("the image-mass floor actually drops a head from the all-head map",
+          not np.allclose(low, SL.pooled_patch_map(col, row_total, 1, floor)))
+
+
 # ---------------------------------------------------------------------------
 def _ids(grids, prefix=3, tail=4):
     n_img = sum(t * gh * gw for t, gh, gw in grids)
@@ -581,6 +642,7 @@ def main():
     print("sink_location CPU checks")
     test_geometry()
     test_reducer()
+    test_pooled_map()
     test_locate()
     test_attention()
     test_transforms()

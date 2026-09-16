@@ -350,8 +350,9 @@ def _cell_distribution(col_sum, row_total, n_rows, col_null=None):
     return p, raw, tot, img_abs, live, mass
 
 
-def pooled_patch_map(col_sum, row_total, n_rows, min_mass=0.002, col_null=None):
-    """The per-patch decomposition of the ALL-HEAD table. -> [N], sums to ~1.
+def pooled_patch_map(col_sum, row_total, n_rows, min_mass=0.002, col_null=None,
+                     cells=None):
+    """The per-patch decomposition of a head set's table. -> [N], sums to ~1.
 
     Every cross-model table is "the mean, over the (layer, head) cells that clear the
     image-mass floor, of that cell's share of the picture's attention on some patch set".
@@ -359,15 +360,36 @@ def pooled_patch_map(col_sum, row_total, n_rows, min_mass=0.002, col_null=None):
     set reproduces the table's numerator exactly. It is what the heatmaps draw, and the
     reason they cannot drift away from the numbers printed beside them.
 
-    A head that puts no weight on the picture still has a patch distribution, and it is
-    noise wearing a statistic's name -- hence the floor, which is the report's own.
+    `cells` is None for the ALL-HEAD map, or an explicit list of (layer, head) -- the two
+    the overlap reward trains on. The two treatments of the floor differ on purpose, and
+    it is the same split `sink_location_probe._enrich` makes:
+
+      all-head    floored. A head that puts no weight on the picture still has a patch
+                  distribution, and it is noise wearing a statistic's name.
+      named       never floored. These cells were named by the reward, not selected for
+                  being large, so dropping them on the pictures where they happen to look
+                  away would quietly turn "where these two heads look" into "where they
+                  look on the pictures they bother to look at" -- a different claim, and a
+                  flattering one.
+
+    A cell outside the array is ignored rather than an error: L22 exists in every family
+    here, but a 20-layer model would otherwise make this raise from inside a scan.
     """
     p, _raw, _tot, _img, _live, mass = _cell_distribution(col_sum, row_total, n_rows,
                                                           col_null)
-    ok = np.isfinite(mass) & (mass >= float(min_mass))
+    if cells is None:
+        ok = np.isfinite(mass) & (mass >= float(min_mass))
+    else:
+        ok = np.zeros(mass.shape, dtype=bool)
+        for layer, head in cells:
+            if 0 <= layer < ok.shape[0] and 0 <= head < ok.shape[1]:
+                ok[layer, head] = True
     if not ok.any():
         return np.full(p.shape[-1], np.nan)
-    return np.nanmean(np.where(ok[..., None], p, np.nan).reshape(-1, p.shape[-1]), axis=0)
+    sel = np.where(ok[..., None], p, np.nan).reshape(-1, p.shape[-1])
+    if not np.isfinite(sel).any():
+        return np.full(p.shape[-1], np.nan)
+    return np.nanmean(sel, axis=0)
 
 
 def content_stats(image, gh, gw):

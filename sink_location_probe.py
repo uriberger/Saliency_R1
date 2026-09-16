@@ -476,19 +476,32 @@ def measure(model, processor, images, question, device, scan, tap=None,
     mean = cut(prim["col_sum"]).mean(1)
     got["maps"] = mean / np.maximum(mean.sum(-1, keepdims=True), 1e-30)
 
-    # ... and the ALL-HEAD pooled map, once per query set. This is the per-patch
-    # decomposition of the cross-model tables -- summing it over any patch set
+    # ... and the pooled map, once per query set and once per head set. This is the
+    # per-patch decomposition of the cross-model tables -- summing it over any patch set
     # reproduces that table's numerator -- so a heatmap drawn from it cannot disagree
     # with the numbers printed beside it. [N] floats each.
+    #
+    # The `_tr` twins are the same quantity at the two cells the overlap reward trains on
+    # (L22 h28/31), which is the only way to draw "where the REWARDED heads look" rather
+    # than "where the model looks". They are not a subset of the all-head map in any
+    # readable sense -- two cells out of 1,152, and the pair is edge-leaning (see
+    # docs/sink-location-by-image-type.md 17.3) -- so they are stored, never derived.
+    trained = [(TRAINED_LAYER, h) for h in TRAINED_HEADS]
     got["map_q"] = SL.pooled_patch_map(cut(prim["col_sum"]), prim["row_total"],
                                        prim["n_rows"], min_mass)
+    got["map_q_tr"] = SL.pooled_patch_map(cut(prim["col_sum"]), prim["row_total"],
+                                          prim["n_rows"], min_mass, cells=trained)
     if gq is not None and gq["n_rows"] > 0:
         got["map_gen"] = SL.pooled_patch_map(cut(gq["col_sum"]), gq["row_total"],
                                              gq["n_rows"], min_mass)
-        got["map_all"] = SL.pooled_patch_map(
-            cut(prim["col_sum"]) + cut(gq["col_sum"]),
-            prim["row_total"] + gq["row_total"],
-            prim["n_rows"] + gq["n_rows"], min_mass)
+        got["map_gen_tr"] = SL.pooled_patch_map(cut(gq["col_sum"]), gq["row_total"],
+                                                gq["n_rows"], min_mass, cells=trained)
+        union_col = cut(prim["col_sum"]) + cut(gq["col_sum"])
+        union_tot = prim["row_total"] + gq["row_total"]
+        union_n = prim["n_rows"] + gq["n_rows"]
+        got["map_all"] = SL.pooled_patch_map(union_col, union_tot, union_n, min_mass)
+        got["map_all_tr"] = SL.pooled_patch_map(union_col, union_tot, union_n, min_mass,
+                                                cells=trained)
 
     if res["spans"] is not None:
         denom = np.maximum(prim["row_total"], 1e-30)
@@ -597,7 +610,8 @@ def arrays_of(got):
     """
     keep = ("stats", "peak", "maps", "spans", "hnorm", "vnorm", "stats_img_q", "perm",
             "stats_gen", "peak_gen", "stats_all", "peak_all",
-            "map_q", "map_gen", "map_all")
+            "map_q", "map_gen", "map_all",
+            "map_q_tr", "map_gen_tr", "map_all_tr")
     return {k: np.asarray(got[k]) for k in keep if got.get(k) is not None}
 
 

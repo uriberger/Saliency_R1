@@ -1,15 +1,24 @@
 #!/usr/bin/env python
-"""Three models x three query sets: the patch-set tables and the nine heatmaps.
+"""Three arms x three query sets: the patch-set tables and the nine heatmaps.
 
     python sink_location_xmodel_tables.py --dirs A,B,C --out-dir DIR
+    python sink_location_xmodel_tables.py --out-dir DIR --panels \\
+        'ours all heads=DIR_A:all,ours trained pair=DIR_A:trained,base=DIR_B:trained'
 
 WHAT IT PRODUCES
 
-  tables.md / tables.txt   three tables, one per query set, a row per model and a column
+  tables.md / tables.txt   three tables, one per query set, a row per arm and a column
                            per patch set: the border ring, its four sides, its four
                            corners, and the centre (everything the ring is not).
-  heat_<qset>_<family>.png/.pdf    nine heatmaps, one per (query set, model).
-  heat_qwen3_vl_modalgrid.png      the validation panel described below.
+  heat_<qset>_<arm>.png/.pdf       nine heatmaps, one per (query set, arm).
+  heat_modalgrid_<arm>.png         the validation panel described below.
+
+AN ARM IS A DIRECTORY AND A HEAD SET, not a directory. `--dirs` names three models at
+every head; `--panels` names each panel outright, so one scan can appear twice -- once
+over all 1,152 heads and once at the two cells the overlap reward trains on (L22 h28/31).
+Those two are different claims about the same weights: "where the model looks" and "where
+the rewarded heads look", and 17.3 of docs/sink-location-by-image-type.md is the reason
+they cannot stand in for each other.
 
 THE THREE QUERY SETS. All three come out of ONE forward pass per picture -- the model
 writes an answer at full speed, then a single teacher-forced pass over prompt ++ answer is
@@ -63,6 +72,10 @@ Q_SETS = (("prompt tokens", "stats", "map_q"),
           ("generated tokens", "stats_gen", "map_gen"),
           ("all tokens after the image", "stats_all", "map_all"))
 
+#: The head sets a panel can ask for. `trained` is filled in from the probe's own
+#: constants at run time, so it cannot drift from the pair the reward actually reads.
+HEAD_SETS = ("all", "trained")
+
 #: (column header, the stat that carries its share, how to get its area share)
 #: `centre` is not a stored statistic: the ring and the interior partition the picture, so
 #: the interior's share is 1 - the ring's, exactly, and deriving it beats storing it.
@@ -92,6 +105,15 @@ CLIP = 2.0
 
 
 # ---------------------------------------------------------------------------
+def _slug(label):
+    """A panel label as a filename. Two labels that differ only in punctuation collide,
+    which is why `main` rejects duplicate labels before anything is drawn."""
+    s = "".join(c if c.isalnum() else "_" for c in label.strip().lower())
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("_") or "panel"
+
+
 def resample_map(p, gh, gw, GH, GW):
     """A patch map on a gh x gw grid, onto a GH x GW lattice. Mass-preserving.
 
@@ -155,15 +177,27 @@ def model_maps(meta, arrays, field, lattice=None, only_grid=None):
     return mean * mean.size, n, grids      # -> enrichment: 1.0 is a fair share
 
 
-def table_rows(meta, arrays, field, min_mass):
-    """One row of one table: every column's enrichment, pooled over pictures."""
+def table_rows(meta, arrays, field, min_mass, cells=None):
+    """One row of one table: every column's enrichment, pooled over pictures.
+
+    `cells` mirrors `sink_location.pooled_patch_map`: None averages every head that
+    clears the image-mass floor, a list of (layer, head) averages exactly those and
+    applies no floor. The two functions have to agree on this or the heatmap stops being
+    the table's own decomposition, which is the whole reason it is drawn from `map_*`.
+    """
     vals = {c: [] for c, _s, _a in COLUMNS}
     for m in meta:
         a = arrays.get(m["unit"], {}).get(field)
         if a is None:
             continue
         a = np.asarray(a, dtype=np.float64)
-        live = a[..., SL.STAT_INDEX["image_mass"]] >= min_mass
+        if cells is None:
+            live = a[..., SL.STAT_INDEX["image_mass"]] >= min_mass
+        else:
+            live = np.zeros(a.shape[:2], dtype=bool)
+            for layer, head in cells:
+                if 0 <= layer < live.shape[0] and 0 <= head < live.shape[1]:
+                    live[layer, head] = True
         if not live.any():
             continue
         gh, gw = m["grid"]
@@ -248,40 +282,90 @@ def draw(mat, title, subtitle, path, note=""):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dirs", required=True, help="comma-separated scan directories")
+    ap.add_argument("--dirs", default=None, help="comma-separated scan directories")
+    ap.add_argument("--panels", default=None,
+                    help="comma-separated LABEL=DIR[:HEADSET], HEADSET in all|trained. "
+                         "Overrides --dirs, and lets one scan appear under two head sets")
+    ap.add_argument("--title", default=None, help="the heading tables.md opens with")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--min-mass", type=float, default=0.002)
     ap.add_argument("--lattice", type=int, default=16,
                     help="the common lattice a variable grid is resampled onto")
     args = ap.parse_args()
+    if not args.dirs and not args.panels:
+        raise SystemExit("one of --dirs or --panels is required")
 
     P = _load("_xm_probe", "sink_location_probe.py")
+    TRAINED = [(P.TRAINED_LAYER, h) for h in P.TRAINED_HEADS]
+    HEAD_TEXT = {"all": "all heads",
+                 "trained": f"L{P.TRAINED_LAYER} h"
+                            + "/".join(str(h) for h in P.TRAINED_HEADS)}
     out = Path(args.out_dir)
     (out / "figures").mkdir(parents=True, exist_ok=True)
 
+    # (label, directory, head set). `--dirs` is the cross-model form: every directory at
+    # every head, labelled by its family. `--panels` names each panel outright.
+    specs = []
+    if args.panels:
+        for item in [x for x in args.panels.split(",") if x.strip()]:
+            label, eq, rest = item.partition("=")
+            if not eq:
+                raise SystemExit(f"--panels entry {item!r} is not LABEL=DIR[:HEADSET]")
+            d, _colon, heads = rest.partition(":")
+            heads = heads or "all"
+            if heads not in HEAD_SETS:
+                raise SystemExit(f"head set {heads!r} is not one of {HEAD_SETS}")
+            specs.append((label.strip(), d.strip(), heads))
+    else:
+        specs = [(None, d, "all") for d in args.dirs.split(",") if d]
+
+    # One read per DIRECTORY, not one per panel: the npz parts are ~140 MB a scan and the
+    # whole point of --panels is that a directory appears more than once.
+    cache = {}
     runs = []
-    for d in [x for x in args.dirs.split(",") if x]:
-        meta, arrays = P.read_stage(d, "scan")
+    for label, d, heads in specs:
+        if d not in cache:
+            meta, arrays = P.read_stage(d, "scan")
+            cache[d] = (meta, arrays)
+        meta, arrays = cache[d]
         if not meta:
             print(f"(skipping {d}: no scan results)")
             continue
-        runs.append({"dir": d, "meta": meta, "arrays": arrays,
-                     "family": P._family_of(meta)})
+        family = P._family_of(meta)
+        runs.append({"dir": d, "meta": meta, "arrays": arrays, "family": family,
+                     "heads": heads, "cells": TRAINED if heads == "trained" else None,
+                     "label": label or family})
     if not runs:
         raise SystemExit("no results")
+    # On the SLUG, not the label: "ours, all heads" and "ours all heads" are two labels
+    # and one filename, and the second panel would silently overwrite the first.
+    if len({_slug(r["label"]) for r in runs}) != len(runs):
+        raise SystemExit("two panels share a filename: "
+                         + ", ".join(f"{r['label']!r} -> {_slug(r['label'])}"
+                                     for r in runs))
 
-    lines = ["# Attention inside the picture: three models, three query sets", ""]
+    mixed = len({r["heads"] for r in runs}) > 1
+    lines = [f"# {args.title or 'Attention inside the picture: three arms, three query sets'}",
+             ""]
     lines += [
         "Every entry is an **enrichment**: that patch set's share of the picture's "
         "attention", "divided by its share of the patches. **1.00 is exactly a fair "
         "share**, so a raw", "percentage never appears -- the one-patch border is 23% of "
-        "a 16x16 grid and 16% of a", "24x24 one.  Averaged over **all** layers and heads "
-        "that clear an image-mass floor of",
-        f"{args.min_mass} (a head that puts no weight on the picture still has a ring "
-        "share, and it is", "noise wearing a statistic's name); no head is selected.  "
-        "`centre` is everything the", "ring is not.  TL/TR/BL/BR are single patches, so "
-        "they are priced against a flat map's", "1/N and run on a different scale from "
-        "the block columns beside them.", ""]
+        "a 16x16 grid and 16% of a", "24x24 one.  `centre` is everything the ring is not. "
+        " TL/TR/BL/BR are single patches,", "so they are priced against a flat map's 1/N "
+        "and run on a different scale from the", "block columns beside them.", "",
+        "The **head set** column says which (layer, head) cells were averaged.  "
+        "`all heads`", f"averages every cell clearing an image-mass floor of "
+        f"{args.min_mass} -- a head that puts no",
+        "weight on the picture still has a ring share, and it is noise wearing a "
+        "statistic's", "name -- and selects no head on any other ground.  "
+        f"`{HEAD_TEXT['trained']}` is the pair the", "overlap reward reads, named by the "
+        "reward and never floored.", ""]
+    if mixed:
+        lines += ["The two are **not** a whole and a part in any readable sense: two "
+                  "cells out of 1,152,", "and the pair is edge-leaning against the "
+                  "model's average head (17.3 of", "`docs/sink-location-by-image-type.md`)."
+                  "  Read them as two claims, not one", "claim at two resolutions.", ""]
 
     # How long the answers were, per model. The `generated` row is an average over
     # whatever the model wrote, and the picture is the unit of analysis, so a two-token
@@ -296,36 +380,43 @@ def main():
               " `generated` row.", "",
               "| model | median | p10 | p90 | share under 10 tokens |", "|---|---|---|---|---|"]
     print("\n=== how much each model wrote (completion length, capped at 256) ===")
-    for r in runs:
+    # Keyed on the DIRECTORY: the head set changes which rows of the attention matrix are
+    # read, never what the model wrote, so two panels over one scan are one row here.
+    for d in dict.fromkeys(r["dir"] for r in runs):
+        r = next(x for x in runs if x["dir"] == d)
         n = np.array([m["n_generated"] for m in r["meta"] if m.get("n_generated")])
         if not n.size:
             continue
-        row = (f"| {r['family']} | {np.median(n):.0f} | {np.percentile(n, 10):.0f} | "
+        name = r["label"] if args.panels else r["family"]
+        row = (f"| {name} | {np.median(n):.0f} | {np.percentile(n, 10):.0f} | "
                f"{np.percentile(n, 90):.0f} | {np.mean(n < 10):.1%} |")
         lines.append(row)
-        print(f"{r['family']:<12} median {np.median(n):>4.0f}  p10 "
+        print(f"{name:<24} median {np.median(n):>4.0f}  p10 "
               f"{np.percentile(n, 10):>4.0f}  p90 {np.percentile(n, 90):>4.0f}  "
               f"under 10 tokens {np.mean(n < 10):.1%}")
     lines.append("")
 
     for label, field, mapfield in Q_SETS:
         lines += [f"## Query set: {label}", "",
-                  "| model | n | grid | " + " | ".join(c for c, _s, _a in COLUMNS) + " |",
-                  "|---|---|---|" + "---|" * len(COLUMNS)]
+                  "| arm | head set | n | grid | "
+                  + " | ".join(c for c, _s, _a in COLUMNS) + " |",
+                  "|---|---|---|---|" + "---|" * len(COLUMNS)]
         print(f"\n=== {label} ===")
-        print(f"{'model':<12} {'n':>5} {'grid':>9} " +
+        print(f"{'arm':<24} {'head set':<12} {'n':>5} {'grid':>9} " +
               " ".join(f"{c:>8}" for c, _s, _a in COLUMNS))
         for r in runs:
-            vals, n = table_rows(r["meta"], r["arrays"], field, args.min_mass)
+            vals, n = table_rows(r["meta"], r["arrays"], field, args.min_mass,
+                                 cells=r["cells"])
             if not n:
                 continue
             grids = [tuple(m["grid"]) for m in r["meta"]]
             g = (f"{max(set(grids), key=grids.count)[0]}x"
                  f"{max(set(grids), key=grids.count)[1]}"
                  + ("*" if len(set(grids)) > 1 else ""))
-            lines.append(f"| {r['family']} | {n} | {g} | " +
+            heads = HEAD_TEXT[r["heads"]]
+            lines.append(f"| {r['label']} | {heads} | {n} | {g} | " +
                          " | ".join(f"{vals[c]:.2f}" for c, _s, _a in COLUMNS) + " |")
-            print(f"{r['family']:<12} {n:>5} {g:>9} " +
+            print(f"{r['label']:<24} {heads:<12} {n:>5} {g:>9} " +
                   " ".join(f"{vals[c]:>8.2f}" for c, _s, _a in COLUMNS))
         lines.append("")
         lines.append("\\* the grid varies per picture; the modal shape is shown.")
@@ -334,34 +425,39 @@ def main():
         for r in runs:
             lat = (args.lattice, args.lattice)
             grids = {tuple(m["grid"]) for m in r["meta"]}
-            mat, n, _g = model_maps(r["meta"], r["arrays"], mapfield,
+            field_name = mapfield + ("_tr" if r["heads"] == "trained" else "")
+            mat, n, _g = model_maps(r["meta"], r["arrays"], field_name,
                                     lattice=lat if len(grids) > 1 else None)
             if mat is None:
+                print(f"  (no {field_name} in {r['dir']}; rescan to draw "
+                      f"{r['label']} / {label})")
                 continue
-            slug = f"heat_{field}_{r['family']}"
+            slug = f"heat_{field}_{_slug(r['label'])}"
             note = ("" if len(grids) == 1 else
                     f"{len(grids)} distinct grids, area-resampled onto a "
                     f"{lat[0]}x{lat[1]} lattice in normalised coordinates")
-            draw(mat, f"{r['family']} - {label}",
-                 f"n={n} pictures, all heads, enrichment over a fair share",
+            draw(mat, f"{r['label']} - {label}",
+                 f"n={n} pictures, {HEAD_TEXT[r['heads']]}, enrichment over a fair share",
                  str(out / "figures" / slug), note)
             print(f"  wrote figures/{slug}.png")
 
-    # the validation panel: Qwen3-VL on its modal grid alone, no resampling at all
+    # the validation panel: the same arm on its modal grid alone, no resampling at all
     for r in runs:
         grids = [tuple(m["grid"]) for m in r["meta"]]
         if len(set(grids)) == 1:
             continue
         modal = max(set(grids), key=grids.count)
-        mat, n, _g = model_maps(r["meta"], r["arrays"], "map_q", only_grid=modal)
+        field_name = "map_q" + ("_tr" if r["heads"] == "trained" else "")
+        mat, n, _g = model_maps(r["meta"], r["arrays"], field_name, only_grid=modal)
         if mat is None or n < 20:
             continue
-        draw(mat, f"{r['family']} - prompt tokens, modal grid only",
-             f"n={n} pictures whose grid really is {modal[0]}x{modal[1]}",
-             str(out / "figures" / f"heat_modalgrid_{r['family']}"),
+        draw(mat, f"{r['label']} - prompt tokens, modal grid only",
+             f"n={n} pictures whose grid really is {modal[0]}x{modal[1]}, "
+             f"{HEAD_TEXT[r['heads']]}",
+             str(out / "figures" / f"heat_modalgrid_{_slug(r['label'])}"),
              "validation panel: no resampling. If this agrees with the resampled "
              "figure, the resampling is not doing any work.")
-        print(f"  wrote figures/heat_modalgrid_{r['family']}.png")
+        print(f"  wrote figures/heat_modalgrid_{_slug(r['label'])}.png")
 
     (out / "tables.md").write_text("\n".join(lines) + "\n")
     print(f"\nwrote {out / 'tables.md'} and {len(runs) * len(Q_SETS)} figures")
