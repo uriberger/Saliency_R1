@@ -109,21 +109,42 @@ def main():
     ap.add_argument("--fork", default=str(REPO / "laser_fork"))
     ap.add_argument("--out-dir", default=str(REPO / "cold_data" / "laser" / "coldstart"))
     ap.add_argument("--max-chars", type=int, default=48000,
-                    help="drop traces longer than this. cutoff_len is 32768 TOKENS; this "
-                         "is a cheap pre-filter so the tokenizer is not handed novels")
+                    help="cheap pre-filter, applied before the tokenizer so it is not "
+                         "handed novels. NOT the real length bound -- see --max-tokens")
+    ap.add_argument("--max-tokens", type=int, default=12288,
+                    help="THE REAL BOUND, measured with the model's own tokenizer. "
+                         "Do not raise it without redoing the memory arithmetic below")
+    ap.add_argument("--tokenizer", default="Qwen/Qwen3-VL-8B-Instruct")
     ap.add_argument("--scan-limit", type=int, default=0,
                     help="stop after scanning this many source rows (0 = no limit)")
     args = ap.parse_args()
 
     from datasets import load_dataset
+    from transformers import AutoTokenizer
 
     format_reward, think_gate = load_format_checkers(Path(args.fork))
+    # Length is bounded in TOKENS, with the model's own tokenizer, because a character
+    # budget does not survive contact with LaTeX. A 48,000-char cap was assumed to be
+    # ~13.5K tokens at 3.5 chars/token; maths traces run closer to 2.3, so the real tail
+    # was ~20.7K and it OOM'd the backward pass twice at 12.6-15.6 GiB.
+    #
+    # The peak allocation is the fp32 cross-entropy GRADIENT over the logits:
+    #     micro_batch x seq_len x vocab(152K) x 4 bytes
+    # At micro_batch 1 and 12,288 tokens that is 7.5 GiB, against ~10 GiB of headroom
+    # observed at the second failure. Raising --max-tokens without redoing that sum is
+    # how this bites a third time.
+    #
+    # FILTERED, NOT TRUNCATED. Lowering cutoff_len instead would truncate from the right
+    # and cut `</answer>` off the end of the longest targets -- teaching the model to open
+    # tags and never close them, which is the exact failure the cold start exists to fix.
+    tok = AutoTokenizer.from_pretrained(args.tokenizer)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ds = load_dataset(args.source, split="train", streaming=True)
     rows, seen, stats = [], 0, {"no_gen": 0, "unverified": 0, "unsplittable": 0,
-                                "too_long": 0, "bad_boxed": 0, "format_reject": 0}
+                                "too_long": 0, "bad_boxed": 0, "format_reject": 0,
+                                "too_many_tokens": 0}
     for ex in ds:
         seen += 1
         if args.scan_limit and seen > args.scan_limit:
@@ -157,6 +178,10 @@ def main():
         # The gate that matters: score it with THEIR code before writing it.
         if format_reward(target) != 1.0 or think_gate(target) != 1.0:
             stats["format_reject"] += 1
+            continue
+        n_tok = len(tok(ex["problem"]).input_ids) + len(tok(target).input_ids)
+        if n_tok > args.max_tokens:
+            stats["too_many_tokens"] += 1
             continue
         rows.append({"conversations": [
             {"from": "human", "value": ex["problem"]},

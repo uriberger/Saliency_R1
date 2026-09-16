@@ -31,8 +31,30 @@
 #   SAVE_FREQ/TEST_FREQ=-1  no checkpointing, no validation: pure cost for a mechanical
 #                           check.
 #
-# MAX_RESPONSE_LENGTH is deliberately left at their 2048. Shrinking it would cut the
-# window count, and the windowed reward is the mechanism under test.
+# MAX_RESPONSE_LENGTH IS 8192, NOT THEIR 2048, AND IT IS MEASURED RATHER THAN GUESSED.
+#
+# Their 2048 was sized for Qwen2.5-VL-7B cold-started on ReVisual-R1's GRAMMAR. Ours is
+# Qwen3-VL-8B cold-started on OpenR1-Math traces averaging ~4,800 tokens -- a different
+# base model AND a longer-winded cold start, so the budget has to move with it. Keeping
+# 2048 would not be fidelity; it would truncate most rollouts to format 0 and zero both
+# attention rewards, which is the same failure this whole pipeline exists to avoid.
+#
+# 48 rollouts per budget, bare user turn, epoch-5 checkpoint:
+#
+#     budget   format   think_gate   accuracy   truncated (<think> only)
+#      4096     0.562      0.604       0.271        14/48  (29%)
+#      8192     0.729      0.771       0.250         5/48  (10%)
+#
+# `structure` fails 0 times at BOTH budgets -- when the model finishes it finishes
+# correctly, so the gap is purely length. The residual 6/48 that omit the opening <think>
+# would fail at any budget and cap format near 0.87.
+#
+# The cost is generation time, which is the dominant term in a GRPO step; 8192 roughly
+# doubles it against 4096. If wall clock ever becomes the binding constraint rather than
+# signal quality, 4096 is the defensible fallback and this table is the trade.
+#
+# Note this one variable also drives `overlong_buffer_cfg.len` and `max_resp_len` in
+# train.sh, so setting it here keeps all three consistent.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +66,12 @@ DURATION=2
 STEPS=3
 FORK="$REPO/laser_fork"
 DATA="$REPO/cold_data/laser/verl"
-MODEL="Qwen/Qwen3-VL-8B-Instruct"
+# THE COLD-STARTED CHECKPOINT, not the instruct model. `Qwen/Qwen3-VL-8B-Instruct` emits
+# ZERO <think> tags under any prompt placement (64 rollouts, jobs 6722516/6722589), so a
+# run against it scores format 0 on every rollout and zeroes both attention rewards. The
+# Stage 1 cold start is what teaches the four tags, and this checkpoint measures format
+# 0.729 at MAX_RESPONSE_LENGTH=8192.
+MODEL="/home/uberger/scratch/research/saliency_r1/checkpoint/laser_coldstart_qwen3_vl_8b_revisual"
 OUT_DIR="$REPO/outputs/laser/smoke"
 PARTITION_OVERRIDE=""
 DRY_RUN=0
@@ -118,6 +145,7 @@ RUNNER="$LOG_ROOT/$NAME.runner.sh"
     printf '    ATTENTION_START_STEP=1 ENABLE_ATTENTION=True APPLY_HOOK_ATTENTION=True \\\n'
     printf '    APPLY_RECTIFICATION=True APPLY_SINK_SUPPRESSION=True \\\n'
     printf '    APPLY_EARLY_WEIGHTED_STABILITY=True \\\n'
+    printf '    MAX_RESPONSE_LENGTH=8192 \\\n'
     printf '    SAVE_FREQ=-1 TEST_FREQ=-1 TOTAL_EPOCHS=1 VAL_BEFORE_TRAIN=False \\\n'
     printf '    MODEL_PATH=%q \\\n' "$MODEL"
     printf '    TRAIN_FILES=%q VAL_FILES=%q \\\n' "$TRAIN_FILE" "$VAL_FILE"

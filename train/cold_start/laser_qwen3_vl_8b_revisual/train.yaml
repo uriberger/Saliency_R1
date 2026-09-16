@@ -22,7 +22,12 @@ finetuning_type: full
 deepspeed: /home/uberger/scratch/research/LLaMA-Factory/examples/deepspeed/ds_z2_config.json
 
 ### the four tags, added to the vocabulary rather than asked for in a prompt
-new_special_tokens: <think>,</think>,<answer>,</answer>
+# Their yaml says `new_special_tokens`; this LLaMA-Factory renamed it to
+# `add_special_tokens` and the old name is a hard parse error, not a warning
+# ("Some keys are not used by the HfArgumentParser"). Same semantics: patcher.py:341
+# does `tokenizer.add_tokens(..., special_tokens=True)`. Do NOT use `add_tokens` --
+# that is the NON-special variant and would add them as ordinary vocabulary.
+add_special_tokens: <think>,</think>,<answer>,</answer>
 resize_vocab: true
 
 ### dataset
@@ -48,7 +53,20 @@ preprocessing_num_workers: 128
 ### output
 output_dir: /home/uberger/scratch/research/saliency_r1/checkpoint/laser_coldstart_qwen3_vl_8b_revisual
 logging_steps: 1
-save_steps: 150
+# DEVIATION 6: theirs is 150. Set to 50 after two interactive allocations expired
+# mid-run and cost ~90 minutes each. 50 caps the loss at ~85 minutes.
+#
+# NOT LOWER, AND THE REASON IS I/O RATHER THAN DISK. A checkpoint here is 126 GB -- 109 GB
+# of DeepSpeed optimizer state plus 17 GB of weights. At ~102 s/step, save_steps 10 would
+# be a 126 GB write every ~17 minutes, plausibly 10-25% of wall clock spent checkpointing
+# -- more time than the crashes it protects against. At 50 it is every ~85 minutes, which
+# is noise.
+#
+# save_total_limit 10 -> ~1.26 TB retained (29 TB free, so space is fine). It prunes
+# OLDEST first, so after ten new saves checkpoint-150 and then -300 disappear. -300 is the
+# 0.96-epoch checkpoint the epoch-1 decision rests on; copy its weights aside (17 GB, not
+# the full 126) before it is pruned.
+save_steps: 50
 save_total_limit: 10
 # Resumability across the wall limit, as launch_coldstart_job.sh's autoresume expects:
 # keep full trainer state and do not wipe the output dir.
@@ -62,13 +80,24 @@ run_name: laser_coldstart_qwen3_vl_8b_revisual
 
 ### train
 # DEVIATION 5, and it changes no maths: theirs is 4 x 4. Global batch is identical at
-# 2 x 8 x 8 GPUs = 128, so the optimizer sees exactly the same updates -- but the logit
-# peak halves, and the logits are what actually blow up here. Vocab is ~152K, so a
-# micro-batch of 4 at this corpus's p99 length is 4 x 12K x 152K x 2 B = ~15 GB in bf16
-# before the fp32 softmax. Their 4 x 4 was measured on a 3B model. Drop to 1 x 16 if it
-# still OOMs; the global batch stays 128 either way.
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 8
+# 1 x 16 x 8 GPUs = 128, so the optimizer sees exactly the same updates.
+#
+# MEASURED, not guessed. 2 x 8 OOMs on an 80 GB card, in the BACKWARD pass, trying to
+# allocate 15.59 GiB in one go. That is the cross-entropy gradient over the logits:
+#
+#     2 samples x ~12.8K tokens x 152K vocab x 4 bytes (fp32) = 15.6 GiB
+#
+# which is the arithmetic to reach for whenever a large-vocab model OOMs at a size that
+# looks absurd for an 8B. Note the fp32: the forward logits are bf16, the CE gradient is
+# not, so the peak is twice what a bf16 estimate predicts -- that is the part I got wrong
+# first time. per_device 1 halves it to ~7.8 GiB against ~21 GiB free.
+#
+# The real fix, if this is ever tight again, is `enable_liger_kernel: true` -- its fused
+# linear cross-entropy never materialises the logits at all. It needs `liger-kernel`
+# installed in sr1_coldstart (a GLOBAL change to a shared env, per CLAUDE.md) and its
+# Qwen3-VL support is unverified, so it is not the first move.
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
 learning_rate: 1.0e-5      # their YAML. The paper's Table 5 says 2e-5; same paper-vs-code
                            # drift as LASER's own window size, and the code wins.
 

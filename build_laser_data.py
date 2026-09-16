@@ -38,19 +38,22 @@ form `problem` already has in both corpora, so the text passes through untouched
 `process_image` consumes. `reward_model.ground_truth` is what the `dapo` reward manager
 reads, and `data_source` is its `reward_fn_key`.
 
-THE PROMPT IS THE ONE THING THEY DID NOT PUBLISH
+THERE IS NO SYSTEM PROMPT, AND THAT IS A DECISION
 
-Their reward requires a specific shape -- `format_reward` in `openr1_verl.py` wants
-exactly one `<think></think>`, exactly one `<answer></answer>`, the whole completion to
-match `^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$`, and exactly one `\boxed{}`
-inside the answer; `_format_reward_think`, which gates the ATTENTION rewards separately,
-wants the same tags. A prompt that does not ask for that shape scores 0 on format for
-every rollout, which zeroes the attention terms too and would look like a broken port
-rather than a broken prompt.
+Their reward needs a specific shape -- exactly one `<think></think>`, exactly one
+`<answer></answer>`, a whole-string structure match, and exactly one `\boxed{}` inside the
+answer. Nothing in their repo says how to elicit it, and an earlier version of this file
+wrote a system prompt against those checkers.
 
-No such prompt exists anywhere in their repo. `SYSTEM_PROMPT` below is written to their
-checkers rather than copied from them, and it is the largest single deviation in this
-build. It is a module constant so a later correction is one edit and a rebuild.
+That approach is dead. Qwen3-VL-8B-Instruct emits **zero** `<think>` tags under any
+placement (system, user, both, terse; 64 rollouts). The format is taught by the Stage 1
+cold start, as four tokens in the weights -- and once taught, a system prompt the
+cold-start corpus never contained pushes the model OFF-distribution and drops format back
+to 0.000. Rows are therefore a bare user turn, matching the cold-start data exactly.
+
+A parquet whose `prompt` carries a system turn predates the cold start and will score
+format 0 against the cold-started model. `manifest_*.json` records `system_prompt: null`
+so the two generations are distinguishable after the fact.
 """
 
 from __future__ import annotations
@@ -61,10 +64,13 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
 
-#: Written against `openr1_verl.format_reward` and `dp_actor._format_reward_think`, NOT
-#: copied from upstream -- see the module docstring. Both tag pairs and the single
-#: \boxed{} are load-bearing: miss any one and every rollout scores format 0.
-SYSTEM_PROMPT = (
+#: HISTORICAL, AND NO LONGER USED. This was written against `openr1_verl.format_reward`
+#: when the plan was to prompt Qwen3-VL-8B-Instruct into the four-tag format. That plan
+#: died: the instruct model emits zero <think> tags under any placement, and the Stage 1
+#: cold start teaches the format in the weights instead. Kept only so the rows written
+#: before 2026-09-15 can be identified -- if a parquet's prompt has a system turn, it
+#: predates the cold start and will score format 0 against the cold-started model.
+_UNUSED_SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question about an image, "
     "and the Assistant solves it. The Assistant first thinks about the reasoning process "
     "in the mind and then provides the user with the answer. The reasoning process is "
@@ -101,8 +107,15 @@ def load_rows(data_dir: Path, name: str, spec: dict):
             sub = cols[spec["source_col"]][i] if spec["source_col"] else None
             out.append({
                 "data_source": f"{name}/{sub}" if sub else name,
+                # NO SYSTEM MESSAGE, and that is the point. Earlier versions put
+                # SYSTEM_PROMPT here to ask for the four-tag format. After the Stage 1
+                # cold start that prompt is not merely unnecessary, it is HARMFUL: the
+                # cold-start corpus is bare user/assistant turns with no system message,
+                # so injecting one puts the model off-distribution and it reverts to
+                # instruct behaviour. Measured on the epoch-5 checkpoint: format 0.000
+                # with any system prompt or user suffix, and the tags appear as soon as
+                # the user turn is bare. The format now comes from the weights.
                 "prompt": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
                     # `problem` already carries the <image> placeholder that
                     # _build_messages splits on. Left exactly as published.
                     {"role": "user", "content": problem},
@@ -195,9 +208,10 @@ def main():
         "train": str(tr), "val": str(va), "n_train": len(train), "n_val": len(val),
         "by_corpus": by_corpus, "seed": args.seed, "smoke": bool(args.smoke),
         "max_rows": args.max_rows or None,
-        "system_prompt": SYSTEM_PROMPT,
-        "note": "system_prompt is written against their reward checkers, not copied from "
-                "upstream -- see build_laser_data.py's docstring.",
+        "system_prompt": None,
+        "note": "No system message: the Stage 1 cold start teaches the four-tag format in "
+                "the weights, and injecting a system prompt the cold-start corpus never "
+                "had drives format to 0.000 on the cold-started model.",
     }
     (out_dir / f"manifest_{tag}.json").write_text(json.dumps(meta, indent=2))
     print(f"\n  {tr}\n  {va}\n  {out_dir / f'manifest_{tag}.json'}")
