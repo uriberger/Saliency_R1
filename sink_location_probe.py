@@ -397,8 +397,14 @@ def load_family(model, processor, system_prompt="auto"):
 
 
 def build_inputs(fam, processor, images, question, device, **kw):
-    """The prompt, at batch size 1, with one or two pictures, in the family's template."""
-    return fam.build_inputs(processor, images, question, device, **kw)
+    """The prompt, at batch size 1, with one or two pictures, in the family's template.
+
+    Filtered through `model_inputs` HERE rather than at each forward, because there are
+    four of them -- the selftest's logits and greedy passes, the generation, and the
+    measured forward -- and a processor output the model rejects fails at whichever one
+    was missed. A no-op for every family but Nemotron.
+    """
+    return fam.model_inputs(fam.build_inputs(processor, images, question, device, **kw))
 
 
 def generate_then_teacher_force(model, processor, images, question, device, scan,
@@ -519,7 +525,7 @@ def measure(model, processor, images, question, device, scan, tap=None,
     if gen is None:
         inputs = build_inputs(scan.family, processor, images, question, device,
                               **proc_kwargs)
-        case, scan.prompt_len_override = scan.family.model_inputs(inputs), None
+        case, scan.prompt_len_override = inputs, None
     else:
         inputs, prompt_len, comp = gen
         case = scan.family.teacher_forced_case(inputs, comp, device)
