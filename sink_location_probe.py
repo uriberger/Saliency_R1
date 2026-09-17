@@ -398,8 +398,14 @@ def _repair_radio_summary_idxs(model, cfg):
 
     radio = getattr(getattr(model, "vision_model", None), "radio_model", None)
     got = getattr(radio, "summary_idxs", None) if radio is not None else None
-    if got is None or torch.is_floating_point(got) is False:
-        return                                   # absent, or already a sane integer buffer
+    if got is None:
+        return                       # the buffer was never registered; the path is unused
+    # Restored WHENEVER it is recoverable, not only when it looks wrong. transformers
+    # preserves the registered dtype, so a missing int64 buffer comes back as int64 full
+    # of uninitialised memory -- which `is_floating_point` reports as False, and an
+    # earlier version of this guard therefore skipped exactly the case it existed for.
+    # These are indices into a fixed teacher list, not learned weights, so overwriting
+    # with the upstream value is a no-op when the checkpoint did ship them.
     ref = (getattr(cfg, "vision_config", None) or object())
     amap = getattr(ref, "auto_map", None) or {}
     repo = str(amap.get("AutoModel", "")).split("--")[0]
@@ -412,8 +418,9 @@ def _repair_radio_summary_idxs(model, cfg):
     for f in (sorted(glob.glob(snaps[-1] + "/*.safetensors")) if snaps else []):
         for k, v in load_file(f).items():
             if k.endswith("summary_idxs"):
+                was = got.tolist()[:4]
                 radio.summary_idxs = v.to(radio.summary_idxs.device)
-                print(f"[load] restored RADIO summary_idxs from {repo}: {v.tolist()}",
+                print(f"[load] RADIO summary_idxs {was} -> {v.tolist()} (from {repo})",
                       flush=True)
                 return
     raise SystemExit(f"RADIO's summary_idxs was newly initialised and {repo} is not "
