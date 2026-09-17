@@ -74,6 +74,9 @@ TEXT_ATTENTION = {
     "mistral": "MistralAttention", "gemma": "GemmaAttention",
     "gemma2": "Gemma2Attention", "gemma3_text": "Gemma3Attention",
     "phi3": "Phi3Attention", "olmo2": "Olmo2Attention",
+    # A Mamba-Transformer hybrid: only the layers marked '*' in its
+    # `hybrid_override_pattern` have attention at all. See NemotronVL.
+    "nemotron_h": "NemotronHAttention",
 }
 
 
@@ -254,12 +257,26 @@ class Family:
                                     (v1 - v0) * H / max(1, gh)))))
 
     # -- the vision side -------------------------------------------------
+    #: An attribute path to the row module, for families whose projector is a bare
+    #: `nn.Sequential` -- the class name "Sequential" would match dozens of modules, so
+    #: the path is the only unambiguous handle. Tried before the class-name search.
+    row_attr = None
+
     def row_module(self, model):
         """The module whose output holds the LLM-facing image rows."""
+        if self.row_attr:
+            m = model
+            for part in self.row_attr.split("."):
+                m = getattr(m, part, None)
+                if m is None:
+                    break
+            if m is not None:
+                return m
         for m in model.modules():
             if type(m).__name__ in self.row_classes:
                 return m
-        raise RuntimeError(f"{self.name}: no module of {self.row_classes} on this model")
+        raise RuntimeError(f"{self.name}: no module at {self.row_attr!r} and none of "
+                           f"{self.row_classes} on this model")
 
     def permute_rows(self, out, make_perm):
         """Apply a row permutation to that module's output. -> (new out, perm).
@@ -575,6 +592,95 @@ class Idefics3(Family):
             self.fixed_grid, self.encoder_px = (side, side), px * sf
         self.attn_classes = text_attention(cfg, self.attn_classes)
         return self
+
+
+# ---------------------------------------------------------------------------
+@register
+class NemotronVL(Family):
+    """NVIDIA's VLMs, on the RADIO tower -- a fourth encoder lineage, and a hybrid decoder.
+
+    Two checkpoints, one family. `Llama-3.1-Nemotron-Nano-VL-8B-V1` is a plain Llama-3.1
+    decoder, 32 layers all attention. `Nemotron-3-Nano-Omni-30B-A3B` is a MAMBA-TRANSFORMER
+    HYBRID whose `hybrid_override_pattern` is
+
+        MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME
+        M = Mamba (23)      E = MoE (23)      * = attention (6)
+
+    so **only 6 of its 52 decoder layers have an attention matrix at all**. Everything
+    this module measures is defined per (layer, head), and for the other 46 layers there
+    is no such thing. The scan therefore reports 6 x 32 = 192 cells for it rather than the
+    ~1,152 the dense models give, and that row is a different claim -- "where the only
+    attention layers look" -- not a smaller sample of the same one. It is labelled, never
+    pooled.
+
+    GEOMETRY. Despite an InternVL-shaped config (`force_image_size`, `downsample_ratio`,
+    `use_thumbnail`) this does NOT tile: the processor buckets the picture to an
+    aspect-matched resolution and emits one grid, so the token grid is (H//32, W//32) from
+    `imgs_sizes` -- a 16px patch with a 2x2 shuffle, the same 32px token as Qwen3-VL.
+
+    RADIO is the reason to want it: distilled from CLIP ViT-H/14, SigLIP-SO400M, DINOv2-g
+    WITH REGISTERS, and SAM -- the only tower in the panel whose ancestry includes the
+    model Darcet et al. found registers in.
+    """
+
+    name = "nemotron_vl"
+    model_types = ("NemotronH_Nano_Omni_Reasoning_V3", "Llama_Nemotron_Nano_VL")
+    attn_classes = ("NemotronHAttention",)
+    row_attr = "mlp1"                     # an nn.Sequential; the class name is useless
+    row_classes = ()
+    start_tokens = ("<img>",)
+    end_tokens = ("</img>",)
+    encoder_px = 32                       # patch 16 x the 2x2 pixel shuffle
+    #: RADIO's own ViT also has modules called `Attention`; the decoder's class is what
+    #: `bind` resolves off the text config, so the tower is never switched over.
+    passthrough_inputs = ("pixel_values", "image_flags")
+
+    def bind(self, model=None, processor=None, config=None):
+        super().bind(model=model, processor=processor, config=config)
+        cfg = self.config
+        if self.image_token_id is None and cfg is not None:
+            got = getattr(cfg, "img_context_token_id", None)
+            if got is None and processor is not None:
+                tok = getattr(processor, "tokenizer", None) or processor
+                name = getattr(cfg, "img_context_token", None) or "<image>"
+                got = tok.convert_tokens_to_ids(name)
+            self.image_token_id = None if got is None else int(got)
+        self.attn_classes = text_attention(cfg, self.attn_classes)
+        return self
+
+    def grids_for(self, runs, inputs):
+        """The token grid, from the size the processor actually resized to.
+
+        `imgs_sizes` is the resized (H, W) per picture and the grid is that over the 32px
+        token. Derived rather than assumed, because this processor buckets to an
+        aspect-matched resolution instead of a fixed square -- 512x320 and 352x224 both
+        come back 416x672, and a fixed-grid assumption would be right for neither.
+        """
+        sizes = inputs if not hasattr(inputs, "get") else inputs.get("imgs_sizes")
+        if sizes is None or len(sizes) != len(runs):
+            raise RuntimeError(
+                f"{len(runs)} image token runs but "
+                f"{0 if sizes is None else len(sizes)} sizes: this family reads its grid "
+                "from `imgs_sizes` and will not guess it")
+        out = []
+        for run, hw in zip(runs, sizes):
+            h, w = (int(x) for x in hw)
+            gh, gw = h // self.encoder_px, w // self.encoder_px
+            if int(run.numel()) != gh * gw:
+                raise RuntimeError(
+                    f"image run of {int(run.numel())} tokens against a {gh}x{gw} grid "
+                    f"derived from {h}x{w}: the {self.encoder_px}px token assumption is "
+                    "wrong for this checkpoint")
+            out.append((1, gh, gw))
+        return out
+
+    def grid_of(self, processor, image):
+        got = processor(text=["<image>"], images=[image], return_tensors="pt")
+        h, w = (int(x) for x in got["imgs_sizes"][0])
+        return (h // self.encoder_px, w // self.encoder_px)
+
+    def patch_px(self, image):
+        return self.encoder_px
 
 
 # ---------------------------------------------------------------------------

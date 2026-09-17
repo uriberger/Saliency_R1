@@ -73,6 +73,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 REPO = Path(__file__).resolve().parent
 
@@ -342,6 +343,42 @@ def read_manifest(out_dir, types=None):
 # ---------------------------------------------------------------------------
 # one measured picture
 # ---------------------------------------------------------------------------
+def load_model(path, adapter, device, attn_impl="sdpa"):
+    """`overlap_probe.load_model`, plus the remote-code path it cannot take.
+
+    That one resolves the architecture as `getattr(transformers, config.architectures[0])`,
+    which is exactly right for a natively supported model and raises AttributeError for a
+    `trust_remote_code` one. NVIDIA's Nemotron VLMs are the latter, and they need two more
+    things a native model does not:
+
+      * the attention implementation set on EVERY SUB-CONFIG before construction. The
+        wrapper builds its language model as `NemotronHForCausalLM(config.llm_config)`,
+        passing the sub-config straight through, so an `attn_implementation=` argument to
+        the outer class never reaches it -- and `llm_config` ships with
+        flash_attention_2 baked in, which is not installed here.
+      * eager rather than sdpa. The wrapper declares no SDPA support and refuses it. That
+        costs nothing: the scan replaces the attention implementation anyway, and the
+        selftest's reference is stock eager.
+    """
+    from transformers import AutoConfig, AutoModel, AutoProcessor
+
+    cfg = AutoConfig.from_pretrained(path, trust_remote_code=True)
+    if not getattr(cfg, "auto_map", None):
+        return PROBE.load_model(path, adapter, device, attn_impl)
+    if adapter:
+        raise SystemExit("--adapter is not supported on a remote-code model")
+    impl = "eager"
+    for sub in ("llm_config", "text_config", "vision_config", "sound_config"):
+        c = getattr(cfg, sub, None)
+        if c is not None:
+            c._attn_implementation = impl
+    cfg._attn_implementation = impl
+    processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
+    model = AutoModel.from_pretrained(path, config=cfg, dtype=torch.bfloat16,
+                                      trust_remote_code=True)
+    return processor, model.to(device).eval()
+
+
 def load_family(model, processor, system_prompt="auto"):
     """The adapter for this model, with the system prompt the run asked for.
 
@@ -784,7 +821,7 @@ def stage_scan(args):
                        len(mine), f"scan/{args.shard}", already_done=len(mine) - len(todo))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    processor, model = PROBE.load_model(args.model, args.adapter, device, "sdpa")
+    processor, model = load_model(args.model, args.adapter, device, "sdpa")
     fam = load_family(model, processor, args.system_prompt)
     print(f"[scan] family={fam.name}  system prompt="
           f"{'(none)' if not fam.system_prompt else fam.system_prompt[:40] + '...'}",
@@ -868,7 +905,7 @@ def stage_arms(args):
                        already_done=len(mine) * len(args.arms) - len(units))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    processor, model = PROBE.load_model(args.model, args.adapter, device, "sdpa")
+    processor, model = load_model(args.model, args.adapter, device, "sdpa")
     fam = load_family(model, processor, args.system_prompt)
     print(f"[arms] family={fam.name}", flush=True)
     scan = SL.install(model, family=fam, want_key_stats=False)
@@ -1141,7 +1178,7 @@ def stage_selftest(args):
     if not rows:
         raise SystemExit("no corpus; run --stage corpus first")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    processor, model = PROBE.load_model(args.model, args.adapter, device, "sdpa")
+    processor, model = load_model(args.model, args.adapter, device, "sdpa")
     fam = load_family(model, processor, args.system_prompt)
     print(f"\nselftest  model={args.model}  family={fam.name}  {len(rows)} pictures")
     print(f"          decoder attention {fam.attn_classes}, rows from "
@@ -1177,9 +1214,22 @@ def stage_selftest(args):
         scan_logits, scan_ids = last_logits(), greedy_ids()
         d_scan = float((scan_logits - base_logits).abs().max())
         d_eager = float((eager_logits - base_logits).abs().max())
-        check("the scan is no further from the fused kernel than stock eager is",
-              d_scan <= 2 * d_eager + 1e-4,
-              f"scan {d_scan:.2e} vs eager {d_eager:.2e} (both against sdpa)")
+        # The fused kernel is the reference ONLY when the model has one. NVIDIA's
+        # Nemotron wrappers declare no SDPA support and refuse it, so they are loaded
+        # eager and `base` IS `eager` -- which makes d_eager ~0 and turns this check into
+        # "the scan is within 1e-4 of eager", a threshold nothing calibrated. Where there
+        # is no fused path the comparison is reported and the WEIGHT is carried by the
+        # greedy-token check below, which is the stronger statement anyway.
+        cfg_impl = getattr(getattr(model.config, "text_config", None)
+                           or model.config, "_attn_implementation", "?")
+        fused = d_eager > 0.0
+        if fused:
+            check("the scan is no further from the fused kernel than stock eager is",
+                  d_scan <= 2 * d_eager + 1e-4,
+                  f"scan {d_scan:.2e} vs eager {d_eager:.2e} (both against sdpa)")
+        else:
+            print(f"  ----  no fused reference on this model (loaded {cfg_impl!r}); "
+                  f"|scan - eager| = {d_scan:.2e}")
         check("the scan picks the same next token",
               int(scan_logits.argmax()) == int(base_logits.argmax()))
         # Against EAGER, not against SDPA. The reference has to be the path the scan is a
