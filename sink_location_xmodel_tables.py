@@ -70,7 +70,8 @@ import sink_location as SL  # noqa: E402
 #: (label, the stats field, the pooled-map field)
 Q_SETS = (("prompt tokens", "stats", "map_q"),
           ("generated tokens", "stats_gen", "map_gen"),
-          ("all tokens after the image", "stats_all", "map_all"))
+          ("all tokens after the image", "stats_all", "map_all"),
+          ("observe-step tokens", "stats_obs", "map_obs"))
 
 #: The head sets a panel can ask for. `trained` is filled in from the probe's own
 #: constants at run time, so it cannot drift from the pair the reward actually reads.
@@ -404,7 +405,53 @@ def main():
               f"under 10 tokens {np.mean(n < 10):.1%}")
     lines.append("")
 
+    # Observe-step coverage. The observe row is a mean over the pictures that HAVE an
+    # observe step, so the share that do is not a footnote: at 60% coverage the row
+    # describes a self-selected 60% of the corpus, and the other rows describe all of it.
+    cov = []
+    for d in dict.fromkeys(r["dir"] for r in runs):
+        meta = next(x for x in runs if x["dir"] == d)["meta"]
+        seg = [m for m in meta if m.get("obs_n_comp") is not None]
+        if not seg:
+            continue
+        with_obs = [m for m in seg if (m.get("n_observe") or 0) > 0]
+        steps = np.array([m.get("obs_n_steps") or 0 for m in seg])
+        toks = np.array([m.get("n_observe") or 0 for m in with_obs])
+        retok = [m for m in seg if m.get("obs_retok_len") is not None]
+        agree = np.mean([m["obs_retok_len"] == m["obs_n_comp"] for m in retok]) \
+            if retok else float("nan")
+        cov.append((Path(d).name, len(seg), np.mean([m["obs_format_ok"] for m in seg]),
+                    len(with_obs) / len(seg), float(np.median(steps)),
+                    float(np.median(toks)) if toks.size else 0.0, agree))
+    if cov:
+        lines += ["## Observe-step coverage", "",
+                  "The observe-step row averages only the pictures whose completion HAS an "
+                  "observe step,", "so read it against this table: a low share means that "
+                  "row describes a self-selected", "part of the corpus while every other "
+                  "row describes all of it.  `retok agree` is the",
+                  "share of completions where re-tokenising the decoded text gives back as "
+                  "many tokens", "as the model generated -- the trainer's segmentation "
+                  "indexes the re-tokenised space,", "and where the two disagree the step "
+                  "spans are skewed by the difference. This is the",
+                  "reward's own approximation, reproduced rather than repaired.", "",
+                  "| model | n | `<think>` well-formed | has an observe step | median steps"
+                  " | median observe tokens | retok agree |",
+                  "|---|---|---|---|---|---|---|"]
+        print("\n=== observe-step coverage ===")
+        for name, n, fmt, share, msteps, mtoks, agree in cov:
+            lines.append(f"| {name} | {n} | {fmt:.1%} | {share:.1%} | {msteps:.0f} | "
+                         f"{mtoks:.0f} | {agree:.1%} |")
+            print(f"{name:<24} n={n:<5} format {fmt:>6.1%}  has observe {share:>6.1%}  "
+                  f"median steps {msteps:>3.0f}  median tokens {mtoks:>4.0f}  "
+                  f"retok agree {agree:>6.1%}")
+        lines.append("")
+
     for label, field, mapfield in Q_SETS:
+        # A query set no scan in this run carries is skipped outright. Emitting the
+        # heading with an empty table under it reads as "measured, found nothing".
+        if not any(r["arrays"].get(m["unit"], {}).get(field) is not None
+                   for r in runs for m in r["meta"]):
+            continue
         lines += [f"## Query set: {label}", "",
                   "| arm | head set | n | grid | "
                   + " | ".join(c for c, _s, _a in COLUMNS) + " |",

@@ -80,9 +80,17 @@ IMPL_NAME = "sink_scan"
 #               the image->image block is a vision-tower artefact wearing a language
 #               model's clothes. Needs the causal correction; the other two do not.
 #
-# "all tokens" is not a fourth accumulator: column sums are additive, so text + generated
+#   observe     a SUBSET of `generated`: only the tokens of the sentences the reward's own
+#               FLAN-T5 classifier labels "observe". Everything the overlap reward scores
+#               is read off those rows and no others, so `generated` -- which averages
+#               them together with the plan and deduce sentences and the answer -- is a
+#               wider set than the reward ever looked at. It cannot be derived from the
+#               other accumulators: which rows belong to it is a function of the text the
+#               model wrote, not of any position the scan can compute.
+#
+# "all tokens" is not a fifth accumulator: column sums are additive, so text + generated
 # with the row counts added is exactly the union, and deriving it costs nothing.
-Q_SETS = ("text", "generated", "image")
+Q_SETS = ("text", "generated", "observe", "image")
 PRIMARY_Q = "text"
 
 SPANS = ("first", "pre_image", "vision_start", "image", "vision_end", "post_image")
@@ -542,6 +550,11 @@ class SinkScan:
         # pre-hook would infer is the WHOLE thing and `generated` would come back empty.
         # The caller sets this to the real prompt length before that forward.
         self.prompt_len_override = None
+        # Absolute query positions of the observe-step tokens, in the same space as
+        # `prompt_len` and `img_cols`. Set by the caller alongside `prompt_len_override`
+        # and cleared with it: which rows those are cannot be inferred from any position,
+        # only from the sentences the model wrote and how the classifier labelled them.
+        self.observe_rows = None
         self.img_cols = None
         self.grids = []
         self.runs = []
@@ -582,6 +595,15 @@ class SinkScan:
             sel = (pos >= lo) & (pos < self.prompt_len)
         elif name == "generated":
             sel = pos >= self.prompt_len
+        elif name == "observe":
+            # A named set of absolute positions, never a range: observe sentences are
+            # scattered through the chain, and a picture whose completion has none is an
+            # empty set rather than a fallback to the whole of `generated` -- which would
+            # quietly answer a different question on exactly the rows that failed.
+            if self.observe_rows is None or len(self.observe_rows) == 0:
+                return pos.new_empty(0, dtype=torch.long)
+            want = torch.as_tensor(self.observe_rows, device=device, dtype=pos.dtype)
+            sel = torch.isin(pos, want)
         elif name == "image":
             sel = torch.isin(pos, self.img_cols)
         else:

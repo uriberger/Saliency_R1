@@ -202,6 +202,37 @@ def test_reducer():
           f"{st6[0, 0, SL.STAT_INDEX['peak_cv']]:.4f}")
 
 
+def test_observe_rows():
+    """The observe query set selects named rows, and never falls back to `generated`."""
+    print("\nobserve rows")
+    scan = SL.SinkScan(torch.nn.Module())
+    scan.img_cols = torch.arange(3, 13)
+    scan.prompt_len = 20
+    dev = torch.device("cpu")
+
+    check("observe is one of the query sets", "observe" in SL.Q_SETS)
+    check("with no rows named, observe is EMPTY -- not all of generated",
+          SL.SinkScan.rows_for(scan, "observe", 0, 40, dev).numel() == 0)
+
+    scan.observe_rows = [22, 23, 30]
+    got = SL.SinkScan.rows_for(scan, "observe", 0, 40, dev).tolist()
+    check("named rows are selected, as offsets into the query block", got == [22, 23, 30],
+          str(got))
+    gen = SL.SinkScan.rows_for(scan, "generated", 0, 40, dev).tolist()
+    check("...and they are a strict SUBSET of generated",
+          set(got) < set(gen), f"{len(got)} of {len(gen)}")
+
+    # A forward that starts part-way through the sequence (a cached second chunk) still
+    # has to name absolute positions, or the set silently shifts by the chunk offset.
+    off = SL.SinkScan.rows_for(scan, "observe", 20, 20, dev).tolist()
+    check("rows_for returns block-relative offsets for the absolute positions named",
+          off == [2, 3, 10], str(off))
+
+    scan.observe_rows = []
+    check("an empty list is empty, not everything",
+          SL.SinkScan.rows_for(scan, "observe", 0, 40, dev).numel() == 0)
+
+
 def test_pooled_map():
     """The heatmap has to BE the table, not illustrate it, at both head sets."""
     print("\npooled map")
@@ -642,6 +673,7 @@ def main():
     print("sink_location CPU checks")
     test_geometry()
     test_reducer()
+    test_observe_rows()
     test_pooled_map()
     test_locate()
     test_attention()

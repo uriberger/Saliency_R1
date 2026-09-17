@@ -87,6 +87,10 @@ def _load_module(name: str, relpath: str):
 
 PROBE = _load_module("_sl_overlap_probe", "overlap_probe.py")
 IV = _load_module("_sl_intervene", "intervene_probe.py")
+# The reward's own observe-step segmenter, loaded by path for the same reason PROBE is:
+# `trl/` is a package whose __init__ drags in the trainer. Kept as the trainer's module
+# and not a reimplementation, so "the tokens the reward scored" means exactly that.
+STEPS = _load_module("_sl_overlap_steps", "trl/overlap_steps.py")
 sys.path.insert(0, str(REPO))
 import sink_location as SL  # noqa: E402
 import sink_shift as SS  # noqa: E402
@@ -390,8 +394,53 @@ def generate_then_teacher_force(model, processor, images, question, device, scan
     return (inputs, prompt_len, comp) if comp else None
 
 
+def observe_spans(processor, comp, question, classifier):
+    """The completion's OBSERVE-step token spans. -> (spans, diagnostics).
+
+    This is `grpo_trainer_qwen3._compute_overlap_step_maps`'s segmentation, step for step,
+    and deliberately so: the question is where the REWARD looked, so a cleaner
+    reimplementation would answer a question nobody asked. Specifically it keeps the
+    trainer's one real approximation -- token indices come from RE-TOKENISING the decoded
+    completion, not from the ids the model generated -- because the reward's step spans
+    have that same skew baked into them.
+
+    The skew is measured rather than assumed: `retok_len` and `n_comp` come back in the
+    diagnostics, and the report prints how often they agree. Where they do, the spans are
+    exact; where they do not, they are the reward's spans and still the right target.
+
+    Spans are half-open [a, b) offsets into the COMPLETION, not absolute positions.
+    """
+    import re
+
+    text = processor.tokenizer.decode(comp, skip_special_tokens=False,
+                                      clean_up_tokenization_spaces=False)
+    diag = {"n_comp": len(comp), "retok_len": None, "format_ok": False, "n_steps": 0}
+    body = re.sub(r"<\|im_end\|>\s*$", "", text).strip()
+    diag["format_ok"] = bool(re.match(PROBE.FORMAT_PATTERN, body, re.DOTALL | re.MULTILINE)
+                             and body.count("<think>") == 1
+                             and body.count("</think>") == 1)
+
+    m_lo = re.search(r"<think>\s*(\S\S*)", text, re.DOTALL | re.MULTILINE)
+    m_hi = re.search(r"(\S)\s*</think>", text, re.DOTALL | re.MULTILINE)
+    if not m_lo or not m_hi:
+        return [], diag
+    lo_char, hi_char = m_lo.start(1), m_hi.start(1)
+
+    out = processor.tokenizer([text])
+    diag["retok_len"] = len(out["input_ids"][0])
+    ts, te = out.char_to_token(0, lo_char), out.char_to_token(0, hi_char)
+    if ts is None or te is None or te < ts:
+        return [], diag
+
+    steps = STEPS.segment_observe_steps(text, lo_char, hi_char, out, 0, ts, te,
+                                        question, classifier)
+    diag["n_steps"] = len(steps)
+    return [(a, b) for _t, a, b in steps], diag
+
+
 def measure(model, processor, images, question, device, scan, tap=None,
-            want_hidden=True, max_new_tokens=0, tile=0, min_mass=0.002, **proc_kwargs):
+            want_hidden=True, max_new_tokens=0, tile=0, min_mass=0.002,
+            classifier=None, **proc_kwargs):
     """One prefill. -> the reduced cells, the maps, the norms, and the geometry.
 
     Everything this experiment reads comes out of this single forward: the column view at
@@ -406,6 +455,7 @@ def measure(model, processor, images, question, device, scan, tap=None,
     import torch
 
     gen = None
+    obs_diag = None
     if max_new_tokens > 0:
         gen = generate_then_teacher_force(model, processor, images, question, device,
                                           scan, max_new_tokens)
@@ -417,12 +467,23 @@ def measure(model, processor, images, question, device, scan, tap=None,
         inputs, prompt_len, comp = gen
         case = scan.family.teacher_forced_case(inputs, comp, device)
         scan.prompt_len_override = prompt_len
+        if classifier is not None:
+            spans, obs_diag = observe_spans(processor, comp, question, classifier)
+            # Completion offsets -> absolute query positions, which is the space
+            # `rows_for` works in. Clamped to the completion this forward actually
+            # carries: a re-tokenisation longer than the generated ids would otherwise
+            # index rows belonging to no token at all.
+            rows = [prompt_len + i for a, b in spans
+                    for i in range(a, min(b, len(comp)))]
+            scan.observe_rows = sorted(set(rows))
+            obs_diag["n_rows"] = len(scan.observe_rows)
     scan.reset()
     try:
         with torch.no_grad():
             out = model(**case, output_hidden_states=bool(want_hidden), use_cache=False)
     finally:
         scan.prompt_len_override = None
+        scan.observe_rows = None
     res = scan.result()
     if res is None or not res["grids"]:
         return None
@@ -471,6 +532,23 @@ def measure(model, processor, images, question, device, scan, tap=None,
             gh, gw, res["kv_len"])
         got["stats_all"], got["peak_all"] = sa, pa
 
+    # The observe-step rows: a subset of `generated`, and the only rows the overlap reward
+    # ever read. Absent -- not zero -- when the completion had no observe step the
+    # classifier recognised, so a picture that failed segmentation drops out of the mean
+    # instead of entering it as a picture the model looked nowhere on.
+    ob = res.get("observe")
+    if obs_diag is not None:
+        # Kept even when segmentation found nothing: "no observe step on this picture" is
+        # a result about the model, and a run where it happens often is a run whose
+        # observe row means rest on a self-selected subset. The report has to be able to
+        # say so, which it cannot if the failures are simply missing.
+        got["observe_diag"] = obs_diag
+    if ob is not None and ob["n_rows"] > 0:
+        got["n_observe"] = int(ob["n_rows"])
+        so, po = SL.reduce_cells(cut(ob["col_sum"]), None, ob["n_rows"],
+                                 ob["row_total"], gh, gw, res["kv_len"])
+        got["stats_obs"], got["peak_obs"] = so, po
+
     # the layer-mean map, which is what the per-patch regression and the radial profiles
     # are fitted on. Head-mean per layer: 36 x N floats, not 36 x 32 x N.
     mean = cut(prim["col_sum"]).mean(1)
@@ -502,6 +580,11 @@ def measure(model, processor, images, question, device, scan, tap=None,
         got["map_all"] = SL.pooled_patch_map(union_col, union_tot, union_n, min_mass)
         got["map_all_tr"] = SL.pooled_patch_map(union_col, union_tot, union_n, min_mass,
                                                 cells=trained)
+    if ob is not None and ob["n_rows"] > 0:
+        got["map_obs"] = SL.pooled_patch_map(cut(ob["col_sum"]), ob["row_total"],
+                                             ob["n_rows"], min_mass)
+        got["map_obs_tr"] = SL.pooled_patch_map(cut(ob["col_sum"]), ob["row_total"],
+                                                ob["n_rows"], min_mass, cells=trained)
 
     if res["spans"] is not None:
         denom = np.maximum(prim["row_total"], 1e-30)
@@ -568,7 +651,7 @@ class Sink:
     #: stored as integers, because they are LABELS on a grid. float16 is exact to 2048
     #: and the grids here are far smaller, but a patch index that rounds is a patch index
     #: that points at the wrong patch, and nothing downstream could tell.
-    INT_FIELDS = ("peak", "peak_img_q", "peak_gen", "peak_all", "perm")
+    INT_FIELDS = ("peak", "peak_img_q", "peak_gen", "peak_all", "peak_obs", "perm")
 
     def flush(self):
         """One encoding for every field: flat values, per-unit shapes, per-unit indices.
@@ -610,8 +693,9 @@ def arrays_of(got):
     """
     keep = ("stats", "peak", "maps", "spans", "hnorm", "vnorm", "stats_img_q", "perm",
             "stats_gen", "peak_gen", "stats_all", "peak_all",
-            "map_q", "map_gen", "map_all",
-            "map_q_tr", "map_gen_tr", "map_all_tr")
+            "stats_obs", "peak_obs",
+            "map_q", "map_gen", "map_all", "map_obs",
+            "map_q_tr", "map_gen_tr", "map_all_tr", "map_obs_tr")
     return {k: np.asarray(got[k]) for k in keep if got.get(k) is not None}
 
 
@@ -673,13 +757,26 @@ def stage_scan(args):
           flush=True)
     scan = SL.install(model, family=fam, want_key_stats=not args.no_key_stats)
     tap = SL.VisionTap(model, family=fam).install()
+    # The observe query set costs one FLAN-T5-base encoder on the same card (~0.5 GB) and
+    # one batched forward per completion. It is off unless asked for, because it is only
+    # meaningful on a model whose completions are <think> chains -- and because a missing
+    # classifier checkpoint should stop the run that wanted it, not every run.
+    clf = None
+    if args.observe_steps and args.max_new_tokens > 0:
+        clf = STEPS.OverlapStepsClassifier.load(args.steps_ckpt or None, device=device)
+        print(f"[scan] observe-step classifier on {device} "
+              f"from {args.steps_ckpt or STEPS._DEFAULT_CKPT}", flush=True)
+    elif args.observe_steps:
+        raise SystemExit("--observe-steps needs --max-new-tokens > 0: there is no "
+                         "completion to segment without one")
     try:
         from PIL import Image
         for r in todo:
             im = Image.open(r["path"]).convert("RGB")
             got = measure(model, processor, [im], r["question"], device, scan, tap,
                           want_hidden=not args.no_hidden,
-                          max_new_tokens=args.max_new_tokens, min_mass=args.min_mass)
+                          max_new_tokens=args.max_new_tokens, min_mass=args.min_mass,
+                          classifier=clf)
             if got is None:
                 print(f"[scan] {r['key']}: no picture located, skipped", flush=True)
                 prog.tick()
@@ -692,8 +789,11 @@ def stage_scan(args):
             got["view"] = fam.view_box(im)
             cs = SL.content_stats(VF.view_crop(im, got["view"]), gh, gw)
             got["content"] = np.stack([cs[k] for k in CONTENT_KEYS])
-            sink.write(r["key"],
-                       meta_of(got, r, {"n_generated": got.get("n_generated")}, fam),
+            extra = {"n_generated": got.get("n_generated"),
+                     "n_observe": got.get("n_observe")}
+            extra.update({f"obs_{k}": v
+                          for k, v in (got.get("observe_diag") or {}).items()})
+            sink.write(r["key"], meta_of(got, r, extra, fam),
                        dict(arrays_of(got), content=got["content"]))
             prog.tick()
     finally:
@@ -2559,6 +2659,11 @@ def main():
                          "0 the model writes an answer at full speed and ONE teacher-forced "
                          "forward over prompt ++ answer is measured, which is the same "
                          "construction the training reward used")
+    ap.add_argument("--observe-steps", action="store_true",
+                    help="also accumulate a query set over the OBSERVE-step tokens only, "
+                         "segmented by the overlap reward's own FLAN-T5 classifier")
+    ap.add_argument("--steps-ckpt", default="",
+                    help="observe-step classifier checkpoint (default: the trainer's)")
     ap.add_argument("--system-prompt", default="auto",
                     help="auto = each family's own (Qwen3-VL gets the project's trainer "
                          "prompt, so the published numbers reproduce; the others get "
