@@ -376,7 +376,48 @@ def load_model(path, adapter, device, attn_impl="sdpa"):
     processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
     model = AutoModel.from_pretrained(path, config=cfg, dtype=torch.bfloat16,
                                       trust_remote_code=True)
+    _repair_radio_summary_idxs(model, cfg)
     return processor, model.to(device).eval()
+
+
+def _repair_radio_summary_idxs(model, cfg):
+    """Restore a buffer NVIDIA's VLM checkpoints omit and their vision code then indexes.
+
+    `RADIOModel.summary_idxs` is a registered buffer of INDICES -- the forward does
+    `all_summary[:, self.summary_idxs]`. The Nemotron checkpoints do not ship it, so
+    transformers reports it MISSING, newly-initialises it with random floats, and the
+    first vision forward dies in a CUDA device-side assert several frames away from the
+    cause (it surfaced inside an RMSNorm in the projector).
+
+    The value is not invented here: it is read from NVIDIA's own standalone release of
+    the same encoder, named by the vision config's `auto_map`. If that repo is not
+    cached, this refuses rather than guessing -- a wrong index set would silently select
+    the wrong summary tokens instead of crashing.
+    """
+    import glob
+
+    radio = getattr(getattr(model, "vision_model", None), "radio_model", None)
+    got = getattr(radio, "summary_idxs", None) if radio is not None else None
+    if got is None or torch.is_floating_point(got) is False:
+        return                                   # absent, or already a sane integer buffer
+    ref = (getattr(cfg, "vision_config", None) or object())
+    amap = getattr(ref, "auto_map", None) or {}
+    repo = str(amap.get("AutoModel", "")).split("--")[0]
+    if not repo:
+        raise SystemExit("RADIO's summary_idxs was newly initialised and no upstream "
+                         "encoder repo is named in vision_config.auto_map to recover it")
+    from safetensors.torch import load_file
+    snaps = sorted(glob.glob("/home/uberger/scratch/cache/hf_cache/hub/models--"
+                             + repo.replace("/", "--") + "/snapshots/*"))
+    for f in (sorted(glob.glob(snaps[-1] + "/*.safetensors")) if snaps else []):
+        for k, v in load_file(f).items():
+            if k.endswith("summary_idxs"):
+                radio.summary_idxs = v.to(radio.summary_idxs.device)
+                print(f"[load] restored RADIO summary_idxs from {repo}: {v.tolist()}",
+                      flush=True)
+                return
+    raise SystemExit(f"RADIO's summary_idxs was newly initialised and {repo} is not "
+                     "cached, so the real value cannot be recovered. Fetch it first.")
 
 
 def load_family(model, processor, system_prompt="auto"):
