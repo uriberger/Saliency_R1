@@ -377,7 +377,52 @@ def load_model(path, adapter, device, attn_impl="sdpa"):
     model = AutoModel.from_pretrained(path, config=cfg, dtype=torch.bfloat16,
                                       trust_remote_code=True)
     _repair_radio_summary_idxs(model, cfg)
+    _shim_masking_api()
     return processor, model.to(device).eval()
+
+
+def _shim_masking_api():
+    """Bridge the one transformers API change NVIDIA's decoder code predates.
+
+    `modeling_nemotron_h.py` targets transformers 4.55.4 and calls
+
+        create_causal_mask(config=..., input_embeds=..., cache_position=..., ...)
+
+    where 5.13 spells the first `inputs_embeds` and has dropped `cache_position`
+    entirely -- it derives the positions from `past_key_values` and `position_ids`. Those
+    are the only two differences, so this renames one argument and drops the other in the
+    remote module's own namespace.
+
+    Patched HERE rather than in the file on disk because the modules cache is
+    re-downloaded whenever the repo changes, so an edit there is silently lost; and
+    rather than by pinning transformers 4.55 in a second environment, which is the
+    heavier alternative and stays available if more drift turns up. A shim that changed
+    the MASK would change the model's output, so the selftest's greedy decode -- which
+    compares the scan against stock attention token for token, and would produce nonsense
+    under a broken mask -- is what says this is inert.
+    """
+    import sys
+
+    n = 0
+    for name, mod in list(sys.modules.items()):
+        if "transformers_modules" not in name:
+            continue
+        fn = getattr(mod, "create_causal_mask", None)
+        if fn is None or getattr(fn, "_sl_shimmed", False):
+            continue
+
+        def wrapped(*args, _orig=fn, **kw):
+            if "input_embeds" in kw:
+                kw["inputs_embeds"] = kw.pop("input_embeds")
+            kw.pop("cache_position", None)
+            return _orig(*args, **kw)
+
+        wrapped._sl_shimmed = True
+        mod.create_causal_mask = wrapped
+        n += 1
+    if n:
+        print(f"[load] bridged create_causal_mask in {n} remote module(s): "
+              "input_embeds -> inputs_embeds, cache_position dropped", flush=True)
 
 
 def _repair_radio_summary_idxs(model, cfg):
@@ -1292,6 +1337,12 @@ def stage_selftest(args):
         # near-ties -- LLaVA-1.5's fp16 weights read in bf16 are one -- that drift flips a
         # token ten steps in. Asserting scan == SDPA there fails a scan that is provably
         # doing nothing, and the number that says so is printed rather than dropped.
+        # A shimmed or mis-derived causal mask would still produce SOME tokens and the
+        # scan-vs-eager comparison would still pass, because both paths share the mask.
+        # Printing what the model actually wrote is the check that catches it.
+        print("        model wrote: "
+              + repr(processor.tokenizer.decode(base_ids[len(inputs["input_ids"][0]):],
+                                                skip_special_tokens=True))[:140])
         check("the scan reproduces stock unfused attention (greedy tokens)",
               scan_ids == eager_ids,
               f"{sum(a == b for a, b in zip(scan_ids, eager_ids))}/{len(eager_ids)} equal")
