@@ -515,7 +515,12 @@ def main():
         print(f"  wrote figures/heat_modalgrid_{_slug(r['label'])}.png")
 
     (out / "tables.md").write_text("\n".join(lines) + "\n")
-    print(f"\nwrote {out / 'tables.md'} and {len(runs) * len(Q_SETS)} figures")
+    # Counted, not computed. `panels x query sets` is what a complete run WOULD write,
+    # and a query set with no stored map -- an observe column on a scan that never ran
+    # --observe-steps -- is correctly skipped, so the formula over-reports. A figure
+    # count that cannot be wrong is worth the glob.
+    n_fig = len(list((out / "figures").glob("*.png")))
+    print(f"\nwrote {out / 'tables.md'} and {n_fig} figures")
     return 0
 
 
