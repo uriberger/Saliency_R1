@@ -213,24 +213,62 @@ def score_one(smap, mask):
 # ---------------------------------------------------------------------------
 # answers
 # ---------------------------------------------------------------------------
-def extract_answer(text: str) -> str:
-    """What the model finally said.
+# Lines base Qwen3-VL-8B-Instruct ends on that are ABOUT its answer rather than the
+# answer. Taking the last line literally scores "This is my answer." against the gold
+# string and marks a correct model wrong -- which is the artefact this whole comparison
+# has to avoid, not commit.
+_BOILERPLATE = re.compile(
+    r"^\W*(this is my (answer|reasoning)|answer|final answer|in summary|conclusion)\W*$",
+    re.IGNORECASE)
+
+
+def extract_answer(text: str) -> tuple[str, str]:
+    """-> (what to print, what to grade on).
 
     A cold-started chain is `<think> ... </think> ANSWER`, which is what the trainer's
-    accuracy_reward parses. Base Qwen3-VL-8B-Instruct has no think block at all (0/20
-    format_ok on val_natural) and answers in prose, so falling back to the whole
-    completion -- the trainer's fallback -- would hand the grader four paragraphs. Take
-    its last non-empty line instead, which is where its conclusion lives.
+    accuracy_reward parses, and there the two are the same string. Base Qwen3-VL-8B-
+    Instruct has no think block at all (0/20 format_ok on val_natural), answers in prose
+    and often signs off with a line about the answer rather than the answer; falling back
+    to the whole completion -- the trainer's fallback -- would hand the grader four
+    paragraphs, and falling back to the last line hands it the sign-off. So: drop the
+    sign-off lines, print the last real one, and grade over the last two, which is where
+    a "Therefore, ..." conclusion and its restatement both live.
     """
     text = text.replace("<|im_end|>", " ").strip()
     m = re.search(r"</think>\s*(.*)", text, re.DOTALL)
     if m and m.group(1).strip():
-        return m.group(1).strip()
+        return m.group(1).strip(), m.group(1).strip()
     m = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
     if m:
-        return m.group(1).strip()
+        return m.group(1).strip(), m.group(1).strip()
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    return lines[-1] if lines else text
+    real = [ln for ln in lines if not _BOILERPLATE.match(ln)]
+    if not real:
+        return (lines[-1] if lines else text), text
+    return real[-1], " ".join(real[-2:])
+
+
+def mcq_letter(text: str):
+    """The option letter a free-form answer is choosing, or None.
+
+    A bare `\\bA\\b` search is not it: prose contains the article "A", and on a
+    five-option benchmark that alone would hand a wrong model a 1-in-5 credit. So the
+    letter has to be in a position that means a choice -- the whole answer, a
+    "the answer is X", or a parenthesised "(X)".
+    """
+    t = (text or "").strip()
+    m = re.fullmatch(r"\W*([A-Ea-e])\W*", t)                  # the answer IS the letter
+    if m:
+        return m.group(1).upper()
+    m = re.match(r"^\W*([A-E])\s*[.):,\-]", t)                # "C. In the upper left area"
+    if m:
+        return m.group(1)
+    m = re.search(r"(?:answer|option|choice)\s*(?:is|are)?\s*[:\-]?\s*[*\(\[]*([A-E])\b(?!['\w])",
+                  t, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    m = re.findall(r"[\(\[]([A-E])[\)\]]", t)
+    return m[-1] if m else None
 
 
 def grade(answer: str, gold: str) -> dict:
@@ -241,13 +279,22 @@ def grade(answer: str, gold: str) -> dict:
     the strict grade would make a verbose baseline look wrong for being verbose -- the
     same artefact as the LogicVista MCQ parser -- so both are carried and the caption
     quotes the soft one.
+
+    A single-letter gold is a multiple-choice benchmark, where neither rule works: exact
+    match fails on "The best answer is: C" and the substring rule fires on the article
+    "A". Both grades then come from `mcq_letter`.
     """
     a = (answer or "").strip().lower().rstrip(".")
-    g = (gold or "").strip().lower().rstrip(".")
+    g = (gold or "").strip().rstrip(".")
     if not g:
-        return {"strict": None, "soft": None}
-    soft = bool(re.search(rf"(?<![a-z0-9]){re.escape(g)}(?![a-z0-9])", a)) if g else False
-    return {"strict": a == g, "soft": soft}
+        return {"strict": None, "soft": None, "kind": "none"}
+    if re.fullmatch(r"[A-Ea-e]", g):
+        got = mcq_letter(answer)
+        ok = got is not None and got.upper() == g.upper()
+        return {"strict": ok, "soft": ok, "kind": "mcq", "parsed": got}
+    g = g.lower()
+    soft = bool(re.search(rf"(?<![a-z0-9]){re.escape(g)}(?![a-z0-9])", a))
+    return {"strict": a == g, "soft": soft, "kind": "text"}
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +319,7 @@ def collect(run_dir: Path, models: dict[str, str], maps: list[str]):
             if not have:
                 continue
             gen = meta.get("generation", "")
-            ans = extract_answer(gen)
+            ans, span = extract_answer(gen)
             image = Image.open(sdir / "original.png").convert("RGB")
             for i, step in enumerate(meta["steps"]):
                 items.append({
@@ -280,7 +327,8 @@ def collect(run_dir: Path, models: dict[str, str], maps: list[str]):
                     "dataset": meta.get("dataset"), "step": i, "text": step["text"],
                     "question": meta.get("question", ""),
                     "gt_answer": meta.get("gt_answer", ""),
-                    "answer": ans, "grade": grade(ans, str(meta.get("gt_answer", ""))),
+                    "answer": ans, "answer_span": span,
+                    "grade": grade(span, str(meta.get("gt_answer", ""))),
                     "format_ok": meta.get("format_ok"), "n_steps": len(meta["steps"]),
                     "image": image, "sdir": str(sdir),
                     "maps": {m: np.clip(z[m][i], 0, None).astype(np.float64) for m in have},

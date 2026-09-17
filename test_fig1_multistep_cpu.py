@@ -94,23 +94,46 @@ def test_crossover_sign():
 
 
 def test_answers():
-    print("extract_answer / grade")
-    check("cold-start chain -> what follows </think>",
-          M.extract_answer("<think> reasoning </think> Counter <|im_end|>") == "Counter")
+    print("extract_answer")
+    shown, span = M.extract_answer("<think> reasoning </think> Counter <|im_end|>")
+    check("cold-start chain -> what follows </think>", (shown, span) == ("Counter", "Counter"))
+    shown, span = M.extract_answer("Step 1 ...\n\nThe cup stands on a shelf.<|im_end|>")
     check("base prose -> its last line, not four paragraphs",
-          M.extract_answer("Step 1 ...\n\nThe cup stands on a shelf.<|im_end|>")
-          == "The cup stands on a shelf.")
-    check("<answer> tags are honoured when there is no think block",
-          M.extract_answer("blah <answer>goat</answer> blah") == "goat")
+          shown == "The cup stands on a shelf.")
+    # The sign-off is the failure the pilot actually hit: base ends on "This is my
+    # answer." and the last line is then a sentence ABOUT the answer.
+    shown, span = M.extract_answer(
+        "Looking at the image...\n\nTherefore, the man in the foreground wears them.\n\n"
+        "This is my answer.<|im_end|>")
+    check("a sign-off line is not the answer",
+          shown == "Therefore, the man in the foreground wears them.", shown)
+    check("and the graded span still reaches back past it", "man" in span)
+    shown, _ = M.extract_answer("blah <answer>goat</answer> blah")
+    check("<answer> tags are honoured when there is no think block", shown == "goat")
+
+    print("grade -- free text")
     check("strict is the trainer's rule", M.grade("Counter", "counter")["strict"] is True)
+    g = M.grade("The cup stands on a shelf", "shelf")
     check("a prose answer fails strict and passes soft",
-          M.grade("The cup stands on a shelf", "shelf")
-          == {"strict": False, "soft": True})
+          (g["strict"], g["soft"], g["kind"]) == (False, True, "text"))
     # Word boundaries, or "shelf" would match "shelves" and every plural would read right.
     check("soft is word-bounded, not a substring test",
           M.grade("shelves", "shelf")["soft"] is False)
     check("soft does not fire on a longer word",
           M.grade("the goatherd is here", "goat")["soft"] is False)
+
+    print("grade -- multiple choice")
+    check("a bare letter answer", M.grade("C", "C")["soft"] is True)
+    check("the benchmark's own phrasing",
+          M.grade("The best answer is: C", "C")["soft"] is True)
+    check("a parenthesised choice", M.grade("I would pick (B) here.", "B")["soft"] is True)
+    check("a wrong letter is wrong", M.grade("The best answer is: D", "C")["soft"] is False)
+    # The whole reason mcq_letter exists: the article "A" must not score.
+    check("the article 'a' does not count as choosing A",
+          M.grade("A man is standing on the left.", "A")["soft"] is False)
+    check("an unparseable answer is wrong, not None",
+          M.grade("I cannot tell from this image.", "A")
+          == {"strict": False, "soft": False, "kind": "mcq", "parsed": None})
 
 
 def main():
