@@ -281,6 +281,16 @@ class Family:
     #: the path is the only unambiguous handle. Tried before the class-name search.
     row_attr = None
 
+    def attention_layers(self, model):
+        """Which decoder layer indices have an attention matrix. None = all of them.
+
+        Dense decoders answer None and the scan checks 0..n-1. A hybrid cannot: most of
+        its layers are state-space or MLP blocks with no attention at all, so "the scan
+        saw fewer layers than the model has" is the correct outcome there and a bug
+        anywhere else. Returning the real list is what keeps that distinction.
+        """
+        return None
+
     def row_module(self, model):
         """The module whose output holds the LLM-facing image rows."""
         if self.row_attr:
@@ -730,6 +740,18 @@ class NemotronVL(Family):
 
     def patch_px(self, image):
         return self.encoder_px
+
+    def attention_layers(self, model):
+        """The `*` positions of `hybrid_override_pattern`, read off the loaded model.
+
+        Read from the modules rather than from the pattern string, so it reports what
+        was actually built. On the 8B -- a plain Llama decoder -- this returns all 32 and
+        is equivalent to the dense answer.
+        """
+        idx = sorted(int(m.layer_idx) for m in model.modules()
+                     if type(m).__name__ in self.attn_classes
+                     and getattr(m, "layer_idx", None) is not None)
+        return idx or None
 
 
 # ---------------------------------------------------------------------------

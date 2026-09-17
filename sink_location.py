@@ -642,13 +642,25 @@ class SinkScan:
         Layers are stacked in index order and a layer that never fired is refused rather
         than zero-filled: a missing layer means the attention implementation was not
         installed on it, and a zero row would read as "this layer ignores the picture".
+
+        "Every layer" is not the same as "0 to n-1". A Mamba-Transformer hybrid has
+        attention in only some of its layers -- Nemotron-Nano-Omni in 6 of 52, at the
+        positions its `hybrid_override_pattern` marks -- and there is nothing for this
+        scan to see in the rest, because they have no attention matrix. So the family
+        says which layers SHOULD have fired and the check is against that; the
+        contiguous-from-zero rule is what a dense model's family returns.
         """
         if not self._acc[self.q_sets[0]]:
             return None
         layers = sorted(self._acc[self.q_sets[0]])
-        if layers != list(range(len(layers))):
-            raise RuntimeError(f"layers {layers} are not a contiguous block from 0: the "
-                               "scan did not see every layer")
+        want = self.family.attention_layers(self.model)
+        if want is None:
+            want = list(range(len(layers)))
+        if layers != list(want):
+            raise RuntimeError(
+                f"the scan saw layers {layers} but this family's attention layers are "
+                f"{list(want)}: the attention implementation was not installed on every "
+                "one of them, and a missing layer is not a layer that ignores the picture")
         out = {"layers": layers, "kv_len": self.kv_len, "scaling": self.scaling,
                "grids": self.grids, "n_image_tokens": int(self.img_cols.numel())}
         for q in self.q_sets:
