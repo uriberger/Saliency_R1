@@ -206,7 +206,13 @@ def table_rows(meta, arrays, field, min_mass, cells=None):
         for col, stat, area in COLUMNS:
             share = (1.0 - ring) if stat is None else float(
                 np.nanmean(np.where(live, a[..., SL.STAT_INDEX[stat]], np.nan)))
-            vals[col].append(share / area(gh, gw))
+            # A set with no area has no enrichment, and on a native-resolution model
+            # this is not hypothetical: a grid 2 patches or fewer on a side is ENTIRELY
+            # ring, so `centre` covers nothing. Division there is not a small number, it
+            # is undefined, and the picture drops out of that one column rather than
+            # poisoning it.
+            frac = area(gh, gw)
+            vals[col].append(share / frac if frac > 0 else float("nan"))
     return ({c: float(np.nanmean(v)) if v else float("nan") for c, v in vals.items()},
             max(len(v) for v in vals.values()))
 
