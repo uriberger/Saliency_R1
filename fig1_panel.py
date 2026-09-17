@@ -113,6 +113,124 @@ def load_step_map(sdir: Path, step: int, key: str):
     return np.clip(z[key][step], 0, None).astype(np.float64)
 
 
+PALETTE = ["#00ff66", "#ff2fd0", "#ffd400", "#00d2ff", "#ff7a3c", "#b18cff"]
+
+
+def chain_panel(blob, c, run_dir, base_img, out, cmap, args):
+    """N steps of our chain, each with its own tight referent, in chain order.
+
+    The pair mode exists for the crossover claim, which is a statement about exactly two
+    regions swapping. A chain that enumerates four objects is a different picture and a
+    better one, and it needs the whole N x N table -- step k's map scored in every
+    region, not just in two -- or "it moved to the right object" is being asserted from
+    the diagonal alone.
+
+    Every other model gets, per region, the step of ITS OWN chain that scores highest
+    there: the best it can do on this picture, for the same reason the pair mode
+    maximises over its step pairs.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_fig1ms_raster",
+                                                  Path(__file__).resolve().parent / "fig1_multistep.py")
+    FMS = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(FMS)
+
+    want = [int(x) for x in args.chain.split(",") if x != ""]
+    ours = blob["ours"]
+    by_model = {}
+    for s in blob["steps"]:
+        if s["run"] == c["run"] and s["sample"] == c["sample"]:
+            by_model.setdefault(s["model"], {})[s["step"]] = s
+
+    picked = []
+    for k, si in enumerate(want):
+        s = by_model.get(ours, {}).get(si)
+        if s is None or not s.get("tight_boxes"):
+            raise SystemExit(f"step {si} of {ours} has no tight referent")
+        gh, gw = s["grid"]
+        picked.append({"step": si, "text": s["text"], "boxes": s["tight_boxes"],
+                       "mask": FMS.raster(s["tight_boxes"], gh, gw),
+                       "colour": PALETTE[k % len(PALETTE)]})
+    if any(p["mask"] is None for p in picked):
+        raise SystemExit("a requested step rasterises to an empty referent")
+
+    all_boxes = Image.fromarray(np.asarray(base_img))
+    for p in picked:
+        all_boxes = draw_boxes(all_boxes, p["boxes"], p["colour"])
+    all_boxes.save(out / "parts" / "regions.png")
+
+    rows, tables = [], []
+    for tag in [ours] + [t for t in blob["models"] if t != ours]:
+        sdir = run_dir / blob["models"].get(tag, tag) / "samples" / c["sample"]
+        if not (sdir / "maps.npz").exists():
+            print(f"[skip] {tag}: no maps at {sdir}")
+            continue
+        z = np.load(sdir / "maps.npz")
+        if args.map not in z.files:
+            print(f"[skip] {tag}: no `{args.map}` map")
+            continue
+        maps = np.clip(z[args.map], 0, None).astype(np.float64)
+        panels = [caption(all_boxes, [tag, "the chain's referents, in order"])]
+        table = []
+        for k, p in enumerate(picked):
+            if tag == ours:
+                step = p["step"]
+            else:
+                # its own best step for this region, not the one with the same index
+                scores = [(FMS.OREW._mean_in_v2(maps[t], p["mask"]) or -9e9, t)
+                          for t in range(maps.shape[0])]
+                step = max(scores)[1]
+            row = [FMS.OREW._mean_in_v2(maps[step], q["mask"]) for q in picked]
+            table.append((step, row))
+            ov = draw_boxes(overlay(base_img, maps[step], cmap, args), p["boxes"], p["colour"])
+            ov.save(out / "parts" / f"{tag}_region{k}_step{step:02d}.png")
+            others = [v for j, v in enumerate(row) if j != k and v is not None]
+            panels.append(caption(ov, [
+                f"{tag}  step {step}  -> region {k + 1}",
+                f"{args.map} v2 {row[k]:.2f} here, {max(others):.2f} at best elsewhere"]))
+        rows.append(panels)
+        tables.append((tag, table))
+
+    if not rows:
+        raise SystemExit("nothing to draw")
+    grid(rows).save(out / "panel.png")
+
+    e = html.escape
+    parts = [
+        "<!doctype html><meta charset='utf-8'><title>figure 1 chain</title>",
+        "<style>body{background:#111;color:#ddd;font:13px/1.55 -apple-system,sans-serif;"
+        "margin:24px;max-width:1200px}img{max-width:100%;border:1px solid #333}"
+        "pre{white-space:pre-wrap;background:#181818;padding:8px;border-radius:4px}"
+        "td,th{padding:3px 10px;text-align:left}code{color:#9cf}"
+        "td.d{background:#243; font-weight:bold}</style>",
+        f"<h1>{e(c['sample'])} &mdash; {e(str(c['dataset']))}</h1>",
+        f"<p><b>Q.</b> <pre>{e(c['question'])}</pre><b>gold:</b> {e(str(c['gt_answer']))}</p>",
+        "<p>" + "<br>".join(
+            f"<span style='color:{p['colour']}'>region {k + 1}</span> = step {p['step']}: "
+            f"<i>{e(p['text'])}</i>" for k, p in enumerate(picked)) + "</p>",
+        "<p><img src='panel.png'></p>",
+    ]
+    for tag, table in tables:
+        parts.append(f"<h2>{e(tag)} &mdash; {e(args.map)} v2 of each step's map in each region "
+                     "(chance = 1.0; the diagonal is the step's own object)</h2>")
+        parts.append("<table><tr><th>step</th>"
+                     + "".join(f"<th>region {k + 1}</th>" for k in range(len(picked)))
+                     + "</tr>")
+        for k, (step, row) in enumerate(table):
+            cells = "".join(
+                f"<td class='{'d' if j == k else ''}'>"
+                f"{'n/a' if v is None else format(v, '.2f')}</td>"
+                for j, v in enumerate(row))
+            parts.append(f"<tr><td>{step}</td>{cells}</tr>")
+        parts.append("</table>")
+        sdir = run_dir / blob["models"].get(tag, tag) / "samples" / c["sample"]
+        meta = json.loads((sdir / "meta.json").read_text())
+        parts.append(f"<pre>{e(meta.get('generation', ''))}</pre>")
+    (out / "panel.html").write_text("\n".join(parts))
+    print(f"[out] {out/'panel.png'}\n[out] {out/'panel.html'}\n[out] {out/'parts'}/")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -120,6 +238,11 @@ def main():
     ap.add_argument("--rank", type=int, default=0, help="which candidate, 0 = best")
     ap.add_argument("--sample", default=None,
                     help="pick by sample directory name instead of by rank")
+    ap.add_argument("--chain", default=None, metavar="i,j,k,...",
+                    help="draw these steps of OUR chain in order, each with its own tight "
+                         "referent, instead of the candidate's two. This is the panel for a "
+                         "chain that enumerates several objects; the pair mode is for the "
+                         "crossover claim, which needs exactly two regions to swap between")
     ap.add_argument("--out", required=True)
     ap.add_argument("--map", default="glimpse")
     ap.add_argument("--norm", default="percentile", choices=["percentile", "minmax", "rank"])
@@ -158,6 +281,10 @@ def main():
     base_img = Image.open(Path(c["sdir_i"]) / "original.png").convert("RGB")
     boxes = {"A": c["boxes_i"], "B": c["boxes_j"]}
     colours = {"A": args.colour_a, "B": args.colour_b}
+
+    if args.chain:
+        chain_panel(blob, c, run_dir, base_img, out, cmap, args)
+        return
 
     plan = [(ours, c["step_i"], c["step_j"], c["crossover"].get(blob["rank_map"]))]
     for tag, best in (c.get("others_crossover") or {}).items():
