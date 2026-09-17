@@ -427,7 +427,11 @@ def main():
     for it in items:
         by_key.setdefault((it["run"], it["sample"]), []).append(it)
 
-    candidates, rates = [], {t: [0, 0] for t in models}
+    # Rates are kept per (model, map), not just for the ranking map: "do the two rewarded
+    # heads follow the steps too?" is a separate question from "does GLIMPSE?", and it is
+    # the one the reward actually paid for.
+    candidates = []
+    rates = {(t, m): [0, 0] for t in models for m in maps}
     for (run, sample), recs in sorted(by_key.items()):
         per_model = {}
         for t in models:
@@ -448,8 +452,12 @@ def main():
                     pm = pair_margin(ri, rj, mi, mj, args.rank_map)
                     if pm is None:
                         continue
-                    rates[t][1] += 1
-                    rates[t][0] += int(pm["margin"] > 0)
+                    for m in maps:
+                        other = pair_margin(ri, rj, mi, mj, m)
+                        if other is None:
+                            continue
+                        rates[(t, m)][1] += 1
+                        rates[(t, m)][0] += int(other["margin"] > 0)
                     if t != args.ours:
                         continue
                     # The same two regions, scored against every OTHER model's best own
@@ -510,18 +518,21 @@ def main():
         "cfg": {k: getattr(args, k) for k in
                 ("box_threshold", "max_box_area", "tight_score_frac", "tight_max_box_area",
                  "max_referent_area", "max_pair_iou")},
-        "crossover_rates": {t: {"pos": v[0], "n": v[1],
-                                "rate": (v[0] / v[1] if v[1] else None)}
-                            for t, v in rates.items()},
+        "crossover_rates": {f"{t}|{m}": {"model": t, "map": m, "pos": v[0], "n": v[1],
+                                         "rate": (v[0] / v[1] if v[1] else None)}
+                            for (t, m), v in rates.items()},
         "steps": steps_json, "candidates": candidates}, indent=1, default=str))
 
     print(f"\n[out] {out}  ({len(candidates)} candidate panels)")
-    print(f"\n=== crossover rate on `{args.rank_map}`, over every disjoint within-chain "
-          f"pair (IoU<={args.max_pair_iou}, each referent <={args.max_referent_area:.0%} "
-          f"of the grid) ===")
-    for t, (pos, n) in rates.items():
-        print(f"  {t:28s} {pos:4d}/{n:4d} pairs move the right way"
-              + (f"  ({pos / n:.0%})" if n else "  (no qualifying pair)"))
+    print(f"\n=== crossover rate, over every disjoint within-chain pair "
+          f"(IoU<={args.max_pair_iou}, each referent <={args.max_referent_area:.0%} "
+          f"of the grid). Pairs are selected on `{args.rank_map}`; each map is then "
+          f"scored on the same pairs ===")
+    for m in maps:
+        for t in models:
+            pos, n = rates[(t, m)]
+            print(f"  {m:10s} {t:24s} {pos:4d}/{n:4d} pairs move the right way"
+                  + (f"  ({pos / n:.0%})" if n else "  (no qualifying pair)"))
 
     print(f"\n=== top {args.top} candidates ===")
     for c in candidates[:args.top]:
