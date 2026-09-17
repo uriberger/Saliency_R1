@@ -271,8 +271,15 @@ def mcq_letter(text: str):
     return m[-1] if m else None
 
 
-def grade(answer: str, gold: str) -> dict:
+def grade(answer: str, gold: str, span: str | None = None) -> dict:
     """Strict is the trainer's rule; soft is the one a prose answer can pass.
+
+    `answer` is the model's last real line, `span` the couple of lines around it. The
+    two-line span is what a free-text gold needs (the conclusion and its restatement are
+    often on different lines) and is exactly wrong for a multiple-choice gold: base
+    answers a whole paragraph and then "B" on its own line, and searching the paragraph
+    too finds no option letter at all and scores a correct answer wrong. So MCQ reads
+    the last line first and only falls back to the span.
 
     The trainer scores `answer.lower() == gold.lower()`, which a model that writes "The
     cup stands on top of a bathroom vanity." fails even when it is right. Reporting only
@@ -284,16 +291,18 @@ def grade(answer: str, gold: str) -> dict:
     match fails on "The best answer is: C" and the substring rule fires on the article
     "A". Both grades then come from `mcq_letter`.
     """
+    span = answer if span is None else span
     a = (answer or "").strip().lower().rstrip(".")
+    s = (span or "").strip().lower().rstrip(".")
     g = (gold or "").strip().rstrip(".")
     if not g:
         return {"strict": None, "soft": None, "kind": "none"}
     if re.fullmatch(r"[A-Ea-e]", g):
-        got = mcq_letter(answer)
+        got = mcq_letter(answer) or mcq_letter(span)
         ok = got is not None and got.upper() == g.upper()
         return {"strict": ok, "soft": ok, "kind": "mcq", "parsed": got}
     g = g.lower()
-    soft = bool(re.search(rf"(?<![a-z0-9]){re.escape(g)}(?![a-z0-9])", a))
+    soft = bool(re.search(rf"(?<![a-z0-9]){re.escape(g)}(?![a-z0-9])", s))
     return {"strict": a == g, "soft": soft, "kind": "text"}
 
 
@@ -328,7 +337,7 @@ def collect(run_dir: Path, models: dict[str, str], maps: list[str]):
                     "question": meta.get("question", ""),
                     "gt_answer": meta.get("gt_answer", ""),
                     "answer": ans, "answer_span": span,
-                    "grade": grade(span, str(meta.get("gt_answer", ""))),
+                    "grade": grade(ans, str(meta.get("gt_answer", "")), span),
                     "format_ok": meta.get("format_ok"), "n_steps": len(meta["steps"]),
                     "image": image, "sdir": str(sdir),
                     "maps": {m: np.clip(z[m][i], 0, None).astype(np.float64) for m in have},

@@ -134,6 +134,18 @@ def test_answers():
     check("an unparseable answer is wrong, not None",
           M.grade("I cannot tell from this image.", "A")
           == {"strict": False, "soft": False, "kind": "mcq", "parsed": None})
+    # The one that was actually wrong: base reasons for a paragraph and then puts "B" on
+    # its own line. Graded over the two-line span, the paragraph swamps the letter and a
+    # correct answer reads wrong -- which is the direction this must never fail in.
+    para = ("The bike is tilted and the rider is losing balance, so it will crash.")
+    check("MCQ reads the last line, not the paragraph before it",
+          M.grade("B", "B", span=f"{para} B")["soft"] is True)
+    check("and still finds a letter when the last line is prose",
+          M.grade(para, "B", span=f"the answer is B. {para}")["soft"] is True)
+    # Free text is the opposite: the span is what a two-line conclusion needs.
+    check("free text still grades over the span",
+          M.grade("It is underneath it.", "shelf",
+                  span="The cup is on a shelf. It is underneath it.")["soft"] is True)
 
 
 def main():
