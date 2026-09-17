@@ -519,7 +519,7 @@ def measure(model, processor, images, question, device, scan, tap=None,
     if gen is None:
         inputs = build_inputs(scan.family, processor, images, question, device,
                               **proc_kwargs)
-        case, scan.prompt_len_override = inputs, None
+        case, scan.prompt_len_override = scan.family.model_inputs(inputs), None
     else:
         inputs, prompt_len, comp = gen
         case = scan.family.teacher_forced_case(inputs, comp, device)

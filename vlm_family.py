@@ -157,6 +157,14 @@ class Family:
     # -- the prompt ------------------------------------------------------
     #: Processor keyword arguments this family must pin. Empty for most; see InternVL.
     proc_defaults = {}
+    #: Processor OUTPUTS that the model's forward does not accept. Empty for most.
+    drop_inputs = ()
+
+    def model_inputs(self, inputs):
+        """The processor's output, reduced to what `forward()` will accept."""
+        if not self.drop_inputs:
+            return inputs
+        return {k: v for k, v in inputs.items() if k not in self.drop_inputs}
 
     def image_arg(self, images):
         """How this processor wants the pictures: flat, or nested one list per sample."""
@@ -634,6 +642,21 @@ class NemotronVL(Family):
     #: RADIO's own ViT also has modules called `Attention`; the decoder's class is what
     #: `bind` resolves off the text config, so the tower is never switched over.
     passthrough_inputs = ("pixel_values", "image_flags")
+    #: Processor outputs that `forward()` does not accept. They describe the geometry
+    #: rather than feed the model, and passing them through raises TypeError.
+    drop_inputs = ("num_patches", "num_tokens", "imgs_sizes")
+
+    def build_inputs(self, processor, images, question, device, **proc_kwargs):
+        out = super().build_inputs(processor, images, question, device, **proc_kwargs)
+        # The grid lives in `imgs_sizes`, which is NOT a forward kwarg and so is stripped
+        # before the model is called -- which means the scan's pre-hook never sees it.
+        # Cached here, at the one place that knows the pictures and the sizes belong
+        # together, and read back by `grids_for`. Safe only because this module is batch
+        # size 1 throughout and `build_inputs` immediately precedes the forward; both are
+        # enforced elsewhere, and `grids_for` re-checks the run length against the grid
+        # it derives, so a stale cache fails loudly rather than mislabelling patches.
+        self._sizes = out.get("imgs_sizes")
+        return out
 
     def bind(self, model=None, processor=None, config=None):
         super().bind(model=model, processor=processor, config=config)
@@ -657,6 +680,8 @@ class NemotronVL(Family):
         come back 416x672, and a fixed-grid assumption would be right for neither.
         """
         sizes = inputs if not hasattr(inputs, "get") else inputs.get("imgs_sizes")
+        if sizes is None:
+            sizes = getattr(self, "_sizes", None)      # see build_inputs
         if sizes is None or len(sizes) != len(runs):
             raise RuntimeError(
                 f"{len(runs)} image token runs but "
