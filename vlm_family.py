@@ -656,6 +656,16 @@ class NemotronVL(Family):
         # enforced elsewhere, and `grids_for` re-checks the run length against the grid
         # it derives, so a stale cache fails loudly rather than mislabelling patches.
         self._sizes = out.get("imgs_sizes")
+        # `image_flags` marks which of the encoder's outputs are real pictures. The
+        # forward requires it -- `image_flags.squeeze(-1)` on the way in -- and this
+        # processor does not emit it, so it is synthesised here as [N, 1] ones, N being
+        # the number of images the encoder was given. Shape matters: squeeze(-1) on a
+        # bare [N] would collapse a single image to a 0-d tensor.
+        if out.get("image_flags") is None and out.get("pixel_values") is not None:
+            import torch
+            n = int(out["pixel_values"].shape[0])
+            out["image_flags"] = torch.ones(n, 1, dtype=torch.long,
+                                            device=out["pixel_values"].device)
         return out
 
     def bind(self, model=None, processor=None, config=None):
