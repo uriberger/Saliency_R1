@@ -414,7 +414,8 @@ def observe_spans(processor, comp, question, classifier):
 
     text = processor.tokenizer.decode(comp, skip_special_tokens=False,
                                       clean_up_tokenization_spaces=False)
-    diag = {"n_comp": len(comp), "retok_len": None, "format_ok": False, "n_steps": 0}
+    diag = {"n_comp": len(comp), "retok_len": None, "format_ok": False, "n_steps": 0,
+            "span": None}
     body = re.sub(r"<\|im_end\|>\s*$", "", text).strip()
     diag["format_ok"] = bool(re.match(PROBE.FORMAT_PATTERN, body, re.DOTALL | re.MULTILINE)
                              and body.count("<think>") == 1
@@ -422,9 +423,28 @@ def observe_spans(processor, comp, question, classifier):
 
     m_lo = re.search(r"<think>\s*(\S\S*)", text, re.DOTALL | re.MULTILINE)
     m_hi = re.search(r"(\S)\s*</think>", text, re.DOTALL | re.MULTILINE)
-    if not m_lo or not m_hi:
-        return [], diag
-    lo_char, hi_char = m_lo.start(1), m_hi.start(1)
+    if m_lo and m_hi:
+        lo_char, hi_char = m_lo.start(1), m_hi.start(1)
+        diag["span"] = "think"
+    else:
+        # NO THINK TAGS. On this project's own checkpoints the completion is always a
+        # <think> chain, and restricting to it is what makes the spans the reward's own.
+        # Three of the four models in the cross-model panel are instruct models prompted
+        # without a system prompt, and they simply answer -- no tags, and under the strict
+        # rule an empty observe set on every picture, which would read as "this model has
+        # no observe steps" when it means "this measurement did not apply".
+        #
+        # So fall back to the WHOLE completion and record which rule was used. The two are
+        # not the same quantity -- "the observe steps of a reasoning chain" and "the
+        # observe sentences of a plain answer" -- and the report keys off `span` rather
+        # than pooling them.
+        # `body` is `text` with the trailing turn-end stripped, so it IS a substring and
+        # `find` locates it exactly -- no offset arithmetic to get wrong.
+        lo_char = text.find(body) if body else -1
+        if lo_char < 0:
+            return [], diag
+        hi_char = lo_char + len(body) - 1
+        diag["span"] = "whole_completion"
 
     out = processor.tokenizer([text])
     diag["retok_len"] = len(out["input_ids"][0])
@@ -477,6 +497,11 @@ def measure(model, processor, images, question, device, scan, tap=None,
                     for i in range(a, min(b, len(comp)))]
             scan.observe_rows = sorted(set(rows))
             obs_diag["n_rows"] = len(scan.observe_rows)
+        # Keep what the model wrote. Generation is ~99% of the cost of this stage, and
+        # without the ids every future span definition -- plan steps, deduce steps, the
+        # last third of the chain -- pays for it again. With them, only the single
+        # teacher-forced forward has to be redone.
+        got_completion = np.asarray(comp, dtype=np.int32)
     scan.reset()
     try:
         with torch.no_grad():
@@ -500,6 +525,8 @@ def measure(model, processor, images, question, device, scan, tap=None,
 
     got = {"grid": [gh, gw], "kv_len": res["kv_len"], "n_grids": len(res["grids"]),
            "tile": int(tile), "n_image_tokens": res["n_image_tokens"]}
+    if gen is not None:
+        got["completion"] = got_completion
     prim = res[SL.PRIMARY_Q]
     stats, peak = SL.reduce_cells(
         cut(prim["col_sum"]), cut(prim["col_sq"]), prim["n_rows"], prim["row_total"],
@@ -651,7 +678,13 @@ class Sink:
     #: stored as integers, because they are LABELS on a grid. float16 is exact to 2048
     #: and the grids here are far smaller, but a patch index that rounds is a patch index
     #: that points at the wrong patch, and nothing downstream could tell.
-    INT_FIELDS = ("peak", "peak_img_q", "peak_gen", "peak_all", "peak_obs", "perm")
+    #:
+    #: `completion` is here for the same reason and a sharper one: these are VOCAB ids,
+    #: which run past 151,000. float16 is exact only to 2048, so storing them as floats
+    #: would silently corrupt every token id above that -- which is nearly all of them --
+    #: and the stored completion would decode to garbage.
+    INT_FIELDS = ("peak", "peak_img_q", "peak_gen", "peak_all", "peak_obs", "perm",
+                  "completion")
 
     def flush(self):
         """One encoding for every field: flat values, per-unit shapes, per-unit indices.
@@ -695,7 +728,8 @@ def arrays_of(got):
             "stats_gen", "peak_gen", "stats_all", "peak_all",
             "stats_obs", "peak_obs",
             "map_q", "map_gen", "map_all", "map_obs",
-            "map_q_tr", "map_gen_tr", "map_all_tr", "map_obs_tr")
+            "map_q_tr", "map_gen_tr", "map_all_tr", "map_obs_tr",
+            "completion")
     return {k: np.asarray(got[k]) for k in keep if got.get(k) is not None}
 
 
