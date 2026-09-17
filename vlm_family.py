@@ -376,6 +376,41 @@ class Qwen3VL(Family):
 
 # ---------------------------------------------------------------------------
 @register
+class Glm4V(Qwen3VL):
+    """GLM-4.1V -- a third language-model family, on a native-resolution tower of its own.
+
+    Subclassed off Qwen3-VL because the two really are the same shape where this module
+    touches them, and re-typing that would be two copies to keep in step rather than one:
+    a native-resolution ViT whose grid comes from `image_grid_thw`, a 2x2 spatial merge so
+    the token grid is (h//2, w//2), and a vision model that hands the language model its
+    rows as `pooler_output`. What differs is the identifiers, the 14px patch (so a token
+    is 28px, not Qwen3-VL's 32), and the absence of DeepStack -- a single injection point,
+    like InternVL and LLaVA, which is one fewer place a positional mark can be planted.
+
+    The decoder is GLM-4, 40 layers by 32 heads: neither Qwen nor Llama, which is the
+    point. It is also a reasoning model, so its `generated` query set is a long chain
+    rather than the handful of tokens the instruct models write.
+    """
+
+    name = "glm4v"
+    model_types = ("glm4v",)
+    attn_classes = ("Glm4vTextAttention",)
+    row_classes = ("Glm4vVisionModel",)
+    uses_project_prompt = False
+    image_token_id = 151343
+    vision_start_ids = (151339,)          # <|begin_of_image|>
+    vision_end_ids = (151340,)            # <|end_of_image|>
+    encoder_px = 28                       # patch 14 x spatial_merge 2
+
+    def patch_px(self, image):
+        # 28 exactly, for the reason Qwen3-VL's is 32: the picture's own width is a
+        # rounded multiple of the token size, so deriving it would round differently on
+        # some sizes and quietly change what the padding arms pad by.
+        return 28
+
+
+# ---------------------------------------------------------------------------
+@register
 class InternVL(Family):
     """A Qwen3 text tower with someone else's eyes -- the best-controlled comparison.
 
