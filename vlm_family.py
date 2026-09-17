@@ -166,6 +166,17 @@ class Family:
             return inputs
         return {k: v for k, v in inputs.items() if k not in self.drop_inputs}
 
+    #: Keys that `forward()` needs but `generate()` rejects. `generate` validates its
+    #: kwargs against the LANGUAGE model's signature, so a multimodal-wrapper argument
+    #: that the wrapper consumes itself is an error there and required here.
+    drop_for_generate = ()
+
+    def generate_inputs(self, inputs):
+        """The same inputs, reduced to what `generate()` will accept."""
+        if not self.drop_for_generate:
+            return inputs
+        return {k: v for k, v in inputs.items() if k not in self.drop_for_generate}
+
     def image_arg(self, images):
         """How this processor wants the pictures: flat, or nested one list per sample."""
         return list(images)
@@ -645,6 +656,9 @@ class NemotronVL(Family):
     #: Processor outputs that `forward()` does not accept. They describe the geometry
     #: rather than feed the model, and passing them through raises TypeError.
     drop_inputs = ("num_patches", "num_tokens", "imgs_sizes")
+    #: `image_flags` is consumed by the wrapper's own forward and is not a kwarg the
+    #: language model's `generate` will accept.
+    drop_for_generate = ("image_flags",)
 
     def build_inputs(self, processor, images, question, device, **proc_kwargs):
         out = super().build_inputs(processor, images, question, device, **proc_kwargs)

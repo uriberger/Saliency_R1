@@ -519,7 +519,8 @@ def generate_then_teacher_force(model, processor, images, question, device, scan
     scan.paused = True
     try:
         with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
+            out = model.generate(**scan.family.generate_inputs(inputs),
+                                 max_new_tokens=max_new_tokens, do_sample=False,
                                  pad_token_id=processor.tokenizer.pad_token_id)
     finally:
         scan.paused = False
@@ -1301,7 +1302,8 @@ def stage_selftest(args):
 
     def greedy_ids():
         with torch.no_grad():
-            return model.generate(**inputs, max_new_tokens=args.selftest_tokens,
+            return model.generate(**fam.generate_inputs(inputs),
+                                  max_new_tokens=args.selftest_tokens,
                                   do_sample=False,
                                   pad_token_id=processor.tokenizer.pad_token_id)[0].tolist()
 
