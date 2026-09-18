@@ -122,6 +122,12 @@ class Family:
     #: a fixed part of the family.
     start_tokens = ()
     end_tokens = ()
+    #: True when the processor stacks a multi-image batch's `pixel_values` into one dense
+    #: tensor and therefore cannot take two pictures of different sizes. Only the A6
+    #: two-image arm ever sends more than one, and it resizes the PARTNER to match rather
+    #: than zero-padding either -- padding would staple a black border onto a picture in
+    #: an experiment about borders.
+    batch_needs_equal_size = False
 
     def __init__(self):
         self.system_prompt = None
@@ -669,6 +675,11 @@ class NemotronVL(Family):
     #: `image_flags` is consumed by the wrapper's own forward and is not a kwarg the
     #: language model's `generate` will accept.
     drop_for_generate = ("image_flags",)
+    #: Its processor hands `pixel_values` to `BatchFeature` as a LIST and lets that stack
+    #: them, so two pictures of different sizes raise. RADIO is native-resolution, so on
+    #: this corpus that is nearly every pair: the A6 arm took down a whole 8-GPU run 8
+    #: pictures in before this flag existed.
+    batch_needs_equal_size = True
 
     def build_inputs(self, processor, images, question, device, **proc_kwargs):
         out = super().build_inputs(processor, images, question, device, **proc_kwargs)

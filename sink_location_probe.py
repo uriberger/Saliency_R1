@@ -1079,8 +1079,20 @@ def stage_arms(args):
     try:
         for r, arm in units:
             im = Image.open(r["path"]).convert("RGB")
-            out = _run_arm(model, processor, im, r, arm, device, scan, partners, args,
-                           fam)
+            # One arm that raises must not cost the shard the other twenty. This is not
+            # hypothetical: Nemotron's processor refused a ragged two-image batch and
+            # took down a whole 8-GPU run 8 pictures in, after the model had loaded. A
+            # failed arm is recorded as a skip and the loop goes on, which is what the
+            # `got is None` path below already does for a failure that returns rather
+            # than raises.
+            try:
+                out = _run_arm(model, processor, im, r, arm, device, scan, partners,
+                               args, fam)
+            except Exception as exc:                          # noqa: BLE001
+                print(f"[arms] {r['key']}|{arm}: FAILED {type(exc).__name__}: "
+                      f"{str(exc)[:200]}", flush=True)
+                prog.tick()
+                continue
             for got, extra, suffix in out:
                 if got is None:
                     print(f"[arms] {r['key']}|{arm}: "
@@ -1188,10 +1200,21 @@ def _run_arm(model, processor, im, row, arm, device, scan, partners, args, fam):
         if partner is None:
             return [(None, {"skipped": "no partner picture"}, "")]
         other = Image.open(partner["path"]).convert("RGB")
+        note = {}
+        # Some processors stack a batch's pixel_values into ONE tensor, which a
+        # native-resolution model can only do when the two pictures are the same size --
+        # Nemotron's raises rather than accept a ragged batch. Its own advice is
+        # `padding=True`, which zero-pads to a common shape: a black border bolted onto a
+        # picture, in an experiment about borders. Resizing the PARTNER instead leaves
+        # the measured picture untouched, which is the one the arm reads.
+        if getattr(fam, "batch_needs_equal_size", False) and other.size != im.size:
+            note = {"partner_resized": f"{other.size[0]}x{other.size[1]}"
+                                       f"->{im.size[0]}x{im.size[1]}"}
+            other = other.resize(im.size, Image.LANCZOS)
         got = measure(model, processor, [im, other], row["question"], device, scan,
                       want_hidden=False)
-        return [(got, {"partner": partner["key"],
-                       "partner_type": partner["type"]}, "")]
+        return [(got, dict(note, partner=partner["key"],
+                           partner_type=partner["type"]), "")]
 
     if arm == "prompt_swap":
         q = PROMPT_SWAPS[abs(hash(row["key"])) % len(PROMPT_SWAPS)]
