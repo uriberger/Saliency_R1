@@ -604,3 +604,137 @@ upper-left peak — two mechanisms, not one, and the paper must split the claim.
 - **A10's follow-slot is 0.727 on InternVL**, against 0.990 for its own identity control —
   so roughly a quarter of its pictures do move. The arm is clear in direction and not
   absolute.
+
+---
+
+# The boxed corpus — border vs. answer, 2026-09-18
+
+A second corpus, built for a different question. The twelve-type corpus above separates
+"the border" from "the background"; this one asks whether the border is where the picture's
+**information** is. It needs a human box, and only 548 of the twelve-type pictures have one,
+so `build_boxed_corpus.py` draws 1,800 fresh (picture, question) pairs from Visual-CoT —
+every one carrying an annotated answer region, sampled in proportion to each source's share
+of the boxed pool. Four models: Qwen3-VL-8B, InternVL3.5-8B, GLM-4.1V-9B and
+Nemotron-3-Nano-Omni-30B. LLaVA-1.5 is excluded — §6 showed it has no ring to explain.
+
+The three claims under test, and what each measurement is:
+
+| | claim | measurement |
+|---|---|---|
+| 1 | the model attends the geometric **border** | ring enrichment of the pooled attention map |
+| 2 | the human says the answer is **elsewhere** | ring enrichment of the corpus box |
+| 3 | the model **reasons** about elsewhere | ring enrichment of Grounding-DINO on its own observe steps |
+
+All three are the same statistic — a region's share over its share of the patches, on the
+picture's own grid, 1.0 being a fair share — so they are directly comparable.
+Attention is averaged over the **observe-step tokens** (`sink_location_probe --observe-steps`,
+the FLAN-T5 POD classifier's `observe` spans), which is the query set the argument is about;
+all four query sets are kept in `tables.md` so the aggregation can be changed without
+rescanning. Grids differ per picture and per model, so everything is area-weighted onto each
+model's own modal lattice.
+
+## The null, and why claims 2 and 3 do not survive together
+
+A region's ring enrichment is a function of its **size and shape** before it is a function of
+its position. The border is a thin frame, so a blob dropped anywhere covers proportionally
+little of it and scores well below 1 without preferring the centre at all. Every geometric
+row therefore carries a matched null: **the same mask, rigidly translated to every position
+it fits on that grid**, averaged exactly rather than sampled. Area, shape, contiguity and
+grid are held; only position moves.
+
+```
+model             n | top-k attn   null  ratio |  human   null  ratio | referent   null  ratio
+-----------------------------------------------------------------------------------------------
+qwen3_vl       1759 |       1.45   1.17   1.23 |   0.42   0.60   0.71 |     0.66   0.63   1.04
+internvl3.5    1499 |       1.18   1.10   1.07 |   0.41   0.53   0.76 |     0.55   0.50   1.09
+glm4v          1742 |       1.92   1.65   1.16 |   0.41   0.56   0.72 |     0.57   0.52   1.09
+nemotron       1790 |       1.50   1.15   1.31 |   0.40   0.54   0.75 |     0.62   0.60   1.05
+```
+
+`top-k attn` is the k most-attended patches with k set to that picture's human-box size, so
+attention is compared to the boxes as a region of equal area rather than as a distribution.
+
+- **Claim 1 holds.** The most-attended patches are border-leaning beyond what their size
+  explains, in all four models (1.07–1.31).
+- **Claim 2 holds.** The human box is genuinely central: 0.40–0.42 against a null of
+  0.53–0.60, a ratio of **0.71–0.76**. Its low raw number is not merely its size.
+- **Claim 3 fails.** The model's grounded referents sit at **1.04–1.09** — at chance, if
+  anything marginally border-leaning. Their raw 0.55–0.66 was size and nothing else.
+
+The referent result is robust. The union above is large by construction (a chain with eight
+observe steps contributes eight boxes), so the per-**step** region was measured separately
+and swept across area caps:
+
+```
+per step, max_box_area:   0.50              0.25              0.10
+                        ring  null  ratio | ring  null ratio | ring  null ratio   area@0.10
+qwen3_vl                0.58  0.53  1.09  | 0.55  0.49  1.14 | 0.54  0.49  1.11     0.140
+internvl3.5             0.53  0.47  1.14  | 0.48  0.41  1.17 | 0.46  0.42  1.09     0.143
+glm4v                   0.54  0.48  1.11  | 0.50  0.44  1.15 | 0.49  0.45  1.08     0.139
+nemotron                0.50  0.44  1.13  | 0.47  0.40  1.20 | 0.47  0.41  1.14     0.122
+```
+
+At a 0.10 cap the referent is the same size as the human box (0.122–0.143 vs 0.175) and
+still scores 1.08–1.14 where the human box scores 0.71–0.76. The regions the observe
+sentences name are not central; what made them look central was that they are big.
+
+## The model is not looking at the border INSTEAD of the answer
+
+The complement of the geometry block, and the result that most constrains how claim 1 can be
+phrased. Attention mass inside a region over that region's share of the patches needs no
+size null — but it does need a **position** null, because attention is not flat and any
+central region would score high wherever the answer happened to be. So the same translation
+null is applied to the map:
+
+```
+model           BORDER | human box   null  ratio | referent   null  ratio | hu area  rf area
+--------------------------------------------------------------------------------------------
+qwen3_vl          1.13 |      1.57   0.97   1.61 |     1.05   0.98   1.07 |   0.179    0.646
+internvl3.5       1.15 |      2.02   0.98   2.06 |     1.20   0.99   1.20 |   0.177    0.517
+glm4v             1.34 |      1.89   0.94   2.01 |     1.12   0.94   1.19 |   0.175    0.554
+nemotron          1.30 |      2.40   0.96   2.50 |     1.17   1.01   1.16 |   0.175    0.675
+```
+
+The border does get more than its fair share (1.13–1.34). But the **human box gets 1.6–2.5×
+what an identical region moved anywhere else gets** — far more than the border does. The
+model finds the annotated answer region and attends it strongly; the border excess sits on
+top of that, not in place of it. Any framing of the form "the model looks at the frame
+rather than at what matters" is refuted by this table.
+
+Its own referents, by contrast, earn only 1.07–1.20 — the model attends the region a human
+marked considerably better than it attends the region its own sentences name. That is the
+same anti-localisation the step-referent work found (AUROC 0.43 inside a step's own
+referent), reproduced here on 1,800 fresh pictures and four model families.
+
+## What runs it
+
+```fish
+python build_boxed_corpus.py --out-dir outputs/sink_location/xmodel/boxed --n 1800
+# one scan per model, 8 shards, observe steps on
+bash launch_sink_location_job.sh --name slxb-qwen3vl --stage scan --gpus 8 \
+    --out-dir outputs/sink_location/xmodel/box_qwen3vl --model Qwen/Qwen3-VL-8B-Instruct \
+    --system-prompt none --max-new-tokens 1024 --observe-steps
+# the third leg, one GPU, several directories in one allocation
+bash launch_sink_observe_boxes_job.sh --name slxb-dino --dirs outputs/.../box_qwen3vl,...
+# tables + figures (area-weighted, each model's own modal lattice), then the three legs
+python sink_location_xmodel_tables.py --out-dir outputs/.../boxed_report --dirs ...
+python sink_three_legs.py --dirs ... --out outputs/.../boxed_report/three_legs.txt
+```
+
+`sink_three_legs.py --query {obs,gen,prompt,all}` re-reads a different query set's pooled
+map without rescanning anything.
+
+## Caveats
+
+- **The observe row is a subset.** 97.7% / 83.3% / 96.8% / 99.4% of completions have an
+  observe step (Qwen3-VL / InternVL3.5 / GLM-4.1V / Nemotron). InternVL's row describes
+  1,499 pictures and a median of one step per chain, against Nemotron's eight.
+- **Four of Nemotron's 1,800 units lost their arrays** to a part-file collision between two
+  concurrent jobs (since fixed, `Sink._part_name` is pid-tagged). n=1,796 for its attention
+  rows.
+- **Grounding-DINO at `box_threshold=0.10` returns ~15 boxes per sentence**, median area
+  0.05. The union is what the overlap reward itself used, so it is the principled default,
+  but the per-step sweep above is the reason claim 3's verdict does not rest on it.
+- **The human box is Visual-CoT's answer region**, not a free-viewing fixation map. It says
+  where the information needed for *this question* is, which is the right thing for this
+  argument and is not the same as a saliency ground truth.
