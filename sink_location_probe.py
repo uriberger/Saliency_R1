@@ -789,10 +789,21 @@ class Sink:
         self.jsonl = self.dir / f"{stage}_shard{shard}.jsonl"
         self.flush_every = int(flush_every)
         self.buf = []
+        # A per-process tag in the part name. Scanning for the next free number is only
+        # safe while ONE process writes a shard; two jobs pointed at the same output
+        # directory both pick the same next number and the second silently overwrites
+        # the first's arrays. That happened -- two Nemotron jobs briefly overlapped and
+        # cost 251 units their arrays while leaving their JSONL lines in place, so
+        # resume considered them done and they could never be regenerated. The metadata
+        # is append-only and survives concurrency; the arrays did not, and now do.
+        self.tag = f"{os.getpid():d}"
         self.part = 0
-        while (self.dir / f"{stage}_shard{shard}_part{self.part}.npz").exists():
+        while (self.dir / self._part_name(self.part)).exists():
             self.part += 1
         self.fh = open(self.jsonl, "a")
+
+    def _part_name(self, part):
+        return f"{self.stage}_shard{self.shard}_part{part}_{self.tag}.npz"
 
     def done(self):
         if not self.jsonl.exists():
@@ -844,8 +855,7 @@ class Sink:
             packed[name + "__shapes"] = np.asarray([v.shape for _i, v in have],
                                                    dtype=np.int64)
             packed[name + "__idx"] = np.asarray([i for i, _v in have], dtype=np.int64)
-        np.savez_compressed(self.dir / f"{self.stage}_shard{self.shard}_part{self.part}.npz",
-                            **packed)
+        np.savez_compressed(self.dir / self._part_name(self.part), **packed)
         self.part += 1
         self.buf = []
 
