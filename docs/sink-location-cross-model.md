@@ -738,3 +738,38 @@ map without rescanning anything.
 - **The human box is Visual-CoT's answer region**, not a free-viewing fixation map. It says
   where the information needed for *this question* is, which is the right thing for this
   argument and is not the same as a saliency ground truth.
+
+## The two maps side by side
+
+`sink_box_coverage.py` puts the generated-token attention map beside a map of the **boxes
+themselves**: per patch, the fraction of the 1,800 pictures in which that patch falls inside
+the human answer box. Both are divided by their own mean over the lattice, so both read on
+the fair-share scale and the two panels of a row are comparable.
+
+```
+                attention (generated tokens)          human-box coverage
+model    ring   top  bottom   TL    BR  centre | ring   top  bottom   TL    BR  centre
+qwen3_vl 1.20  1.73    1.05  6.64  1.86   0.92 | 0.57  0.38    0.79  0.25  0.51   1.16
+intern   1.18  1.15    1.44  2.18  2.15   0.95 | 0.53  0.33    0.76  0.23  0.50   1.14
+glm4v    1.50  2.50    1.32  2.28  0.88   0.82 | 0.56  0.37    0.79  0.24  0.51   1.15
+nemotron 1.43  1.29    1.66  3.75  3.51   0.87 | 0.55  0.35    0.77  0.24  0.50   1.14
+```
+
+The two columns are mirror images: attention is above a fair share on the ring (1.18–1.50)
+and below it in the centre (0.82–0.95); the boxes are the other way round (ring 0.53–0.57,
+centre 1.14–1.16). The corners are the sharpest version — 2.2–6.6× for attention, 0.23–0.25
+for the boxes, an order of magnitude apart. Figure:
+`boxed_report/figures/attention_vs_boxes_4x2.png`.
+
+Two things to keep in mind when quoting this. **The boxes do not depend on the model** — the
+four right-hand rows differ only through the lattice each model's grids were resampled onto,
+and their spread (0.53–0.57 on the ring) is this measurement's geometry artefact, not a
+finding. And **the box map's low ring number is still partly size**: mean box area is 0.176,
+and the translation null above is what separates the real centre preference (ratio 0.71–0.76)
+from the part that is merely area. The panel shows the contrast; the null is what licenses
+calling it a preference.
+
+`box_coverage.md` also carries the same coverage map under the attention map's own
+`mask / mask.sum()` convention, where each picture contributes one unit of mass however large
+its box. It is the stricter like-for-like comparison and it moves the ring from 0.53–0.57 to
+0.40–0.44 — the difference is entirely that small boxes get more weight.
