@@ -155,23 +155,30 @@ def resample_map(p, gh, gw, GH, GW):
     rather than at a relative position -- two pictures' 40th tokens land in different
     lattice cells. The modal-grid panel is the guard against that.
     """
-    def axis(n_src, n_dst):
-        """Lattice index -> source index, with the ENDPOINTS pinned.
+    def weights(n_src, n_dst):
+        """[n_src, n_dst] overlap weights, each destination column summing to 1.
 
-        Sampling at cell centres looks right and is not: for a source grid more than
-        twice the lattice's size, the first centre falls inside source row 1 and the
-        border row is never sampled at all. Nemotron-Omni has grids up to 53 patches on
-        a side against a 16-cell lattice, and 25 of its 600 pictures were losing their
-        edge that way. Anchoring index 0 to 0 and index n_dst-1 to n_src-1 makes the
-        lattice's border the source's border for ANY pair of sizes, and is the identity
-        when they match.
+        AREA-WEIGHTED AVERAGING (OpenCV's INTER_AREA, PIL's Image.BOX). Each lattice
+        cell's value is the overlap-weighted MEAN of the source patches it covers, so
+        every source patch contributes to something and none is discarded.
+
+        The normalisation is the whole point. The same overlap arithmetic WITHOUT it is
+        first-order conservative remapping, which preserves mass and therefore dilutes a
+        peak across however many cells it is split into -- that is what made GLM-4.1V's
+        corner read 5.04 against the table's 5.51. Dividing each destination cell by its
+        own area turns a sum of mass into a mean of enrichment, which leaves the
+        fair-share scale at 1.0 and the overall mean of the map exactly 1.
         """
-        if n_dst == 1:
-            return np.zeros(1, dtype=int)
-        return np.rint(np.arange(n_dst) * (n_src - 1) / (n_dst - 1)).astype(int)
+        es, ed = np.linspace(0, 1, n_src + 1), np.linspace(0, 1, n_dst + 1)
+        hi = np.minimum(es[1:, None], ed[None, 1:])
+        lo = np.maximum(es[:-1, None], ed[None, :-1])
+        ov = np.clip(hi - lo, 0.0, None)                       # [n_src, n_dst]
+        return ov / np.maximum(ov.sum(0, keepdims=True), 1e-30)
 
     e = np.asarray(p, dtype=np.float64).reshape(gh, gw) * (gh * gw)   # -> enrichment
-    return e[np.ix_(axis(gh, GH), axis(gw, GW))]
+    if (gh, gw) == (GH, GW):
+        return e
+    return weights(gh, GH).T @ e @ weights(gw, GW)
 
 
 def model_maps(meta, arrays, field, lattice=None, only_grid=None):
@@ -198,6 +205,32 @@ def model_maps(meta, arrays, field, lattice=None, only_grid=None):
     if acc is None:
         return None, 0, []
     return acc / n, n, grids               # already enrichment: 1.0 is a fair share
+
+
+#: Each column as a boolean mask on the common grid. A patch set's enrichment is the
+#: MEAN of the per-cell enrichment over its cells -- share/area-share expands to exactly
+#: that -- so reading a column off the map is one `mat[mask].mean()`, and the figure and
+#: the table cannot disagree because they are the same array.
+def column_masks(GH, GW):
+    s = SL.named_sets(GH, GW)
+    m = {k: s[k].reshape(GH, GW) for k in ("ring", "top", "bottom", "left", "right")}
+    m["centre"] = ~m["ring"]
+    for name, (r, c) in (("TL", (0, 0)), ("TR", (0, GW - 1)),
+                         ("BL", (GH - 1, 0)), ("BR", (GH - 1, GW - 1))):
+        z = np.zeros((GH, GW), dtype=bool)
+        z[r, c] = True
+        m[name] = z
+    return m
+
+
+def table_from_map(mat):
+    """Every column, read off the common-grid map. -> {column: enrichment}."""
+    masks = column_masks(*mat.shape)
+    out = {}
+    for col, _stat, _area in COLUMNS:
+        sel = masks[col]
+        out[col] = float(np.nanmean(mat[sel])) if sel.any() else float("nan")
+    return out
 
 
 def table_rows(meta, arrays, field, min_mass, cells=None):
@@ -486,10 +519,19 @@ def main():
         print(f"{'arm':<24} {'head set':<12} {'n':>5} {'grid':>9} " +
               " ".join(f"{c:>8}" for c, _s, _a in COLUMNS))
         for r in runs:
-            vals, n = table_rows(r["meta"], r["arrays"], field, args.min_mass,
-                                 cells=r["cells"])
-            if not n:
+            # ONE map per (panel, query set): the table row is read off it and the figure
+            # draws it. Computing them separately is what let a corner say 5.51 in one
+            # and 5.04 in the other.
+            shapes = [tuple(m["grid"]) for m in r["meta"]]
+            modal = max(set(shapes), key=shapes.count)
+            lat = (modal if args.lattice == "modal"
+                   else (int(args.lattice), int(args.lattice)))
+            fname = mapfield + ("_tr" if r["heads"] == "trained" else "")
+            mat, n, _g = model_maps(r["meta"], r["arrays"], fname, lattice=lat)
+            if mat is None or not n:
                 continue
+            r.setdefault("maps", {})[label] = (mat, n, lat)
+            vals = table_from_map(mat)
             grids = [tuple(m["grid"]) for m in r["meta"]]
             g = (f"{max(set(grids), key=grids.count)[0]}x"
                  f"{max(set(grids), key=grids.count)[1]}"
@@ -510,17 +552,15 @@ def main():
             # modal grid and COARSER than GLM-4.1V's 18x18, so GLM was being sampled
             # down for no reason. On the modal grid the sampling is the identity for the
             # largest single group of that model's pictures.
-            shapes = [tuple(m["grid"]) for m in r["meta"]]
-            modal = max(set(shapes), key=shapes.count)
-            lat = (modal if args.lattice == "modal"
-                   else (int(args.lattice), int(args.lattice)))
-            field_name = mapfield + ("_tr" if r["heads"] == "trained" else "")
-            mat, n, _g = model_maps(r["meta"], r["arrays"], field_name,
-                                    lattice=lat if len(grids) > 1 else None)
-            if mat is None:
-                print(f"  (no {field_name} in {r['dir']}; rescan to draw "
+            # THE SAME ARRAY the table row above was read from -- not a second
+            # computation of it. That is what makes every cell of this figure the number
+            # printed in the table, rather than something close to it.
+            got = r.get("maps", {}).get(label)
+            if got is None:
+                print(f"  (no {mapfield} in {r['dir']}; rescan to draw "
                       f"{r['label']} / {label})")
                 continue
+            mat, n, lat = got
             slug = f"heat_{field}_{_slug(r['label'])}"
             # The dilution warning is not decoration. Resampling is mass-preserving but
             # it SMOOTHS: where a picture's grid is finer than the lattice, one extreme
