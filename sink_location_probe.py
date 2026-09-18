@@ -988,6 +988,65 @@ def stage_scan(args):
 CONTENT_KEYS = ("pix_var", "edge", "sat", "blank")
 
 
+def arm_sample(by_type, rng, total=0, per_type=40):
+    """The pictures the arms run on. -> [row], deterministic in `rng`.
+
+    TWO SAMPLING RULES, because two corpora want different ones.
+
+    `per_type` (the original) caps each type at N and is right for the twelve-image-type
+    corpus, whose types are equal by construction and each of which is a condition being
+    contrasted with the others -- capping there balances the contrast.
+
+    `total` takes N rows overall, allocated across the types IN PROPORTION to their share
+    of the pool by largest remainder. It exists for the boxed corpus, whose "types" are
+    Visual-CoT source datasets ranging from 7 rows to 464: a per-type cap would seat CUB's
+    7 pictures beside GQA's 44 and hand a 2%-of-corpus source an eighth of the sample.
+    `build_boxed_corpus.py` drew the corpus itself proportionally, so drawing the arm
+    subset the same way is what keeps an arm result comparable to the scan result beside
+    it.
+
+    A type with fewer rows than its allocation contributes all of them and the shortfall
+    is redistributed, so the total is met exactly whenever the pool is large enough.
+    """
+    if not total:
+        out = []
+        for _t, rs in sorted(by_type.items()):
+            idx = rng.permutation(len(rs))[:per_type]
+            out += [rs[i] for i in sorted(idx)]
+        return out
+
+    pool = sum(len(v) for v in by_type.values())
+    total = min(int(total), pool)
+    take = {t: 0 for t in by_type}
+    remaining, types = total, sorted(by_type)
+    # Iterate: proportional allocation, then give away whatever a small type could not
+    # absorb. Two passes would leave a remainder on a corpus with several small types.
+    while remaining > 0:
+        room = {t: len(by_type[t]) - take[t] for t in types}
+        free = sum(room.values())
+        if free == 0:
+            break
+        exact = {t: remaining * room[t] / free for t in types}
+        add = {t: min(room[t], int(np.floor(exact[t]))) for t in types}
+        for t in sorted(types, key=lambda k: -(exact[k] - np.floor(exact[k]))):
+            if sum(add.values()) >= remaining:
+                break
+            if add[t] < room[t]:
+                add[t] += 1
+        if sum(add.values()) == 0:
+            break
+        for t in types:
+            take[t] += add[t]
+        remaining -= sum(add.values())
+
+    out = []
+    for t in types:
+        rs = by_type[t]
+        idx = rng.permutation(len(rs))[: take[t]]
+        out += [rs[i] for i in sorted(idx)]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # stage: arms
 # ---------------------------------------------------------------------------
@@ -1000,10 +1059,7 @@ def stage_arms(args):
     by_type = {}
     for r in rows:
         by_type.setdefault(r["type"], []).append(r)
-    chosen = []
-    for t, rs in sorted(by_type.items()):
-        idx = rng.permutation(len(rs))[: args.arm_rows_per_type]
-        chosen += [rs[i] for i in sorted(idx)]
+    chosen = arm_sample(by_type, rng, args.arm_rows, args.arm_rows_per_type)
     mine = chosen[args.shard::args.num_shards]
 
     sink = Sink(args.out_dir, "arms", args.shard, args.flush_every)
@@ -2897,6 +2953,10 @@ def main():
     ap.add_argument("--arms", default=",".join(SL.DEFAULT_ARMS),
                     help=f"any of {','.join(SL.ARMS + SL.SPECIAL_ARMS)}")
     ap.add_argument("--arm-rows-per-type", type=int, default=40)
+    ap.add_argument("--arm-rows", type=int, default=0,
+                    help="total pictures for the arms stage, allocated across types in "
+                         "proportion to their share of the pool. Overrides "
+                         "--arm-rows-per-type, which caps each type equally instead")
     ap.add_argument("--no-hidden", action="store_true",
                     help="skip the hidden-state norms (M1); saves memory on a big model")
     ap.add_argument("--no-key-stats", action="store_true", help="skip M2's key statistics")
