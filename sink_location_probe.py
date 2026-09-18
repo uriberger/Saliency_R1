@@ -2801,12 +2801,12 @@ def stage_crossmodel(args):
         print(f"    {arm:<24} " + " ".join(
             f"{r['arms'].get(arm, {}).get('dE_ring', float('nan')):>+20.3f}" for r in runs))
     for col, label in (("follow_content", "follow content"), ("follow_slot", "follow slot")):
-        print(f"\n    {label:<24} " +
+        print(f"\n    {label:<27} " +
               " ".join(f"{r['family']:>20}" for r in runs))
         for arm in want:
             if not any(arm in r["arms"] for r in runs):
                 continue
-            print(f"      {arm:<22} " + " ".join(
+            print(f"      {arm:<25} " + " ".join(
                 f"{r['arms'].get(arm, {}).get(col, float('nan')):>20.3f}" for r in runs))
 
     print("\n" + "=" * 78)

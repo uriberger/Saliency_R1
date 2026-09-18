@@ -773,3 +773,59 @@ calling it a preference.
 `mask / mask.sum()` convention, where each picture contributes one unit of mass however large
 its box. It is the stricter like-for-like comparison and it moves the ring from 0.53–0.57 to
 0.40–0.44 — the difference is entirely that small boxes get more weight.
+
+## The interventions, on the boxed corpus
+
+The 21 arms, re-run on **450 of the 1,800 boxed pictures** (`--arm-rows 450`, allocated
+across the twelve Visual-CoT sources in proportion to their share of the pool, so the
+subset's mix matches the corpus's to within 0.1% per source) on the same four models.
+Each arm is one prefill, paired against its own baseline at the dev-selected cells;
+`dE_ring` is the change in ring enrichment, `follow content` the share of pictures whose
+peak patch still SHOWS the baseline's peak patch, `follow slot` the share whose peak stays
+at the same grid position. Full grid in `boxed_report/arms_crossmodel.txt`.
+
+```
+arm                       qwen3_vl   internvl      glm4v   nemotron     <- dE_ring
+permute            (A9)     -2.374     -0.835     -1.985     -1.428
+permute_identity            +0.000     +0.000     +0.000     +0.000
+permute_pixels     (A10)    -0.101     +0.110     -0.193     +0.067
+permute_pixels_identity     +0.004     -0.000     +0.000     +0.001
+rot180             (A1)     -0.021     +0.052     +0.002     +0.013
+rot90                       -0.016     +0.031     -0.014     -0.024
+hflip                       -0.011     +0.013     +0.002     +0.007
+res256             (A7)     -0.893     +0.033     -1.524     +0.139
+res384                      -0.592     -0.005     -0.691     +0.046
+donut              (A5)     -0.427     -0.243     -0.279     +0.091
+canvas8            (A4)     -0.460     +0.088     +0.021     +0.082
+two_images         (A6)     -0.095     -0.968     -0.026     -0.289
+```
+
+**A10 rules out content, in all four.** Shuffling whole cells of the picture BEFORE the
+encoder leaves the ring where it was (|dE| ≤ 0.193) while the peak patch shows something
+else entirely (`follow content` 0.000 everywhere) and stays at its slot (`follow slot`
+0.998 / 0.604 / 0.651 / 0.344). Whatever the ring is, it is not the pixels that happen to
+live there.
+
+**A1 rules out the raster order, in all four.** Rotation and reflection move the content
+but not the ring: |dE_ring| ≤ 0.052 across rot90, rot180 and hflip on every model, with
+`follow content` at or near zero and `follow slot` high. The mark stays with the frame.
+
+**A9 says where it is written.** Permuting the encoder's OUTPUT rows — content untouched,
+only which slot holds which patch embedding — collapses the ring on every model (−0.8 to
+−2.4), and the peak travels with the CONTENT rather than the slot (`follow content`
+1.000 / 0.340 / 0.702 / 0.369 against `follow slot` 0.000 / 0.147 / 0.002 / 0.002). The
+mark rides in the patch embedding; the language model's slot is not what puts it there.
+That is the twelve-type corpus's conclusion for Qwen3-VL and InternVL, now reproduced on a
+different corpus and extended to GLM-4.1V and Nemotron.
+
+**Where the models differ** is the resolution ladder. Halving the side costs Qwen3-VL 0.89
+and GLM-4.1V 1.52 of ring enrichment and costs InternVL and Nemotron essentially nothing
+(+0.03, +0.14) — which is what a fixed-448 tower versus a native-resolution one should do,
+and is the same split §7 found. InternVL's `two_images` (−0.968) is the other outlier.
+
+Caveats: 12–13 of the 9,450 arm units are missing on three of the models (the `pad_*`
+family on 3–4 pictures each, where padding pushes the picture past `MAX_IMAGE_SIDE`);
+InternVL is complete. Nemotron's A6 resizes the PARTNER picture to the measured picture's
+size, because its processor stacks a batch's `pixel_values` into one tensor and will not
+take a ragged batch — the measured picture is untouched, but its A6 is not strictly the
+same intervention as the other three models'.
