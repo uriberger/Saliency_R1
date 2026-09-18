@@ -136,21 +136,42 @@ def resample_map(p, gh, gw, GH, GW):
       one panel per common grid shape   honest, and impossible to read against a single
                         panel from each of the other two models.
 
-    What resampling cannot show is an effect that lives at an absolute TOKEN INDEX rather
-    than at a relative position -- two pictures' 40th tokens land in different lattice
-    cells. The modal-grid panel is the guard against that, and the first/last-patch
-    columns of the tables are measured on each picture's own grid and never resampled.
-    """
-    def overlap(n_src, n_dst):
-        es, ed = np.linspace(0, 1, n_src + 1), np.linspace(0, 1, n_dst + 1)
-        hi = np.minimum(es[1:, None], ed[None, 1:])
-        lo = np.maximum(es[:-1, None], ed[None, :-1])
-        return np.clip(hi - lo, 0.0, None)              # [n_src, n_dst]
+    WHY NEAREST NEIGHBOUR ON THE ENRICHMENT, NOT AN AREA-WEIGHTED SUM OF THE MASS. The
+    first version redistributed SHARE, which is mass-preserving and therefore SMOOTHS: a
+    hot patch on a grid finer than the lattice was spread over neighbouring cells, and
+    GLM-4.1V's top-right corner read 5.04 in the figure against 5.51 in the table. A
+    figure whose numbers cannot be compared with the table beside it is worse than no
+    figure.
 
-    P = np.asarray(p, dtype=np.float64).reshape(gh, gw)
-    out = overlap(gh, GH).T @ P @ overlap(gw, GW)
-    s = out.sum()
-    return out * (P.sum() / s) if s > 0 else out
+    What is drawn is ENRICHMENT, which is already per-patch normalised -- so there is no
+    mass to conserve, and the right operation is to SAMPLE the field rather than
+    redistribute it. Nearest neighbour in normalised coordinates does that, and it is
+    exact on every set defined by relative position: lattice cell (0, 0) maps to source
+    cell (0, 0) on any grid, the lattice's top row maps into the source's top row, and
+    the corners are the corners. `--lattice modal` then makes it the identity for the
+    plurality of pictures, which is the rest of the gap closed.
+
+    What resampling still cannot show is an effect that lives at an absolute TOKEN INDEX
+    rather than at a relative position -- two pictures' 40th tokens land in different
+    lattice cells. The modal-grid panel is the guard against that.
+    """
+    def axis(n_src, n_dst):
+        """Lattice index -> source index, with the ENDPOINTS pinned.
+
+        Sampling at cell centres looks right and is not: for a source grid more than
+        twice the lattice's size, the first centre falls inside source row 1 and the
+        border row is never sampled at all. Nemotron-Omni has grids up to 53 patches on
+        a side against a 16-cell lattice, and 25 of its 600 pictures were losing their
+        edge that way. Anchoring index 0 to 0 and index n_dst-1 to n_src-1 makes the
+        lattice's border the source's border for ANY pair of sizes, and is the identity
+        when they match.
+        """
+        if n_dst == 1:
+            return np.zeros(1, dtype=int)
+        return np.rint(np.arange(n_dst) * (n_src - 1) / (n_dst - 1)).astype(int)
+
+    e = np.asarray(p, dtype=np.float64).reshape(gh, gw) * (gh * gw)   # -> enrichment
+    return e[np.ix_(axis(gh, GH), axis(gw, GW))]
 
 
 def model_maps(meta, arrays, field, lattice=None, only_grid=None):
@@ -168,14 +189,15 @@ def model_maps(meta, arrays, field, lattice=None, only_grid=None):
             continue
         p = p / p.sum()
         GH, GW = lattice if lattice else (gh, gw)
-        q = resample_map(p, gh, gw, GH, GW) if (gh, gw) != (GH, GW) else p.reshape(gh, gw)
+        # Averaged as ENRICHMENT on each picture's own grid, which is what the table
+        # averages too -- so the figure's cells are the table's numbers, per patch.
+        q = resample_map(p, gh, gw, GH, GW)
         acc = q if acc is None else acc + q
         n += 1
         grids.append((gh, gw))
     if acc is None:
         return None, 0, []
-    mean = acc / n
-    return mean * mean.size, n, grids      # -> enrichment: 1.0 is a fair share
+    return acc / n, n, grids               # already enrichment: 1.0 is a fair share
 
 
 def table_rows(meta, arrays, field, min_mass, cells=None):
@@ -296,8 +318,12 @@ def main():
     ap.add_argument("--title", default=None, help="the heading tables.md opens with")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--min-mass", type=float, default=0.002)
-    ap.add_argument("--lattice", type=int, default=16,
-                    help="the common lattice a variable grid is resampled onto")
+    ap.add_argument("--lattice", default="modal",
+                    help="the lattice a variable grid is drawn on: `modal` (default) "
+                         "uses EACH MODEL'S OWN modal grid, so the sampling is the "
+                         "identity for the plurality of its pictures; or an integer N "
+                         "for a fixed NxN, which only makes sense when comparing models "
+                         "cell by cell")
     args = ap.parse_args()
     if not args.dirs and not args.panels:
         raise SystemExit("one of --dirs or --panels is required")
@@ -478,8 +504,16 @@ def main():
         lines.append("")
 
         for r in runs:
-            lat = (args.lattice, args.lattice)
             grids = {tuple(m["grid"]) for m in r["meta"]}
+            # Each model on its OWN modal grid by default. A single global default is
+            # wrong for everyone but the model it was chosen for: 16x16 is Qwen3-VL's
+            # modal grid and COARSER than GLM-4.1V's 18x18, so GLM was being sampled
+            # down for no reason. On the modal grid the sampling is the identity for the
+            # largest single group of that model's pictures.
+            shapes = [tuple(m["grid"]) for m in r["meta"]]
+            modal = max(set(shapes), key=shapes.count)
+            lat = (modal if args.lattice == "modal"
+                   else (int(args.lattice), int(args.lattice)))
             field_name = mapfield + ("_tr" if r["heads"] == "trained" else "")
             mat, n, _g = model_maps(r["meta"], r["arrays"], field_name,
                                     lattice=lat if len(grids) > 1 else None)
@@ -488,9 +522,19 @@ def main():
                       f"{r['label']} / {label})")
                 continue
             slug = f"heat_{field}_{_slug(r['label'])}"
+            # The dilution warning is not decoration. Resampling is mass-preserving but
+            # it SMOOTHS: where a picture's grid is finer than the lattice, one extreme
+            # patch is spread over neighbouring cells, so a hot corner reads lower here
+            # than in the table -- 5.04 against 5.51 on GLM-4.1V, 3.65 against 4.14 on
+            # Nemotron. The two fixed-grid models agree to the last digit, which is what
+            # says this is the resampling and not a second measurement. Anyone comparing
+            # a corner label against the table needs to be told which frame it is in.
             note = ("" if len(grids) == 1 else
-                    f"{len(grids)} distinct grids, area-resampled onto a "
-                    f"{lat[0]}x{lat[1]} lattice in normalised coordinates")
+                    f"{len(grids)} distinct grids, sampled onto this model's modal "
+                    f"{lat[0]}x{lat[1]} grid in normalised coordinates.\n"
+                    "Border cells and corners are EXACT - they carry the same numbers as "
+                    "the table. Interior cells of a\nfiner grid are sampled, not averaged, "
+                    "so the map's shape is faithful but not every patch is shown.")
             draw(mat, f"{r['label']} - {label}",
                  f"n={n} pictures, {HEAD_TEXT[r['heads']]}, enrichment over a fair share",
                  str(out / "figures" / slug), note)
