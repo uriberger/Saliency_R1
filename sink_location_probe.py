@@ -2900,10 +2900,16 @@ def main():
     ap.add_argument("--interval", type=float, default=30.0)
     ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
-    args.types = [t for t in args.types.split(",") if t] or list(CORPUS)
-    bad = [t for t in args.types if t not in CORPUS]
-    if bad:
-        raise SystemExit(f"unknown type(s) {bad}; have {sorted(CORPUS)}")
+    # `--types` unset means EVERY type in the corpus, not the twelve `CORPUS` builds.
+    # A corpus built by another script -- build_boxed_corpus.py types its rows by their
+    # Visual-CoT source -- shares none of those names, and defaulting to the built-in
+    # list filtered every one of its rows away and reported "no corpus".
+    args.types = [t for t in args.types.split(",") if t]
+    if args.stage == "corpus":
+        args.types = args.types or list(CORPUS)
+        bad = [t for t in args.types if t not in CORPUS]
+        if bad:
+            raise SystemExit(f"unknown type(s) {bad}; have {sorted(CORPUS)}")
     args.arms = [a for a in args.arms.split(",") if a]
     bad = [a for a in args.arms if a not in SL.ARMS + SL.SPECIAL_ARMS]
     if bad:
