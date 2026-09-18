@@ -569,12 +569,17 @@ def main():
             # Nemotron. The two fixed-grid models agree to the last digit, which is what
             # says this is the resampling and not a second measurement. Anyone comparing
             # a corner label against the table needs to be told which frame it is in.
+            # Area-weighted averaging: every source patch contributes to the lattice
+            # cells it overlaps, weighted by how much, each cell's weights summing to 1.
+            # Nothing is discarded -- but a cell of a coarser lattice is a BLEND, so a
+            # corner is the corner patch plus a little of its neighbours. The table is
+            # read off this same array, so the two agree cell for cell.
             note = ("" if len(grids) == 1 else
-                    f"{len(grids)} distinct grids, sampled onto this model's modal "
-                    f"{lat[0]}x{lat[1]} grid in normalised coordinates.\n"
-                    "Border cells and corners are EXACT - they carry the same numbers as "
-                    "the table. Interior cells of a\nfiner grid are sampled, not averaged, "
-                    "so the map's shape is faithful but not every patch is shown.")
+                    f"{len(grids)} distinct grids, area-weighted onto this model's modal "
+                    f"{lat[0]}x{lat[1]} grid (INTER_AREA).\n"
+                    "Every patch contributes, weighted by overlap, so each cell is a "
+                    "BLEND of the patches it covers.\nThe table beside this figure is "
+                    "read off the same array, cell for cell.")
             draw(mat, f"{r['label']} - {label}",
                  f"n={n} pictures, {HEAD_TEXT[r['heads']]}, enrichment over a fair share",
                  str(out / "figures" / slug), note)
