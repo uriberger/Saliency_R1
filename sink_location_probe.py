@@ -2255,7 +2255,7 @@ def report_arms(out_dir, cells, args):
     print("    An arm marked (=) leaves every patch showing what it showed -- `donut`")
     print("    repaints in place, the resolution ladder only rescales -- so for those two")
     print("    columns are the same question asked twice and neither discriminates.")
-    print(f"\n    {'arm':<20} {'n':>4} {'dE_ring':>9} {'95% CI':>18} {'dE_top':>8} "
+    print(f"\n    {'arm':<24} {'n':>4} {'dE_ring':>9} {'95% CI':>18} {'dE_top':>8} "
           f"{'dE_bottom':>10} {'follow content':>15} {'follow slot':>12}")
     out = {}
     for arm in sorted(by_arm):
@@ -2314,7 +2314,7 @@ def report_arms(out_dir, cells, args):
                     "follow_slot": float(np.mean(fs)) if fs else float("nan"),
                     "identity_frame": _identity_frame(arm), "n": d[3]}
         tag = arm + (" (=)" if _identity_frame(arm) else "")
-        print(f"    {tag:<20} {d[3]:>4} {d[0]:>+9.3f} "
+        print(f"    {tag:<24} {d[3]:>4} {d[0]:>+9.3f} "
               f"{f'[{d[1]:+.3f}, {d[2]:+.3f}]':>18} "
               f"{np.mean(tops) if tops else float('nan'):>+8.3f} "
               f"{np.mean(bots) if bots else float('nan'):>+10.3f} "
@@ -2774,7 +2774,6 @@ def stage_crossmodel(args):
     print("   whether the mark is in the embedding or in the language model's slot;")
     print("   `permute_pixels` (A10) moves the pixels BEFORE the encoder and says whether")
     print("   the encoder's own position embedding is what writes it.")
-    want = ("rot180", "permute", "permute_identity", "permute_pixels", "tiled")
     for r in runs:
         cells, _n = choose_cells(r["meta"], r["arrays"], args.n_cells, args.min_mass)
         import io
@@ -2782,20 +2781,32 @@ def stage_crossmodel(args):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             r["arms"] = report_arms(r["dir"], cells, args) or {}
-    print(f"\n    {'arm':<20} " +
+
+    # The default five are the ones that DISCRIMINATE between the hypotheses this table
+    # was built to separate, which is why it is not simply every arm: rot180 (content vs
+    # position), permute (embedding vs slot), permute_pixels (the encoder's own position
+    # embedding) and their controls. `--cross-arms all` prints the full grid for a reader
+    # who wants the measurements rather than the argument. Computed HERE and not above,
+    # because `all` has to read the arms each run actually produced.
+    want = ("rot180", "permute", "permute_identity", "permute_pixels", "tiled")
+    if args.cross_arms:
+        want = (tuple(sorted({a for r in runs for a in r["arms"]}))
+                if args.cross_arms == "all"
+                else tuple(a for a in args.cross_arms.split(",") if a))
+    print(f"\n    {'arm':<24} " +
           " ".join(f"{r['family'] + ' dE_ring':>20}" for r in runs))
     for arm in want:
         if not any(arm in r["arms"] for r in runs):
             continue
-        print(f"    {arm:<20} " + " ".join(
+        print(f"    {arm:<24} " + " ".join(
             f"{r['arms'].get(arm, {}).get('dE_ring', float('nan')):>+20.3f}" for r in runs))
     for col, label in (("follow_content", "follow content"), ("follow_slot", "follow slot")):
-        print(f"\n    {label:<20} " +
+        print(f"\n    {label:<24} " +
               " ".join(f"{r['family']:>20}" for r in runs))
         for arm in want:
             if not any(arm in r["arms"] for r in runs):
                 continue
-            print(f"      {arm:<18} " + " ".join(
+            print(f"      {arm:<22} " + " ".join(
                 f"{r['arms'].get(arm, {}).get(col, float('nan')):>20.3f}" for r in runs))
 
     print("\n" + "=" * 78)
@@ -2937,6 +2948,11 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--dirs", default=None,
                     help="crossmodel: the scan directories to put side by side")
+    ap.add_argument("--cross-arms", default=None,
+                    help="crossmodel: which arms the comparison prints. A comma-separated "
+                         "list, or `all`. Default is the five that discriminate between "
+                         "the hypotheses (rot180, permute, permute_identity, "
+                         "permute_pixels, tiled)")
     ap.add_argument("--against", default=None,
                     help="verify: the scan directory this one must reproduce")
     ap.add_argument("--verify-tol", type=float, default=1e-3,
