@@ -166,10 +166,30 @@ enumerates the four objects one per step, and GLIMPSE lands on each in turn:
 | 4 "Small green matte sphere" | green sphere | 3.56 | 0.95 | 2.5% |
 | 5 "Large blue matte cube" | blue cube | 4.10 | 0.92 | 7.5% |
 
-It is the best *picture* of the behaviour by a distance. It is not a win over base: base's
-chain is 12 steps long and, allowed to pick its own best step per object, matches it
-(2.79 / 6.71 / 3.77 / 4.39). Use it to show what the model does, not to show that the
-baseline cannot.
+It is the best *picture* of the behaviour by a distance. It is **not** a win over base,
+and it is worth being precise about why, because the obvious caption is wrong.
+
+Base writes 16 observe steps on this picture, seven of them `-` bullets, and **every one
+of the seven peaks on the object its own sentence names** (`figure-clevr-base-alpha/`):
+
+| base step | glimpse v2 in its own referent | AUROC |
+|---|---|---|
+| 2 "- There is a cyan cube, but it is not yellow." | 3.78 | 0.97 |
+| 4 "- The gold cylinder appears to be made of metal" | 2.20 (red sphere 2.06 -- it splits) | 0.90 |
+| 5 "- The red sphere also appears to be made of metal" | **6.71** | **1.00** |
+| 6 "- The green sphere appears to be matte" | 3.77 | 0.94 |
+| 7 "- The cyan cube appears to be shiny (metallic)." | 2.93 | 0.89 |
+
+So the baseline's chain is grounded here too. What it gets wrong is the **judgement it
+makes while looking at the right thing**: the cube is matte, base's step 7 lands squarely
+on it and calls it *shiny (metallic)*, subtracts three objects instead of two, arrives at
+"1", finds 1 is not an option, and loops -- "But 1 is not an option" six times, two
+four-sentence blocks repeated verbatim -- until `--max-new-tokens 768` cuts it off with no
+option letter. At the benchmark's own 4,096 tokens it recovers and scores 1.0
+(`outputs/bench_baselines/qwen3-vl-8b-instruct`).
+
+Caption it as *enumerating versus rambling*, or as *where you look is not what you
+conclude*. Not as *grounded versus ungrounded*, which this picture does not show.
 
 **`panel-dogbed/`** -- `val_natural` row 234, *"Where is on the dog bed?"*, gold `cat`.
 The widest margin gap on an unambiguous question (+1.24 against base's **-0.64**), but
