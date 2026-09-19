@@ -1146,7 +1146,7 @@ def _run_arm(model, processor, im, row, arm, device, scan, partners, args, fam):
         perm = SL.PatchPermute(model, mode=mode, seed=args.seed, family=fam).install()
         try:
             got = measure(model, processor, [im], row["question"], device, scan,
-                          want_hidden=False)
+                          want_hidden=False, max_new_tokens=args.arm_new_tokens)
         finally:
             perm.uninstall()
         if got is None:
@@ -1167,7 +1167,7 @@ def _run_arm(model, processor, im, row, arm, device, scan, partners, args, fam):
         tim, perm = VF.block_permute(src, grid, fam.encoder_px, seed=args.seed,
                                      mode=mode)
         got = measure(model, processor, [tim], row["question"], device, scan,
-                      want_hidden=False)
+                      want_hidden=False, max_new_tokens=args.arm_new_tokens)
         if got is None:
             return [(None, {}, "")]
         if tuple(got["grid"]) != tuple(grid):
@@ -1189,7 +1189,8 @@ def _run_arm(model, processor, im, row, arm, device, scan, partners, args, fam):
         out = []
         for k in range(args.max_tiles):
             got = measure(model, processor, [im], row["question"], device, scan,
-                          want_hidden=False, tile=k, crop_to_patches=True)
+                          want_hidden=False, tile=k, crop_to_patches=True,
+                          max_new_tokens=args.arm_new_tokens)
             if got is None:
                 break
             out.append((got, {"tile_of": got["n_grids"]}, f"#{k}"))
@@ -1212,13 +1213,14 @@ def _run_arm(model, processor, im, row, arm, device, scan, partners, args, fam):
                                        f"->{im.size[0]}x{im.size[1]}"}
             other = other.resize(im.size, Image.LANCZOS)
         got = measure(model, processor, [im, other], row["question"], device, scan,
-                      want_hidden=False)
+                      want_hidden=False, max_new_tokens=args.arm_new_tokens)
         return [(got, dict(note, partner=partner["key"],
                            partner_type=partner["type"]), "")]
 
     if arm == "prompt_swap":
         q = PROMPT_SWAPS[abs(hash(row["key"])) % len(PROMPT_SWAPS)]
-        got = measure(model, processor, [im], q, device, scan, want_hidden=False)
+        got = measure(model, processor, [im], q, device, scan, want_hidden=False,
+                      max_new_tokens=args.arm_new_tokens)
         return [(got, {"question_used": q}, "")]
 
     px = fam.patch_px(im)
@@ -1227,7 +1229,7 @@ def _run_arm(model, processor, im, row, arm, device, scan, partners, args, fam):
     if tim is None:
         return [(None, tmeta, "")]
     got = measure(model, processor, [tim], row["question"], device, scan,
-                  want_hidden=False)
+                  want_hidden=False, max_new_tokens=args.arm_new_tokens)
     if got is None:
         return [(None, tmeta, "")]
     got["view"] = fam.view_box(tim)
@@ -1766,9 +1768,27 @@ def ci_excludes(lo, hi, value):
 # stage: report
 # ---------------------------------------------------------------------------
 def at_cells(stats, stat, cells):
-    """The mean of one statistic over a set of (layer, head) cells. NaN-safe."""
-    v = np.asarray([stats[l, h, SL.STAT_INDEX[stat]] for l, h in cells], dtype=float)
+    """The mean of one statistic over a set of (layer, head) cells. NaN-safe.
+
+    `cells` may also be None, which means EVERY head that clears the image-mass floor --
+    the population the scan tables average over. The floor is not optional there: a head
+    that puts no weight on the picture still has a ring share, and it is noise wearing a
+    statistic's name.
+    """
+    a = np.asarray(stats, dtype=float)
+    if cells is None:
+        live = a[..., SL.STAT_INDEX["image_mass"]] >= AT_CELLS_MIN_MASS
+        if not live.any():
+            return float("nan")
+        v = np.where(live, a[..., SL.STAT_INDEX[stat]], np.nan)
+        return float(np.nanmean(v)) if np.isfinite(v).any() else float("nan")
+    v = np.asarray([a[l, h, SL.STAT_INDEX[stat]] for l, h in cells], dtype=float)
     return float(np.nanmean(v)) if np.isfinite(v).any() else float("nan")
+
+
+#: The floor `at_cells` applies in its all-heads mode. Set from --min-mass by `main`, so
+#: the one number the scan tables use is the one the arms use.
+AT_CELLS_MIN_MASS = 0.002
 
 
 def choose_cells(meta, arrays, k, min_mass):
@@ -2230,8 +2250,19 @@ def report_key_split(meta, arrays, cells, args):
     return {"knorm_ratio": k[0], "align_gap": al[0], "align_gap_lo": al[1]}
 
 
+#: --arm-query -> (the stats field, the peak field). The arms store the same arrays the
+#: scan does, so switching query set is a choice at REPORT time and needs no rerun --
+#: provided the run generated anything at all (--arm-new-tokens).
+ARM_QUERY = {"prompt": ("stats", "peak"),
+             "generated": ("stats_gen", "peak_gen"),
+             "all": ("stats_all", "peak_all")}
+
+
 def report_arms(out_dir, cells, args):
     """The causal half. Every arm is paired against the same picture's own baseline."""
+    stat_f, peak_f = ARM_QUERY[getattr(args, "arm_query", "prompt")]
+    if getattr(args, "arm_heads", "cells") == "all":
+        cells = None
     meta, arrays = read_stage(out_dir, "arms")
     if not meta:
         return {}
@@ -2248,7 +2279,11 @@ def report_arms(out_dir, cells, args):
     print("\n" + "=" * 78)
     print("10. THE ARMS -- same picture, one thing changed, paired against its own "
           "baseline")
-    print("    Enrichment deltas at the dev-selected cells. `follow content` is the share")
+    head_txt = ("every head over the mass floor" if cells is None
+                else f"the {len(cells)} dev-selected cells")
+    print(f"    Query set: {getattr(args, 'arm_query', 'prompt')} tokens, averaged over "
+          f"{head_txt}.")
+    print("    `follow content` is the share")
     print("    of pictures whose peak patch SHOWS the baseline's peak patch; `follow slot`")
     print("    is the share whose peak sits at the same grid position. For a positional")
     print("    sink the second is high and the first is at chance.")
@@ -2267,8 +2302,8 @@ def report_arms(out_dir, cells, args):
             b = base.get(m["key"])
             if b is None:
                 continue
-            a_arm = arrays.get(m["unit"], {}).get("stats")
-            a_base = arrays.get(b["unit"], {}).get("stats")
+            a_arm = arrays.get(m["unit"], {}).get(stat_f)
+            a_base = arrays.get(b["unit"], {}).get(stat_f)
             if a_arm is None or a_base is None:
                 continue
             gh, gw = m["grid"]
@@ -2284,14 +2319,17 @@ def report_arms(out_dir, cells, args):
                 stat = f"{name}_share"
                 lst.append(at_cells(a_arm, stat, cells) / f_arm[name].mean()
                            - at_cells(a_base, stat, cells) / f_base[name].mean())
-            pk_a = arrays.get(m["unit"], {}).get("peak")
-            pk_b = arrays.get(b["unit"], {}).get("peak")
+            pk_a = arrays.get(m["unit"], {}).get(peak_f)
+            pk_b = arrays.get(b["unit"], {}).get(peak_f)
             if pk_a is None or pk_b is None or arm in SL.NO_FOLLOW:
                 continue
             # The MODE over the selected cells, not the median: peak indices are labels on
             # a grid, and the median of two corners is a patch neither head chose.
-            pa = _mode([int(pk_a[l, h]) for l, h in cells])
-            pb = _mode([int(pk_b[l, h]) for l, h in cells])
+            idx = (cells if cells is not None
+                   else [(l, h) for l in range(pk_a.shape[0])
+                         for h in range(pk_a.shape[1])])
+            pa = _mode([int(pk_a[l, h]) for l, h in idx])
+            pb = _mode([int(pk_b[l, h]) for l, h in idx])
             # The permutation is its own correspondence: slot i now holds the embedding
             # (A9) or the pixel block (A10) that was at perm[i]. Nothing else in this
             # table can ask "did the peak follow the VECTOR" without also having moved
@@ -2992,6 +3030,20 @@ def main():
     ap.add_argument("--arms", default=",".join(SL.DEFAULT_ARMS),
                     help=f"any of {','.join(SL.ARMS + SL.SPECIAL_ARMS)}")
     ap.add_argument("--arm-rows-per-type", type=int, default=40)
+    ap.add_argument("--arm-new-tokens", type=int, default=0,
+                    help="tokens each arm GENERATES before the measured pass. 0 (the "
+                         "default) is prefill only, which gives the prompt-token query "
+                         "set and nothing else; set it to the scan's --max-new-tokens to "
+                         "get the generated-token set for every arm, at roughly the "
+                         "scan's cost per unit")
+    ap.add_argument("--arm-query", default="prompt",
+                    choices=["prompt", "generated", "all"],
+                    help="which query set the arms REPORT on. `generated` and `all` need "
+                         "the arms to have been run with --arm-new-tokens")
+    ap.add_argument("--arm-heads", default="cells", choices=["cells", "all"],
+                    help="`cells` averages the --n-cells dev-selected ring-biased heads; "
+                         "`all` averages every head clearing --min-mass, which is what "
+                         "the scan tables report")
     ap.add_argument("--arm-rows", type=int, default=0,
                     help="total pictures for the arms stage, allocated across types in "
                          "proportion to their share of the pool. Overrides "
@@ -3025,6 +3077,10 @@ def main():
     ap.add_argument("--interval", type=float, default=30.0)
     ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
+    # `at_cells`'s all-heads mode has no `args` to read, and the floor it applies must be
+    # the SAME one the scan tables use or the arms would average a different population.
+    global AT_CELLS_MIN_MASS
+    AT_CELLS_MIN_MASS = float(args.min_mass)
     # `--types` unset means EVERY type in the corpus, not the twelve `CORPUS` builds.
     # A corpus built by another script -- build_boxed_corpus.py types its rows by their
     # Visual-CoT source -- shares none of those names, and defaulting to the built-in
