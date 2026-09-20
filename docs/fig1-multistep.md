@@ -196,6 +196,85 @@ The widest margin gap on an unambiguous question (+1.24 against base's **-0.64**
 both models answer correctly and region B is scene furniture rather than something the
 question needs.
 
+## 5b. Eight more benchmarks, against the cold start
+
+A second search, 2026-09-20, on the eight benchmarks asked for -- AlgoPuzzleVQA, POPE,
+HR-Bench 4K and 8K, OmniSpatial, SalBench P3, MathVision, WeMath -- 100 documents each,
+`overlap-8k` against the **cold-start SFT it was trained from** rather than against
+vanilla Qwen3-VL. That is the ablation that isolates the reward: same weights, same
+prompt format, with and without the overlap GRPO. Numbers in
+[fig1-benchmarks-numbers.md](fig1-benchmarks-numbers.md); the scans are
+`outputs/saliency_viz/fig1b-{natural,math,hrbench}` and the search
+`outputs/fig1-multistep/bench_b.json`.
+
+HR-Bench is scanned at `--max-image-side 1024` rather than the training 512, because a
+benchmark whose question is "what is written above that doorway in a 4K frame" is not
+being asked at 512 px. GLIMPSE's cost grows with the square of the token count, so that
+arm also runs `--glimpse-layer-frac 0.6 --max-steps 6`.
+
+**Per step, inside its own referent, `glimpse`:** ours median AUROC **0.578** against the
+cold start's 0.548, 63% vs 59% of steps above chance, over 2,071 and 2,827 steps
+(Mann-Whitney p = 3.5e-5). Ours is ahead on 7 of the 8 benchmarks; MathVision is the tie.
+Two of them are much better than that average and two are at chance:
+
+| benchmark | ours median AUROC | cold start | ours above chance |
+|---|---|---|---|
+| hrbench8k | **0.785** | 0.752 | 90% |
+| hrbench4k | **0.781** | 0.723 | 86% |
+| p3 (SalBench) | 0.629 | 0.576 | 71% |
+| pope | 0.586 | 0.582 | 72% |
+| omnispatial | 0.568 | 0.535 | 62% |
+| mathvision | 0.566 | 0.558 | 62% |
+| wemath | 0.563 | 0.529 | 63% |
+| algopuzzlevqa | **0.503** | 0.451 | 51% |
+
+HR-Bench is where the reward shows up most clearly, which is the one place it should:
+high-resolution photographs where the answer is a small object in a large scene. On
+AlgoPuzzleVQA our model is at chance and the cold start is *below* it -- these are
+rendered puzzle boards, and Grounding-DINO has no referent to find in "the box is in the
+center at (3,3)", so neither model's number there means much.
+
+**Answers.** Unlike the vanilla comparison, ours is ahead: 57% vs 53% soft-correct, and
+over 747 shared pictures ours is right where the cold start is wrong 75 times against 38
+the other way.
+
+**Whole chains.** Requiring every grounded step of a chain to be above chance, over at
+least 2 steps and 2 disjoint places: **50 of 723** pictures for ours; on 19 of those the
+cold start has at least one below-chance step; on exactly **one** it also answers wrong.
+
+**`outputs/fig1-multistep/figB-hrb-count-alpha/`** is that one, and it is the cleanest
+example this whole investigation has produced.
+
+HR-Bench 4K, *"How many people are there in the image?"*, gold **C. Two**. A tram
+interior: a man in a wide-brimmed hat fills the frame, and a second person is barely
+visible through the window behind him.
+
+| | step | referent | AUROC | v2 | area |
+|---|---|---|---|---|---|
+| **ours** | 0 "a person wearing a wide-brimmed hat and a tan jacket" | the man | 0.684 | 2.45 | 8.2% |
+| **ours** | 1 "another person partially visible in the background, sitting near a window" | the second person | 0.703 | 3.63 | 4.4% |
+| cold start | 0 "there's a person sitting inside a vehicle" | a blob | 0.559 | 1.17 | **33.4%** |
+| cold start | 1 "There are no other people visible in the image." | — | **0.437** | 0.89 | 37.8% |
+
+Ours answers `C. Two`. The cold start answers `D. One`. Its second step asserts there is
+nobody else while its attention never leaves the foreground, and its referents cover a
+third of the picture each where ours are 4-8%.
+
+Two more worth keeping, both with the cold start failing on attention but matching on the
+answer: `figB-wemath/` (WeMath, a parallelogram diagram -- five consecutive steps at
+AUROC 0.85-0.92, each on the dimension label its sentence names: 30 cm, then 14 cm, then
+the 20 cm base; the cold start manages 3 of 4 with a low of 0.48) and
+`figB-hrb-flag-ours/` (HR-Bench 4K, the American flag located at AUROC 0.95 on a region
+that is **0.6%** of the grid).
+
+**What did not reproduce.** The crossover rate, which separated ours from vanilla on
+natural validation images (73% vs 59%), is flat here: 39% vs 41%, p = 0.37. These eight
+benchmarks are mostly diagrams, puzzle boards and synthetic fields, where the per-step
+referent is not a place in the sense the crossover test needs. The per-step AUROC, which
+does not depend on two referents being disjoint, still separates them.
+
+And `direct` is unchanged: median AUROC 0.387 / 0.364, 51% of its mass on the border ring.
+
 ## 6. Reproducing it
 
 ```fish

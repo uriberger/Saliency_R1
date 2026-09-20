@@ -131,7 +131,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run-dir", required=True, help="a saliency_viz output root")
-    ap.add_argument("--model", required=True, help="the subdirectory under it")
+    ap.add_argument("--model", required=True, action="append",
+                    help="the subdirectory under it; repeatable, and then each model gets "
+                         "its own labelled block of rows on one sheet. The chains differ "
+                         "in length, so the blocks are laid out independently rather than "
+                         "forced into a grid that would pair step k with step k")
     ap.add_argument("--sample", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--map", default="glimpse")
@@ -160,82 +164,90 @@ def main():
     matplotlib.use("Agg")
     cmap = matplotlib.colormaps[args.cmap]
 
-    sdir = Path(args.run_dir) / args.model / "samples" / args.sample
-    if not (sdir / "maps.npz").exists():
-        raise SystemExit(f"no maps.npz under {sdir}")
-    meta = json.loads((sdir / "meta.json").read_text())
-    z = np.load(sdir / "maps.npz")
-    if args.map not in z.files:
-        raise SystemExit(f"{sdir}/maps.npz has no `{args.map}` map (has {z.files})")
-    maps = np.clip(z[args.map], 0, None).astype(np.float64)
-    img = Image.open(sdir / "original.png").convert("RGB")
-
-    want = ([int(x) for x in args.steps.split(",") if x != ""] if args.steps
-            else list(range(len(meta["steps"]))))
-    bad = [s for s in want if not 0 <= s < maps.shape[0]]
-    if bad:
-        raise SystemExit(f"step(s) {bad} outside 0..{maps.shape[0] - 1}")
-
-    boxes_for = {}
-    if args.boxes:
-        blob = json.loads(Path(args.boxes).read_text())
-        for s in blob["steps"]:
-            if s["sample"] == args.sample and s["model"] == args.model:
-                boxes_for[s["step"]] = s.get("tight_boxes") or []
-
     out = Path(args.out)
     (out / "parts").mkdir(parents=True, exist_ok=True)
-    img.save(out / "parts" / "input.png")
 
-    size = (int(img.size[0] * args.scale), int(img.size[1] * args.scale))
-    big = img.resize(size, Image.LANCZOS)
-    pad = max(4, int(4 * args.scale))
-    f_title = font(max(11, int(8 * args.scale)))
-    f_body = font(max(10, int(7 * args.scale)))
-    line_h = int(f_title.size * 1.35) if hasattr(f_title, "size") else 14
+    boxes_blob = json.loads(Path(args.boxes).read_text()) if args.boxes else None
+    pad = f_title = f_body = line_h = None
+    blocks, metas = [], {}
+    for mi, model in enumerate(args.model):
+        sdir = Path(args.run_dir) / model / "samples" / args.sample
+        if not (sdir / "maps.npz").exists():
+            raise SystemExit(f"no maps.npz under {sdir}")
+        meta = json.loads((sdir / "meta.json").read_text())
+        metas[model] = (sdir, meta)
+        z = np.load(sdir / "maps.npz")
+        if args.map not in z.files:
+            raise SystemExit(f"{sdir}/maps.npz has no `{args.map}` map (has {z.files})")
+        maps = np.clip(z[args.map], 0, None).astype(np.float64)
+        img = Image.open(sdir / "original.png").convert("RGB")
+        if mi == 0:
+            img.save(out / "parts" / "input.png")
+            size = (int(img.size[0] * args.scale), int(img.size[1] * args.scale))
+            pad = max(4, int(4 * args.scale))
+            f_title = font(max(11, int(8 * args.scale)))
+            f_body = font(max(10, int(7 * args.scale)))
+            line_h = int(f_title.size * 1.35) if hasattr(f_title, "size") else 14
 
-    panels = [captioned(big, "input", wrap(f"gold answer: {meta.get('gt_answer')}",
-                                           f_body, size[0] - 2 * pad),
-                        f_title, f_body, pad, line_h)]
-    for si in want:
-        step = meta["steps"][si]
-        ov = overlay(img, maps[si], cmap, args)
-        if boxes_for.get(si):
-            ov = draw_boxes(ov, boxes_for[si], args.box_colour,
-                            width=max(1, int(args.scale)))
-        ov.save(out / "parts" / f"step{si:02d}.png")
-        body = wrap(step["text"], f_body, size[0] - 2 * pad)[: args.caption_lines]
-        panels.append(captioned(ov.resize(size, Image.LANCZOS),
-                                f"step {si}  ({step['n_tokens']} tokens)",
-                                body, f_title, f_body, pad, line_h))
+        want = ([int(x) for x in args.steps.split(",") if x != ""] if args.steps
+                else list(range(len(meta["steps"]))))
+        bad = [s for s in want if not 0 <= s < maps.shape[0]]
+        if bad:
+            raise SystemExit(f"{model}: step(s) {bad} outside 0..{maps.shape[0] - 1}")
 
-    # every panel the same height, so the rows line up even where a caption is shorter
-    ph = max(p.size[1] for p in panels)
-    panels = [p if p.size[1] == ph else
-              (lambda c: (c.paste(p, (0, 0)), c)[1])(Image.new("RGB", (p.size[0], ph), BG))
-              for p in panels]
+        boxes_for = {}
+        if boxes_blob:
+            for s in boxes_blob["steps"]:
+                if s["sample"] == args.sample and s["model"] == model:
+                    boxes_for[s["step"]] = s.get("tight_boxes") or []
 
-    cols = args.cols if args.cols > 0 else len(panels)
-    rows = [panels[i:i + cols] for i in range(0, len(panels), cols)]
+        panels = [captioned(img.resize(size, Image.LANCZOS), f"input  ({model})",
+                            wrap(f"gold answer: {meta.get('gt_answer')}",
+                                 f_body, size[0] - 2 * pad),
+                            f_title, f_body, pad, line_h)]
+        for si in want:
+            step = meta["steps"][si]
+            ov = overlay(img, maps[si], cmap, args)
+            if boxes_for.get(si):
+                ov = draw_boxes(ov, boxes_for[si], args.box_colour,
+                                width=max(1, int(args.scale)))
+            ov.save(out / "parts" / f"{model}_step{si:02d}.png")
+            body = wrap(step["text"], f_body, size[0] - 2 * pad)[: args.caption_lines]
+            panels.append(captioned(ov.resize(size, Image.LANCZOS),
+                                    f"{model}  step {si}  ({step['n_tokens']} tokens)",
+                                    body, f_title, f_body, pad, line_h))
 
-    q = str(meta.get("question", "")).strip()
+        # every panel the same height, so the rows line up even where a caption is shorter
+        ph = max(p.size[1] for p in panels)
+        panels = [p if p.size[1] == ph else
+                  (lambda c, q=p: (c.paste(q, (0, 0)), c)[1])(
+                      Image.new("RGB", (p.size[0], ph), BG))
+                  for p in panels]
+        cols = args.cols if args.cols > 0 else len(panels)
+        blocks.append((model, ph, [panels[i:i + cols]
+                                   for i in range(0, len(panels), cols)]))
+
+    _sdir0, meta0 = metas[args.model[0]]
+    q = str(meta0.get("question", "")).strip()
     shown_q = (args.question or q).strip()
-    body_w = max(sum(p.size[0] for p in r) + pad * (len(r) + 1) for r in rows)
+    body_w = max(sum(p.size[0] for p in r) + pad * (len(r) + 1)
+                 for _m, _ph, rows in blocks for r in rows)
     header_lines = []
     for para in shown_q.splitlines():
         header_lines += wrap(para, f_title, body_w - 2 * pad) or [""]
     header = text_block(header_lines, f_title, body_w, pad, line_h)
 
-    total_h = header.size[1] + sum(ph + pad for _ in rows) + pad
+    total_h = header.size[1] + sum(len(rows) * (ph + pad) for _m, ph, rows in blocks) + pad
     sheet = Image.new("RGB", (body_w, total_h), BG)
     sheet.paste(header, (0, 0))
     y = header.size[1]
-    for r in rows:
-        x = pad
-        for p in r:
-            sheet.paste(p, (x, y))
-            x += p.size[0] + pad
-        y += ph + pad
+    for _model, ph, rows in blocks:
+        for r in rows:
+            x = pad
+            for p in r:
+                sheet.paste(p, (x, y))
+                x += p.size[0] + pad
+            y += ph + pad
     sheet.save(out / "figure.png")
 
     e = html.escape
@@ -244,16 +256,17 @@ def main():
         "<style>body{background:#111;color:#ddd;font:13px/1.55 -apple-system,sans-serif;"
         "margin:24px;max-width:1300px}img{max-width:100%;border:1px solid #333}"
         "pre{white-space:pre-wrap;background:#181818;padding:8px;border-radius:4px}</style>",
-        f"<h1>{e(args.sample)} &mdash; {e(str(meta.get('dataset')))} "
-        f"&mdash; {e(args.model)}, {e(args.map)}</h1>",
+        f"<h1>{e(args.sample)} &mdash; {e(str(meta0.get('dataset')))} "
+        f"&mdash; {e(', '.join(args.model))}, {e(args.map)}</h1>",
         (f"<p><b>header shown in the figure:</b> {e(shown_q)}</p>" if args.question else ""),
         f"<p><b>the prompt the model was given:</b></p><pre>{e(q)}</pre>"
-        f"<p><b>gold:</b> {e(str(meta.get('gt_answer')))}</p>",
+        f"<p><b>gold:</b> {e(str(meta0.get('gt_answer')))}</p>",
         "<p><img src='figure.png'></p>",
-        f"<h2>the chain</h2><pre>{e(meta.get('generation', ''))}</pre>",
     ]
+    for model, (_sd, m) in metas.items():
+        page.append(f"<h2>{e(model)}</h2><pre>{e(m.get('generation', ''))}</pre>")
     (out / "figure.html").write_text("\n".join(page))
-    print(f"[out] {out/'figure.png'}  ({len(want)} step(s), {len(rows)} row(s))")
+    print(f"[out] {out/'figure.png'}  ({len(blocks)} model block(s))")
     print(f"[out] {out/'figure.html'}\n[out] {out/'parts'}/")
 
 

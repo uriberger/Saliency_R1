@@ -147,6 +147,33 @@ def main():
                  f"{auc:.3f}, p = {p:.2g}")
     emit()
 
+    # ---- 1b. per benchmark ----------------------------------------------------------
+    chains = [c for b in blobs for c in b.get("chains", [])]
+    if chains:
+        emit("## 1b. Per benchmark, and per whole chain")
+        emit()
+        emit("`clean` is the figure's actual claim: every grounded step of that chain "
+             "above chance inside its own referent, over at least "
+             f"{blob.get('chain_cfg', {}).get('min_chain_steps', '?')} scored steps and "
+             f"{blob.get('chain_cfg', {}).get('min_chain_regions', '?')} disjoint places. "
+             "It is harder for a model that writes SHORT chains, so read it next to the "
+             "median-steps column rather than on its own.")
+        emit()
+        emit("| benchmark | model | chains | scored steps | median AUROC | AUROC > 0.5 | "
+             "median steps | clean |")
+        emit("|---|---|---|---|---|---|---|---|")
+        for bench in sorted({c["dataset"] for c in chains}):
+            for mdl in models:
+                rows = [c for c in chains if c["dataset"] == bench and c["model"] == mdl]
+                if not rows:
+                    continue
+                au = [p["auroc"] for c in rows for p in c["steps"]]
+                emit(f"| {bench} | {mdl} | {len(rows)} | {len(au)} | "
+                     f"{np.median(au):.3f} | {np.mean([a > 0.5 for a in au]):.0%} | "
+                     f"{np.median([c['n_scored'] for c in rows]):.0f} | "
+                     f"{sum(c['clean'] for c in rows)} |")
+        emit()
+
     # ---- 2. crossover --------------------------------------------------------------
     emit("## 2. Crossover rate over disjoint within-chain step pairs")
     emit()
