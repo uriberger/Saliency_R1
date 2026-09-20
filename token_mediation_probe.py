@@ -29,12 +29,16 @@ Replacing the content holds the attention target in place. The knockout is kept 
 third arm (`--with-ko`) because it is the published construction and the comparison
 between it and `swap` is itself informative -- but it is not what the ratio is built on.
 
-WHICH TOKEN. Not cell (0,0). `docs/peak-location-results.md` puts the peak in a literal
-corner only ~27% of the time, so a fixed corner would miss the marked token on most
-pictures and dilute the effect about fourfold. The peak is read per picture off the
-clean pass's own all-head patch map, which this probe has to compute anyway. Cell (0,0)
-is kept as a separate named arm, because "the first visual token" and "the token the LLM
-leans on" are different claims and both are free here.
+WHICH TOKEN. The peak is read per picture off the clean pass's own all-head patch map,
+which this probe has to compute anyway, and cell (0,0) is a second named arm.
+
+That was built expecting the two to differ. They do not. `docs/peak-location-results.md`
+puts the peak in a literal corner only ~27% of the time, but that was 30 natural
+photographs at one layer and two heads; on the all-head map over the 12-type corpus the
+peak is cell (0,0) on 88.0% of pictures and on the ring on 97.3%. So `swap_peak` and
+`swap_first` are the same cell most of the time and agree to the fourth decimal. Both are
+kept: the agreement is the measurement, and a corpus where they came apart would need
+them separate.
 
 THE METRIC IS NOT "DID THE ANSWER CHANGE". Every arm is scored by teacher-forcing the
 CLEAN chain, so the trajectory is held fixed and the null is exactly zero -- no
@@ -438,6 +442,11 @@ def run(args):
         rows = [r for r in rows if bool(r["dev"]) is want]
     rng = random.Random(args.seed)
     rng.shuffle(rows)
+    # The donor pool is the WHOLE corpus, not the sampled subset. A donor has to have the
+    # target's grid so a cell index means the same slot in both, and this corpus has 48
+    # distinct grids in 150 pictures -- drawing donors from the sample alone left 28 of
+    # the 150 with no partner and no swap arm at all.
+    donor_pool = list(rows)
     if args.limit:
         rows = rows[: args.limit]
     img_root = Path(args.corpus) / "corpus" / "images"
@@ -472,7 +481,7 @@ def run(args):
     # property of the picture's size, so it is knowable before the model runs.
     by_grid = {}
     census = {}
-    for r in rows:
+    for r in donor_pool:
         im = snap_to_grid(PROBE.prepare_image(
             Image.open(img_root / Path(r["image"]).name).convert("RGB")))
         g = fam.grid_of(processor, im)
@@ -746,9 +755,13 @@ def report(args):
               f"[{s['ci'][0]:+.4f}, {s['ci'][1]:+.4f}]  first bigger on "
               f"{100 * s['frac_gt']:.0f}%")
 
-    print("\nMediated fraction  E_after / E_before, as a through-origin slope")
+    # NOT on `field`. A through-origin slope is only a ratio on a ratio scale, and
+    # `kl_logmean` is a log: every arm sits near -10.5, so regressing one on the other
+    # returns ~1.0 by arithmetic whatever the arms did. The decomposition is taken on raw
+    # mean KL, where "twice the effect" is twice the number.
+    print("\nMediated fraction  E_after / E_before, through-origin slope on kl_mean")
     for where in ("peak", "first", "rand"):
-        x, y = _paired(rows, f"swap_{where}", f"pix_{where}", field)
+        x, y = _paired(rows, f"swap_{where}", f"pix_{where}", "kl_mean")
         if x.size < 8:
             continue
         # Through-origin slope of swap on pix. Ratios per picture are unstable when the

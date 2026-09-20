@@ -35,6 +35,7 @@ while [[ $# -gt 0 ]]; do
         --limit)     LIMIT="$2";              shift 2 ;;
         --duration)  DURATION="$2";           shift 2 ;;
         --gpus)      GPUS="$2";               shift 2 ;;
+        --shards)    SHARDS="$2";             shift 2 ;;
         --partition) PARTITION_OVERRIDE="$2"; shift 2 ;;
         --)          shift; EXTRA+=("$@"); break ;;
         *)           EXTRA+=("$1");           shift ;;
