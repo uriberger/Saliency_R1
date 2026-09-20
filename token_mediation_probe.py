@@ -344,13 +344,24 @@ def summarise(m, lo, hi):
     log(KL) is not, and it is what every comparison in the report is taken on.
     """
     kl = np.asarray(m["kl"], dtype=np.float64)
+    # KL is non-negative in exact arithmetic and a hair negative in fp32 whenever the
+    # intervention did nothing at that position. Unclamped, a single such position makes
+    # log() NaN and drops the whole sample from every pooled statistic -- and the samples
+    # it drops are exactly the ones where the arm had no effect, which would bias every
+    # mean upward. `kl_neg` keeps the clamp visible instead of silent.
+    neg = int((kl < 0).sum())
+    kl = np.maximum(kl, 0.0)
     ans = kl[lo:hi] if hi > lo else kl[:0]
     eps = 1e-12
     return {
+        "kl_neg": neg,
         "kl_mean": float(kl.mean()),
         "kl_logmean": float(np.log(kl + eps).mean()),
         "kl_median": float(np.median(kl)),
         "kl_max": float(kl.max()),
+        # Cheap insurance: a pooled statistic that turns out to be the wrong one can be
+        # recomputed from these instead of from a second run of the whole grid.
+        "kl_q": [float(q) for q in np.percentile(kl, [10, 25, 50, 75, 90, 99])],
         "kl_answer": float(ans.mean()) if ans.size else float("nan"),
         "kl_answer_logmean": (float(np.log(ans + eps).mean()) if ans.size
                               else float("nan")),
