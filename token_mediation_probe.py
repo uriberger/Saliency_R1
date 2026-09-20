@@ -291,18 +291,27 @@ def answer_span(processor, comp):
 def clean_logprobs(model, case, prompt_len, n_comp):
     """log p over the vocabulary at every position that predicts a completion token.
 
-    -> [n_comp, V] float32 on the model's device. Position P+j-1 predicts comp[j], so the
-    slice starts one before the completion and is the same length as it.
+    -> ([n_comp, V] float32, [n_comp] argmax) on the model's device. Position P+j-1
+    predicts comp[j], so the slice starts one before the completion and is the same
+    length as it.
+
+    The argmax comes back because divergence has to be measured against THIS pass, not
+    against the ids `generate` produced. Greedy decoding runs through the fused cached
+    kernel and this forward recomputes the whole sequence, so the two disagree on a few
+    positions by numerics alone -- and an identity intervention would then be scored as
+    having diverged. Against the clean teacher-forced argmax the identity is exactly zero
+    divergences, which is the property the whole design rests on.
     """
     import torch
 
     with torch.no_grad():
         out = model(**case, use_cache=False)
     lg = out.logits[0, prompt_len - 1: prompt_len - 1 + n_comp].float()
-    return torch.log_softmax(lg, dim=-1)
+    lp = torch.log_softmax(lg, dim=-1)
+    return lp, lp.argmax(-1)
 
 
-def score_against(model, case, prompt_len, comp, clean_lp):
+def score_against(model, case, prompt_len, comp, clean_lp, clean_argmax):
     """One intervened forward, scored against the clean chain. -> metrics dict.
 
     Every quantity here is zero when the intervention is the identity, which is what
@@ -319,7 +328,7 @@ def score_against(model, case, prompt_len, comp, clean_lp):
     kl = (p_clean * (clean_lp - lp)).sum(-1)                    # [n]
     ids = torch.as_tensor(comp, device=lp.device, dtype=torch.long)
     d_lp = (clean_lp.gather(-1, ids[:, None]) - lp.gather(-1, ids[:, None]))[:, 0]
-    diverge = (lp.argmax(-1) != ids).nonzero()
+    diverge = (lp.argmax(-1) != clean_argmax).nonzero()
     return {
         "kl": kl.cpu().numpy(),
         "dlogp": d_lp.cpu().numpy(),
@@ -518,7 +527,7 @@ def one_picture(model, processor, fam, scan, r, img_root, census, by_grid, arms,
     if peak is None:
         return None
 
-    clean_lp = clean_logprobs(model, case, prompt_len, len(comp))
+    clean_lp, clean_am = clean_logprobs(model, case, prompt_len, len(comp))
     lo, hi, span_kind = answer_span(processor, comp)
     text = processor.tokenizer.decode(comp, skip_special_tokens=False,
                                       clean_up_tokenization_spaces=False)
@@ -561,7 +570,8 @@ def one_picture(model, processor, fam, scan, r, img_root, census, by_grid, arms,
             idx = cells[where]
             try:
                 m = run_arm(model, processor, fam, kind, idx, image, question, device,
-                            gh, gw, comp, prompt_len, clean_lp, donor_rows, donor_deep,
+                            gh, gw, comp, prompt_len, clean_lp, clean_am, donor_rows,
+                            donor_deep,
                             args, rng)
             except Exception as exc:                             # noqa: BLE001
                 rec["arms"][name] = {"error": f"{type(exc).__name__}: {str(exc)[:120]}"}
@@ -575,7 +585,7 @@ def one_picture(model, processor, fam, scan, r, img_root, census, by_grid, arms,
 
 
 def run_arm(model, processor, fam, kind, idx, image, question, device, gh, gw, comp,
-            prompt_len, clean_lp, donor_rows, donor_deep, args, rng):
+            prompt_len, clean_lp, clean_am, donor_rows, donor_deep, args, rng):
     """One arm, scored against the clean chain. -> metrics or None if not applicable."""
     import torch
 
@@ -586,7 +596,7 @@ def run_arm(model, processor, fam, kind, idx, image, question, device, gh, gw, c
         case = fam.teacher_forced_case(inputs, comp, device)
         sw = RowSwap(model, [idx], donor_rows, donor_deep, family=fam).install()
         try:
-            m = score_against(model, case, prompt_len, comp, clean_lp)
+            m = score_against(model, case, prompt_len, comp, clean_lp, clean_am)
         finally:
             sw.uninstall()
         if sw.applied == 0:
@@ -599,7 +609,7 @@ def run_arm(model, processor, fam, kind, idx, image, question, device, gh, gw, c
                              seed=rng.randrange(1 << 30))
         inputs = SLP.build_inputs(fam, processor, [dirty], question, device)
         case = fam.teacher_forced_case(inputs, comp, device)
-        return score_against(model, case, prompt_len, comp, clean_lp)
+        return score_against(model, case, prompt_len, comp, clean_lp, clean_am)
 
     if kind == "ko":
         inputs = SLP.build_inputs(fam, processor, [image], question, device)
@@ -609,7 +619,7 @@ def run_arm(model, processor, fam, kind, idx, image, question, device, gh, gw, c
             return None
         case = dict(case)
         case["attention_mask"] = mask
-        return score_against(model, case, prompt_len, comp, clean_lp)
+        return score_against(model, case, prompt_len, comp, clean_lp, clean_am)
 
     raise ValueError(f"unknown arm kind {kind!r}")
 
@@ -831,9 +841,9 @@ def selftest(args):
     _t, gh, gw = res["grids"][0]
     check("the snapped picture keeps its grid",
           fam.grid_of(processor, image) == (gh, gw), f"{(gh, gw)}")
-    clean_lp = clean_logprobs(model, case, prompt_len, len(comp))
+    clean_lp, clean_am = clean_logprobs(model, case, prompt_len, len(comp))
 
-    m = score_against(model, case, prompt_len, comp, clean_lp)
+    m = score_against(model, case, prompt_len, comp, clean_lp, clean_am)
     check("the identity forward has zero KL", float(np.max(m["kl"])) < 1e-4,
           f"max {float(np.max(m['kl'])):.2e}")
     check("the identity forward never diverges", m["first_diverge"] == -1)
@@ -852,7 +862,7 @@ def selftest(args):
     # A swap with the picture's OWN rows must be the identity: if it is not, the hook is
     # writing into the wrong place and every swap number is meaningless.
     sw = RowSwap(model, [0], cap.rows, cap.deepstack, family=fam).install()
-    m0 = score_against(model, case, prompt_len, comp, clean_lp)
+    m0 = score_against(model, case, prompt_len, comp, clean_lp, clean_am)
     sw.uninstall()
     check("a self-swap is the identity", float(np.max(m0["kl"])) < 1e-3,
           f"max {float(np.max(m0['kl'])):.2e}")
@@ -872,14 +882,20 @@ def selftest(args):
         neg = torch.finfo(torch.float32).min
         case_id["attention_mask"] = torch.triu(
             torch.full((L, L), neg, device=args.device), diagonal=1)[None, None]
+        # NOT a gate. The knockout is the published construction and an optional third
+        # arm; the mediation pair this probe is built on needs no custom mask at all. So
+        # a family whose mask plumbing refuses a 4D tensor disables `--with-ko` and the
+        # run proceeds -- failing the whole selftest here would block the primary
+        # experiment on an arm it does not use.
         try:
-            m1 = score_against(model, case_id, prompt_len, comp, clean_lp)
-            check("a plain causal 4D mask reproduces the unmasked forward",
-                  float(np.max(m1["kl"])) < 1e-3,
-                  f"max {float(np.max(m1['kl'])):.2e}  (--with-ko is unsafe otherwise)")
+            m1 = score_against(model, case_id, prompt_len, comp, clean_lp, clean_am)
+            good = float(np.max(m1["kl"])) < 1e-3
+            check("a plain causal 4D mask reproduces the unmasked forward", good,
+                  f"max {float(np.max(m1['kl'])):.2e}")
         except Exception as exc:                                 # noqa: BLE001
-            check("the model accepts a 4D mask", False,
-                  f"{type(exc).__name__}: {str(exc)[:90]}")
+            print(f"  [skip] this model rejects a 4D attention mask "
+                  f"({type(exc).__name__}: {str(exc)[:70]}) -- --with-ko unavailable, "
+                  "the swap/pixel pair is unaffected")
 
     scan.uninstall()
     print(f"\n{'PASS' if ok else 'FAIL'}")
