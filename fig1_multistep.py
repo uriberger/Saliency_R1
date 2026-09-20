@@ -363,6 +363,65 @@ def pair_margin(rec_i, rec_j, mi, mj, key):
             "margin": min(a - b, c - d)}
 
 
+def chain_summary(by_key, models, args):
+    """Per (model, picture): did EVERY grounded step land on its own object?
+
+    The pair search asks whether two steps swap. This asks the whole-chain question the
+    figure is really about -- "it looked in the right place at every step" -- which needs
+    three things at once and fails on any of them:
+
+      * enough grounded steps (`--min-chain-steps`). A one-step chain is not a chain.
+      * enough DISTINCT places (`--min-chain-regions`): the referents are greedily
+        clustered at the same IoU the pair search uses, so a chain that restates the same
+        object three times counts as one region and does not qualify. Base Qwen3-VL
+        repeats sentences verbatim when it loops, so this is not hypothetical.
+      * every grounded step above `--chain-auroc` inside its own referent.
+
+    Ungrounded steps are counted and reported, not silently dropped: a chain whose steps
+    mostly ground to nothing is not evidence of anything, whatever the rest score.
+    """
+    out = []
+    for (run, sample), recs in sorted(by_key.items()):
+        for tag in models:
+            rs = sorted([r for r in recs if r["model"] == tag], key=lambda r: r["step"])
+            if not rs:
+                continue
+            grounded = [r for r in rs if r["tight_mask"] is not None]
+            per_step, kept = [], []
+            for r in grounded:
+                sc = (r["scores"].get("tight") or {}).get(args.rank_map)
+                if not sc or sc["auroc"] is None:
+                    continue
+                per_step.append({"step": r["step"], "text": r["text"],
+                                 "auroc": sc["auroc"], "mean_in_v2": sc["mean_in_v2"],
+                                 "area_frac": sc["area_frac"], "peak_in": sc["peak_in"],
+                                 "boxes": [[round(float(v), 5) for v in b]
+                                           for b in r["tight_boxes"]]})
+                m = r["tight_mask"]
+                if all((float((m & k).sum()) / float((m | k).sum() or 1)) <= args.max_pair_iou
+                       for k in kept):
+                    kept.append(m)
+            if not per_step:
+                continue
+            aurocs = [p["auroc"] for p in per_step]
+            out.append({
+                "run": run, "sample": sample, "model": tag,
+                "dataset": rs[0]["dataset"], "question": rs[0]["question"],
+                "gt_answer": rs[0]["gt_answer"], "answer": rs[0]["answer"],
+                "grade": rs[0]["grade"], "format_ok": rs[0]["format_ok"],
+                "n_steps": len(rs), "n_scored": len(per_step),
+                "n_ungrounded": len(rs) - len(grounded), "n_regions": len(kept),
+                "min_auroc": min(aurocs), "median_auroc": float(np.median(aurocs)),
+                "n_above": sum(a > args.chain_auroc for a in aurocs),
+                "all_above": all(a > args.chain_auroc for a in aurocs),
+                "clean": (all(a > args.chain_auroc for a in aurocs)
+                          and len(per_step) >= args.min_chain_steps
+                          and len(kept) >= args.min_chain_regions),
+                "steps": per_step,
+            })
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -385,6 +444,14 @@ def main():
                     help="grid IoU below which two referents count as disjoint")
     ap.add_argument("--dino-batch-size", type=int, default=8)
     ap.add_argument("--top", type=int, default=30)
+    ap.add_argument("--min-chain-steps", type=int, default=3,
+                    help="a clean chain needs at least this many grounded steps")
+    ap.add_argument("--min-chain-regions", type=int, default=2,
+                    help="...landing on at least this many mutually disjoint places, so a "
+                         "chain that says the same thing three times does not qualify")
+    ap.add_argument("--chain-auroc", type=float, default=0.5,
+                    help="a step 'looked in the right place' when its AUROC inside its own "
+                         "tight referent is above this")
     args = ap.parse_args()
 
     maps = [m for m in args.maps.split(",") if m]
@@ -435,6 +502,8 @@ def main():
     by_key: dict[tuple, list] = {}
     for it in items:
         by_key.setdefault((it["run"], it["sample"]), []).append(it)
+
+    chains = chain_summary(by_key, models, args)
 
     # Rates are kept per (model, map), not just for the ranking map: "do the two rewarded
     # heads follow the steps too?" is a separate question from "does GLIMPSE?", and it is
@@ -530,9 +599,12 @@ def main():
         "crossover_rates": {f"{t}|{m}": {"model": t, "map": m, "pos": v[0], "n": v[1],
                                          "rate": (v[0] / v[1] if v[1] else None)}
                             for (t, m), v in rates.items()},
-        "steps": steps_json, "candidates": candidates}, indent=1, default=str))
+        "chain_cfg": {k: getattr(args, k) for k in
+                      ("min_chain_steps", "min_chain_regions", "chain_auroc")},
+        "steps": steps_json, "candidates": candidates, "chains": chains},
+        indent=1, default=str))
 
-    print(f"\n[out] {out}  ({len(candidates)} candidate panels)")
+    print(f"\n[out] {out}  ({len(candidates)} candidate panels, {len(chains)} chains)")
     print(f"\n=== crossover rate, over every disjoint within-chain pair "
           f"(IoU<={args.max_pair_iou}, each referent <={args.max_referent_area:.0%} "
           f"of the grid). Pairs are selected on `{args.rank_map}`; each map is then "
@@ -562,6 +634,60 @@ def main():
               f"{own.get('other_i', float('nan')):.2f}  {c['text_i'][:88]}")
         print(f"    s{c['step_j']} v2 {own.get('self_j', float('nan')):.2f} vs "
               f"{own.get('other_j', float('nan')):.2f}  {c['text_j'][:88]}")
+
+    report_chains(chains, models, args)
+
+
+def report_chains(chains, models, args):
+    """Clean chains, and the ones where only OUR chain is clean on that picture."""
+    by = {}
+    for c in chains:
+        by.setdefault((c["run"], c["sample"]), {})[c["model"]] = c
+
+    print(f"\n=== whole-chain: every grounded step above AUROC {args.chain_auroc} inside "
+          f"its own referent, on `{args.rank_map}`, with >= {args.min_chain_steps} scored "
+          f"steps over >= {args.min_chain_regions} disjoint places ===")
+    print(f"  {'model':24s} {'chains':>7s} {'clean':>7s} {'rate':>6s} "
+          f"{'med steps':>10s} {'med AUROC':>10s}")
+    for t in models:
+        rows = [c for c in chains if c["model"] == t]
+        if not rows:
+            continue
+        clean = [c for c in rows if c["clean"]]
+        print(f"  {t:24s} {len(rows):7d} {len(clean):7d} "
+              f"{len(clean) / len(rows):5.0%} {np.median([c['n_scored'] for c in rows]):10.0f} "
+              f"{np.median([c['median_auroc'] for c in rows]):10.3f}")
+
+    ours = args.ours
+    picks = []
+    for key, per in by.items():
+        mine = per.get(ours)
+        if not (mine and mine["clean"]):
+            continue
+        others = {t: c for t, c in per.items() if t != ours}
+        # How far short the best OTHER model falls on the same picture. A picture where
+        # nobody else produced a scorable chain is not evidence and is ranked last.
+        worst = min((c["n_above"] / max(c["n_scored"], 1) for c in others.values()),
+                    default=None)
+        picks.append((-(1 - worst) if worst is not None else 1e9, -mine["min_auroc"],
+                      key, mine, others))
+    picks.sort()
+    print(f"\n=== {sum(1 for p in picks if p[0] < 1e9 or True)} pictures where OUR chain is "
+          f"clean; the ones where another model's is not come first ===")
+    for _k1, _k2, key, mine, others in picks[:args.top]:
+        print(f"{key[0]}/{key[1]} [{mine['dataset']}] {mine['n_scored']} steps over "
+              f"{mine['n_regions']} places, min AUROC {mine['min_auroc']:.2f}, "
+              f"median {mine['median_auroc']:.2f}")
+        print(f"    Q: {str(mine['question'])[:120]}   gold: {mine['gt_answer']}")
+        print(f"    {ours:10s} -> {str(mine['answer'])[:60]!r} soft {mine['grade'].get('soft')}")
+        for t, c in others.items():
+            print(f"    {t:10s} -> {str(c['answer'])[:60]!r} soft {c['grade'].get('soft')}"
+                  f"   {c['n_above']}/{c['n_scored']} steps above chance over "
+                  f"{c['n_regions']} places, min AUROC {c['min_auroc']:.2f}"
+                  f"{'' if c['clean'] else '   <- not clean'}")
+        for p in mine["steps"]:
+            print(f"      s{p['step']} AUROC {p['auroc']:.2f} v2 {p['mean_in_v2']:5.2f} "
+                  f"area {p['area_frac']*100:4.1f}%  {p['text'][:80]}")
 
 
 if __name__ == "__main__":

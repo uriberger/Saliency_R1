@@ -336,6 +336,18 @@ def scan(args, device):
     out = Path(args.out_dir)
     (out / "samples").mkdir(parents=True, exist_ok=True)
 
+    # `overlap_probe.prepare_image` reads this at call time, so setting it before
+    # load_samples is what makes --max-image-side take effect; there is no per-call
+    # argument to thread. 512 is the training value (trl/grpo_vlm_qwen3.MAX_IMAGE_SIDE)
+    # and stays the default, because a map drawn at another resolution is not the map the
+    # reward saw. Raising it is for benchmarks whose whole point is resolution --
+    # HR-Bench 4K/8K -- where 512 px throws away the thing being asked about. GLIMPSE
+    # builds an [N, N] edge matrix per layer, so cost grows with the SQUARE of the token
+    # count: 1024 px is ~4x the image tokens of 512 and about 16x the propagation work.
+    if args.max_image_side != PROBE.MAX_IMAGE_SIDE:
+        print(f"[scan] max image side {PROBE.MAX_IMAGE_SIDE} -> {args.max_image_side}",
+              flush=True)
+        PROBE.MAX_IMAGE_SIDE = args.max_image_side
     rows = PROBE.load_samples(args.dataset, args.n_samples, args.seed,
                               cache_tag=f"_sv{args.shard}", split=args.split)
     todo = list(enumerate(rows))[args.shard::args.num_shards]
@@ -665,6 +677,11 @@ def main():
     # would put all 36 layers' [H, N, N] back in the graph and undo that.
     p.add_argument("--attn-impl", default="sdpa")
     p.add_argument("--max-new-tokens", type=int, default=1024)
+    p.add_argument("--max-image-side", type=int, default=PROBE.MAX_IMAGE_SIDE,
+                   help="long-side cap on the input picture. The default is the training "
+                        "value; raise it only for a benchmark whose question is about "
+                        "resolution, and note that GLIMPSE's cost grows with the square "
+                        "of the token count")
     p.add_argument("--max-steps", type=int, default=0,
                    help="cap observe steps per sample (0 = all)")
     p.add_argument("--steps-ckpt", default=os.environ.get(
