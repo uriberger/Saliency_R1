@@ -441,7 +441,8 @@ def run(args):
     if not todo:
         return
 
-    model, processor = SLP.load_model(args.model, args.adapter, args.device,
+    # (processor, model), in that order -- `overlap_probe.load_model`'s own signature.
+    processor, model = SLP.load_model(args.model, args.adapter, args.device,
                                       args.attn_impl)
     fam = SLP.load_family(model, processor, args.system_prompt)
     scan = SL.install(model, family=fam, want_key_stats=False)
@@ -801,7 +802,8 @@ def selftest(args):
         return 0 if ok else 1
 
     print("\nwith the model")
-    model, processor = SLP.load_model(args.model, args.adapter, args.device,
+    # (processor, model), in that order -- `overlap_probe.load_model`'s own signature.
+    processor, model = SLP.load_model(args.model, args.adapter, args.device,
                                       args.attn_impl)
     fam = SLP.load_family(model, processor, args.system_prompt)
     scan = SL.install(model, family=fam, want_key_stats=False)
