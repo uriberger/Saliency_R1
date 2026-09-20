@@ -242,8 +242,13 @@ the other way.
 least 2 steps and 2 disjoint places: **50 of 723** pictures for ours; on 19 of those the
 cold start has at least one below-chance step; on exactly **one** it also answers wrong.
 
-**`outputs/fig1-multistep/figB-hrb-count-alpha/`** is that one, and it is the cleanest
-example this whole investigation has produced.
+**`outputs/fig1-multistep/figB-hrb-count/`** is that one, and it is the cleanest example
+this whole investigation has produced. It is drawn the way every other heatmap in this
+repo is -- jet blended at 0.5, so everything unattended goes blue -- with the input
+picture first in each model's block. `figB-hrb-count-alpha/` is the same figure with
+`--overlay-mode alpha`, which keeps the photograph's own colours where nothing fires;
+useful for checking *what* is under a hotspot, wrong for a figure that has to be read
+next to the rest of the paper.
 
 HR-Bench 4K, *"How many people are there in the image?"*, gold **C. Two**. A tram
 interior: a man in a wide-brimmed hat fills the frame, and a second person is barely
@@ -263,9 +268,15 @@ third of the picture each where ours are 4-8%.
 Two more worth keeping, both with the cold start failing on attention but matching on the
 answer: `figB-wemath/` (WeMath, a parallelogram diagram -- five consecutive steps at
 AUROC 0.85-0.92, each on the dimension label its sentence names: 30 cm, then 14 cm, then
-the 20 cm base; the cold start manages 3 of 4 with a low of 0.48) and
-`figB-hrb-flag-ours/` (HR-Bench 4K, the American flag located at AUROC 0.95 on a region
-that is **0.6%** of the grid).
+the 20 cm base; the cold start manages 3 of 4 with a low of 0.48) and `figB-hrb-flag/`
+(HR-Bench 4K, the American flag located at AUROC 0.95 on a region that is **0.6%** of the
+grid). `figB-hrb8k-chart/` is a fourth, and it is the one to skip: a 30-bar chart at
+AUROC 0.81-0.86 on 1-2% regions is a real result and an unreadable picture.
+
+All four are `--model ours --model coldstart` on one sheet, so the two chains sit above
+each other on the same picture. They are laid out per model rather than in a shared grid
+because the chains are different lengths and a grid would imply step k of one is step k
+of the other.
 
 **What did not reproduce.** The crossover rate, which separated ours from vanilla on
 natural validation images (73% vs 59%), is flat here: 39% vs 41%, p = 0.37. These eight
