@@ -186,12 +186,19 @@ class RowSwap:
 
     @staticmethod
     def _move(target, donor, m):
-        """target + m * unit(donor - target), or the literal donor row when m is None."""
+        """target + m * unit(donor - target), or the literal donor row when m is None.
+
+        In float32, then cast back. These rows are bfloat16, which carries about three
+        decimal digits: computing `||donor - target||` in it makes the m/n ratio wrong by
+        ~1% even when m IS that norm, so the matched arm did not reproduce the literal
+        swap and the selftest's reconstruction check failed by a fifth of the signal.
+        """
         if m is None:
             return donor.to(target.dtype)
-        delta = donor.to(target.dtype) - target
+        t = target.float()
+        delta = donor.float() - t
         n = delta.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-        return target + delta * (float(m) / n)
+        return (t + delta * (float(m) / n)).to(target.dtype)
 
     def _hook(self, module, args, out):
         pool = out.pooler_output
