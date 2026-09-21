@@ -702,9 +702,14 @@ def stage_dino(args, out_dir):
         keys = keys[: args.limit]
     keys = [k for i, k in enumerate(keys) if i % args.num_shards == args.shard]
 
-    # the control pool: every image any arm was probed on. A sentence that grounds just
-    # as well on someone else's picture is not grounding on THIS one.
-    pool = sorted({(u["image_file"], u["image"]) for u in uniq.values()})
+    # The control pool: every image any arm was probed on, one entry per picture. Each
+    # probe run saved its own copy of the same 100 images, so keying on the file name
+    # rather than the path keeps a picture from being drawn four times over. A sentence
+    # that grounds just as well on someone else's picture is not grounding on THIS one.
+    by_file = {}
+    for u in uniq.values():
+        by_file.setdefault(u["image_file"], u["image"])
+    pool = sorted(by_file.items())
     rng = np.random.default_rng(SEED)
 
     device = args.device
@@ -735,6 +740,22 @@ def stage_dino(args, out_dir):
                 jobs.append((k, f"ctl{j}", others[int(i)][0], others[int(i)][1], u["text"]))
 
     res = defaultdict(dict)
+    f = out_dir / f"dino_shard{args.shard:02d}.json"
+
+    def _save():
+        # Written every so often, not only at the end: Grounding-DINO's own processor
+        # upsamples to 800x1333, so a shard is an hour of calls and a wall-clock kill
+        # that lost all of them has happened. Steps with no `own` run yet are dropped, so
+        # a partial file is a smaller audit rather than a broken one.
+        done = [k for k in keys if "own" in res.get(k, {})]
+        f.write_text(json.dumps({
+            "box_threshold": args.box_threshold, "controls": args.controls,
+            "shard": args.shard, "num_shards": args.num_shards,
+            "n_planned": len(keys), "n_done": len(done),
+            "steps": {k: {"text": uniq[k]["text"], "image_file": uniq[k]["image_file"],
+                          "qid": uniq[k]["qid"], "arms": uniq[k]["arms"],
+                          "stored": uniq[k]["stored"], "runs": res[k]} for k in done}}))
+
     bs = args.dino_batch_size
     for start in range(0, len(jobs), bs):
         chunk = jobs[start:start + bs]
@@ -745,14 +766,9 @@ def stage_dino(args, out_dir):
             res[j[0]][j[1]] = g
         if (start // bs) % 50 == 0:
             print(f"[dino] {start}/{len(jobs)} calls", flush=True)
-
-    payload = {"box_threshold": args.box_threshold, "controls": args.controls,
-               "shard": args.shard, "num_shards": args.num_shards,
-               "steps": {k: {"text": uniq[k]["text"], "image_file": uniq[k]["image_file"],
-                             "qid": uniq[k]["qid"], "arms": uniq[k]["arms"],
-                             "stored": uniq[k]["stored"], "runs": res[k]} for k in keys}}
-    f = out_dir / f"dino_shard{args.shard:02d}.json"
-    f.write_text(json.dumps(payload))
+        if (start // bs) % 200 == 199:
+            _save()
+    _save()
     print(f"[dino] {len(keys)} unique steps, {len(jobs)} calls -> {f}")
 
 
@@ -823,9 +839,9 @@ def stage_crosspass(args, out_dir):
     if args.limit:
         work = work[: args.limit]
 
-    clf = OSTEPS.OverlapStepsClassifier.load(args.steps_ckpt, device=args.device)
     heads = [int(h) for h in args.overlap_heads.split(",")]
     rows = []
+    skipped = Counter()
     for m_arm in map_arms:
         rec = arms[m_arm]
         base = rec["model_path"] or rec["config"]["base_model"]
@@ -839,28 +855,60 @@ def stage_crosspass(args, out_dir):
                                padding=True, padding_side="left",
                                add_special_tokens=False).to(args.device)
             prompt_len = inputs["input_ids"].shape[1]
-            comp_ids = tok(w["text"], add_special_tokens=False)["input_ids"]
-            out = tok([w["text"]])
+            # One tokenisation for both the forward and the spans, with no special tokens
+            # added: the probe's spans live in the same space as its comp_ids, and a BOS
+            # here would shift every span by one and quietly misattribute the map.
+            out = tok([w["text"]], add_special_tokens=False)
+            comp_ids = out["input_ids"][0]
             ts = re.search(r"<think>\s*(\S\S*)", w["text"], re.DOTALL | re.MULTILINE)
             te = re.search(r"(\S)\s*</think>", w["text"], re.DOTALL | re.MULTILINE)
             if not (ts and te):
+                skipped["no_think_span"] += 1
                 continue
             ts_idx, te_idx = ts.start(1), te.start(1)
             t_start = out.char_to_token(0, ts_idx)
             t_end = out.char_to_token(0, te_idx)
             if t_start is None or t_end is None or t_end <= t_start:
+                skipped["span_not_tokenisable"] += 1
                 continue
-            steps = OSTEPS.segment_observe_steps(
-                w["text"], ts_idx, te_idx, out, 0, t_start, t_end, w["question"], clf)
+            # The stored steps already ARE the observe sentences the classifier picked, so
+            # this re-derives only their token spans in this tokenisation. Running the
+            # classifier again would risk a different step set for the two sides of the
+            # comparison, which is the one thing the cross pass must not have.
+            steps, owner = [], []
+            n_chars = len(w["text"])
+            for st in w["steps"]:
+                cs = w["text"].find(st["text"])
+                if cs < 0:
+                    skipped["step_text_not_found"] += 1
+                    continue
+                ce = cs + len(st["text"])
+                tok_a = OSTEPS._char_to_tok(out, 0, cs, n_chars)
+                tok_b_incl = out.char_to_token(0, ce - 1)
+                if tok_b_incl is None:
+                    tok_b_incl = OSTEPS._char_to_tok(out, 0, ce - 1, n_chars)
+                if tok_a is None or tok_b_incl is None:
+                    skipped["step_not_tokenisable"] += 1
+                    continue
+                a = max(tok_a, t_start)
+                b = min(tok_b_incl + 1, t_end + 1)
+                if b <= a:
+                    skipped["empty_span"] += 1
+                    continue
+                steps.append((st["text"], a, b))
+                owner.append(st)
+            if not steps:
+                continue
             gh = int(inputs["image_grid_thw"][0, 1].item()) // 2
             gw = int(inputs["image_grid_thw"][0, 2].item()) // 2
             per_tok = PROBE.capture_layer_attention(
                 model, attn_mod, inputs, prompt_len, comp_ids, heads, args.device)
             maps = PROBE.step_maps_from_attention(per_tok, steps, gh, gw, "mean")
             by_text = {_norm_step(m["text"]): m["map"] for m in maps}
-            for st in w["steps"]:
+            for st in owner:
                 m = by_text.get(_norm_step(st["text"]))
                 if m is None or list(m.shape) != list(st["grid"]):
+                    skipped["grid_mismatch"] += 1
                     continue
                 mask = decode_mask(st["mask_q"], st["grid"][0], st["grid"][1])
                 rows.append(dict(text_arm=w["arm"], map_arm=m_arm, qid=w["qid"],
@@ -876,20 +924,22 @@ def stage_crosspass(args, out_dir):
 
     f = out_dir / f"crosspass_shard{args.shard:02d}.json"
     f.write_text(json.dumps({"rows": rows, "shard": args.shard,
-                             "num_shards": args.num_shards,
+                             "num_shards": args.num_shards, "base": args.base,
+                             "skipped": dict(skipped),
                              "layer": args.overlap_layer, "heads": args.overlap_heads}))
-    print(f"[crosspass] {len(rows)} (step, map arm) scores -> {f}")
+    print(f"[crosspass] {len(rows)} (step, map arm) scores, skipped {dict(skipped)} -> {f}")
 
 
 def merge_crosspass(out_dir):
-    rows, meta = [], None
+    rows, meta, skipped = [], None, Counter()
     for f in sorted(out_dir.glob("crosspass_shard*.json")):
         d = json.load(open(f))
-        meta = meta or {k: v for k, v in d.items() if k != "rows"}
+        meta = meta or {k: v for k, v in d.items() if k not in ("rows", "skipped")}
+        skipped.update(d.get("skipped") or {})
         rows += d["rows"]
     if not rows:
         return None
-    payload = dict(meta or {}, rows=rows)
+    payload = dict(meta or {}, rows=rows, skipped=dict(skipped))
     (out_dir / "crosspass.json").write_text(json.dumps(payload))
     return payload
 
@@ -1364,9 +1414,6 @@ def main():
     p.add_argument("--map-arm", action="append", default=[])
     p.add_argument("--overlap-layer", type=int, default=22)
     p.add_argument("--overlap-heads", default="28,31")
-    p.add_argument("--steps-ckpt",
-                   default=os.environ.get("OVERLAP_STEPS_CKPT",
-                                          str(ROOT / "checkpoint/steps_classifier/best")))
     # sheet
     p.add_argument("--n-sheet", type=int, default=25,
                    help="items per arm on the manual review sheet")
