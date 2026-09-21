@@ -93,6 +93,13 @@ ARMS = (
     ("pix_peak", "pix", "peak"),
     ("pix_first", "pix", "first"),
     ("pix_rand", "pix", "rand"),
+    # The norm-matched control. Every cell is pushed the SAME distance at every injection
+    # point, so `swapn_peak - swapn_rand` cannot be a magnitude effect. If the plain
+    # swap's gap survives here it is about direction -- what the vector says -- and if it
+    # collapses, the peak was only ever a bigger vector.
+    ("swapn_peak", "swapn", "peak"),
+    ("swapn_first", "swapn", "first"),
+    ("swapn_rand", "swapn", "rand"),
 )
 KO_ARMS = (
     ("ko_peak", "ko", "peak"),
@@ -156,16 +163,35 @@ class RowSwap:
     the multiset alone, this one changes one row's content and leaves every position
     alone. Both go through the same module output for the same reason -- the tower has
     already run, so nothing is recomputed and nothing but the vector is different.
+
+    `magnitudes` turns this into the norm-matched control. Without it the substitution is
+    literal, and the perturbation it applies is whatever `donor - target` happens to be
+    at that cell -- so a cell whose vector is an outlier gets a bigger push, and "the
+    peak token matters more" cannot be told from "the peak token is a bigger vector".
+    With it, the row moves along the same direction but by a PRESCRIBED distance at every
+    injection point, so two cells given the same magnitude differ only in direction.
     """
 
-    def __init__(self, model, idx, donor_rows, donor_deepstack, family=None):
+    def __init__(self, model, idx, donor_rows, donor_deepstack, family=None,
+                 magnitudes=None):
         self.model = model
         self.family = family or VF.family_for(model)
         self.idx = list(idx)
         self.donor_rows = donor_rows
         self.donor_deepstack = donor_deepstack
+        #: None, or one magnitude per injection point: [pool, ds0, ds1, ds2].
+        self.magnitudes = magnitudes
         self.applied = 0
         self._handles = []
+
+    @staticmethod
+    def _move(target, donor, m):
+        """target + m * unit(donor - target), or the literal donor row when m is None."""
+        if m is None:
+            return donor.to(target.dtype)
+        delta = donor.to(target.dtype) - target
+        n = delta.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        return target + delta * (float(m) / n)
 
     def _hook(self, module, args, out):
         pool = out.pooler_output
@@ -176,15 +202,18 @@ class RowSwap:
         import torch
 
         idx = torch.as_tensor(self.idx, device=pool.device, dtype=torch.long)
-        pool[idx] = self.donor_rows[idx].to(pool.dtype)
+        mags = self.magnitudes
+        pool[idx] = self._move(pool[idx], self.donor_rows[idx],
+                               None if mags is None else mags[0])
         feats = getattr(out, "deepstack_features", None)
         if feats:
             if len(feats) != len(self.donor_deepstack):
                 raise RuntimeError(
                     f"{len(feats)} DeepStack features on the target and "
                     f"{len(self.donor_deepstack)} on the donor")
-            for f, d in zip(feats, self.donor_deepstack):
-                f[idx] = d[idx].to(f.dtype)
+            for k, (f, d) in enumerate(zip(feats, self.donor_deepstack)):
+                f[idx] = self._move(f[idx], d[idx],
+                                    None if mags is None else mags[k + 1])
         self.applied += 1
         return out
 
@@ -531,11 +560,16 @@ def one_picture(model, processor, fam, scan, r, img_root, census, by_grid, arms,
     case = fam.teacher_forced_case(inputs, comp, device)
     scan.reset()
     scan.prompt_len_override = prompt_len
+    # The target's own rows come out of this same forward -- the tower runs in it anyway,
+    # so the norm-matched arm costs no extra encode.
+    tcap = RowCapture(model, family=fam).install()
     try:
         with torch.no_grad():
             model(**case, use_cache=False)
     finally:
         scan.prompt_len_override = None
+        tcap.uninstall()
+    target_rows, target_deep = tcap.rows, tcap.deepstack
     res = scan.result()
     if res is None or not res["grids"]:
         return None
@@ -584,6 +618,13 @@ def one_picture(model, processor, fam, scan, r, img_root, census, by_grid, arms,
             donor_rows = donor_deep = None
             rec["donor"] = None
 
+    # -- the matched magnitude, and the norms that motivate the control ---------------
+    # One magnitude per injection point, the SMALLEST of the three cells' own
+    # perturbations: scaling every cell down to a common distance never asks a row to
+    # move further than the literal swap would have moved it.
+    mags, rec["norms"] = matched_magnitudes(target_rows, target_deep, donor_rows,
+                                            donor_deep, cells)
+
     scan.paused = True
     try:
         for name, kind, where in arms:
@@ -591,7 +632,7 @@ def one_picture(model, processor, fam, scan, r, img_root, census, by_grid, arms,
             try:
                 m = run_arm(model, processor, fam, kind, idx, image, question, device,
                             gh, gw, comp, prompt_len, clean_lp, clean_am, donor_rows,
-                            donor_deep,
+                            donor_deep, mags,
                             args, rng)
             except Exception as exc:                             # noqa: BLE001
                 rec["arms"][name] = {"error": f"{type(exc).__name__}: {str(exc)[:120]}"}
@@ -604,17 +645,45 @@ def one_picture(model, processor, fam, scan, r, img_root, census, by_grid, arms,
     return rec
 
 
+def matched_magnitudes(target_rows, target_deep, donor_rows, donor_deep, cells):
+    """One perturbation distance per injection point, common to every cell. -> (mags, diag)
+
+    `mags[k]` is the smallest of the three cells' own `||donor - target||` at injection
+    point k, so the matched arm never pushes a row further than the literal swap would.
+    `diag` carries the per-cell row norms and delta norms, which is what says whether the
+    peak was a magnitude outlier in the first place -- `sink_encoder_probe` reports the
+    mark as an alignment effect rather than a magnitude one, and this is the check of
+    that on the rows the language model actually consumes.
+    """
+    if target_rows is None or donor_rows is None:
+        return None, None
+    tgt = [target_rows] + list(target_deep or [])
+    don = [donor_rows] + list(donor_deep or [])
+    want = sorted({int(v) for v in cells.values()})
+    mags, diag = [], {"row": {}, "delta": {}}
+    for k, (t, d) in enumerate(zip(tgt, don)):
+        per = {}
+        for c in want:
+            per[c] = float((d[c].float() - t[c].float()).norm())
+        mags.append(min(per.values()))
+        for name, c in cells.items():
+            diag["row"].setdefault(name, []).append(float(t[int(c)].float().norm()))
+            diag["delta"].setdefault(name, []).append(per[int(c)])
+    return mags, diag
+
+
 def run_arm(model, processor, fam, kind, idx, image, question, device, gh, gw, comp,
-            prompt_len, clean_lp, clean_am, donor_rows, donor_deep, args, rng):
+            prompt_len, clean_lp, clean_am, donor_rows, donor_deep, mags, args, rng):
     """One arm, scored against the clean chain. -> metrics or None if not applicable."""
     import torch
 
-    if kind == "swap":
-        if donor_rows is None:
+    if kind in ("swap", "swapn"):
+        if donor_rows is None or (kind == "swapn" and mags is None):
             return None
         inputs = SLP.build_inputs(fam, processor, [image], question, device)
         case = fam.teacher_forced_case(inputs, comp, device)
-        sw = RowSwap(model, [idx], donor_rows, donor_deep, family=fam).install()
+        sw = RowSwap(model, [idx], donor_rows, donor_deep, family=fam,
+                     magnitudes=mags if kind == "swapn" else None).install()
         try:
             m = score_against(model, case, prompt_len, comp, clean_lp, clean_am)
         finally:
@@ -746,7 +815,12 @@ def report(args):
     print("\nPaired contrasts (positive = first arm moves the model more)")
     for a, b in (("swap_peak", "swap_rand"), ("swap_first", "swap_rand"),
                  ("swap_peak", "swap_first"), ("pix_peak", "pix_rand"),
-                 ("swap_peak", "pix_peak"), ("ko_peak", "swap_peak")):
+                 ("swap_peak", "pix_peak"), ("ko_peak", "swap_peak"),
+                 # The control. If `swapn_peak - swapn_rand` holds up next to
+                 # `swap_peak - swap_rand`, the gap is about what the vector says and not
+                 # about how big it is.
+                 ("swapn_peak", "swapn_rand"), ("swapn_first", "swapn_rand"),
+                 ("swap_peak", "swapn_peak")):
         x, y = _paired(rows, a, b, field)
         s = _wilcoxon(x, y)
         if not s.get("n"):
@@ -776,6 +850,21 @@ def report(args):
         b = np.percentile(boot, [2.5, 97.5])
         print(f"  {where:<6} n={x.size:<5} slope {slope:6.3f} "
               f"[{b[0]:.3f}, {b[1]:.3f}]")
+
+    # Is the peak a magnitude outlier at all? If its row norm and its delta norm sit on
+    # top of the random cell's, the norm-matched arm was never going to change anything
+    # and the control is confirming rather than rescuing the result.
+    have = [r for r in rows if r.get("norms")]
+    if have:
+        print("\nRow and perturbation norms at the pooled injection point "
+              f"(n={len(have)}, median)")
+        print(f"  {'cell':<8}{'||row||':>10}{'||donor-row||':>16}")
+        for name in ("peak", "first", "rand"):
+            rw = [r["norms"]["row"][name][0] for r in have if name in r["norms"]["row"]]
+            dl = [r["norms"]["delta"][name][0] for r in have
+                  if name in r["norms"]["delta"]]
+            if rw:
+                print(f"  {name:<8}{np.median(rw):>10.2f}{np.median(dl):>16.2f}")
 
     print("\nWhere the peak sits")
     gh = np.array([r["grid"][0] for r in rows])
@@ -891,6 +980,32 @@ def selftest(args):
     check("a self-swap is the identity", float(np.max(m0["kl"])) < 1e-3,
           f"max {float(np.max(m0['kl'])):.2e}")
     check("the swap hook fired", sw.applied > 0, f"{sw.applied} forwards")
+
+    # The norm-matched path, against the two magnitudes whose answers are known: zero
+    # must be the identity, and the cell's own ||donor - target|| must reproduce the
+    # literal swap. A rescale that silently does nothing would pass neither.
+    rolled = [cap.rows.roll(1, 0)] , [f.roll(1, 0) for f in cap.deepstack]
+    donor_r, donor_d = rolled[0][0], rolled[1]
+    zero = RowSwap(model, [0], donor_r, donor_d, family=fam,
+                   magnitudes=[0.0] * (1 + len(cap.deepstack))).install()
+    mz = score_against(model, case, prompt_len, comp, clean_lp, clean_am)
+    zero.uninstall()
+    check("a zero-magnitude matched swap is the identity",
+          float(np.max(mz["kl"])) < 1e-3, f"max {float(np.max(mz['kl'])):.2e}")
+
+    own = [float((d[0].float() - t[0].float()).norm())
+           for d, t in zip([donor_r] + donor_d, [cap.rows] + cap.deepstack)]
+    lit = RowSwap(model, [0], donor_r, donor_d, family=fam).install()
+    ml = score_against(model, case, prompt_len, comp, clean_lp, clean_am)
+    lit.uninstall()
+    mt = RowSwap(model, [0], donor_r, donor_d, family=fam, magnitudes=own).install()
+    mm = score_against(model, case, prompt_len, comp, clean_lp, clean_am)
+    mt.uninstall()
+    gap = float(np.max(np.abs(np.asarray(ml["kl"]) - np.asarray(mm["kl"]))))
+    check("matching to the cell's own norm reproduces the literal swap",
+          gap < 1e-3, f"max |diff| {gap:.2e}")
+    check("the literal swap of a different row is NOT the identity",
+          float(np.max(ml["kl"])) > 1e-6, f"max {float(np.max(ml['kl'])):.2e}")
 
     peak, pmap = peak_cell(res, gh, gw)
     check("a peak cell was found", peak is not None, f"cell {peak} of {gh * gw}")
