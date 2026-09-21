@@ -298,6 +298,31 @@
 # the most stereotyped thing in it, so grounding on it hands a prompt's 8 rollouts the most
 # nearly identical masks available -- the opposite of what a per-completion mask is for.
 #
+# EVERY STEP AGAINST THE WHOLE CHAIN'S UNION -- off the ladder, not a rung of it:
+#
+#   bash launch_grpo_qwen3_overlap_colocated_job.sh --merge-boxes --w-overlap <measured>
+#
+# Grounding-DINO is called exactly as on a per-step run -- same calls, same sentences, same
+# count -- and then the completion's box lists are MERGED, so every step is scored against
+# the union of all of them. "Did this step look where its own sentence points" becomes "did
+# this step look anywhere the chain ever mentions". The three flags above trade detector
+# calls for a coarser mask; this one buys nothing on cost and changes only the target,
+# which is what makes it the arm that separates granularity from budget. Adds _mergebox to
+# the run name.
+#
+# Measured over 11 checkpoints of the val_natural probe (mask_variance_probe.py, scheme
+# `chain_union`; docs/merged-boxes.md). The good news: w_overlap 0.4 TRANSFERS -- sd ratio
+# 1.02, matched weight 0.39 -- which no other mask arm manages, and the reward is not a
+# flatness run in disguise (r 0.687 against the per-step union's own 0.723). The bad news
+# is saturation: median merged coverage 0.754 of the grid against the per-step union's
+# 0.568, and the share of completions whose union covers the grid outright -- lost whole,
+# masked not zeroed -- runs 6.5% at the cold start to 67.9% on a 14-step policy, tracking
+# observe steps per completion at Spearman +0.991. This reward lengthens chains, so that
+# rate CLIMBS during the run and nothing in the loss says so. Watch mask/merged_cover and
+# mask/merged_unscored_frac first, the reward second. --max-union-area applies per
+# COMPLETION here and bounds it without removing it (0.9 drops 26.4% of cold-start
+# completions up front, 0.8 drops 45.9%).
+#
 # Why a per-completion mask at all: a mask that is CONSTANT across a generation group
 # cancels out of the advantage except through the map, and what survives is 0.85-0.93
 # correlated with the box-blind `flatness` statistic (against 0.69-0.76 for the per-step
@@ -629,6 +654,17 @@ RECT_SEED=${RECT_SEED:-0}
 # two this one STILL NEEDS the detector, so the sidecar stays up and the GPU layout is
 # unchanged -- it is cheaper, not detector-free. Empty = off.
 CHAIN_BOXES=${CHAIN_BOXES:-}
+# --merge-boxes: ground every observe step exactly as the incumbent does -- same calls,
+# same sentences, same count -- then MERGE the completion's box lists and score every one
+# of its steps against that single union. Not a rung of the ladder above: those trade
+# detector calls for a coarser mask, this buys nothing on cost and changes only the
+# TARGET, so it is the arm that separates granularity from budget. The mask is constant
+# inside a completion but still differs between a prompt's 8 rollouts, which is the
+# property the fixed-mask arms lack. The risk is saturation -- merging only ever grows the
+# mask and the per-step union already covers a median 0.562 of the grid -- so read
+# mask/merged_cover and mask/merged_unscored_frac before reading the reward, and see the
+# --overlap_merge_boxes help in trl/scripts/utils.py. false = off.
+MERGE_BOXES=${MERGE_BOXES:-false}
 # --mismatch-bank <bank.json>: REPLACE the overlap reward with the MISMATCHED-BOX control
 # -- the same metric on the same map, scored against real Grounding-DINO boxes computed
 # for a DIFFERENT question about a DIFFERENT picture. Tests the assumption underneath
@@ -715,6 +751,7 @@ while [[ $# -gt 0 ]]; do
         --rect-placement)         RECT_PLACEMENT="$2";          shift 2 ;;
         --rect-seed)              RECT_SEED="$2";               shift 2 ;;
         --chain-boxes)            CHAIN_BOXES="$2";             shift 2 ;;
+        --merge-boxes)            MERGE_BOXES=true;             shift 1 ;;
         # Absolutised here for the same reason as --question-boxes below, and it bites
         # harder: the existence check further down runs in the invocation cwd and PASSES
         # on a relative path, so the run gets all the way to six ranks importing torch
@@ -955,6 +992,33 @@ if [[ -n "$CHAIN_BOXES" ]]; then
         echo "ERROR: --chain-boxes $CHAIN_BOXES changes which sentence the overlap reward grounds," >&2
         echo "       while ${PLACEBO:+--placebo $PLACEBO}${MASKFREE:+--maskfree $MASKFREE}${MISMATCH_BANK:+--mismatch-bank} replaces that reward outright. The one" >&2
         echo "       grounding call per completion would be made and then thrown away. Pick one." >&2
+        exit 1
+    fi
+fi
+
+# ---------- --merge-boxes: every step against the whole chain's union ----------
+# Per-step grounding is KEPT, so WANT_DINO and the GPU layout are a normal DINO run's and
+# the call count is the incumbent's. What changes is what those calls are merged into.
+if [ "$MERGE_BOXES" = true ]; then
+    if [[ "$REWARD_VARIANT" != "ours" ]]; then
+        echo "ERROR: --merge-boxes needs the attention map (--saliency-method attention);" >&2
+        echo "       got --saliency-method $REWARD_VARIANT. The gradient and glimpse rewards" >&2
+        echo "       build their own masks from their own grounding call, so the flag would" >&2
+        echo "       leave per-step targets running and change nothing -- a null result that" >&2
+        echo "       looks like a finding." >&2
+        exit 1
+    fi
+    if [[ -n "$RECT_FRAC" || -n "${QUESTION_BOXES:-}" || -n "$CHAIN_BOXES" ]]; then
+        echo "ERROR: --merge-boxes and ${RECT_FRAC:+--overlap-rect-frac $RECT_FRAC}${QUESTION_BOXES:+--question-boxes}${CHAIN_BOXES:+--chain-boxes $CHAIN_BOXES} both decide which boxes a step" >&2
+        echo "       is scored against, and only one can win. --merge-boxes keeps per-step" >&2
+        echo "       grounding and widens the TARGET; the others replace the grounding itself." >&2
+        echo "       Run them as separate runs." >&2
+        exit 1
+    fi
+    if [[ -n "$PLACEBO" || -n "$MASKFREE" || -n "$MISMATCH_BANK" ]]; then
+        echo "ERROR: --merge-boxes changes which boxes the overlap reward scores a step against," >&2
+        echo "       while ${PLACEBO:+--placebo $PLACEBO}${MASKFREE:+--maskfree $MASKFREE}${MISMATCH_BANK:+--mismatch-bank} replaces that reward outright. The merged" >&2
+        echo "       union would be built and then thrown away. Pick one." >&2
         exit 1
     fi
 fi
@@ -1204,6 +1268,22 @@ if [[ -n "$CHAIN_BOXES" && -z "${W_OVERLAP_SET:-}" ]]; then
     echo "      checkpoints), so matched pressure is 0.32 at w_ref 0.4 on the cold start." >&2
     echo "      Re-measure with overlap_metric_spread.py or pass --w-overlap deliberately." >&2
 fi
+if [ "$MERGE_BOXES" = true ] && [[ -z "${W_OVERLAP_SET:-}" ]]; then
+    echo "NOTE: --merge-boxes keeps w_overlap=$W_OVERLAP. Unusually, that is the right value:" >&2
+    echo "      the merged union's within-group sd is 1.02x the per-step union's, so the" >&2
+    echo "      matched weight is 0.39 -- this is the only mask arm whose weight transfers." >&2
+    echo "      Pass --w-overlap 0.4 explicitly if the launcher default (0.2) is in play." >&2
+fi
+if [ "$MERGE_BOXES" = true ] && [[ -z "$MAX_UNION_AREA" ]]; then
+    echo "NOTE: --merge-boxes with no --max-union-area. Merging only GROWS the mask: median" >&2
+    echo "      coverage 0.754 of the grid against the per-step union's 0.568, and the share" >&2
+    echo "      of completions whose merged union covers the grid outright -- those are lost" >&2
+    echo "      whole -- runs 6.5% at the cold start to 67.9% on a 14-step policy, tracking" >&2
+    echo "      chain length at Spearman +0.991. This reward lengthens chains, so expect the" >&2
+    echo "      rate to CLIMB during the run; mask/merged_unscored_frac is the only warning." >&2
+    echo "      A cap bounds it but is not free: 0.9 drops 26.4% of cold-start completions" >&2
+    echo "      up front, 0.8 drops 45.9%. See docs/merged-boxes.md before choosing." >&2
+fi
 
 # An explicit --w-overlap always wins, as it does for every other metric.
 if [[ -n "$PLACEBO" && -z "${W_OVERLAP_SET:-}" ]]; then
@@ -1438,6 +1518,10 @@ fi
 # One grounding per completion changes which sentence is grounded AND which completions
 # are scored, so it must never share a checkpoint dir or a wandb name with a per-step run.
 [[ -n "$CHAIN_BOXES" ]] && SUFFIX="${SUFFIX}_chain${CHAIN_BOXES}"
+# Same rule once more, and here it is the TARGET that moves rather than the grounding:
+# every step is scored against the whole chain's union, which is a different reward on the
+# same maps and must not land in a per-step run's checkpoint directory.
+[[ "$MERGE_BOXES" == true ]] && SUFFIX="${SUFFIX}_mergebox"
 # Same rule a third time. The seed is in the name because it IS the experiment: two
 # mismatch runs at different seeds are different random pairings of the same corpus, and
 # they must not land in one checkpoint directory.
@@ -1623,6 +1707,8 @@ else
 echo "DINO reward:      127.0.0.1:$DINO_PORT  box_threshold=$BOX_THRESHOLD max_box_area=$([[ "$MAX_BOX_AREA" == "0" ]] && echo 'off (no per-box cap)' || echo "$MAX_BOX_AREA") max_union_area=$([[ -n "$MAX_UNION_AREA" ]] && echo "$MAX_UNION_AREA" || echo 'off')"
 if [[ -n "$CHAIN_BOXES" ]]; then
 echo "Grounding:        ONCE per completion, on its $CHAIN_BOXES observe step (not once per step)"
+elif [ "$MERGE_BOXES" = true ]; then
+echo "Grounding:        once per observe step, on the step text (unchanged -- --merge-boxes moves the TARGET, not the calls)"
 else
 echo "Grounding:        once per observe step, on the step text"
 fi
@@ -1657,6 +1743,19 @@ echo "                  Same metric, same reward slot; Grounding-DINO still runs
 echo "                  instead of once per step. The scored SET differs: if that one step grounds"
 echo "                  nothing the whole completion is unscored, with no fallback -- watch"
 echo "                  mask/chain_ungrounded_frac. --max-union-area is now per completion too."
+fi
+if [ "$MERGE_BOXES" = true ]; then
+echo "Mask:             the MERGED union of every box the completion grounded, scored against"
+echo "                  every one of its observe steps. Same metric, same reward slot, and the"
+echo "                  same Grounding-DINO calls as a per-step run -- only the target is wider."
+echo "                  The scored SET is LARGER: a step that grounds nothing is scored on the"
+echo "                  boxes its neighbours produced, and only a completion where NOTHING"
+echo "                  grounded is lost. Merging only GROWS the mask -- median coverage 0.754"
+echo "                  of the grid against the per-step union at 0.568 -- so read"
+echo "                  mask/merged_cover and mask/merged_unscored_frac BEFORE the reward: a"
+echo "                  union covering the whole grid is refused and costs the completion, and"
+echo "                  that rate tracks chain length (6.5% at the cold start, 67.9% at 14"
+echo "                  steps). --max-union-area is per completion here and bounds it."
 fi
 if [[ -n "$QUESTION_BOXES" ]]; then
 echo "Mask:             the row's QUESTION union, grounded once before the run -- no Grounding-DINO."
@@ -1860,6 +1959,7 @@ if ! $DIRECT; then
                 $([ "$MASKFREE_PARITY" = true ] && echo --maskfree-parity) \
                 ${RECT_FRAC:+--overlap-rect-frac $RECT_FRAC --rect-placement $RECT_PLACEMENT --rect-seed $RECT_SEED} \
                 ${CHAIN_BOXES:+--chain-boxes $CHAIN_BOXES} \
+                $([ "$MERGE_BOXES" = true ] && echo --merge-boxes) \
                 ${MISMATCH_BANK:+--mismatch-bank $MISMATCH_BANK --mismatch-seed $MISMATCH_SEED} \
                 --saliency-method $SALIENCY_METHOD_R \
                 --grad-target $GRAD_TARGET \
@@ -2107,6 +2207,8 @@ RECT_FLAG=""
 # step) applies and an existing run's command line is reproduced byte for byte.
 CHAIN_BOXES_FLAG=""
 [[ -n "$CHAIN_BOXES" ]] && CHAIN_BOXES_FLAG="--overlap_chain_boxes $CHAIN_BOXES"
+MERGE_BOXES_FLAG=""
+[[ "$MERGE_BOXES" == true ]] && MERGE_BOXES_FLAG="--overlap_merge_boxes True"
 # Same shape again, and the seed goes with it: --mismatch_seed has a dataclass default of
 # 0, so emitting it only with the bank keeps every existing run's command line byte-identical.
 MISMATCH_FLAG=""
@@ -2250,6 +2352,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     $NATURAL_ONLY_FLAG \
     $QUESTION_BOXES_FLAG \
     $CHAIN_BOXES_FLAG \
+    $MERGE_BOXES_FLAG \
     $EVAL_FLAGS \
     $DINO_API_FLAG \
     --reward_weights $REWARD_WEIGHTS \

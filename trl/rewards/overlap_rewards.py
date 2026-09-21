@@ -367,6 +367,77 @@ default):
       re-measuring: 0.4 x sd(per-step)/sd(scheme) puts 'last' at 0.32 on the cold start,
       bracketed by [0.19, 0.34] over the 11 checkpoints.
 
+ALL the steps' boxes, merged (--overlap_merge_boxes, OFF by default):
+
+      Not a rung of the ladder above -- a different axis. Grounding-DINO is called exactly
+      as the incumbent calls it, once per observe step on that step's own sentence, and
+      then the completion's box lists are CONCATENATED and every step is scored against
+      that one merged union. The question is no longer "did this step look where its own
+      sentence points" but "did this step look anywhere the chain ever mentions".
+
+      What it costs and what it keeps, against the incumbent:
+
+        * SAME number of detector calls. Unlike --overlap_chain_boxes this buys nothing on
+          cost; it is an experiment about the target, not about the budget.
+        * The mask is constant within a completion but still varies BETWEEN the 8 rollouts
+          of a prompt, since each rollout writes its own chain. That is the property the
+          fixed-mask arms lack (a mask constant inside a group cancels out of the
+          advantage), and the one --overlap_chain_boxes has -- see the table under that
+          flag for why it matters.
+        * The step-duplication hack loses its lever on the mask but keeps it on the mean,
+          exactly as under --overlap_chain_boxes and --overlap_question_boxes. Re-quoting
+          a groundable sentence adds nothing new to a union that already contains it.
+        * A step that grounds nothing is no longer skipped -- it is scored against the
+          union its NEIGHBOURS produced. The scored set is therefore LARGER than the
+          incumbent's, at completion granularity: a completion is scored if ANY of its
+          steps grounded, and unscored as a whole if none did.
+
+      WHAT IT KEEPS (mask_variance_probe.py, scheme `chain_union`, 11 checkpoints of the
+      val_natural probe -- identical generations, only the mask varied):
+
+        * w_overlap TRANSFERS. Median within-group sd ratio to the per-step reward 1.02,
+          matched weight 0.39 against the incumbent's 0.4. This is the only mask source
+          measured for which that is true -- chain_last wants 0.32, question_boxes 0.55, a
+          centred rectangle 0.60. Read it as +-25% like the rest.
+        * it is not a flatness run wearing a box's name: r with the box-blind `flatness`
+          statistic 0.687, BELOW the per-step union's own 0.723 (and below its own per-step
+          reference in 8 of the 11), where every fixed-mask arm sits at 0.89-0.93.
+        * it reproduces the incumbent's within-group ranking more closely than any other
+          arm -- r 0.827, against chain_last 0.705, question_boxes 0.727, rect 0.710. GRPO
+          only ever sees that ranking, so this cuts both ways: the least confounded
+          comparison available, and the least likely to land anywhere different.
+
+      THE RISK, and the number to read first: SATURATION. Merging only ever grows the
+      mask, the per-step union already covers a median 0.562 of the patch grid
+      (overlap_metric_spread.py, 1074 grounded steps of the cold-start policy on set_a),
+      and the unions being merged are the LEAST alike masks in the corpus -- two steps of
+      ONE chain sit at closeness 0.614 against 0.842 for two chains' first steps
+      (step_box_similarity.py) -- so every extra step adds genuinely new area. Measured:
+      median merged coverage 0.754 of the grid against the per-step union's 0.568, and at
+      exactly 100% _union_mask refuses, which under this flag costs the WHOLE completion.
+
+      That refusal rate runs 0.0% to 67.9% over the 11 checkpoints, and it is a
+      deterministic function of chain length: Spearman +0.991 with observe steps per
+      completion. 6.5% at the cold start, 50.4% at a checkpoint averaging 5.6 steps, 67.9%
+      at 14.1. This reward is KNOWN to lengthen chains (the wov0.4 / set_a run: 163 -> 356
+      mean tokens, duplicate-sentence fraction 0.00 -> 0.19 over steps 1000-2000), so the
+      drift does not merely dilute this arm, it switches it off completion by completion,
+      for exactly the completions that ramble -- and masked is neutral, so nothing in the
+      loss says so. Worse, the cliff has a ramp: under mean_in a growing union RAISES the
+      score (r +0.17 with the area fraction), so adding steps pays until it does not.
+
+      `mask/merged_cover` logs the merged union's coverage per completion, recorded BEFORE
+      the refusal so it is defined for the completions the reward drops; a coverage mean
+      taken over the survivors alone would read low exactly when this is going wrong.
+      `mask/merged_unscored_frac` logs the refusals. Read both before reading the reward.
+
+      --max_union_area applies per COMPLETION here (the merged list is the same for every
+      step, so the cap's verdict is too), and it BOUNDS the damage rather than removing
+      it: at the cold start a cap of 0.9 drops 26.4% of completions up front and 0.8 drops
+      45.9%. Every value of it also changes which completions are scored, so it is a
+      second experimental variable and not a safety net. docs/merged-boxes.md has the full
+      table and what would falsify the arm.
+
 One grounding per QUESTION instead of one per step (--overlap_question_boxes, OFF by
 default):
 
@@ -479,6 +550,10 @@ _CFG = {
     # COMPLETION, on that step's sentence, reused for every step of the completion. Still
     # needs the detector; see the module docstring for why "last" is the default.
     "chain_boxes": None,
+    # True -> ground every step exactly as the incumbent does, then score every step of a
+    # completion against the UNION of all of its steps' boxes. Same call count, bigger
+    # mask; the saturation risk and what to read are in the module docstring.
+    "merge_boxes": False,
 }
 
 # Lazily-loaded local Grounding-DINO singleton (one per training process).
@@ -514,7 +589,15 @@ def _diag(key: str, value: float):
 # the control it was named for. `chain_ungrounded_frac` is the other one: it says how
 # often --overlap_chain_boxes lost a whole completion because its chosen step grounded
 # nothing, which the per-step path would have survived.
-MASK_DIAG_KEYS = ("union_frac", "ring_frac", "n_placements", "chain_ungrounded_frac")
+#
+# The last two belong to --overlap_merge_boxes, where the failure mode is the opposite of
+# an empty mask -- a merged union so large that "inside the box" stops being a question.
+# `merged_cover` is its rasterised coverage per completion, recorded BEFORE any rejection
+# so it is defined for the completions the reward then drops; `merged_unscored_frac` is
+# how often it was dropped (degenerate, or over --max_union_area, which under that flag
+# applies per completion). Read both before reading that arm's reward.
+MASK_DIAG_KEYS = ("union_frac", "ring_frac", "n_placements", "chain_ungrounded_frac",
+                  "merged_cover", "merged_unscored_frac")
 _MASK_DIAG: dict[str, list[float]] = {}
 
 
@@ -525,7 +608,7 @@ def _mask_diag(key: str, value: float):
 def mask_diag_active() -> bool:
     """True when a mask-source flag is installed, so the trainer may branch its logging
     collectives on it. Rank-uniform: it is a CLI decision made on every process."""
-    return rect_active() or bool(_CFG.get("chain_boxes"))
+    return rect_active() or bool(_CFG.get("chain_boxes")) or merge_boxes_active()
 
 
 def pop_mask_diagnostics() -> dict[str, float]:
@@ -560,6 +643,7 @@ def configure(**kwargs):
     _ROLL_RNG = np.random.default_rng(int(_CFG["roll_seed"]))
     _validate_rect()
     _validate_chain_boxes()
+    _validate_merge_boxes()
 
 
 def rect_active() -> bool:
@@ -577,6 +661,33 @@ def chain_boxes_active() -> bool:
     return bool(_CFG.get("chain_boxes"))
 
 
+def merge_boxes_active() -> bool:
+    """True when every step is scored against the union of ALL of its completion's boxes."""
+    return bool(_CFG.get("merge_boxes"))
+
+
+def _validate_merge_boxes():
+    """--overlap_merge_boxes conflicts with every other source of the mask.
+
+    It is not one of the ladder's rungs -- it grounds per step like the incumbent -- but it
+    decides the same thing they do: which boxes a step is scored against. Two of them and
+    one silently wins, with the run named after the loser.
+    """
+    if not merge_boxes_active():
+        return
+    other = ("--overlap_rect_frac" if rect_active()
+             else "--overlap_question_boxes" if _CFG.get("question_boxes")
+             else f"--overlap_chain_boxes {_CFG['chain_boxes']}" if _CFG.get("chain_boxes")
+             else None)
+    if other:
+        raise ValueError(
+            f"--overlap_merge_boxes and {other} both decide which boxes a step is scored "
+            "against, and only one of them can win. --overlap_merge_boxes keeps the "
+            "incumbent's per-step grounding and widens the TARGET (every step against the "
+            "whole chain's union); the others replace the grounding itself. Run them as "
+            "separate runs, not as one configuration.")
+
+
 def _validate_chain_boxes():
     """--overlap_chain_boxes conflicts with every other source of the mask."""
     sel = _CFG.get("chain_boxes")
@@ -586,13 +697,15 @@ def _validate_chain_boxes():
         raise ValueError(
             f"--overlap_chain_boxes must be one of {'|'.join(CHAIN_SELECTORS)}, got {sel!r}.")
     other = ("--overlap_rect_frac" if rect_active()
-             else "--overlap_question_boxes" if _CFG.get("question_boxes") else None)
+             else "--overlap_question_boxes" if _CFG.get("question_boxes")
+             else "--overlap_merge_boxes" if merge_boxes_active() else None)
     if other:
         raise ValueError(
             f"--overlap_chain_boxes {sel} and {other} both decide where the mask comes "
-            "from, and only one of them can win. They are consecutive rungs of one "
-            "experiment -- per step, per completion, per row, no detector -- so run them "
-            "as separate runs, not as one configuration.")
+            "from, and only one of them can win. Four of them are consecutive rungs of one "
+            "experiment -- per step, per completion, per row, no detector -- and "
+            "--overlap_merge_boxes is a fifth answer to the same question, so run them as "
+            "separate runs, not as one configuration.")
 
 
 def _validate_rect():
@@ -899,6 +1012,31 @@ def _box_area(b):
     return max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
 
+def _raster_union(boxes, grid_h, grid_w):
+    """Area-filtered boxes rasterised onto the patch grid, with NOTHING rejected.
+
+    The inner half of _union_mask, split out because one caller needs to see a union the
+    caller above would have refused: --overlap_merge_boxes logs `merged_cover` for every
+    completion including the ones whose merged union is degenerate, and a coverage number
+    that silently omits the saturated completions is exactly the number that would hide
+    the failure mode that flag has to be watched for.
+
+    Can return an all-False or an all-True mask. Anything scoring "inside vs outside" must
+    go through _union_mask instead, which refuses both.
+    """
+    max_area = _CFG.get("max_box_area")
+    if max_area is not None and float(max_area) > 0:
+        boxes = [b for b in boxes if _box_area(b) <= max_area]
+    mask = np.zeros((int(grid_h), int(grid_w)), dtype=bool)
+    for x1, y1, x2, y2 in boxes:
+        r0 = max(0, int(y1 * grid_h))
+        r1 = min(grid_h, max(r0 + 1, round(y2 * grid_h)))
+        c0 = max(0, int(x1 * grid_w))
+        c1 = min(grid_w, max(c0 + 1, round(x2 * grid_w)))
+        mask[r0:r1, c0:c1] = True
+    return mask
+
+
 def _union_mask(boxes, grid_h, grid_w, apply_union_cap=True):
     """Boolean (grid_h, grid_w) union of area-filtered boxes; None if degenerate.
 
@@ -927,18 +1065,7 @@ def _union_mask(boxes, grid_h, grid_w, apply_union_cap=True):
     mask the cap rejected (overlap_probe uses this to distinguish "the cap dropped this
     step" from "DINO grounded nothing"). The reward path always leaves it True.
     """
-    max_area = _CFG.get("max_box_area")
-    if max_area is not None and float(max_area) > 0:
-        boxes = [b for b in boxes if _box_area(b) <= max_area]
-    if not boxes:
-        return None
-    mask = np.zeros((grid_h, grid_w), dtype=bool)
-    for x1, y1, x2, y2 in boxes:
-        r0 = max(0, int(y1 * grid_h))
-        r1 = min(grid_h, max(r0 + 1, round(y2 * grid_h)))
-        c0 = max(0, int(x1 * grid_w))
-        c1 = min(grid_w, max(c0 + 1, round(x2 * grid_w)))
-        mask[r0:r1, c0:c1] = True
+    mask = _raster_union(boxes, grid_h, grid_w)
     n_in = int(mask.sum())
     if n_in == 0 or n_in == grid_h * grid_w:
         return None
@@ -1218,6 +1345,13 @@ def think_overlap_reward(
     Under --overlap_chain_boxes the detector IS called, once per completion instead of
     once per observe step, and the union it returns is scored against every step of that
     completion. A completion whose chosen step grounds nothing is unscored as a whole.
+
+    Under --overlap_merge_boxes the detector is called exactly as on the incumbent path --
+    once per observe step, on that step's own sentence -- and then the completion's box
+    lists are merged and every step is scored against the union of all of them. A step
+    that grounds nothing is no longer skipped (its neighbours' boxes still give it a
+    mask), so the route to None becomes per completion: no step grounded, or the merged
+    union was degenerate or over --max_union_area.
     """
     n = len(saliency_map)
     if valid_list is None:
@@ -1302,6 +1436,32 @@ def think_overlap_reward(
                 flat_owner.append((c, si))
 
         boxes_per_item = _dino_boxes(flat_images, flat_texts) if flat_images else []
+
+        if merge_boxes_active():
+            # --overlap_merge_boxes: the grounding above is the incumbent's, unchanged --
+            # same calls, same sentences, same count. All that happens here is that the
+            # completion's box lists are CONCATENATED and the merged list replaces each
+            # step's own, so the scoring loop below is untouched and the arm differs from
+            # its per-step reference in the target and in nothing else.
+            #
+            # The RAW lists are merged, before any cap: --max_box_area is per box and so
+            # is indifferent to the grouping, and --max_union_area is meant to see the
+            # union that will actually be scored. _union_mask applies both, once, below.
+            merged: dict[int, list] = {}
+            for (c, _si), boxes in zip(flat_owner, boxes_per_item):
+                merged.setdefault(c, []).extend(boxes or [])
+            for c, boxes in merged.items():
+                # Every step of a completion shares an image and therefore a patch grid,
+                # so the first step's is the completion's.
+                gh, gw = saliency_map[c][0]["map"].shape
+                # Recorded per completion, and BEFORE the rejection below, because the
+                # completions this arm drops are the ones whose coverage explains the
+                # drop. A mean taken over the survivors alone would read low exactly when
+                # the flag is failing.
+                _mask_diag("merged_cover", float(_raster_union(boxes, gh, gw).mean()))
+                _mask_diag("merged_unscored_frac",
+                           float(_union_mask(boxes, gh, gw) is None))
+            boxes_per_item = [merged[c] for c, _si in flat_owner]
 
     # --overlap_rect_placement interior_hash draws the rectangle's position from the
     # completion's own text, so the texts have to be here. Resolved once, up front, so a

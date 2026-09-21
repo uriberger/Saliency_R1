@@ -112,7 +112,7 @@ def expand(**env):
         MAX_BOX_AREA="0.5", MAX_UNION_AREA="", OVERLAP_METRIC="mean_in",
         MASS_FLOOR_TAU="", PLACEBO="", MASKFREE="", MASKFREE_PARITY="false",
         RECT_FRAC="", RECT_PLACEMENT="centre", RECT_SEED="0",
-        CHAIN_BOXES="", MISMATCH_BANK="", MISMATCH_SEED="0",
+        CHAIN_BOXES="", MERGE_BOXES="false", MISMATCH_BANK="", MISMATCH_SEED="0",
         SALIENCY_METHOD_R="attention", GRAD_TARGET="clogit", GRAD_NULL_OFFSETS="16",
         GRAD_LOGRATIO_CLIP="1.0", GLIMPSE_TARGET="clogit", GLIMPSE_LAYER_FRAC="1.0",
         GLIMPSE_TOKEN_CAP="0", GLIMPSE_DEPTH_TEMP="0.2", GLIMPSE_TEMP="1.0",
@@ -162,6 +162,12 @@ chained = expand(CHAIN_BOXES="last")
 check("chain run forwards --chain-boxes last",
       after(chained, "--chain-boxes") == "last", str(after(chained, "--chain-boxes")))
 check("chain run still emits no rect flag", "--overlap-rect-frac" not in chained)
+
+# --merge-boxes is a bare switch, so the failure it can have is the other one: leaking an
+# empty token into every ordinary command line. `base` above already pins its absence.
+merged = expand(MERGE_BOXES="true")
+check("merge run forwards --merge-boxes", "--merge-boxes" in merged)
+check("an ordinary run emits no --merge-boxes", "--merge-boxes" not in base)
 
 # A centred rect is byte-identical to the incumbent on the trainer side, so forwarding
 # `--rect-placement centre` must not change what the inner invocation resolves to. It is

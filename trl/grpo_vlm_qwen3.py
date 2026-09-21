@@ -672,6 +672,31 @@ if __name__ == "__main__":
                     "call per completion would be made and thrown away."
                 )
 
+    # --overlap_merge_boxes lives inside think_overlap_reward too, and it needs the same
+    # protection as --overlap_chain_boxes for the same reason: it keeps per-step grounding
+    # and changes only what that grounding is merged into, so on any other reward it would
+    # be a no-op that still names the run after an arm that did not happen.
+    if script_args.overlap_merge_boxes:
+        if script_args.reward_variant != "ours":
+            raise SystemExit(
+                "--overlap_merge_boxes needs --saliency_method attention "
+                "(--reward_variant ours); got "
+                f"reward_variant='{script_args.reward_variant}'. The gradient and glimpse "
+                "rewards flatten (completion, step) into their own _dino_boxes call and "
+                "build their own masks from it, so the flag would leave per-step targets "
+                "running and change nothing -- a null result that looks like a finding."
+            )
+        for _name, _val in (("--placebo", script_args.placebo),
+                            ("--maskfree", script_args.maskfree),
+                            ("--mismatch_bank", script_args.mismatch_bank)):
+            if _val:
+                raise SystemExit(
+                    f"--overlap_merge_boxes and {_name} cannot be combined: the first "
+                    "changes which boxes the overlap reward scores a step against, the "
+                    "second replaces that reward outright, so the merged union would be "
+                    "built and thrown away."
+                )
+
     # --overlap_question_boxes is read by think_overlap_reward and by nothing else. Every
     # other variant flattens (completion, step) into its OWN _dino_boxes call, so passing
     # the flag to one of them would leave the per-step grounding running and change
@@ -724,6 +749,10 @@ if __name__ == "__main__":
             question_boxes=script_args.overlap_question_boxes,
             # And the rung between them: the detector still runs, once per completion.
             chain_boxes=script_args.overlap_chain_boxes,
+            # Off the ladder entirely: per-step grounding kept, per-step TARGET widened to
+            # the union of the whole chain's boxes. configure() refuses it alongside any
+            # of the three above.
+            merge_boxes=script_args.overlap_merge_boxes,
         )
         if script_args.overlap_question_boxes:
             # Load and validate NOW rather than on the first reward call: a threshold or

@@ -486,6 +486,48 @@ class ScriptArguments:
             "'last'. Sweep dimension - appears in the model/wandb name."
         },
     )
+    overlap_merge_boxes: bool = field(
+        default=False,
+        metadata={
+            "help": "reward_variant='ours': ground every observe step exactly as the "
+            "incumbent does - same calls, same sentences, same count - then MERGE the "
+            "completion's box lists and score every one of its steps against that single "
+            "union. The question stops being 'did this step look where its own sentence "
+            "points' and becomes 'did this step look anywhere the chain ever mentions'. "
+            "Not a rung of the --overlap_chain_boxes / --overlap_question_boxes / "
+            "--overlap_rect_frac ladder, which trades detector calls for a coarser mask: "
+            "this buys nothing on cost and changes only the target, so it is the arm that "
+            "isolates granularity from budget. It keeps the property those fixed-mask arms "
+            "lack - the mask is constant inside a completion but still varies between a "
+            "prompt's 8 rollouts, and a mask constant inside a group cancels out of the "
+            "GRPO advantage. It also widens the scored set: a step that grounds nothing is "
+            "scored against its neighbours' boxes instead of being skipped, and only a "
+            "completion where NOTHING grounded is lost. Measured on the val_natural probe, "
+            "11 checkpoints (mask_variance_probe.py, scheme `chain_union`): w_overlap "
+            "TRANSFERS - within-group sd ratio 1.02 and matched weight 0.39 against the "
+            "incumbent's 0.4, the only mask source for which that is true (chain_last wants "
+            "0.32, question_boxes 0.55, a centred rectangle 0.60); r with the box-blind "
+            "`flatness` statistic 0.687, BELOW the per-step union's own 0.723 where every "
+            "fixed-mask arm sits at 0.89-0.93; and r 0.827 with the per-step reward's own "
+            "within-group ranking, the closest of any arm, which makes it both the least "
+            "confounded comparison and the least likely to land anywhere different. THE "
+            "RISK is saturation: merging only grows the mask, the per-step union already "
+            "covers a median 0.562 of the grid, and two steps of one chain are the LEAST "
+            "alike pairing measured (closeness 0.614), so the area really does add up - "
+            "median merged coverage 0.754, and at exactly 100% the union is refused, which "
+            "here costs the WHOLE completion. That refusal rate is 0.0-67.9% across the 11 "
+            "checkpoints and is a deterministic function of chain length (Spearman +0.991 "
+            "with observe steps per completion): 6.5% at the cold start, 67.9% at 14 steps. "
+            "Since this reward is known to lengthen chains, the drift switches the arm off "
+            "rather than diluting it, silently, because masked is neutral. Watch "
+            "mask/merged_cover (recorded before the refusal, so the dropped completions are "
+            "in it) and mask/merged_unscored_frac, in that order, before the reward. "
+            "--max_union_area applies per COMPLETION here and bounds the damage without "
+            "removing it - at the cold start a cap of 0.9 drops 26.4% of completions up "
+            "front, 0.8 drops 45.9%. See docs/merged-boxes.md. Sweep dimension - appears in "
+            "the model/wandb name."
+        },
+    )
     box_threshold: float = field(
         default=0.10,
         metadata={"help": "reward_variant='ours': Grounding-DINO confidence threshold for per-step boxes. "
