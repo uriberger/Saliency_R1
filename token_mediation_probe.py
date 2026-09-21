@@ -57,6 +57,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import random
 import sys
 from pathlib import Path
@@ -486,20 +487,31 @@ def _corpus(args):
     return rows, img_root, list(rows)
 
 
-def _census(fam, processor, donor_pool, img_root):
+def _census(fam, processor, donor_pool, img_root, cache=None):
     """Grid per picture, and the pictures grouped by grid. -> (by_grid, census).
 
-    Before the model runs: the grid is a property of the picture's size alone.
+    Before the model runs: the grid is a property of the picture's size alone. Cached to
+    disk because every shard needs the WHOLE corpus (a donor can come from outside the
+    shard) and four shards each opening and resizing 1,800 pictures is four times the
+    CPU for one answer.
     """
     from PIL import Image
 
     by_grid, census = {}, {}
+    if cache is not None and Path(cache).exists():
+        census = {k: tuple(v) for k, v in json.loads(Path(cache).read_text()).items()}
     for r in donor_pool:
-        im = snap_to_grid(PROBE.prepare_image(
-            Image.open(img_root / Path(r["image"]).name).convert("RGB")))
-        g = fam.grid_of(processor, im)
-        census[r["key"]] = g
-        by_grid.setdefault(g, []).append(r)
+        g = census.get(r["key"])
+        if g is None:
+            im = snap_to_grid(PROBE.prepare_image(
+                Image.open(img_root / Path(r["image"]).name).convert("RGB")))
+            g = fam.grid_of(processor, im)
+            census[r["key"]] = g
+        by_grid.setdefault(tuple(g), []).append(r)
+    if cache is not None and not Path(cache).exists():
+        tmp = Path(f"{cache}.{os.getpid()}")
+        tmp.write_text(json.dumps({k: list(v) for k, v in census.items()}))
+        tmp.replace(cache)                       # atomic: shards race to write it
     print(f"[census] {len(by_grid)} distinct grids over {len(donor_pool)} pictures, "
           f"modal {max(by_grid, key=lambda k: len(by_grid[k]))}", flush=True)
     return by_grid, census
@@ -538,7 +550,8 @@ def run(args):
     fam = SLP.load_family(model, processor, args.system_prompt)
     scan = SL.install(model, family=fam, want_key_stats=False)
     arms = list(ARMS) + (list(KO_ARMS) if args.with_ko else [])
-    by_grid, census = _census(fam, processor, donor_pool, img_root)
+    by_grid, census = _census(fam, processor, donor_pool, img_root,
+                              cache=Path(args.corpus) / 'grid_census.json')
 
     n_ok = 0
     with open(sink, "a") as fh:
@@ -694,15 +707,27 @@ def matched_magnitudes(target_rows, target_deep, donor_rows, donor_deep, cells):
 
 
 def run_arm(model, processor, fam, kind, idx, image, question, device, gh, gw, comp,
-            prompt_len, clean_lp, clean_am, donor_rows, donor_deep, mags, args, rng):
-    """One arm, scored against the clean chain. -> metrics or None if not applicable."""
+            prompt_len, clean_lp, clean_am, donor_rows, donor_deep, mags, args, rng,
+            clean_case=None):
+    """One arm, scored against the clean chain. -> metrics or None if not applicable.
+
+    `clean_case` is the prompt++completion the CLEAN picture builds. A swap arm changes
+    nothing upstream of the vision tower's output -- same picture, same prompt, same ids
+    -- so rebuilding it per arm only re-runs the image processor. At three cells per
+    picture that was invisible; over every cell of the grid it is most of the run, and
+    with four shards sharing one node's CPUs it dominated: 280 s per picture against the
+    30 s a single process needed.
+    """
     import torch
 
     if kind in ("swap", "swapn"):
         if donor_rows is None or (kind == "swapn" and mags is None):
             return None
-        inputs = SLP.build_inputs(fam, processor, [image], question, device)
-        case = fam.teacher_forced_case(inputs, comp, device)
+        if clean_case is not None:
+            case = clean_case
+        else:
+            inputs = SLP.build_inputs(fam, processor, [image], question, device)
+            case = fam.teacher_forced_case(inputs, comp, device)
         sw = RowSwap(model, [idx], donor_rows, donor_deep, family=fam,
                      magnitudes=mags if kind == "swapn" else None).install()
         try:
@@ -860,11 +885,10 @@ def one_map(model, processor, fam, scan, r, img_root, census, by_grid, args):
         for c in range(n_cells):
             for variant in args.variants:
                 try:
-                    m = run_arm(model, processor, fam,
-                                {"swap": "swap", "swapn": "swapn", "pix": "pix"}[variant],
+                    m = run_arm(model, processor, fam, variant,
                                 c, image, question, device, gh, gw, comp, prompt_len,
                                 clean_lp, clean_am, donor_rows, donor_deep, mags, args,
-                                rng)
+                                rng, clean_case=case)
                 except Exception:                                # noqa: BLE001
                     m = None
                 if m is not None:
@@ -912,7 +936,8 @@ def run_map(args):
                                       args.attn_impl)
     fam = SLP.load_family(model, processor, args.system_prompt)
     scan = SL.install(model, family=fam, want_key_stats=False)
-    by_grid, census = _census(fam, processor, donor_pool, img_root)
+    by_grid, census = _census(fam, processor, donor_pool, img_root,
+                              cache=Path(args.corpus) / 'grid_census.json')
 
     n_ok = 0
     with open(sink, "a") as fh:
@@ -1280,6 +1305,18 @@ def selftest(args):
           gap < 1e-3, f"max |diff| {gap:.2e}")
     check("the literal swap of a different row is NOT the identity",
           float(np.max(ml["kl"])) > 1e-6, f"max {float(np.max(ml['kl'])):.2e}")
+
+    # Reusing the clean case for swap arms is a 9x speedup and it must be a bit-for-bit
+    # no-op. If it were not, the map and the three-cell arms would be different
+    # experiments wearing the same name.
+    a_cached = run_arm(model, processor, fam, "swap", 0, image, r["question"],
+                       args.device, gh, gw, comp, prompt_len, clean_lp, clean_am,
+                       donor_r, donor_d, None, args, random.Random(0), clean_case=case)
+    a_fresh = run_arm(model, processor, fam, "swap", 0, image, r["question"],
+                      args.device, gh, gw, comp, prompt_len, clean_lp, clean_am,
+                      donor_r, donor_d, None, args, random.Random(0), clean_case=None)
+    d = float(np.max(np.abs(np.asarray(a_cached["kl"]) - np.asarray(a_fresh["kl"]))))
+    check("reusing the clean case changes nothing", d == 0.0, f"max |diff| {d:.2e}")
 
     peak, pmap = peak_cell(res, gh, gw)
     check("a peak cell was found", peak is not None, f"cell {peak} of {gh * gw}")
