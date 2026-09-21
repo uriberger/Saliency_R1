@@ -19,6 +19,8 @@ NAME=""
 MODEL=""
 OUT_DIR="outputs/token_mediation/pilot"
 LIMIT=150
+STAGE=run
+CANON=12
 DURATION=2
 GPUS=1
 SHARDS=1
@@ -33,6 +35,8 @@ while [[ $# -gt 0 ]]; do
         --model)     MODEL="$2";              shift 2 ;;
         --out-dir)   OUT_DIR="$2";            shift 2 ;;
         --limit)     LIMIT="$2";              shift 2 ;;
+        --stage)     STAGE="$2";              shift 2 ;;
+        --canon)     CANON="$2";              shift 2 ;;
         --duration)  DURATION="$2";           shift 2 ;;
         --gpus)      GPUS="$2";               shift 2 ;;
         --shards)    SHARDS="$2";             shift 2 ;;
@@ -80,7 +84,8 @@ RUNNER="$LOG_ROOT/$NAME.runner.sh"
     echo 'nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true'
     printf 'python token_mediation_probe.py selftest --model %q\n' "$MODEL"
     for ((s = 0; s < SHARDS; s++)); do
-        printf 'CUDA_VISIBLE_DEVICES=%d python token_mediation_probe.py run' "$((s % GPUS))"
+        printf 'CUDA_VISIBLE_DEVICES=%d python token_mediation_probe.py %q' \
+            "$((s % GPUS))" "$STAGE"
         printf ' --model %q --out %q --limit %q --shard %d --shards %d' \
             "$MODEL" "$OUT_DIR" "$LIMIT" "$s" "$SHARDS"
         for a in ${EXTRA[@]+"${EXTRA[@]}"}; do printf ' %q' "$a"; done
@@ -88,13 +93,19 @@ RUNNER="$LOG_ROOT/$NAME.runner.sh"
         echo
     done
     [[ $SHARDS -gt 1 ]] && echo "wait"
-    printf 'python token_mediation_probe.py report --out %q\n' "$OUT_DIR"
+    if [[ "$STAGE" == map ]]; then
+        printf 'python token_mediation_probe.py mapreport --out %q --canon %q\n' \
+            "$OUT_DIR" "$CANON"
+    else
+        printf 'python token_mediation_probe.py report --out %q\n' "$OUT_DIR"
+    fi
 } > "$RUNNER"
 chmod +x "$RUNNER"
 
 echo "=========================================================================="
 echo "Job     : $NAME   ($ACCOUNT, $PARTITION, ${DURATION}h, ${GPUS} GPU)"
 echo "Model   : $MODEL"
+echo "Stage   : $STAGE"
 echo "Out dir : $OUT_DIR   (limit $LIMIT, $SHARDS shard(s))"
 echo "=========================================================================="
 cat "$RUNNER"

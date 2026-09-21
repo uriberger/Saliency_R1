@@ -466,28 +466,54 @@ def donor_for(row, by_grid, grid, rng):
     return pool[rng.randrange(len(pool))]
 
 
-def run(args):
-    import torch
-    from PIL import Image
+def _corpus(args):
+    """-> (rows, image root, donor pool). Shared by `run` and `map`.
 
+    The donor pool is the WHOLE corpus, not the sampled subset. A donor has to have the
+    target's grid so a cell index means the same slot in both, and this corpus has 99
+    distinct grids -- drawing donors from a 150-picture sample alone left 28 of them with
+    no partner and no swap arm at all.
+    """
     corpus = Path(args.corpus)
     rows = SLP.read_manifest(corpus.parent if corpus.name == "corpus" else corpus,
                              args.types)
     if args.split in ("dev", "test"):
         want = args.split == "dev"
         rows = [r for r in rows if bool(r["dev"]) is want]
+    img_root = corpus / "corpus" / "images"
+    if not img_root.exists():
+        img_root = corpus / "images"
+    return rows, img_root, list(rows)
+
+
+def _census(fam, processor, donor_pool, img_root):
+    """Grid per picture, and the pictures grouped by grid. -> (by_grid, census).
+
+    Before the model runs: the grid is a property of the picture's size alone.
+    """
+    from PIL import Image
+
+    by_grid, census = {}, {}
+    for r in donor_pool:
+        im = snap_to_grid(PROBE.prepare_image(
+            Image.open(img_root / Path(r["image"]).name).convert("RGB")))
+        g = fam.grid_of(processor, im)
+        census[r["key"]] = g
+        by_grid.setdefault(g, []).append(r)
+    print(f"[census] {len(by_grid)} distinct grids over {len(donor_pool)} pictures, "
+          f"modal {max(by_grid, key=lambda k: len(by_grid[k]))}", flush=True)
+    return by_grid, census
+
+
+def run(args):
+    import torch
+    from PIL import Image
+
+    rows, img_root, donor_pool = _corpus(args)
     rng = random.Random(args.seed)
     rng.shuffle(rows)
-    # The donor pool is the WHOLE corpus, not the sampled subset. A donor has to have the
-    # target's grid so a cell index means the same slot in both, and this corpus has 48
-    # distinct grids in 150 pictures -- drawing donors from the sample alone left 28 of
-    # the 150 with no partner and no swap arm at all.
-    donor_pool = list(rows)
     if args.limit:
         rows = rows[: args.limit]
-    img_root = Path(args.corpus) / "corpus" / "images"
-    if not img_root.exists():
-        img_root = Path(args.corpus) / "images"
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -512,19 +538,7 @@ def run(args):
     fam = SLP.load_family(model, processor, args.system_prompt)
     scan = SL.install(model, family=fam, want_key_stats=False)
     arms = list(ARMS) + (list(KO_ARMS) if args.with_ko else [])
-
-    # Grid census first: a donor has to have the target's grid, and the grid is a
-    # property of the picture's size, so it is knowable before the model runs.
-    by_grid = {}
-    census = {}
-    for r in donor_pool:
-        im = snap_to_grid(PROBE.prepare_image(
-            Image.open(img_root / Path(r["image"]).name).convert("RGB")))
-        g = fam.grid_of(processor, im)
-        census[r["key"]] = g
-        by_grid.setdefault(g, []).append(r)
-    print(f"[run] grid census: {len(by_grid)} distinct grids, "
-          f"modal {max(by_grid, key=lambda k: len(by_grid[k]))}", flush=True)
+    by_grid, census = _census(fam, processor, donor_pool, img_root)
 
     n_ok = 0
     with open(sink, "a") as fh:
@@ -744,6 +758,233 @@ def ko_mask(fam, case, idx, device):
 
 
 # ---------------------------------------------------------------------------
+# the full map -- every cell, not three
+# ---------------------------------------------------------------------------
+def canonical_weights(gh, gw, g):
+    """Area overlap between a gh x gw patch grid and a canonical g x g one. -> [gh*gw, g*g]
+
+    This corpus has 99 distinct grids and the modal one covers 13.6% of pictures, so
+    there is no common cell index to average over and a heatmap has to be accumulated in
+    NORMALISED coordinates. Exact rectangle overlap, not nearest-neighbour: a 70-token
+    picture and a 256-token one otherwise contribute at different effective resolutions
+    and the map quietly becomes a map of picture size.
+
+    Each row sums to that cell's area share of the picture, so summing a picture's whole
+    map over the canonical grid conserves its total.
+    """
+    ry = np.linspace(0.0, 1.0, gh + 1)
+    rx = np.linspace(0.0, 1.0, gw + 1)
+    cy = np.linspace(0.0, 1.0, g + 1)
+    cx = np.linspace(0.0, 1.0, g + 1)
+    # overlap[i, j] on each axis independently, then the outer product per cell pair
+    oy = np.clip(np.minimum(ry[1:, None], cy[None, 1:]) -
+                 np.maximum(ry[:-1, None], cy[None, :-1]), 0, None)     # [gh, g]
+    ox = np.clip(np.minimum(rx[1:, None], cx[None, 1:]) -
+                 np.maximum(rx[:-1, None], cx[None, :-1]), 0, None)     # [gw, g]
+    w = np.einsum("ia,jb->ijab", oy, ox).reshape(gh * gw, g * g)
+    return w
+
+
+def one_map(model, processor, fam, scan, r, img_root, census, by_grid, args):
+    """Every cell of one picture, in three variants. -> record or None.
+
+    `swap` is the literal substitution, `swapn` holds the perturbation distance fixed
+    across every cell of the picture, and `pix` destroys the cell's pixels and re-runs
+    the tower. The pair of swap maps is the point: ||row|| runs 28.9 at the peak against
+    12.7 at a random cell, so the literal map is largely a picture of the norms and the
+    matched one is what is left when that is taken out.
+    """
+    import torch
+    from PIL import Image
+
+    rng = random.Random(f"{args.seed}:map:{r['key']}")
+    image = snap_to_grid(PROBE.prepare_image(
+        Image.open(img_root / Path(r["image"]).name).convert("RGB")))
+    question, device = r["question"], args.device
+
+    gen = SLP.generate_then_teacher_force(model, processor, [image], question, device,
+                                          scan, args.max_new_tokens)
+    if gen is None:
+        return None
+    inputs, prompt_len, comp = gen
+    case = fam.teacher_forced_case(inputs, comp, device)
+    scan.reset()
+    scan.prompt_len_override = prompt_len
+    tcap = RowCapture(model, family=fam).install()
+    try:
+        with torch.no_grad():
+            model(**case, use_cache=False)
+    finally:
+        scan.prompt_len_override = None
+        tcap.uninstall()
+    res = scan.result()
+    if res is None or not res["grids"]:
+        return None
+    _t, gh, gw = res["grids"][0]
+    n_cells = gh * gw
+    peak, pmap = peak_cell(res, gh, gw, args.min_mass)
+    clean_lp, clean_am = clean_logprobs(model, case, prompt_len, len(comp))
+    lo, hi, span_kind = answer_span(processor, comp)
+
+    donor = donor_for(r, by_grid, (gh, gw), rng)
+    if donor is None:
+        return None
+    dim = snap_to_grid(PROBE.prepare_image(
+        Image.open(img_root / Path(donor["image"]).name).convert("RGB")))
+    cap = RowCapture(model, family=fam).install()
+    scan.paused = True
+    try:
+        with torch.no_grad():
+            model(**SLP.build_inputs(fam, processor, [dim], question, device),
+                  use_cache=False)
+        donor_rows, donor_deep = cap.rows, cap.deepstack
+    finally:
+        scan.paused = False
+        cap.uninstall()
+    if donor_rows is None or int(donor_rows.shape[0]) != n_cells:
+        return None
+
+    # One magnitude per injection point for the WHOLE picture -- the median cell's own
+    # perturbation. The three-cell arms used the min of three, which is not defined here
+    # and would anyway be set by whichever cell happened to be smallest.
+    tgt = [tcap.rows] + list(tcap.deepstack or [])
+    don = [donor_rows] + list(donor_deep or [])
+    deltas = [(d[:n_cells].float() - t[:n_cells].float()).norm(dim=-1).cpu().numpy()
+              for t, d in zip(tgt, don)]
+    mags = [float(np.median(dn)) for dn in deltas]
+    rownorm = tgt[0][:n_cells].float().norm(dim=-1).cpu().numpy()
+
+    out = {v: [None] * n_cells for v in ("swap", "swapn", "pix")}
+    scan.paused = True
+    try:
+        for c in range(n_cells):
+            for variant in args.variants:
+                try:
+                    m = run_arm(model, processor, fam,
+                                {"swap": "swap", "swapn": "swapn", "pix": "pix"}[variant],
+                                c, image, question, device, gh, gw, comp, prompt_len,
+                                clean_lp, clean_am, donor_rows, donor_deep, mags, args,
+                                rng)
+                except Exception:                                # noqa: BLE001
+                    m = None
+                if m is not None:
+                    out[variant][c] = round(summarise(m, lo, hi)["kl_logmean"], 5)
+    finally:
+        scan.paused = False
+
+    return {
+        "key": r["key"], "type": r["type"], "dev": bool(r["dev"]),
+        "grid": [gh, gw], "n_cells": n_cells, "peak": peak,
+        "peak_mass": None if peak is None else float(pmap[peak]),
+        "span": span_kind, "n_comp": len(comp), "donor": donor["key"],
+        "mags": mags, "row_norm": [round(float(x), 3) for x in rownorm],
+        "delta_norm": [round(float(x), 3) for x in deltas[0]],
+        "map": {v: out[v] for v in args.variants},
+    }
+
+
+def run_map(args):
+    from PIL import Image
+
+    rows, img_root, donor_pool = _corpus(args)
+    rng = random.Random(args.seed)
+    rng.shuffle(rows)
+    if args.limit:
+        rows = rows[: args.limit]
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sink = out_dir / f"map_shard{args.shard}.jsonl"
+    done = set()
+    if sink.exists() and not args.rebuild:
+        for line in sink.read_text().splitlines():
+            try:
+                done.add(json.loads(line)["key"])
+            except Exception:                                    # noqa: BLE001
+                pass
+    todo = [r for i, r in enumerate(rows)
+            if i % args.shards == args.shard and r["key"] not in done]
+    print(f"[map] {len(todo)} pictures on shard {args.shard}/{args.shards}, "
+          f"variants {args.variants}", flush=True)
+    if not todo:
+        return
+
+    processor, model = SLP.load_model(args.model, args.adapter, args.device,
+                                      args.attn_impl)
+    fam = SLP.load_family(model, processor, args.system_prompt)
+    scan = SL.install(model, family=fam, want_key_stats=False)
+    by_grid, census = _census(fam, processor, donor_pool, img_root)
+
+    n_ok = 0
+    with open(sink, "a") as fh:
+        for r in todo:
+            try:
+                rec = one_map(model, processor, fam, scan, r, img_root, census, by_grid,
+                              args)
+            except Exception as exc:                             # noqa: BLE001
+                print(f"[map] {r['key']}: FAILED {type(exc).__name__}: {str(exc)[:200]}",
+                      flush=True)
+                continue
+            if rec is None:
+                print(f"[map] {r['key']}: skipped", flush=True)
+                continue
+            fh.write(json.dumps(rec) + "\n")
+            fh.flush()
+            n_ok += 1
+            print(f"[map] {n_ok}/{len(todo)}  {rec['key']}  {rec['n_cells']} cells",
+                  flush=True)
+    scan.uninstall()
+    print(f"[map] wrote {n_ok} rows to {sink}", flush=True)
+
+
+def map_report(args):
+    """Pool the per-picture maps onto one canonical grid and draw it."""
+    recs = []
+    for p in sorted(Path(args.out).glob("map_shard*.jsonl")):
+        for line in p.read_text().splitlines():
+            try:
+                recs.append(json.loads(line))
+            except Exception:                                    # noqa: BLE001
+                pass
+    if not recs:
+        raise SystemExit(f"no map rows under {args.out}")
+    g = args.canon
+    variants = [v for v in ("swap", "swapn", "pix") if v in recs[0]["map"]]
+    print(f"\n{len(recs)} pictures, {sum(r['n_cells'] for r in recs):,} cells, "
+          f"canonical {g}x{g}\n")
+
+    for variant in variants + ["row_norm"]:
+        acc = np.zeros(g * g)
+        wsum = np.zeros(g * g)
+        for r in recs:
+            gh, gw = r["grid"]
+            vals = (r["map"][variant] if variant in r["map"] else r.get(variant))
+            v = np.array([np.nan if x is None else x for x in vals], dtype=np.float64)
+            if v.size != gh * gw or not np.isfinite(v).any():
+                continue
+            # Within-picture standardisation: without it a handful of pictures with big
+            # overall effects set the map, and it becomes a map of which pictures are
+            # fragile rather than of which positions matter.
+            mu, sd = np.nanmean(v), np.nanstd(v)
+            z = (v - mu) / (sd if sd > 1e-9 else 1.0)
+            w = canonical_weights(gh, gw, g)
+            ok = np.isfinite(z)
+            acc += (z[ok, None] * w[ok]).sum(0)
+            wsum += w[ok].sum(0)
+        m = np.where(wsum > 0, acc / np.maximum(wsum, 1e-12), np.nan).reshape(g, g)
+        print(f"--- {variant}  (within-picture z, + = this position matters more) ---")
+        for row in m:
+            print("  " + " ".join(f"{x:+5.2f}" if np.isfinite(x) else "    ."
+                                  for x in row))
+        ring = np.zeros((g, g), bool)
+        ring[0], ring[-1], ring[:, 0], ring[:, -1] = True, True, True, True
+        print(f"  ring {np.nanmean(m[ring]):+.3f}   interior {np.nanmean(m[~ring]):+.3f}"
+              f"   corner(0,0) {m[0, 0]:+.3f}   max {np.nanmax(m):+.3f} at "
+              f"{np.unravel_index(np.nanargmax(m), m.shape)}\n")
+        np.save(Path(args.out) / f"map_{variant}_{g}x{g}.npy", m)
+    print(f"maps written to {args.out}/map_*_{g}x{g}.npy")
+
+
+# ---------------------------------------------------------------------------
 # the report
 # ---------------------------------------------------------------------------
 def read_rows(out_dir):
@@ -927,6 +1168,32 @@ def selftest(args):
               f"{int(moved.sum())} px moved, {int((moved & ~want).sum())} outside")
         check(f"corruption of cell {cell} keeps the size", d.size == sn.size)
 
+    # The canonical rebinning. A heatmap pooled over 99 grids is only as trustworthy as
+    # this, and every failure mode here is silent: weights that do not conserve area turn
+    # the map into a map of picture size.
+    print("\ncanonical rebinning")
+    for (gh, gw) in ((16, 16), (8, 16), (12, 16), (7, 13), (1, 1)):
+        w = canonical_weights(gh, gw, 12)
+        check(f"{gh}x{gw} rows sum to their area share",
+              np.allclose(w.sum(1), 1.0 / (gh * gw)), f"{w.sum(1).min():.6f}")
+        check(f"{gh}x{gw} columns tile the canonical grid",
+              np.allclose(w.sum(0), 1.0 / 144), f"{w.sum(0).min():.6f}")
+        check(f"{gh}x{gw} conserves total", abs(w.sum() - 1.0) < 1e-9)
+    # A constant map must come back constant, whatever the source grid.
+    for (gh, gw) in ((16, 16), (8, 16), (7, 13)):
+        w = canonical_weights(gh, gw, 12)
+        got = (np.full(gh * gw, 3.0)[:, None] * w).sum(0) / w.sum(0)
+        check(f"{gh}x{gw} constant map stays constant", np.allclose(got, 3.0),
+              f"spread {got.max() - got.min():.2e}")
+    # A left-half/right-half step must land on the left/right half of the canonical grid.
+    gh, gw = 8, 16
+    v = np.array([1.0 if (i % gw) < gw // 2 else -1.0 for i in range(gh * gw)])
+    w = canonical_weights(gh, gw, 12)
+    m = ((v[:, None] * w).sum(0) / w.sum(0)).reshape(12, 12)
+    check("a left/right step maps to left/right",
+          m[:, :6].mean() > 0.99 and m[:, 6:].mean() < -0.99,
+          f"left {m[:, :6].mean():+.3f} right {m[:, 6:].mean():+.3f}")
+
     if not args.model:
         print("\n(no --model: stopping before the model checks)")
         return 0 if ok else 1
@@ -1077,6 +1344,26 @@ def main(argv=None):
     p.add_argument("--shards", type=int, default=1)
     p.add_argument("--rebuild", action="store_true")
 
+    p = sub.add_parser("map")
+    common(p)
+    p.add_argument("--out", required=True)
+    p.add_argument("--limit", type=int, default=300)
+    p.add_argument("--types", nargs="*", default=None)
+    p.add_argument("--split", default="all", choices=("all", "dev", "test"))
+    p.add_argument("--max-new-tokens", type=int, default=256)
+    p.add_argument("--corrupt", default="mean", choices=("mean", "noise", "shuffle"))
+    p.add_argument("--min-mass", type=float, default=0.002)
+    p.add_argument("--variants", nargs="+", default=["swap", "swapn", "pix"],
+                   choices=("swap", "swapn", "pix"))
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--shard", type=int, default=0)
+    p.add_argument("--shards", type=int, default=1)
+    p.add_argument("--rebuild", action="store_true")
+
+    p = sub.add_parser("mapreport")
+    p.add_argument("--out", required=True)
+    p.add_argument("--canon", type=int, default=12)
+
     p = sub.add_parser("report")
     p.add_argument("--out", required=True)
     p.add_argument("--field", default="kl_logmean")
@@ -1087,6 +1374,10 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.cmd == "run":
         return run(args) or 0
+    if args.cmd == "map":
+        return run_map(args) or 0
+    if args.cmd == "mapreport":
+        return map_report(args) or 0
     if args.cmd == "report":
         return report(args) or 0
     return selftest(args)
