@@ -9,10 +9,11 @@ CPU only, a few seconds, no GPU and no Grounding-DINO. Everything comes off disk
 quantised to its own peak (`map_q`) with the peak alongside (`map_max`), the DINO union
 raster (`mask_q`) and the patch grid.
 
-WHY THIS EXISTS. The reward's mask can come from four places -- once per step (the
+WHY THIS EXISTS. The reward's mask can come from five places -- once per step (the
 incumbent), once per completion (--overlap_chain_boxes), once per row
-(--overlap_question_boxes) or from no detector at all (--overlap_rect_frac) -- and the
-choice is usually argued from how well the mask resembles DINO's. That is the wrong
+(--overlap_question_boxes), from no detector at all (--overlap_rect_frac), or from every
+step's boxes merged (--overlap_merge_boxes) -- and the choice is usually argued from how
+well the mask resembles DINO's. That is the wrong
 question. GRPO subtracts the group mean before anything else, so the ONLY thing a reward
 contributes is how it varies BETWEEN the 8 rollouts of one prompt. A mask that is the
 same for all 8 cannot contribute through the mask at all: it cancels, and what is left is
@@ -38,7 +39,16 @@ it, so a number here is a number about the code a run will execute. Same reason
 test_rect_reward_cpu.py compares the shipped rectangle against centre_box_probe.py's.
 
 SCHEMES. `true` is the incumbent. `qbox` and `rect*` are the fixed-mask arms. `chain_*`
-are --overlap_chain_boxes. `flat` is the floor: no mask at all.
+are --overlap_chain_boxes. `chain_union` is --overlap_merge_boxes. `flat` is the floor:
+no mask at all.
+
+`chain_union` gets an extra line under the table, because it is the only scheme whose mask
+is strictly LARGER than the incumbent's and the column that decides it is coverage, not
+spread: merging every step's union can saturate the grid, and a saturated mask scores
+everything as "inside the box" long before its weight matters. The reward refuses a fully
+covered union and loses the whole completion, so that line reports coverage over EVERY
+completion (including the refused ones) plus the refusal rate -- which is what
+mask/merged_cover and mask/merged_unscored_frac log during a run.
 """
 
 from __future__ import annotations
@@ -200,13 +210,14 @@ def ring_mask(gh, gw):
 # ---------------------------------------------------------------------------
 # the schemes
 # ---------------------------------------------------------------------------
-SCHEMES = ["true", "chain_first", "chain_last", "qbox", "rect_centre", "rect_inctr",
-           "rect_inhash", "rect_jitter", "flat"]
+SCHEMES = ["true", "chain_first", "chain_last", "chain_union", "qbox", "rect_centre",
+           "rect_inctr", "rect_inhash", "rect_jitter", "flat"]
 
 DESCRIBE = {
     "true": "per-step DINO union (incumbent)",
     "chain_first": "--overlap_chain_boxes first",
     "chain_last": "--overlap_chain_boxes last",
+    "chain_union": "--overlap_merge_boxes (all the chain's boxes)",
     "qbox": "--overlap_question_boxes",
     "rect_centre": "--overlap_rect_frac, centre",
     "rect_inctr": "... --overlap_rect_placement interior_centre",
@@ -226,12 +237,28 @@ def _jitter_rect(gh, gw, rng, frac=F_FIXED):
                                  int(rng.integers(gw - cols + 1)))
 
 
+def merged_union(comp):
+    """--overlap_merge_boxes' mask: the OR of every step's own DINO union.
+
+    Raw, so an all-covered result is visible rather than refused. `analyse` reports its
+    coverage over every completion including the ones the reward then drops, because a
+    coverage mean taken over the survivors alone is the number that would hide saturation
+    -- the only failure mode a mask that can only GROW actually has.
+    """
+    return np.logical_or.reduce([st.mask for st in comp])
+
+
 def masks_for(comp, sample_boxes, rng, text, frac):
     """{scheme: mask or None} for one completion. `true` is per step, so it is absent."""
     gh, gw = comp[0].gh, comp[0].gw
+    mu = merged_union(comp)
     out = {
         "chain_first": comp[0].mask,
         "chain_last": comp[-1].mask,
+        # None on a fully-covered union, mirroring _union_mask: "inside vs outside" is not
+        # a question on a mask that covers everything, and the reward drops the completion
+        # rather than scoring it. The coverage of those completions is reported separately.
+        "chain_union": (mu if 0 < int(mu.sum()) < mu.size else None),
         "qbox": (ORW._union_mask(sample_boxes, gh, gw) if sample_boxes else None),
         "rect_centre": ORW._centre_rect_mask(gh, gw, frac),
         "rect_inctr": ORW._interior_rect_mask(gh, gw, frac),
@@ -249,6 +276,10 @@ def analyse(model_rec, qb, frac, seed=20260904):
     ring_groups, area_groups = [], []
     ring_shr = {s: [] for s in SCHEMES}
     ring_cov = {s: [] for s in SCHEMES}
+    # --overlap_merge_boxes' own two numbers, kept outside `ring_*` because they are taken
+    # over EVERY completion -- the saturated ones are absent from every per-scheme column,
+    # and they are the ones that decide the arm.
+    merged_cover, merged_drop = [], []
     verify, n_comp, n_steps, qb_missing = [], 0, 0, 0
 
     for s, comps in load_chains(model_rec):
@@ -267,6 +298,9 @@ def analyse(model_rec, qb, frac, seed=20260904):
             n_comp += 1
             n_steps += len(comp)
             rg = ring_mask(comp[0].gh, comp[0].gw)
+            mu = merged_union(comp)
+            merged_cover.append(float(mu.mean()))
+            merged_drop.append(float(int(mu.sum()) == mu.size))
             per["true"].append(float(np.mean([ORW._mean_in(st.smap, st.mask) for st in comp])))
             for k, m in masks_for(comp, boxes, rng, f"completion {ci}", frac).items():
                 if m is None or m.shape != comp[0].mask.shape:
@@ -310,10 +344,15 @@ def analyse(model_rec, qb, frac, seed=20260904):
             "ringcov": float(np.mean(ring_cov[k])) if ring_cov[k] else float("nan"),
             "n": len(flat_vals),
         }
+    step_cover = [v for g in area_groups for v in g if v is not None]
     return {
         "rows": rows, "n_comp": n_comp, "n_steps": n_steps, "qb_missing": qb_missing,
         "verify": float(np.max(verify)) if verify else float("nan"),
         "r_true_area": pearson(c_true, c_area),
+        "merged_cover": float(np.mean(merged_cover)) if merged_cover else float("nan"),
+        "merged_cover_p90": float(np.percentile(merged_cover, 90)) if merged_cover else float("nan"),
+        "merged_drop": float(np.mean(merged_drop)) if merged_drop else float("nan"),
+        "step_cover": float(np.mean(step_cover)) if step_cover else float("nan"),
     }
 
 
@@ -423,6 +462,14 @@ def main():
                   f"{d['level']:>8.4f} {d['r_flat']:>8.3f} {d['r_ring']:>8.3f} "
                   f"{d['r_true']:>8.3f} {d['ringshr']:>8.3f} {d['ringcov']:>8.3f} "
                   f"{d['n']:>5}  {DESCRIBE[k]}")
+        # The one column the table cannot carry: chain_union's mask can only GROW, so what
+        # decides it is coverage, and the saturated completions are missing from its row
+        # above by construction. Both numbers here are over EVERY completion.
+        print(f"    chain_union coverage: mean {r['merged_cover']:.3f} / p90 "
+              f"{r['merged_cover_p90']:.3f} of the grid, against the per-step union's "
+              f"{r['step_cover']:.3f};")
+        print(f"      {r['merged_drop']:.1%} of completions saturate it -- the reward drops "
+              "those whole (mask/merged_unscored_frac).")
 
 
 if __name__ == "__main__":

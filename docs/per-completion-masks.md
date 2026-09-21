@@ -49,6 +49,14 @@ checkpoints above 1.0 for `last`, 10 of 11 for `first`).
 not evidence that the detector is unnecessary — it is also consistent with "the contrast
 GRPO saw was mostly box-blind". The two new arms separate those.
 
+> **A fifth source, off this ladder — 2026-09-21.** `--overlap_merge_boxes` keeps the
+> incumbent's per-step grounding and merges the completion's boxes instead, so it changes
+> the reward's *target* without changing its *cost*. Same probe, scheme `chain_union`:
+> within-group sd ratio 1.02 (so `w_overlap` 0.4 transfers unchanged — the only arm for
+> which that is true), r with `flatness` 0.687, and median mask coverage 0.754 of the grid
+> against the per-step union's 0.568. That last number is the problem, and it scales with
+> chain length at Spearman +0.991. See [merged-boxes.md](merged-boxes.md).
+
 ## Why `last`, not `first`
 
 The obvious way to ground once per completion is on its first observe step. It is the worst
