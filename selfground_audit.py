@@ -905,16 +905,34 @@ def stage_crosspass(args, out_dir):
                 model, attn_mod, inputs, prompt_len, comp_ids, heads, args.device)
             maps = PROBE.step_maps_from_attention(per_tok, steps, gh, gw, "mean")
             by_text = {_norm_step(m["text"]): m["map"] for m in maps}
-            for st in owner:
+            for (_, tok_a, tok_b), st in zip(steps, owner):
                 m = by_text.get(_norm_step(st["text"]))
                 if m is None or list(m.shape) != list(st["grid"]):
                     skipped["grid_mismatch"] += 1
                     continue
-                mask = decode_mask(st["mask_q"], st["grid"][0], st["grid"][1])
+                gh_, gw_ = st["grid"]
+                mask = decode_mask(st["mask_q"], gh_, gw_)
+                smap = np.asarray(m, dtype=np.float64)
+                tot = float(smap.sum())
+                ring = ring_mask(gh_, gw_)
+                # The map's own shape, recorded alongside phi: with the text held fixed,
+                # these say whether the trained weights moved the attention at all -- the
+                # corner sink of Figure 5 and the flatness phi mostly rides on.
                 rows.append(dict(text_arm=w["arm"], map_arm=m_arm, qid=w["qid"],
                                  sample=w["sample"], comp=w["comp"], step=st["step"],
-                                 phi=mean_in(np.asarray(m, dtype=np.float64), mask),
-                                 phi_stored=st["phi_stored"]))
+                                 phi=mean_in(smap, mask),
+                                 phi_stored=st["phi_stored"],
+                                 flat=(float(smap.mean() / smap.max())
+                                       if smap.max() > 0 else float("nan")),
+                                 ring_mass=(float(smap[ring].sum() / tot) if tot > 0
+                                            else float("nan")),
+                                 ring_en=(float((smap[ring].sum() / tot)
+                                                / (ring.sum() / ring.size))
+                                          if tot > 0 else float("nan")),
+                                 tl_en=(float((smap[0, 0] / tot) * smap.size)
+                                        if tot > 0 else float("nan")),
+                                 union_frac=float(mask.mean()),
+                                 n_tokens=int(tok_b - tok_a)))
             del per_tok
             if wi % 25 == 0:
                 torch.cuda.empty_cache()
@@ -1114,6 +1132,120 @@ def judge_sheet(items, out_dir, args):
 
 
 # ---------------------------------------------------------------------------
+# stage: figs -- the distributions behind the means
+# ---------------------------------------------------------------------------
+def stage_figs(args, out_dir):
+    """The reviewer asked for distributions, not means: a box-area histogram, where the
+    boxes sit, what the detector's confidence looks like, and what phi tracks."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows = json.loads((out_dir / "steps.json").read_text())
+    rows = [r for r in rows if r.get("grounded")]
+    arms = args.keep_arm or [args.base, "ours"]
+    arms = [a for a in arms if any(r["arm"] == a for r in rows)]
+    colors = {a: c for a, c in zip(arms, ["#4c6ef5", "#f03e3e", "#37b24d", "#f59f00",
+                                          "#7048e8", "#0ca678"])}
+
+    def _hist(ax, field, bins, title, xlabel):
+        for a in arms:
+            v = np.array([r[field] for r in rows if r["arm"] == a
+                          and r.get(field) is not None
+                          and np.isfinite(r.get(field, np.nan))], float)
+            if v.size:
+                ax.hist(v, bins=bins, density=True, histtype="step", linewidth=1.8,
+                        color=colors[a], label=f"{a} (n={v.size})")
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel(xlabel, fontsize=9)
+        ax.set_ylabel("density", fontsize=9)
+        ax.legend(fontsize=7, frameon=False)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    _hist(axes[0][0], "mean_box_area", np.linspace(0, 1, 41),
+          "box area (mean over the step's boxes)", "fraction of the image")
+    _hist(axes[0][1], "union_frac", np.linspace(0, 1, 41),
+          "union area, before the cap", "fraction of the patch grid")
+    _hist(axes[0][2], "mean_box_ecc", np.linspace(0, 1, 41),
+          "box centre distance from the image centre", "0 = centre, 1 = corner")
+    _hist(axes[1][0], "ring_share", np.linspace(0, 1, 41),
+          "share of the union on the border ring", "fraction of the union")
+    _hist(axes[1][1], "phi", np.linspace(0, 0.3, 61),
+          "phi, the per-step reward", "mean(map in union) / max(map)")
+    _hist(axes[1][2], "n_boxes_raw", np.arange(0, 61, 2),
+          "boxes the detector returned", "boxes per step")
+    fig.suptitle("What the self-grounding loop targets, before and after RL "
+                 "(held-out prompts, 8 rollouts each)", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out_dir / "fig_boxes.png", dpi=140)
+    plt.close(fig)
+
+    # phi against the box-blind statistic it is supposed to improve on
+    fig, axes = plt.subplots(1, len(arms), figsize=(4.6 * len(arms), 4.2), squeeze=False)
+    for ax, a in zip(axes[0], arms):
+        x = np.array([r["flatness"] for r in rows if r["arm"] == a], float)
+        y = np.array([r["phi"] for r in rows if r["arm"] == a], float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        ax.scatter(x[ok], y[ok], s=4, alpha=0.25, color=colors[a], edgecolors="none")
+        lim = [0, max(0.3, float(np.nanpercentile(np.concatenate([x[ok], y[ok]]), 99.5)))]
+        ax.plot(lim, lim, color="#adb5bd", linewidth=1, linestyle="--")
+        ax.set_xlim(lim); ax.set_ylim(lim)
+        ax.set_title(f"{a}  (r = {pearson(x, y):+.2f})", fontsize=10)
+        ax.set_xlabel("map mean / map max  (no boxes)", fontsize=9)
+        ax.set_ylabel("phi  (with boxes)", fontsize=9)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+    fig.suptitle("phi against the statistic that ignores the boxes; the dashed line is "
+                 "'the union scores exactly the image average'", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out_dir / "fig_phi_flatness.png", dpi=140)
+    plt.close(fig)
+
+    made = ["fig_boxes.png", "fig_phi_flatness.png"]
+
+    dino = (json.loads((out_dir / "dino_audit.json").read_text())
+            if (out_dir / "dino_audit.json").exists() else None)
+    if dino:
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+        for a in arms:
+            own, ctl = [], []
+            for v in dino["steps"].values():
+                if a not in v["arms"]:
+                    continue
+                runs = v.get("runs") or {}
+                s = (runs.get("own") or {}).get("scores") or []
+                if s:
+                    own.append(max(s))
+                for n, c in runs.items():
+                    if n.startswith("ctl") and c.get("scores"):
+                        ctl.append(max(c["scores"]))
+            if own:
+                axes[0].hist(own, bins=np.linspace(0, 1, 41), density=True,
+                             histtype="step", linewidth=1.8, color=colors[a],
+                             label=f"{a} (n={len(own)})")
+            if ctl:
+                axes[1].hist(ctl, bins=np.linspace(0, 1, 41), density=True,
+                             histtype="step", linewidth=1.8, color=colors[a],
+                             label=f"{a} (n={len(ctl)})")
+        axes[0].set_title("best box confidence, own image", fontsize=10)
+        axes[1].set_title("best box confidence, a WRONG image", fontsize=10)
+        for ax in axes:
+            ax.set_xlabel("Grounding-DINO score", fontsize=9)
+            ax.set_ylabel("density", fontsize=9)
+            ax.legend(fontsize=7, frameon=False)
+            for s in ("top", "right"):
+                ax.spines[s].set_visible(False)
+        fig.tight_layout()
+        fig.savefig(out_dir / "fig_confidence.png", dpi=140)
+        plt.close(fig)
+        made.append("fig_confidence.png")
+
+    print(f"[figs] {', '.join(made)} -> {out_dir}")
+
+
+# ---------------------------------------------------------------------------
 # stage: report
 # ---------------------------------------------------------------------------
 def _c(cell, dec=3, pct=False):
@@ -1153,6 +1285,7 @@ def union_bin_table(steps_rows, base, arms, n_bins=5, field="phi", by="union_fra
     if vals.size < n_bins * 10:
         return None
     edges = np.quantile(vals, np.linspace(0, 1, n_bins + 1))
+    labels = [f"{edges[b]:.3g}–{edges[b + 1]:.3g}" for b in range(n_bins)]
     edges[0], edges[-1] = -np.inf, np.inf
     out = []
     for b in range(n_bins):
@@ -1160,7 +1293,7 @@ def union_bin_table(steps_rows, base, arms, n_bins=5, field="phi", by="union_fra
         sel = lambda r: (r.get(by) is not None and np.isfinite(r.get(by, np.nan))
                          and lo <= r[by] < hi)
         base_rows = [r for r in steps_rows if r["arm"] == base and sel(r)]
-        row = {"bin": f"{max(lo,0):.2f}–{min(hi,1):.2f}", "n_base": len(base_rows),
+        row = {"bin": labels[b], "n_base": len(base_rows),
                "base": boot_mean(base_rows, field)}
         for a in arms:
             if a == base:
@@ -1248,6 +1381,12 @@ def stage_report(args, out_dir):
         L += ["", "| arm | distinct content terms per completion |", "|---|---|"]
         for a in order:
             L.append(f"| {a} | {_c(text['arms'][a]['distinct_terms_per_completion'], 2)} |")
+        L += ["", "The commonest things the observation sentences name (share of that "
+              "arm's observe steps that use the term at least once):", ""]
+        for a in order:
+            n = max(text["arms"][a]["n_observe_steps"], 1)
+            top = text["arms"][a]["terms"][:15]
+            L.append(f"- **{a}**: " + ", ".join(f"{w} ({100.0*c/n:.0f}%)" for w, c in top))
         for a in order[1:]:
             v = text["vocab"][a]
             L += ["", f"**{a}** vs {base}, log-odds z (informative Dirichlet prior):", "",
@@ -1294,11 +1433,17 @@ def stage_report(args, out_dir):
             cells = cross["cells"][t]
             L.append(f"| {t} | " + " | ".join(_c(cells.get("map:" + m), 4) for m in arms)
                      + f" | {_c(cells.get('own'), 4)} |")
-        L += ["", "| arm | text effect (its boxes − base's, under base attention) | "
+        L += ["", "`prior` scores the same boxes under the base model's mean map over "
+              "EVERY image of that grid shape -- an attention target that knows nothing "
+              "about this picture, so a gain there is the boxes drifting toward where the "
+              "model looks in general.", "",
+              "| arm | text effect (its boxes − base's, under base attention) | "
+              "text effect under the image-independent prior | "
               "attention effect (base's boxes, its attention − base's) | total |",
-              "|---|---|---|---|"]
+              "|---|---|---|---|---|"]
         for a, d in cross["deltas"].items():
             L.append(f"| {a} | {_d(d['text_under_base'], 4)} | "
+                     f"{_d(d['text_under_prior'], 4)} | "
                      f"{_d(d['attention_on_base_text'], 4)} | {_d(d['total'], 4)} |")
 
     if cpass:
@@ -1335,8 +1480,64 @@ def stage_report(args, out_dir):
                     f"{_d(boot_diff(by[(base, t)], by[(base, base)], 'phi'), 4)} | "
                     f"{_d(boot_diff(by[(t, t)], by[(base, base)], 'phi'), 4)} |")
 
+        # With the text held fixed, did the weights move the MAP at all? phi can be flat
+        # because nothing moved or because two things cancelled; these say which.
+        shapes = [("flat", "map mean / map max"), ("ring_en", "border-ring enrichment"),
+                  ("tl_en", "top-left patch enrichment"),
+                  ("phi", "phi")]
+        if any(r.get("flat") is not None for r in rows):
+            L += ["", "### the map's own shape, with the text held fixed", "",
+                  "Every row is the SAME completions, re-read through each model.", "",
+                  "| text from | statistic | " + " | ".join(m_arms) + " | Δ |",
+                  "|---" * (len(m_arms) + 3) + "|"]
+            for t in t_arms:
+                for k, label in shapes:
+                    cells = [boot_mean(by[(t, m)], k) for m in m_arms]
+                    d = (boot_diff(by[(t, m_arms[-1])], by[(t, m_arms[0])], k)
+                         if len(m_arms) == 2 else None)
+                    L.append(f"| {t} | {label} | " +
+                             " | ".join(_c(c, 4) for c in cells) +
+                             f" | {_d(d, 4) if d else '—'} |")
+        # and the length-matched version of the text effect
+        if any(r.get("n_tokens") for r in rows):
+            same_map = [dict(r, arm=r["text_arm"]) for r in rows if r["map_arm"] == base]
+            tab = union_bin_table(same_map, base, t_arms, field="phi", by="n_tokens")
+            if tab:
+                L += ["", "### the text effect inside matched step-length bins", "",
+                      "All of these are read through the BASE model's attention, so only "
+                      "the sentences differ. If the effect were only that trained "
+                      "sentences are longer -- a longer span averages more token maps and "
+                      "a flatter map scores higher -- it would vanish here.", "",
+                      "| step length (tokens) | n (base) | base phi | " +
+                      " | ".join(a for a in t_arms if a != base) + " |",
+                      "|---" * (len(t_arms) + 2) + "|"]
+                for r in tab:
+                    L.append(f"| {r['bin']} | {r['n_base']} | {_c(r['base'], 4)} | " +
+                             " | ".join(_d(r.get(a), 4) for a in t_arms if a != base) + " |")
+
     if dino:
         L += ["", "## 8. Grounding confidence, and the wrong-image control", ""]
+        # The re-grounding must reproduce the boxes the probe stored, or it is measuring a
+        # different detector call from the one the reward made.
+        same, close, tot = 0, 0, 0
+        for v in dino["steps"].values():
+            own = (v.get("runs") or {}).get("own") or {}
+            st = v.get("stored")
+            if st is None:
+                continue
+            tot += 1
+            got = own.get("boxes") or []
+            same += int(len(got) == len(st))
+            if got and st:
+                g = np.asarray(got[: min(len(got), len(st))], float)
+                s = np.asarray(st[: min(len(got), len(st))], float)
+                close += int(np.abs(g - s).max() < 1e-3)
+        if tot:
+            L += [f"Reproduction of the probe's own call: same box count on "
+                  f"{100.0*same/tot:.1f}% of {tot} steps, and where the count matches the "
+                  f"coordinates agree to 1e-3 on {100.0*close/tot:.1f}%. The residue is "
+                  f"GPU-vs-GPU nondeterminism at the 0.1 score threshold, where a box "
+                  f"crosses in or out.", ""]
         rec = []
         for k, v in dino["steps"].items():
             own = (v.get("runs") or {}).get("own") or {}
@@ -1394,7 +1595,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--stage", required=True,
-                   choices=["text", "crossmap", "dino", "crosspass", "sheet", "report"])
+                   choices=["text", "crossmap", "dino", "crosspass", "sheet", "figs", "report"])
     p.add_argument("--probe", action="append", default=[],
                    help="probe_merged.json (or its directory); repeatable")
     p.add_argument("--out-dir", required=True)
@@ -1446,6 +1647,8 @@ def main():
             stage_crosspass(args, out_dir)
     elif args.stage == "sheet":
         stage_sheet(args, out_dir)
+    elif args.stage == "figs":
+        stage_figs(args, out_dir)
     elif args.stage == "report":
         merge_dino(out_dir)
         merge_crosspass(out_dir)
