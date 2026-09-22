@@ -16,24 +16,31 @@ Companion page: [reasoning-alignment.md](reasoning-alignment.md) asks whether th
 attention lands on the region the current step names. This page asks whether the *step*
 moved to meet the attention.
 
-## The answer in five lines
+## The answer in six lines
 
-1. **The grounding loop itself was not gamed.** Grounding succeeds on 100% of observation
-   sentences before and after training, the boxes barely move, the detector's confidence
-   goes *down* (0.496 → 0.481) while the own-image-vs-wrong-image gap goes *up*
-   (0.082 → 0.097), and every box statistic that does move moves further in the two arms
-   whose reward cannot see the text at all.
-2. **But the reward was gamed, through the text.** Teacher-forcing each arm's completions
-   through each model shows the whole reward gain is carried by the sentences:
-   text +0.0134 [+0.0102, +0.0167], attention −0.0005 [−0.0015, +0.0005], total +0.0130.
-3. **The channel is not groundability, it is span geometry.** 88% of the text effect lands
-   on `map mean / map max`, a statistic with no boxes in it: trained observation sentences
-   are 60% longer, a step's map is the mean over its tokens, and `phi` divides by that
-   map's own peak.
-4. **What is left over is real but small and still anti-localised**: union enrichment
-   0.774 → 0.838, i.e. the named region still receives *less* attention than the image
-   average.
-5. **The weights did move the attention** — the top-left sink shrinks 17% with the text
+1. **Grounding did not get easier.** It succeeds on 100% of observation sentences before
+   and after training, the detector's confidence goes *down* (0.496 → 0.481) while the
+   own-image-vs-wrong-image gap goes *up* (0.082 → 0.097), and the boxes get smaller and
+   slightly less central. The reviewer's "easy to localize" route is not the one taken.
+2. **The whole reward gain is carried by the text.** Teacher-forcing each arm's
+   completions through each model: text +0.0134 [+0.0102, +0.0167], attention
+   −0.0005 [−0.0015, +0.0005], total +0.0130. Holding the sentences fixed, the trained
+   weights are worth nothing on the reward they were trained on.
+3. **For `phi` the channel is span geometry, not grounding.** 88% of the text effect lands
+   on `map mean / map max`, a statistic with no boxes in it: observation sentences get 60%
+   longer, a step's map is the mean over its tokens, and `phi` divides by that map's own
+   peak.
+4. **Closing that route does not make the attention move.** `mean_in_v2` — the same
+   self-grounding loop scored by `mean(in)/mean(image)`, which has no peak to flatten
+   against — writes *shorter* steps and more of them, and its enrichment gain is likewise
+   100% text (attention −0.003 [−0.007, +0.001]).
+5. **What the text does instead is the reviewer's other hypothesis.** Against the human
+   box Saliency-R1-8K ships, the named regions become ~11% *less* concentrated
+   (enrichment 2.07 → 1.85 for `ours`, 1.85 for `mean_in_v2`, 1.81 for `center_rect`,
+   all \*) while getting *more* aligned with where this model's attention already goes.
+   The four arms with no attention reward do not move; neither does the arm whose target
+   is grounded on the question.
+6. **The weights did move the attention** — the top-left sink shrinks 17% with the text
    held fixed — but that movement is worth nothing on the reward.
 
 ## The arms, and why these controls
@@ -68,14 +75,15 @@ steps, is the reward. Five routes raise it without the model looking anywhere ne
 
 | | route | measured by | verdict |
 |---|---|---|---|
-| H1 | ground more often — an ungroundable step is skipped, not scored 0 | grounding rate | **no move; it was already at ceiling** |
-| H2 | ground bigger — a union that swallows the image regresses phi to a box-blind ratio | union area, box area | small move, and the controls move more |
-| H3 | ground where the attention already is — the map peaks on the border ring | union ring share/coverage, eccentricity | small move, wrong sign for "more central" |
-| H4 | say less — the reward is a mean over the steps | observe steps per completion | real, and every RL arm does it |
-| H5 | **say each thing at greater length** — a step's map is the mean over its tokens, so a longer span is a flatter map, and phi divides by the map's own peak | flatness with the text held fixed | **this is the one that fires: 88% of the effect** |
+| H1 | ground more often — an ungroundable step is skipped, not scored 0 | grounding rate, detector confidence, wrong-image control | **no; it was already at ceiling, and confidence falls** |
+| H2 | ground bigger — a union that swallows the image regresses phi to a box-blind ratio | union area, box area | small move, and the text-blind controls move more |
+| H3 | **ground where the attention already is** | the annotated-box test (§10), the image-independent prior | **yes — ~11% of annotated-box enrichment, in every arm with an attention reward** |
+| H4 | say less — the reward is a mean over the steps | observe steps per completion | real under `phi`, reversed under `mean_in_v2`, and every RL arm shortens |
+| H5 | **say each thing at greater length** — a step's map is the mean over its tokens, so a longer span is a flatter map, and phi divides by the map's own peak | flatness with the text held fixed | **yes under `phi`: 88% of the effect. Absent under `mean_in_v2`** |
 
-H1–H3 are the reviewer's hypotheses and none of them survives. H5 is not in the
-objection, is worse than the objection, and is what the data show.
+H1–H4 are the reviewer's hypotheses. H1 and H2 do not survive; H3 does, in a form that
+turns out not to be specific to self-grounding. H5 is not in the objection and is the
+larger of the two effects under the metric the paper actually trains on.
 
 ## H1. Grounding success does not move
 
@@ -290,6 +298,33 @@ sentences and **fewer** of them — and that is exactly what the trained policy 
 move, and the boxes did not move. The dominant term, flatness at +0.70, is the same one
 the cross pass isolates.
 
+### the same split on the metric that cannot be flattened
+
+`phi = flatness x enrichment`, and `enrichment` is exactly `mean_in_v2`: the same map on
+both sides of the ratio, chance 1.0, no peak to flatten against. Running the cross pass on
+that column instead:
+
+| arm | text effect | attention effect | total |
+|---|---|---|---|
+| `ours` | +0.065 [+0.039, +0.092] \* | −0.001 [−0.005, +0.003] | +0.066 [+0.039, +0.093] \* |
+| `mean_in_v2` | +0.090 [+0.068, +0.113] \* | −0.003 [−0.007, +0.001] | — |
+| `center_rect` | +0.093 [+0.056, +0.127] \* | — | — |
+| `question_boxes` | +0.069 [+0.036, +0.100] \* | — | — |
+| `no_sal` | −0.009 [−0.026, +0.007] | — | — |
+
+`mean_in_v2` is the arm that could not take the flatness route, and it did not: its step
+length went *down* (−0.93 tokens), its flatness barely moved (+0.0017 against `ours`'s
++0.0111), and its `phi` gain is a third of `ours`'s. Its **enrichment** gain is the
+largest of any arm — and it is **entirely text as well**: with its sentences held fixed,
+its weights are worth −0.003 [−0.007, +0.001].
+
+So the conclusion survives the metric change. Closing the flatness route does not make the
+attention move; it moves the policy to a different text route. Which one is Section 10.
+
+The enrichment gain is not an artifact of the unions getting bigger or landing on the
+border ring either — it survives matching on union area (+0.03 to +0.12 in every quartile)
+and on ring coverage (+0.04 to +0.09 in three of four).
+
 ### and the weights did move the attention — just not in a way `phi` sees
 
 With the text held fixed, the trained model's maps are not flatter (Δ −0.0006, n.s.) and
@@ -344,11 +379,12 @@ kept. Distributions in `fig_confidence.png`.
 
 | arm | boxes | best box's confidence | mean confidence | best confidence on a WRONG image | own − wrong |
 |---|---|---|---|---|---|
-| `base_coldstart` | 19.6 | 0.496 [0.483, 0.507] | 0.216 | 0.413 | 0.082 [0.071, 0.093] |
+| `base_coldstart` | 19.6 | 0.496 [0.483, 0.507] | 0.217 | 0.413 | 0.082 [0.071, 0.093] |
 | `no_sal` | 19.6 | 0.498 | 0.218 | 0.411 | 0.086 |
+| `mean_in_v2` | 21.3 | 0.494 [0.480, 0.506] | 0.215 | 0.410 | 0.084 [0.072, 0.095] |
 | `ours` | 26.0 | **0.481 [0.463, 0.499]** | 0.206 | 0.384 | **0.097 [0.085, 0.110]** |
 | `center_rect` | 28.9 | 0.461 | 0.200 | 0.352 | 0.109 |
-| `question_boxes` | 23.3 | 0.451 | 0.205 | 0.361 | 0.090 |
+| `question_boxes` | 23.3 | 0.451 | 0.205 | 0.362 | 0.090 |
 | `ease` / `dapo` / `saliency_r1` | 19.1–19.7 | 0.489–0.495 | 0.215–0.219 | 0.407–0.412 | 0.082–0.083 |
 
 Both columns point away from the objection:
@@ -366,15 +402,53 @@ image provided, there are cups with beverages on the table"* the returned `text_
 spans like *"based on the image provided, there are cups with beverages on the"* — it is
 grounding the sentence, not the nouns in it.
 
+## 10. The named regions drift away from the annotated ones
+
+The text effect on enrichment has two readings — *"the policy names what the attention
+already stares at"* (the reviewer's hypothesis) and *"the policy names what matters, and
+the attention already knew"* — and one target tells them apart because it owes nothing to
+the model: Saliency-R1-8K ships a **human box** per row, the same annotation Saliency-R1
+trains on. `--stage humanbox` scores every step's DINO union against it, over 17,092
+steps.
+
+| arm | recall of the human box | precision | enrichment (chance 1.0) | Δ enrichment |
+|---|---|---|---|---|
+| `base_coldstart` | 0.821 | 0.302 | **2.072** | — |
+| `no_sal` | 0.827 | 0.315 | 2.089 | +0.017 [−0.148, +0.154] |
+| `ease` | 0.836 | 0.310 | 2.092 | +0.020 [−0.143, +0.170] |
+| `dapo` | 0.835 | 0.310 | 2.031 | −0.040 [−0.182, +0.082] |
+| `saliency_r1` | 0.819 | 0.320 | 2.185 | +0.114 [−0.060, +0.271] |
+| `question_boxes` | 0.867 | 0.329 | 2.069 | +0.053 [−0.178, +0.313] |
+| **`ours`** | 0.849 | 0.285 | **1.852** | **−0.223 [−0.470, −0.031] \*** |
+| **`mean_in_v2`** | 0.793 | 0.288 | **1.853** | **−0.219 [−0.420, −0.065] \*** |
+| **`center_rect`** | 0.889 | 0.295 | **1.811** | **−0.275 [−0.541, −0.053] \*** |
+
+**The reviewer's hypothesis is the right one, in a broader form than posed.** The three
+arms trained against an attention target that is not the annotated region — the two
+self-grounding ones and the fixed rectangle — all name regions that are ~11% *less*
+concentrated on the human box than the cold start's, while being *more* aligned with
+where this model's attention generically goes (the image-independent prior gains
++0.0061 [+0.0017, +0.0104] for `ours` and +0.0055 [+0.0025, +0.0085] for `mean_in_v2`,
+and nothing for the text-blind arms). The four arms with no attention reward, and the one
+whose target is grounded on the **question** rather than on the policy's own words, do not
+move.
+
+Read the size of it before the sign: every arm stays at ~1.8–2.2× chance, and recall of
+the human box actually *rises* for `ours` (+0.029 \*). What moves is where the extra
+described area goes — toward regions the model was already looking at rather than toward
+the annotated one. It is a drift, not a collapse.
+
 ## Is the grounded phrase actually supported by the image?
 
-`--stage sheet` writes `outputs/selfground/holdout/sheet.html`: 120 steps, 30 per arm, one
-step per prompt, each rendered with the boxes the reward's mask was built from, in random
-order with the arm hidden behind a button. That is the instrument for the manual pass and
-it is ready to score.
+`--stage sheet` writes `outputs/selfground/holdout/sheet.html` (120 steps, 30 each for
+`base_coldstart`, `ours`, `no_sal`, `center_rect`) and
+`outputs/selfground/holdout2/sheet.html` (60 more, 30 each for `mean_in_v2` and
+`question_boxes`): one step per prompt, each rendered with the boxes the reward's mask was
+built from, in random order with the arm hidden behind a button. That is the instrument
+for the manual pass and it is ready to score.
 
-Pending a human, two things have been done on it. A **blind 40-item spot check** (10 per
-arm, graded by this assistant from the image and the sentence alone, arm hidden):
+Pending a human, a **blind 60-item spot check** (10 per arm, graded by this assistant from
+the image and the sentence alone, arm hidden):
 
 | arm | sentence supported: yes / partly / no | boxes on the referent: yes / partly / no |
 |---|---|---|
@@ -382,8 +456,12 @@ arm, graded by this assistant from the image and the sentence alone, arm hidden)
 | `no_sal` | 80% / 10% / 10% | 70% / 20% / 10% |
 | `center_rect` | 70% / 30% / 0% | 60% / 40% / 0% |
 | `ours` | 60% / 40% / 0% | 70% / 20% / 10% |
+| `mean_in_v2` † | 90% / 10% / 0% | 70% / 30% / 0% |
+| `question_boxes` † | 70% / 30% / 0% | 60% / 30% / 10% |
 
-39 of 40 sentences were at least partly supported and the one that was not came from
+† a second draw, from `outputs/selfground/holdout2/sheet.html`, same protocol.
+
+59 of 60 sentences were at least partly supported and the one that was not came from
 `no_sal`, so there is no hallucination signal here. The fully-supported rate is lower for
 `ours` (60% vs 80%) but at n = 10 per arm that is inside the noise, and the movement is
 `yes` → `partly` rather than into `no`: the trained arm's sentences are 60% longer and
@@ -403,24 +481,29 @@ has not been run.
 ## What this means for the paper
 
 The reviewer asked for six statistics and for the possibility to be studied rather than
-assumed away. All six are above, and on all six the self-grounding loop comes out clean:
-the policy did not learn to name easier objects, more central objects, or objects the
-attention was already on. That part of the answer can go in a rebuttal as it stands.
+assumed away. All six are above. Two of the three mechanisms named in the objection do not
+happen — the policy did not learn to name easier-to-localise objects, and it did not learn
+to name more central ones — and the statistics that would show them move the other way.
+The third one does happen, and the study turned up a fourth that is larger. Four
+consequences:
 
-The harder half is that the study turned up a different hack. `R_sal` can be raised by
-writing longer observation sentences, because a step's map is the mean over its tokens and
-`phi` is normalised by that map's own peak — and that is where essentially all of the
-measured gain comes from. Three consequences:
-
-1. **`phi` is not evidence of alignment.** Any claim of the form "training raised the
+1. **`phi` is not evidence of alignment.** Its gain is 100% text-mediated, and 88% of that
+   lands on a statistic with no boxes in it. Any claim of the form "training raised the
    saliency score, therefore attention aligned" needs the flatness column beside it
    ([reasoning-alignment.md](reasoning-alignment.md) makes the same point from the
-   translation null).
-2. **A length-normalised score would close this route.** Scoring the step's map after
-   subtracting or dividing out `map mean / map max` — or scoring per token and averaging
-   the scores rather than averaging the maps — removes the lever without changing the
-   reward's intent. Neither has been run.
-3. **What the weights did learn is still worth reporting**: a 17% cut in the top-left
+   translation null). Scoring per token and averaging the scores, rather than averaging
+   the maps and scoring once, would close that route; so does `mean_in_v2`, which is
+   already implemented and trained.
+2. **But closing it is not enough.** `mean_in_v2` cannot be flattened and its gain is
+   still 100% text — the policy moves to naming regions the attention already favours
+   instead. An attention reward whose target is chosen by the policy will be met by
+   moving the target.
+3. **The honest headline number is §10**: the described regions drift ~11% away from the
+   human-annotated ones, in every arm with an attention reward, including the one whose
+   mask is a fixed rectangle. Since `center_rect` shows it too, this is not a property of
+   *self*-grounding; it is what happens when a model is paid to look somewhere that is not
+   where the annotation is.
+4. **What the weights did learn is still worth reporting**: a 17% cut in the top-left
    sink with the text held fixed, which is a clean statement and does not depend on the
    reward at all.
 
@@ -434,21 +517,41 @@ wrong one).
 
 ## Reproducing
 
+The eight arms of `align-A…D` come from `analysis/reasoning-alignment`; the ninth
+(`mean_in_v2`) was generated by the same probe, from that same tree, so the generation
+path is identical:
+
 ```fish
-set -l A outputs/overlap_probe
-python selfground_audit.py --stage text  --probe $A/align-A --probe $A/align-B \
-    --probe $A/align-C --probe $A/align-D --out-dir outputs/selfground/holdout
-python selfground_audit.py --stage crossmap --probe $A/align-A --probe $A/align-B \
-    --probe $A/align-C --probe $A/align-D --out-dir outputs/selfground/holdout
-bash launch_selfground_audit_job.sh --name sg-dino --stage dino --duration 3 \
-    --out-dir outputs/selfground/holdout -- --probe $A/align-A --probe $A/align-C
-bash launch_selfground_audit_job.sh --name sg-crosspass --stage crosspass --duration 2 \
-    --out-dir outputs/selfground/holdout -- --probe $A/align-A --probe $A/align-C \
-    --text-arm base_coldstart --text-arm ours --map-arm base_coldstart --map-arm ours
-python selfground_audit.py --stage sheet  --out-dir outputs/selfground/holdout ...
-python selfground_audit.py --stage figs   --out-dir outputs/selfground/holdout ...
-python selfground_audit.py --stage report --out-dir outputs/selfground/holdout
+# the ninth arm, if it ever needs regenerating (~12 min on one 8-GPU node)
+bash launch_overlap_probe_job.sh --name sg-meanv2 --duration 1 --n-samples 100 \
+    --out-dir <...>/outputs/selfground/probe_meanv2 \
+    --trained-adapter mean_in_v2=<...>/checkpoint/grpo-coldstart_..._saliency_r1_8k_mean_in_v2/checkpoint-3990 \
+    -- --no-judge --dataset peterant330/saliency-r1-8k --split holdout \
+       --alt-head-sets allheads=all --skip-base
 ```
 
+Then, with `set -l P "--probe outputs/overlap_probe/align-A --probe ... --probe outputs/selfground/probe_meanv2"`:
+
+```fish
+set -l O outputs/selfground/holdout
+python selfground_audit.py --stage text     $P --out-dir $O   # seconds ... 5 min
+python selfground_audit.py --stage crossmap $P --out-dir $O
+python selfground_audit.py --stage humanbox $P --out-dir $O
+bash launch_selfground_audit_job.sh --name sg-dino --stage dino --duration 3 \
+    --out-dir $O -- $P --controls 3 --dino-batch-size 16
+bash launch_selfground_audit_job.sh --name sg-crosspass --stage crosspass --duration 2 \
+    --out-dir $O -- $P --text-arm base_coldstart --text-arm ours --text-arm no_sal \
+    --text-arm center_rect --map-arm base_coldstart --map-arm ours --base base_coldstart
+python selfground_audit.py --stage sheet    $P --out-dir $O --n-sheet 30
+python selfground_audit.py --stage figs        --out-dir $O
+python selfground_audit.py --stage report      --out-dir $O
+```
+
+A GPU stage run into a second directory joins the audit by copying its shards in under a
+higher index — `dino_shard0i.json` → `dino_shard1i.json`, likewise `crosspass_shard*` —
+which is how the ninth arm's detector run and the two extra cross-pass cells were added
+without re-running the first eight. `--stage report` merges every shard it finds.
+
 `--stage figs` needs matplotlib, which lives in `saliency_r1_qwen3_vllm`, not in
-`lmms_eval`.
+`lmms_eval`; `--stage humanbox` needs `HF_HOME` and `HF_HUB_OFFLINE=1` for the cached
+copy of the corpus.
