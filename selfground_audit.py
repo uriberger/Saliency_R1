@@ -56,6 +56,7 @@ image and one question, so resampling completions would understate the spread.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import importlib.util
 import json
@@ -297,7 +298,13 @@ def flatten(arms):
                                     if mask is not None and mask.any() else float("nan")),
                         ring_cover=(float(mask[ring].sum() / ring.sum())
                                     if mask is not None and mask.any() else float("nan")),
-                        phi=r.get("mean_in_raw"), auroc=r.get("auroc_raw"),
+                        phi=r.get("mean_in_raw"),
+                        # mean_in_v2 = mean(map in union) / mean(map over the image):
+                        # the same map on both sides, so the scale cancels and there is
+                        # no peak to flatten against. Chance is 1.0. It is the
+                        # enrichment factor phi hides -- phi = flatness x this.
+                        enrichment=r.get("mean_in_v2_raw"),
+                        auroc=r.get("auroc_raw"),
                         logratio=r.get("logratio_raw"),
                         map_max=r.get("map_max"), map_mean=r.get("map_mean"),
                         image_mass=r.get("image_mass"),
@@ -455,9 +462,10 @@ STEP_METRICS = [
     ("ring_cover", "share of the border ring the union covers"),
     ("n_tokens", "step length (tokens)"),
     ("phi", "phi = mean_in (the reward's per-step score)"),
+    ("flatness", "flatness = map mean / map max (box-blind)"),
+    ("enrichment", "enrichment = mean_in_v2 = phi / flatness (chance 1.0)"),
     ("logratio", "logratio vs the union's own translates"),
     ("auroc", "auroc of the map inside the union"),
-    ("flatness", "map mean / map max (box-blind)"),
 ]
 
 COMP_METRICS = [
@@ -849,11 +857,22 @@ def stage_dino(args, out_dir):
 
 
 def merge_dino(out_dir):
+    """Merge every dino_shard*.json in the directory.
+
+    Two arms that wrote the same sentence about the same picture share a key -- that is
+    the point, the detector is called once -- so a later shard must UNION the arm list
+    rather than replace it. Shards from a second run (dropped in as dino_shard1*.json)
+    merge the same way, which is how an arm probed later joins the audit.
+    """
     steps, meta = {}, None
     for f in sorted(out_dir.glob("dino_shard*.json")):
         d = json.load(open(f))
         meta = meta or {k: v for k, v in d.items() if k != "steps"}
-        steps.update(d["steps"])
+        for k, v in d["steps"].items():
+            prev = steps.get(k)
+            if prev is not None:
+                v = dict(v, arms=sorted(set(prev.get("arms", [])) | set(v.get("arms", []))))
+            steps[k] = v
     if not steps:
         return None
     payload = dict(meta or {}, steps=steps)
@@ -1208,6 +1227,72 @@ def judge_sheet(items, out_dir, args):
 
 
 # ---------------------------------------------------------------------------
+# stage: humanbox -- do the named regions get closer to the annotated one?
+# ---------------------------------------------------------------------------
+def stage_humanbox(args, out_dir):
+    """Score every step's DINO union against the row's HUMAN box.
+
+    The crossmap prior says the trained arms' unions sit where this model generically
+    looks. That has two readings -- "it names what it already stares at" (the reviewer's
+    hypothesis) and "it names what matters, and the attention already knew" -- and they
+    are told apart by a target that owes nothing to the model: Saliency-R1-8K ships one
+    annotated box per row, the same boxes Saliency-R1 trains on.
+
+    Reported per step, against that box H and the union U on the step's own patch grid:
+      recall      |U n H| / |H|          how much of the annotated region is named
+      precision   |U n H| / |U|          how much of what is named is annotated
+      enrichment  precision / (|H|/|P|)  1.0 = the union is placed at chance w.r.t. H
+    """
+    arms = load_arms(args.probe, keep=set(args.keep_arm) if args.keep_arm else None,
+                     drop=set(args.drop_arm) if args.drop_arm else None)
+    from datasets import load_dataset
+
+    ds = load_dataset(args.human_box_dataset, split="train")
+    boxes = {}
+    for qid, bb in zip(ds["question_id"], ds["bbox"]):
+        # the column is stored as a STRING, and a row may carry one box or several
+        if isinstance(bb, str):
+            try:
+                bb = ast.literal_eval(bb)
+            except (ValueError, SyntaxError):
+                continue
+        if bb and not isinstance(bb[0], (list, tuple)):
+            bb = [bb]
+        boxes[str(qid)] = [[float(v) for v in b] for b in bb] if bb else None
+    print(f"[humanbox] {len(boxes)} annotated rows from {args.human_box_dataset}", flush=True)
+
+    rows = []
+    for arm, rec in arms.items():
+        for s in rec["samples"]:
+            qid = str(s.get("question_id"))
+            hb = boxes.get(qid)
+            if not hb:
+                continue
+            for c in s["completions"]:
+                for r in c.get("observe_steps") or []:
+                    if not (r.get("mask_q") and r.get("grid") and r.get("grounded")):
+                        continue
+                    gh, gw = r["grid"]
+                    u = decode_mask(r["mask_q"], gh, gw)
+                    h = _raster(hb, gh, gw)
+                    nu, nh = float(u.sum()), float(h.sum())
+                    inter = float(np.logical_and(u, h).sum())
+                    if nu <= 0 or nh <= 0:
+                        continue
+                    prec = inter / nu
+                    rows.append(dict(
+                        arm=arm, qid=qid, sample=s.get("sample_index"), comp=c.get("index"),
+                        step=r.get("step_index"), recall=inter / nh, precision=prec,
+                        enrichment=prec / (nh / u.size),
+                        iou=inter / float(np.logical_or(u, h).sum()),
+                        human_area=nh / u.size, union_area=nu / u.size))
+    if not rows:
+        raise SystemExit("no steps matched an annotated row")
+    (out_dir / "humanbox.json").write_text(json.dumps({"rows": rows}))
+    print(f"[humanbox] {len(rows)} steps over {len(arms)} arms -> {out_dir}/humanbox.json")
+
+
+# ---------------------------------------------------------------------------
 # stage: figs -- the distributions behind the means
 # ---------------------------------------------------------------------------
 def stage_figs(args, out_dir):
@@ -1541,6 +1626,10 @@ def stage_report(args, out_dir):
         rows = cpass["rows"]
         by = defaultdict(list)
         for r in rows:
+            # phi = flatness x enrichment, and enrichment is exactly mean_in_v2: the same
+            # map on both sides of the ratio, so it cannot be moved by flattening.
+            r["enr"] = (r["phi"] / r["flat"]
+                        if r.get("flat") and r.get("phi") is not None else float("nan"))
             by[(r["text_arm"], r["map_arm"])].append(r)
         t_arms = sorted({r["text_arm"] for r in rows})
         m_arms = sorted({r["map_arm"] for r in rows})
@@ -1562,20 +1651,22 @@ def stage_report(args, out_dir):
                   f"r = {pearson(a, b):.3f}."]
         base = cpass.get("base") or (t_arms[0] if t_arms else None)
         if base:
-            L += ["", "| arm | text effect | attention effect | total |", "|---|---|---|---|"]
-            for t in t_arms:
-                if t == base:
-                    continue
-                L.append(
-                    f"| {t} | {_d(boot_diff(by[(t, base)], by[(base, base)], 'phi'), 4)} | "
-                    f"{_d(boot_diff(by[(base, t)], by[(base, base)], 'phi'), 4)} | "
-                    f"{_d(boot_diff(by[(t, t)], by[(base, base)], 'phi'), 4)} |")
+            for field, label, dec in (("phi", "phi", 4), ("enr", "enrichment", 3)):
+                L += ["", f"**{label}**", "",
+                      "| arm | text effect | attention effect | total |", "|---|---|---|---|"]
+                for t in t_arms:
+                    if t == base:
+                        continue
+                    L.append(
+                        f"| {t} | {_d(boot_diff(by[(t, base)], by[(base, base)], field), dec)} | "
+                        f"{_d(boot_diff(by[(base, t)], by[(base, base)], field), dec)} | "
+                        f"{_d(boot_diff(by[(t, t)], by[(base, base)], field), dec)} |")
 
         # With the text held fixed, did the weights move the MAP at all? phi can be flat
         # because nothing moved or because two things cancelled; these say which.
         shapes = [("flat", "map mean / map max"), ("ring_en", "border-ring enrichment"),
                   ("tl_en", "top-left patch enrichment"),
-                  ("phi", "phi")]
+                  ("phi", "phi"), ("enr", "enrichment (= mean_in_v2)")]
         if any(r.get("flat") is not None for r in rows):
             L += ["", "### the map's own shape, with the text held fixed", "",
                   "Every row is the SAME completions, re-read through each model.", "",
@@ -1681,6 +1772,35 @@ def stage_report(args, out_dir):
                      f"{frac('support','no')} | {frac('boxes_ok','yes')} | "
                      f"{sum(1 for r in R if r.get('judge_error'))} |")
 
+    hb_file = out_dir / "humanbox.json"
+    if hb_file.exists():
+        hb = json.loads(hb_file.read_text())["rows"]
+        hb_arms = sorted({r["arm"] for r in hb})
+        base = (text or {}).get("base") or hb_arms[0]
+        L += ["", "## 10. The named region against the ANNOTATED one", "",
+              "Saliency-R1-8K ships one human box per row. `enrichment` is the share of "
+              "the union that falls inside that box over the share expected if the union "
+              "were placed at chance, so 1.0 is chance and the union's size is divided "
+              "out.", "",
+              "| arm | steps | recall of the human box | precision | enrichment | IoU |",
+              "|---|---|---|---|---|---|"]
+        for a in [base] + [x for x in hb_arms if x != base]:
+            R = [r for r in hb if r["arm"] == a]
+            L.append(f"| {a} | {len(R)} | {_c(boot_mean(R, 'recall'), 3)} | "
+                     f"{_c(boot_mean(R, 'precision'), 3)} | "
+                     f"{_c(boot_mean(R, 'enrichment'), 3)} | {_c(boot_mean(R, 'iou'), 3)} |")
+        L += ["", "| arm | Δ recall | Δ precision | Δ enrichment | Δ IoU |",
+              "|---|---|---|---|---|"]
+        B = [r for r in hb if r["arm"] == base]
+        for a in hb_arms:
+            if a == base:
+                continue
+            A_ = [r for r in hb if r["arm"] == a]
+            L.append(f"| {a} | {_d(boot_diff(A_, B, 'recall'), 3)} | "
+                     f"{_d(boot_diff(A_, B, 'precision'), 3)} | "
+                     f"{_d(boot_diff(A_, B, 'enrichment'), 3)} | "
+                     f"{_d(boot_diff(A_, B, 'iou'), 3)} |")
+
     (out_dir / "report.md").write_text("\n".join(L) + "\n")
     print(f"[report] -> {out_dir}/report.md")
 
@@ -1689,7 +1809,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--stage", required=True,
-                   choices=["text", "crossmap", "dino", "crosspass", "sheet", "figs", "report"])
+                   choices=["text", "crossmap", "dino", "crosspass", "sheet", "humanbox", "figs", "report"])
     p.add_argument("--probe", action="append", default=[],
                    help="probe_merged.json (or its directory); repeatable")
     p.add_argument("--out-dir", required=True)
@@ -1709,6 +1829,9 @@ def main():
     p.add_argument("--map-arm", action="append", default=[])
     p.add_argument("--overlap-layer", type=int, default=22)
     p.add_argument("--overlap-heads", default="28,31")
+    # humanbox
+    p.add_argument("--human-box-dataset", default="peterant330/saliency-r1-8k",
+                   help="the corpus whose `bbox` column is the annotated region")
     # sheet
     p.add_argument("--n-sheet", type=int, default=25,
                    help="items per arm on the manual review sheet")
@@ -1741,6 +1864,8 @@ def main():
             stage_crosspass(args, out_dir)
     elif args.stage == "sheet":
         stage_sheet(args, out_dir)
+    elif args.stage == "humanbox":
+        stage_humanbox(args, out_dir)
     elif args.stage == "figs":
         stage_figs(args, out_dir)
     elif args.stage == "report":

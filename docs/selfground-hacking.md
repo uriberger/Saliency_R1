@@ -41,7 +41,8 @@ moved to meet the attention.
 | arm | what it is | can its text move its reward target? |
 |---|---|---|
 | `base_coldstart` | the cold start, before GRPO | — (no RL) |
-| `ours` | SELF-SALIENCY, `wov0.4`, 3,990 steps | **yes** — DINO grounds its own sentence |
+| `ours` | SELF-SALIENCY, `mean_in`, `wov0.4`, 3,990 steps | **yes** — DINO grounds its own sentence |
+| `mean_in_v2` | the same loop scored by `mean_in_v2`, `wov0.033`, 3,990 steps | **yes** — same grounding, different metric |
 | `no_sal` | the same GRPO run with `R_sal` removed | no — there is no saliency reward |
 | `center_rect` | `R_sal` against a fixed centred rectangle | **no** — the mask ignores the text |
 | `question_boxes` | `R_sal` against boxes grounded on the QUESTION | **no** — one mask per row |
@@ -50,7 +51,15 @@ moved to meet the attention.
 `no_sal` separates "RL drift" from "`R_sal` drift". `center_rect` and `question_boxes` are
 the sharper control: they are trained by an attention reward whose mask **cannot** depend
 on what the policy writes, so any text change they also show is not the self-grounding
-loop.
+loop. `mean_in_v2` is the fourth control and the most useful one: it keeps the
+self-grounding loop exactly as it is and changes only the scoring function, from
+
+    phi     = mean(map over the union) / max(map over the image)      (chance: unknown)
+    mean_in_v2 = mean(map over the union) / mean(map over the image)  (chance: 1.0)
+
+so the map's own scale cancels and there is no peak left to flatten against. Everything
+below that is specific to `phi`'s normalisation should disappear in that column — and it
+does.
 
 ## The five ways the loop could be gamed
 
@@ -74,7 +83,10 @@ objection, is worse than the objection, and is what the data show.
 |---|---|---|
 | base_coldstart | 100.0% [100.0, 100.0] | 95.7% [93.9, 97.2] |
 | ours | 100.0% [100.0, 100.0] | 96.4% [94.7, 98.0] |
-| Δ | +0.0 | +0.8 pp [−0.3, +1.9] |
+| mean_in_v2 | 100.0% [100.0, 100.0] | 94.1% [92.3, 95.8] |
+| center_rect | 100.0% [100.0, 100.0] | 95.6% [92.8, 98.0] |
+| question_boxes | 100.0% [100.0, 100.0] | 95.2% [92.2, 97.8] |
+| Δ ours | +0.0 | +0.8 pp [−0.3, +1.9] |
 
 At `--overlap_box_threshold 0.1` the detector returns *something* for **every one** of the
 14,981 observation sentences — zero empty box lists, in any arm. There is no headroom in
@@ -92,15 +104,15 @@ of a policy learning to dodge it.
 Over the steps the reward actually scored (`fig_boxes.png` has the distributions, which
 overlap almost completely):
 
-| metric | base_coldstart | ours | Δ ours | Δ center_rect (control) |
-|---|---|---|---|---|
-| boxes per step | 19.6 | 25.1 | +5.4 [+3.8, +7.2] \* | +9.4 [+7.3, +11.7] \* |
-| mean box area | 0.252 | 0.217 | −0.035 [−0.047, −0.023] \* | −0.055 \* |
-| union area | 0.533 | 0.566 | +0.034 [+0.015, +0.052] \* | +0.075 \* |
-| box centre distance from centre | 0.317 | 0.330 | +0.013 [+0.004, +0.023] \* | +0.020 \* |
-| union centroid distance from centre | 0.186 | 0.173 | −0.013 [−0.024, −0.003] \* | −0.036 \* |
-| share of the union on the border ring | 0.160 | 0.167 | +0.008 [−0.001, +0.017] | +0.016 \* |
-| share of the border ring covered | 0.344 | 0.375 | +0.032 [+0.012, +0.052] \* | +0.074 \* |
+| metric | base_coldstart | ours | mean_in_v2 | question_boxes | center_rect | Δ ours | Δ center_rect (control) |
+|---|---|---|---|---|---|---|---|
+| boxes per step | 19.6 | 25.1 | 21.0 | 22.4 | 28.4 | +5.4 [+3.8, +7.2] \* | +9.4 [+7.3, +11.7] \* |
+| mean box area | 0.252 | 0.217 | 0.263 | 0.234 | 0.197 | −0.035 [−0.047, −0.023] \* | −0.055 \* |
+| union area | 0.533 | 0.566 | 0.549 | 0.557 | 0.604 | +0.034 [+0.015, +0.052] \* | +0.075 \* |
+| box centre distance from centre | 0.317 | 0.330 | 0.329 | 0.320 | 0.336 | +0.013 [+0.004, +0.023] \* | +0.020 \* |
+| union centroid distance from centre | 0.186 | 0.173 | 0.198 | 0.168 | 0.150 | −0.013 [−0.024, −0.003] \* | −0.036 \* |
+| share of the union on the border ring | 0.160 | 0.167 | 0.181 | 0.155 | 0.175 | +0.008 [−0.001, +0.017] | +0.016 \* |
+| share of the border ring covered | 0.344 | 0.375 | 0.386 | 0.351 | 0.412 | +0.032 [+0.012, +0.052] \* | +0.074 \* |
 
 Read the two right-hand columns together. Every box statistic that moves under
 SELF-SALIENCY moves **further** under `center_rect`, whose reward is a fixed rectangle
@@ -129,6 +141,7 @@ about the image *less*, or just talks less.
 | dapo | 191.8 | 2.93 | 1.66 | 17.6 | 10.12 | 19.7 |
 | ease | 183.7 | 2.87 | 1.68 | 17.7 | 10.43 | 20.0 |
 | saliency_r1 | 160.2 | 2.73 | 1.84 | 15.4 | 10.52 | 18.5 |
+| **mean_in_v2** | **174.8** | **3.63** | **2.17** | **22.1** | **13.24** | **18.0** |
 | **ours** | **149.6** | 1.93 | **1.36** | 16.2 | **11.43** | 29.9 |
 | question_boxes | 111.1 | 0.83 | 0.80 | 7.3 | 6.73 | 32.7 |
 | center_rect | 128.9 | 0.82 | 0.64 | 10.0 | 7.81 | 47.5 |
@@ -154,6 +167,14 @@ Every RL arm shortens, including the three with no attention reward at all, and 
 arms whose mask cannot see the text prune hardest on every one of these rows. Duplicate
 observe steps are ~0.1% everywhere, so this is consolidation, not the degenerate step
 pruning seen on `set_a` (HANDOFF result 1).
+
+`mean_in_v2` is the row to read against `ours`: the same self-grounding loop, scored by a
+metric with no peak in the denominator, and it goes the **other way on every one of these
+columns** — 3.63 observe steps per completion against the cold start's 3.48 (2.17 vs 1.69
+per 100 tokens), steps that are no longer (18.0 vs 18.9 tokens), and the densest
+description of any arm at 13.24 content terms per 100 tokens. Whatever pushed `ours`
+toward fewer, longer observation sentences is a property of `phi`, not of grounding the
+policy's own text.
 
 One denominator warning: 40% of `center_rect`'s and 37% of `question_boxes`'s completions
 contain **no** observe step, so a "per completion" average taken only over completions
