@@ -52,10 +52,16 @@ steps, is the reward. Four routes raise it without moving any attention:
 | ours | 100.0% [100.0, 100.0] | 96.4% [94.7, 98.0] |
 | Δ | +0.0 | +0.8 pp [−0.3, +1.9] |
 
-At `--overlap_box_threshold 0.1` the detector returns *something* for every observation
-sentence in all 14,981 of them, so there is no headroom in "make it groundable" to exploit
-and no arm finds any. The ~4% that the reward does not score are steps whose union
-rasterises to nothing or covers the whole grid, and that rate is flat across arms too.
+At `--overlap_box_threshold 0.1` the detector returns *something* for **every one** of the
+14,981 observation sentences — zero empty box lists, in any arm. There is no headroom in
+"make it groundable" to exploit, and no arm finds any.
+
+The 4.1% (621 steps) the reward does not score fail for the opposite reason: 193 because
+every box exceeded the 0.5 per-box area cap, and 428 because the union of their (median
+23) boxes covered the entire patch grid and `_union_mask` refuses a saturated mask. The
+failure mode of this detector on this text is *too big*, never *not found* — and it gets
+rarer after training (120 steps for the cold start, 55 for `ours`), which is the opposite
+of a policy learning to dodge it.
 
 ## H2/H3. The boxes barely move, and the controls move more
 
@@ -80,9 +86,11 @@ loop is being steered. And the direction is not the reviewer's: the individual b
 *smaller* and their centres sit *further* from the image centre, not nearer.
 
 The step's sentence is what DINO is given, and it grounds the **whole sentence**, not the
-object phrases in it: the median step's union already covers half the patch grid before
-training. That is a design weakness of the reward (it is why `union_frac` is 0.53), but it
-is not something training made worse in any material way.
+object phrases in it — its returned `text_labels` are spans like
+*"the image provided, there are cups with beverages the table"*. The median scored step's
+union covers **55%** of the patch grid (p90: 86%) before training. That is a design
+weakness of the reward, and it is the main reason the box geometry has so little leverage
+on `phi`; but it is not something training made materially worse.
 
 ## H4. Every RL arm says less; the saliency arms say less still
 
@@ -123,33 +131,92 @@ description. Nothing resembling a groundability-seeking template.
 
 ## The decomposition: is the gain in the text or in the attention?
 
-The direct test. Score each arm's **own** boxes under **another** arm's attention on the
-same image. Two contrasts fall out:
+This is the test that answers the objection. Take each arm's completions, **teacher-force
+them through each model**, read the rewarded heads (L22, h28+31), and score them against
+the **same stored boxes**. Text and attention are then varied one at a time:
 
-* **text effect** = this arm's boxes − the base arm's boxes, both read through the *base*
-  model's attention. Everything here is language.
-* **attention effect** = the base arm's boxes, read through this arm's attention − through
-  the base's. Everything here is attention.
-
-Using each arm's per-image mean map as the stand-in for its per-step map (`crossmap`;
-n = 14,360 steps, the stand-in agrees with the per-step map at r = 0.77):
+| text from ↓ / attention from → | `base_coldstart` | `ours` |
+|---|---|---|
+| `base_coldstart` | 0.0457 [0.0416, 0.0502] | 0.0452 [0.0410, 0.0497] |
+| `no_sal` | 0.0450 | 0.0444 |
+| `ours` | **0.0591 [0.0538, 0.0653]** | 0.0587 [0.0533, 0.0647] |
+| `center_rect` | 0.0687 | 0.0694 |
 
 | arm | text effect | attention effect | total Δphi |
 |---|---|---|---|
-| `ours` | **+0.0021 [−0.0008, +0.0050]** | **+0.0083 [+0.0052, +0.0114] \*** | +0.0129 [+0.0096, +0.0164] \* |
-| `center_rect` | +0.0039 [+0.0006, +0.0072] \* | +0.0109 \* | +0.0220 \* |
-| `question_boxes` | +0.0035 [+0.0001, +0.0070] \* | +0.0072 \* | +0.0169 \* |
-| `no_sal` | −0.0013 [−0.0028, +0.0003] | −0.0039 \* | −0.0034 \* |
-| `ease` | +0.0002 | +0.0025 | +0.0049 \* |
-| `dapo` | −0.0017 | +0.0002 | −0.0007 |
+| `ours` | **+0.0134 [+0.0102, +0.0167] \*** | **−0.0005 [−0.0015, +0.0005]** | +0.0130 [+0.0097, +0.0164] \* |
+| `center_rect` | +0.0227 [+0.0181, +0.0273] \* | — | — |
+| `no_sal` | −0.0007 [−0.0020, +0.0006] | — | — |
 
-**About one sixth of SELF-SALIENCY's reward gain is attributable to what it says, and that
-sixth is not distinguishable from zero.** Four times as much comes from the attention. And
-the two arms whose mask cannot depend on the text have a *larger*, statistically clear
-text effect — which is the cleanest possible statement that this channel is not the
-self-grounding loop: it is the ordinary drift of RL'd prose landing on a detector.
+**The reviewer is right, and more strongly than the objection put it.** On the held-out
+prompts, *all* of SELF-SALIENCY's saliency-reward gain is carried by the sentences it
+writes: the cold-start model, unchanged, reading the trained model's completions, scores
+0.0591 — the trained model's own number. Hold the sentences fixed and the trained weights
+are worth −0.0005, an interval that excludes anything larger than +0.001.
 
-<!-- FILLED BY THE crosspass STAGE -->
+Three checks that this null is a null and not a mistake:
+
+* **the diagonal reproduces the probe.** Re-reading an arm's own text through its own
+  model gives 0.04571 against the probe's stored 0.04573 (cold start, r = 0.9993) and
+  0.05866 against 0.05864 (`ours`, r = 0.9999). The `ours` adapter is therefore loaded and
+  distinguishable — a failed adapter would have returned the 0.0591 of the base column.
+* **the two models really do give different maps.** On identical tokens, 0% of the 14,388
+  rows score identically, mean |Δphi| = 0.005 — the same size as the effect being hunted.
+  The attention moved; it just does not move the reward.
+* **`no_sal` is flat on both axes**, as an arm with no attention reward should be.
+
+### so the text does carry it — through what?
+
+Not through the grounding. Read every arm's sentences through the **same** (base) model and
+split `phi = flatness x enrichment`, where `flatness = map mean / map max` ignores the
+boxes entirely and `enrichment = phi / flatness` is how much better than the image average
+the union does:
+
+| text from | phi | flatness (no boxes) | enrichment | step length | union | step index in the chain |
+|---|---|---|---|---|---|---|
+| `base_coldstart` | 0.0457 | 0.0575 | 0.774 | 18.9 | 0.533 | 1.77 |
+| `no_sal` | 0.0450 | 0.0572 | 0.765 | 18.3 | 0.528 | 1.57 |
+| `ours` | 0.0591 | 0.0693 | 0.838 | 29.9 | 0.566 | 0.86 |
+| `center_rect` | 0.0687 | 0.0788 | 0.865 | 47.5 | 0.604 | 0.42 |
+
+| arm | Δphi | Δflatness | Δenrichment |
+|---|---|---|---|
+| `ours` | +0.0134 [+0.0102, +0.0167] \* | **+0.0118 [+0.0092, +0.0144] \*** | +0.065 [+0.039, +0.092] \* |
+| `center_rect` | +0.0227 \* | +0.0209 \* | +0.093 \* |
+| `no_sal` | −0.0007 | −0.0002 | −0.009 |
+
+**88% of the text effect is on a statistic that never looks at a box.** A step's map is the
+mean of its tokens' maps, so a longer span averages more peaks together and comes out
+flatter, and `phi` divides by the map's own maximum — a perfectly uniform map scores 1.0
+against any union whatsoever. The trained model writes observation sentences that are 60%
+longer and sit earlier in the chain, and that alone buys almost the whole reward.
+
+The residue is real but small: enrichment rises from 0.774 to 0.838. It is still **below
+1.0**, i.e. the union still receives *less* attention than the image average
+([reasoning-alignment.md](reasoning-alignment.md) reaches the same place from the
+translation null and the AUROC).
+
+Matching on step length does not remove the text effect (+0.006 to +0.015 in four of five
+length quintiles), so length is the largest single ingredient rather than the whole story;
+where in the chain the step sits, and what it talks about, carry the rest.
+
+### and the weights did move the attention — just not in a way `phi` sees
+
+With the text held fixed, the trained model's maps are not flatter (Δ −0.0006, n.s.) and
+their border-ring enrichment is unchanged (−0.012), but the **top-left sink does shrink**:
+enrichment 9.77 → 8.13 on the cold start's own sentences, −1.64 [−1.93, −1.34], about
+−17%, and the same on every arm's text. So Figure 5's corner effect is partly a real
+weight change — and partly the same text artifact, since the arms' own generations differ
+by −35% rather than −17%. It is worth about **zero** on the reward.
+
+### why the cheaper version of this test gets it backwards
+
+`--stage crossmap` does the same decomposition with each arm's **per-image mean map** as a
+stand-in for its per-step map, which needs no GPU. It reports the opposite: text +0.0021
+(n.s.), attention +0.0083 \*. The stand-in is contaminated — an arm's mean map over an
+image is computed *while that arm reads its own sentences*, so the text effect is inside
+the "attention" term. Do not use it; it is kept in the tool only because its disagreement
+with the exact pass is worth being able to reproduce.
 
 ## What phi actually responds to
 
