@@ -191,6 +191,13 @@ option letter. At the benchmark's own 4,096 tokens it recovers and scores 1.0
 Caption it as *enumerating versus rambling*, or as *where you look is not what you
 conclude*. Not as *grounded versus ungrounded*, which this picture does not show.
 
+Redrawn 2026-09-22 with `--upsample map` and `--overlay-mode alpha`. The four objects are
+now visible under the heat, where the old 0.5 blend left a grey wash, and the muddy
+purples the RGB resize invented are gone. Nothing else moved: every v2 in the table above
+and every step the script picked for base is the same number it was, because none of the
+three knobs reaches the scoring path. No blur -- see "Making it legible" for why 8x10 is
+the wrong grid for one.
+
 **`panel-dogbed/`** -- `val_natural` row 234, *"Where is on the dog bed?"*, gold `cat`.
 The widest margin gap on an unambiguous question (+1.24 against base's **-0.64**), but
 both models answer correctly and region B is scene furniture rather than something the
@@ -276,11 +283,27 @@ foreground becomes visibly diffuse rather than merely busy. Above about 1.5 the 
 bleed into each other and the quiet background stops being quiet.
 
 `--upsample map`, now the default, is the other half. Colouring the 32x32 grid and then
-resizing the *RGB* -- which `saliency_viz.py` and `fig1_panel.py` still do -- interpolates
-along a straight line between two colours of a ramp that is not straight, so a red patch
-beside a blue one yields muddy purples that jet does not contain and that read as a
-mid value which is not there. Interpolating the scalar field and colouring afterwards
-costs nothing and removes them. `--upsample rgb` reproduces the old figures.
+resizing the *RGB* -- which `saliency_viz.py` still does -- interpolates along a straight
+line between two colours of a ramp that is not straight, so a red patch beside a blue one
+yields muddy purples that jet does not contain and that read as a mid value which is not
+there. Interpolating the scalar field and colouring afterwards costs nothing and removes
+them. `--upsample rgb` reproduces the old figures.
+
+**Sigma is in patches, and the patch grid is not the same size twice.** `--smooth 1.0` is
+3.1% of the width on the 32x32 grid these benchmark panels have (1024px images), and 10.0%
+on the 8x10 grid a 320x240 picture gets -- three times the blur, on a grid where a single
+referent is already one patch out of eighty. There is no speckle to merge at that size:
+the bicubic in `--upsample map` is the whole of the fix, and `--smooth 0.4` on
+`panel-clevr/` is not distinguishable from `--smooth 0` while 1.0 melts four objects into
+one blob apiece. Read the grid off `maps.npz` before carrying a sigma from one figure to
+another; do not treat 1.0 as a default.
+
+`--overlay-mode alpha` is the third knob and the one a small, low-contrast picture needs.
+The default `blend` tints every pixel by `--alpha`, which on CLEVR's grey background hides
+the four objects the figure is entirely about; `alpha` paints the heat in proportion to
+the map, so the quiet parts stay the photograph and the object under the hot blob is still
+identifiable. `figure-clevr-2row-alpha/` and `figB-hrb-count-smooth-alpha/` are the same
+comparison on the other two figures.
 
 **The blur does not belong in a number.** It is a Gaussian smoother applied to the very
 statistic being scored, and it flatters us in both directions -- on the four panels above
@@ -336,8 +359,11 @@ bash launch_fig1_multistep_job.sh --name fig1ms-all --duration 1 \
 python fig1_report.py --json outputs/fig1-multistep/all.json
 python fig1_panel.py --json outputs/fig1-multistep/all.json \
     --sample sample_167_row000167 --out outputs/fig1-multistep/panel-motorcycle
+# the CLEVR panel. --overlay-mode alpha because its objects are small and low-contrast;
+# no --smooth, because its grid is 8x10 and there is nothing to merge ("Making it legible")
 python fig1_panel.py --json outputs/fig1-multistep/all.json \
-    --sample sample_007_row000007 --chain 2,3,4,5 --out outputs/fig1-multistep/panel-clevr
+    --sample sample_007_row000007 --chain 2,3,4,5 --overlay-mode alpha \
+    --out outputs/fig1-multistep/panel-clevr
 
 # the counting panel, smoothed. Drop --smooth to get figB-hrb-count/ back
 python fig1_steps_figure.py --run-dir outputs/saliency_viz/fig1b-hrbench \

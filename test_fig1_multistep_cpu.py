@@ -191,9 +191,48 @@ def test_render_smoothing():
           big.min() >= 0.0 and big.max() <= 1.0, f"[{big.min():.3f}, {big.max():.3f}]")
 
 
+def test_panel_render_knobs():
+    """The same knobs in fig1_panel.py, which has its own copy of them.
+
+    Two scripts draw the same sample and a figure is only comparable if they draw it the
+    same way, so the copies are gated against each other rather than re-tested. The second
+    half is the one that matters: `overlay` is the only place either script may blur, and
+    every number a panel prints is scored on the raw grid by the caller.
+    """
+    print("panel render knobs")
+    P = _load("_fig1p", "fig1_panel.py")
+    rng = np.random.default_rng(1)
+    m = rng.random((8, 10))
+    for sigma in (0.0, 0.7, 1.0):
+        check(f"the blur matches fig1_steps_figure at sigma {sigma}",
+              np.allclose(P.gaussian_blur(m, sigma), F.gaussian_blur(m, sigma)))
+    check("and so does the scalar upsample",
+          np.allclose(P.upsample_map(m, (32, 24), "map"), F.upsample_map(m, (32, 24), "map")))
+
+    # The trap this whole change is about: a render knob that reaches a scored array.
+    before = m.copy()
+    import types
+    from PIL import Image
+    import matplotlib
+    matplotlib.use("Agg")
+    args = types.SimpleNamespace(smooth=1.0, upsample="map", overlay_mode="alpha",
+                                 norm="percentile", norm_lo=1.0, norm_hi=99.0, alpha=0.5)
+    img = Image.new("RGB", (32, 24), (10, 20, 30))
+    out = P.overlay(img, m, matplotlib.colormaps["jet"], args)
+    check("overlay leaves its input map untouched", np.array_equal(m, before))
+    check("and returns the picture's own size", out.size == img.size, str(out.size))
+
+    # A scan records absolute paths into a worktree that is deleted by design.
+    stale = REPO / ".worktrees" / "gone-for-months" / "outputs" / "fig1-multistep"
+    check("a stale worktree prefix re-roots onto the shared outputs/",
+          not stale.exists() and P.rerooted(stale) == REPO / "outputs" / "fig1-multistep",
+          str(P.rerooted(stale)))
+    check("a path that resolves is returned unchanged", P.rerooted(REPO) == REPO)
+
+
 def main():
     for t in (test_raster, test_tight_referent, test_crossover_sign, test_answers,
-              test_render_smoothing):
+              test_render_smoothing, test_panel_render_knobs):
         t()
     print()
     if FAILED:

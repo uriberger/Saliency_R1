@@ -22,6 +22,20 @@ Output:
 
 CPU only. `--norm`/`--cmap`/`--alpha` are the saliency_viz render knobs and mean the same
 thing here; the default `percentile` 1-99 is what every other picture in this repo uses.
+
+`--smooth SIGMA`, `--upsample` and `--overlay-mode` are `fig1_steps_figure.py`'s and mean
+the same thing too, so the same sample drawn by either script is on one scale. A 32x32
+glimpse map over a 1024px photograph reads as speckle: `--smooth 1.0` merges the isolated
+hot patches into the regions they belong to (past ~1.5 the regions bleed together), and
+`--upsample map` -- the default since the RGB order was retired -- interpolates the scalar
+field and colours it afterwards instead of interpolating along a straight line between two
+colours of a ramp that is not straight, which invented purples jet does not contain.
+
+**None of the three reaches a number.** The blur is a smoother applied to the very
+statistic being scored and it flatters in both directions; every v2 in the captions and in
+the HTML tables, and every step this script picks for another model, is computed on the
+raw grid by `fig1_multistep.py`'s own reward code. `--upsample rgb --smooth 0` reproduces
+a panel drawn before 2026-09-22.
 """
 
 from __future__ import annotations
@@ -33,6 +47,30 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
+
+
+REPO = Path(__file__).resolve().parent
+
+
+def rerooted(p):
+    """A path the scan recorded, made readable from whichever tree is running now.
+
+    `run_dirs` and `sdir_i` go into the JSON as absolute paths, so they name the worktree
+    the scan was launched from -- and worktrees here are disposable, so by the time the
+    panel is redrawn that prefix is usually gone. `outputs/` is a symlink every tree
+    shares, so the file itself never moved: re-root on the last `outputs` component
+    instead of trusting the recorded prefix.
+    """
+    p = Path(p)
+    if p.exists():
+        return p
+    parts = p.parts
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i] == "outputs":
+            cand = REPO.joinpath(*parts[i:])
+            if cand.exists():
+                return cand
+    return p
 
 
 def normalize_map(m, mode, lo, hi):
@@ -51,10 +89,50 @@ def normalize_map(m, mode, lo, hi):
     return np.zeros_like(m) if not b > a else np.clip((m - a) / (b - a), 0.0, 1.0)
 
 
+def gaussian_blur(m, sigma):
+    """Separable Gaussian on the patch grid; `sigma` is in PATCHES, not pixels.
+
+    Edge-padded rather than zero-padded. The outer ring carries real mass in every
+    Qwen3-VL map -- the encoder stamps it -- and zero padding would dim exactly the ring
+    that the border numbers are about, turning a render knob into a silent edit of the
+    thing being shown.
+    """
+    m = np.asarray(m, dtype=np.float64)
+    if sigma <= 0:
+        return m
+    r = int(np.ceil(3 * sigma))
+    k = np.exp(-np.arange(-r, r + 1, dtype=np.float64) ** 2 / (2 * sigma ** 2))
+    k /= k.sum()
+    p = np.pad(m, r, mode="edge")
+    p = np.apply_along_axis(np.convolve, 1, p, k, "valid")
+    return np.apply_along_axis(np.convolve, 0, p, k, "valid")
+
+
+def upsample_map(x, size, mode):
+    """A normalised [0,1] patch grid resampled to `size`, still as a scalar field."""
+    resample = Image.NEAREST if mode == "nearest" else Image.BICUBIC
+    big = Image.fromarray(x.astype(np.float32), mode="F").resize(size, resample)
+    # bicubic overshoots at a sharp edge; the colormap's domain is [0, 1]
+    return np.clip(np.asarray(big, dtype=np.float64), 0.0, 1.0)
+
+
 def overlay(img, m, cmap, args):
-    x = normalize_map(m, args.norm, args.norm_lo, args.norm_hi)
-    rgb = (np.asarray(cmap(x))[..., :3] * 255).astype(np.uint8)
-    heat = Image.fromarray(rgb).resize(img.size, Image.BILINEAR)
+    """The map as colour over the picture. Cosmetic end to end -- every number in the
+    captions and in the tables is computed by the caller on the raw `maps`, never here."""
+    x = normalize_map(gaussian_blur(m, args.smooth), args.norm, args.norm_lo, args.norm_hi)
+    if args.upsample == "rgb":
+        rgb = (np.asarray(cmap(x))[..., :3] * 255).astype(np.uint8)
+        heat = Image.fromarray(rgb).resize(img.size, Image.BILINEAR)
+    else:
+        x = upsample_map(x, img.size, args.upsample)
+        heat = Image.fromarray((np.asarray(cmap(x))[..., :3] * 255).astype(np.uint8))
+    if args.overlay_mode == "alpha":
+        a = Image.fromarray((x * 255 * args.alpha).astype(np.uint8))
+        if a.size != img.size:
+            a = a.resize(img.size, Image.BILINEAR)
+        out = img.convert("RGB").copy()
+        out.paste(heat, (0, 0), a)
+        return out
     return Image.blend(img.convert("RGB"), heat, args.alpha)
 
 
@@ -248,8 +326,22 @@ def main():
     ap.add_argument("--norm", default="percentile", choices=["percentile", "minmax", "rank"])
     ap.add_argument("--norm-lo", type=float, default=1.0)
     ap.add_argument("--norm-hi", type=float, default=99.0)
+    ap.add_argument("--smooth", type=float, default=0.0, metavar="SIGMA",
+                    help="Gaussian blur on the patch grid before normalising, sigma in "
+                         "PATCHES. Cosmetic only -- every number in the captions and the "
+                         "tables is scored on the raw grid. 1.0 is the value the other "
+                         "figures use; 0 = off")
+    ap.add_argument("--upsample", default="map", choices=["map", "rgb", "nearest"],
+                    help="`map` interpolates the scalar field and colours it after "
+                         "(default); `rgb` colours the patch grid first and interpolates "
+                         "the colours, which is the older order and invents off-ramp "
+                         "hues; `nearest` does not interpolate at all")
     ap.add_argument("--cmap", default="jet")
     ap.add_argument("--alpha", type=float, default=0.5)
+    ap.add_argument("--overlay-mode", default="blend", choices=["blend", "alpha"],
+                    help="`blend` tints the whole picture by `--alpha`; `alpha` paints "
+                         "the heat in proportion to the map, so the quiet parts stay the "
+                         "photograph")
     ap.add_argument("--colour-a", default="#00ff66")
     ap.add_argument("--colour-b", default="#ff2fd0")
     args = ap.parse_args()
@@ -268,7 +360,7 @@ def main():
         raise SystemExit(f"--rank {args.rank} but only {len(cands)} candidates")
     c = cands[args.rank]
 
-    run_by_name = {Path(r).name: Path(r) for r in blob["run_dirs"]}
+    run_by_name = {Path(r).name: rerooted(r) for r in blob["run_dirs"]}
     run_dir = run_by_name[c["run"]]
     ours = blob["ours"]
     out = Path(args.out)
@@ -278,7 +370,7 @@ def main():
     # `--n-samples`, so the sample directory of the same name under another model is the
     # same row of the same dataset -- but reading the image once makes that explicit
     # rather than trusting it.
-    base_img = Image.open(Path(c["sdir_i"]) / "original.png").convert("RGB")
+    base_img = Image.open(rerooted(c["sdir_i"]) / "original.png").convert("RGB")
     boxes = {"A": c["boxes_i"], "B": c["boxes_j"]}
     colours = {"A": args.colour_a, "B": args.colour_b}
 
