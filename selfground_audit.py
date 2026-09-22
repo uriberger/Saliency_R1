@@ -224,6 +224,14 @@ def flatten(arms):
                 dup = 1.0 - (len(set(norm)) / len(norm)) if norm else float("nan")
                 phis = [r.get("mean_in_raw") for r in osteps
                         if r.get("grounded") and r.get("mean_in_raw") is not None]
+                # the completion's distinct content terms, and the two per-completion
+                # counts as RATES. Trained arms write much shorter completions, so a
+                # per-completion count mixes "how much it says about the image" with
+                # "how much it says"; the rates separate them.
+                comp_terms = set()
+                for r in osteps:
+                    comp_terms |= set(content_terms(r.get("text")))
+                clen = c.get("n_completion_tokens") or 0
                 toks = [r.get("n_tokens") for r in osteps if r.get("grounded")]
                 unions = [r.get("union_frac_uncapped") for r in osteps
                           if r.get("grounded") and r.get("union_frac_uncapped") is not None]
@@ -245,6 +253,13 @@ def flatten(arms):
                     n_sentences=len(sents),
                     n_observe_total=c.get("n_observe_steps_total"),
                     n_observe_scored=c.get("n_observe_steps_scored"),
+                    n_terms=len(comp_terms),
+                    observe_per_100tok=(100.0 * (c.get("n_observe_steps_total") or 0) / clen
+                                        if clen else float("nan")),
+                    terms_per_100tok=(100.0 * len(comp_terms) / clen
+                                      if clen else float("nan")),
+                    sentences_per_100tok=(100.0 * len(sents) / clen
+                                          if clen else float("nan")),
                     frac_observe=(labels.get("observe", 0) / len(sents)) if sents else float("nan"),
                     n_plan=labels.get("plan", 0), n_deduce=labels.get("deduce", 0),
                     n_none=labels.get("none", 0),
@@ -448,8 +463,12 @@ STEP_METRICS = [
 COMP_METRICS = [
     ("n_tokens", "completion length (tokens)"),
     ("n_sentences", "sentences per completion"),
+    ("sentences_per_100tok", "... per 100 completion tokens"),
     ("n_observe_total", "observe steps per completion"),
+    ("observe_per_100tok", "... per 100 completion tokens"),
     ("n_observe_scored", "observe steps actually scored"),
+    ("n_terms", "distinct content terms per completion"),
+    ("terms_per_100tok", "... per 100 completion tokens"),
     ("frac_observe", "share of sentences labelled observe"),
     ("n_plan", "plan steps"), ("n_deduce", "deduce steps"), ("n_none", "none steps"),
     ("dup_step_frac", "duplicate observe steps (frac)"),
@@ -516,16 +535,18 @@ def stage_text(args, out_dir):
         # vocabulary of the observation sentences (document frequency: a term counts once
         # per step, so one sentence repeating "cup" four times does not become four)
         terms = Counter()
-        by_comp = defaultdict(set)
         for r in S:
-            t = set(content_terms(r["text"]))
-            terms.update(t)
-            by_comp[(r["qid"], r["sample"], r["comp"])] |= t
+            terms.update(set(content_terms(r["text"])))
         arm["terms"] = terms.most_common(60)
         arm["n_terms"] = sum(terms.values())
-        # distinct content terms per completion: "how many different things does it name"
-        arm["distinct_terms_per_completion"] = boot_mean(
-            [dict(qid=k[0], n_types=len(v)) for k, v in by_comp.items()], "n_types")
+        # "how many different things does it name" -- over EVERY completion, including the
+        # ones with no observe step at all. Averaging only over completions that have one
+        # silently changes the denominator between arms: 40% of center_rect's completions
+        # have none.
+        arm["distinct_terms_per_completion"] = boot_mean(C, "n_terms")
+        arm["distinct_terms_per_100tok"] = boot_mean(C, "terms_per_100tok")
+        arm["completions_with_a_step"] = boot_mean(
+            [dict(qid=c["qid"], v=1.0 if c["n_observe_total"] else 0.0) for c in C], "v")
         res["arms"][a] = arm
 
     # paired deltas against the base arm
@@ -1433,9 +1454,13 @@ def stage_report(args, out_dir):
             L.append(f"| {name} | " +
                      " | ".join(_c(text["arms"][a]["frames"][name], 1, pct=True)
                                 for a in order) + " |")
-        L += ["", "| arm | distinct content terms per completion |", "|---|---|"]
+        L += ["", "| arm | distinct content terms per completion | ... per 100 completion "
+              "tokens | completions with at least one observe step |", "|---|---|---|---|"]
         for a in order:
-            L.append(f"| {a} | {_c(text['arms'][a]['distinct_terms_per_completion'], 2)} |")
+            x = text["arms"][a]
+            L.append(f"| {a} | {_c(x['distinct_terms_per_completion'], 2)} | "
+                     f"{_c(x['distinct_terms_per_100tok'], 2)} | "
+                     f"{_c(x['completions_with_a_step'], 1, pct=True)} |")
         L += ["", "The commonest things the observation sentences name (share of that "
               "arm's observe steps that use the term at least once):", ""]
         for a in order:

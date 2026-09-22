@@ -118,21 +118,46 @@ on `phi`; but it is not something training made materially worse.
 
 ## H4. Every RL arm says less; the saliency arms say less still
 
-| arm | observe steps / completion | Δ vs base | step length (tokens) |
-|---|---|---|---|
-| base_coldstart | 3.48 | — | 18.9 |
-| no_sal | 3.13 | −0.35 \* | 18.3 |
-| dapo | 2.93 | −0.55 \* | 19.7 |
-| ease | 2.87 | −0.61 \* | 20.0 |
-| ours | 1.93 | −1.55 \* | 29.9 |
-| question_boxes | 0.83 | −2.65 \* | 32.7 |
-| center_rect | 0.82 | −2.66 \* | 47.5 |
+Every GRPO arm shortens, so the per-completion counts have to be read next to the length
+they are counted over — the rate columns are the ones that say whether the model talks
+about the image *less*, or just talks less.
 
-This one is real and it is the strongest text effect in the data: SELF-SALIENCY writes
-about half as many observation sentences, each about 60% longer. But it is again *not*
-specific to self-grounding — the two arms with text-independent masks prune four times as
-hard. Duplicate observe steps are ~0.1% in every arm, so this is consolidation, not the
-degenerate step-pruning seen on `set_a` (HANDOFF result 1).
+| arm | completion length (tok) | observe steps / completion | per 100 tok | distinct content terms / completion | per 100 tok | step length (tok) |
+|---|---|---|---|---|---|---|
+| base_coldstart | 230.0 | 3.48 | 1.69 | 19.9 | 9.96 | 18.9 |
+| no_sal | 182.7 | 3.13 | 1.89 | 17.3 | 10.69 | 18.3 |
+| dapo | 191.8 | 2.93 | 1.66 | 17.6 | 10.12 | 19.7 |
+| ease | 183.7 | 2.87 | 1.68 | 17.7 | 10.43 | 20.0 |
+| saliency_r1 | 160.2 | 2.73 | 1.84 | 15.4 | 10.52 | 18.5 |
+| **ours** | **149.6** | 1.93 | **1.36** | 16.2 | **11.43** | 29.9 |
+| question_boxes | 111.1 | 0.83 | 0.80 | 7.3 | 6.73 | 32.7 |
+| center_rect | 128.9 | 0.82 | 0.64 | 10.0 | 7.81 | 47.5 |
+
+Paired deltas against the cold start, for `ours` and for the text-blind control:
+
+| | ours | center_rect |
+|---|---|---|
+| Δ completion length | −80.5 [−95.0, −67.0] \* | −101.1 \* |
+| Δ observe steps / completion | −1.55 [−1.76, −1.35] \* | −2.66 \* |
+| Δ observe steps per 100 tok | −0.32 [−0.41, −0.23] \* | −1.05 \* |
+| Δ distinct terms / completion | −3.70 [−4.62, −2.74] \* | −9.88 \* |
+| Δ distinct terms per 100 tok | **+1.47 [+1.00, +1.94] \*** | −2.15 \* |
+
+Two things change once the length is divided out. The step-count drop survives but shrinks
+from −44% to **−19%**: SELF-SALIENCY writes fewer observation sentences per token, not
+merely fewer sentences. And the vocabulary row **flips sign** — per 100 tokens the trained
+model names *more* distinct things (9.96 → 11.43, +15%), where `center_rect` names fewer.
+So the shorter completions are denser in image content, not emptier, which is the opposite
+of what a groundability hack would look like.
+
+Every RL arm shortens, including the three with no attention reward at all, and the two
+arms whose mask cannot see the text prune hardest on every one of these rows. Duplicate
+observe steps are ~0.1% everywhere, so this is consolidation, not the degenerate step
+pruning seen on `set_a` (HANDOFF result 1).
+
+One denominator warning: 40% of `center_rect`'s and 37% of `question_boxes`'s completions
+contain **no** observe step, so a "per completion" average taken only over completions
+that have one is not comparable across arms. Every number here is over all 800.
 
 ## Sentence frames and vocabulary
 
@@ -146,7 +171,8 @@ The generic-frame share does rise (+14.8 pp for "the image/picture/scene"), and 
 the pattern that went pathological on `set_a`, where the background frame reached 75–98%
 of steps. Here it does not: `background` is flat, and the frame that does rise rises
 *more* in the two arms whose reward cannot see the text. Distinct content terms per
-completion fall from 20.5 to 16.6, tracking the shorter completions.
+completion fall from 19.9 to 16.2 — but that is the shorter completion, not a thinner
+description: per 100 tokens they **rise**, 9.96 → 11.43 (H4).
 
 The largest log-odds shifts in `ours` against the cold start are `displays`, `key`,
 `back`, `standing`, `large`, `depicts`, `reads`, `gray` up and `mention`, `there's`,

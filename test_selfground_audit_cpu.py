@@ -205,6 +205,14 @@ check("...and a single step is not",
 c0 = [c for c in comp_rows if c["comp"] == 0][0]
 check("the sentence labels are counted", c0["n_plan"] == 1 and c0["n_deduce"] == 1
       and c0["n_none"] == 1 and np.isclose(c0["frac_observe"], 0.25))
+check("a completion's distinct content terms are counted off its observe steps",
+      c0["n_terms"] == 3 and
+      [c for c in comp_rows if c["comp"] == 1][0]["n_terms"] == 2,
+      str([c["n_terms"] for c in comp_rows]))
+check("...and the per-100-token rate divides by the completion, not by the step",
+      np.isclose(c0["terms_per_100tok"], 30.0) and
+      np.isclose(c0["observe_per_100tok"], 20.0),
+      f"{c0['terms_per_100tok']}, {c0['observe_per_100tok']}")
 r0 = steps_rows[0]
 check("the union's ring share is read off the stored mask",
       np.isclose(r0["ring_share"], 0.0), str(r0["ring_share"]))
