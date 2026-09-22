@@ -23,6 +23,22 @@ The render knobs are `saliency_viz.py`'s and mean the same thing: `--norm percen
 (1-99) is the default everywhere in this repo, so a panel here is on the same scale as one
 from `--stage render`. `--scale` only resamples for output -- the map is always normalised
 on the patch grid first.
+
+Two knobs exist because a 32x32 grid painted over a 1024px photograph reads as speckle:
+
+`--smooth SIGMA` blurs the patch grid, sigma in PATCHES, before normalising. It is purely
+cosmetic -- every AUROC, mean_in and v2 in `docs/fig1-multistep.md` is computed by
+`fig1_multistep.py` on the raw grid and no value here touches them. It merges the isolated
+hot patches a glimpse map is full of into the regions they belong to; past ~1.5 the
+regions bleed into each other and the quiet background stops being quiet, so it is off by
+default and 1.0 is the value the benchmark panels use.
+
+`--upsample map` (the default) interpolates the scalar field and colours it afterwards.
+The obvious order -- colour the 32x32 grid, then resize the RGB, which is what
+`saliency_viz.py` and `fig1_panel.py` still do -- interpolates *along a straight line in
+RGB* between two colours of a ramp that is not straight, so a red patch beside a blue one
+produces the muddy purples jet never contains, and they read as a mid value that is not
+there. `--upsample rgb` restores that order for comparison against an older figure.
 """
 
 from __future__ import annotations
@@ -64,13 +80,45 @@ def normalize_map(m, mode, lo, hi):
     return np.zeros_like(m) if not b > a else np.clip((m - a) / (b - a), 0.0, 1.0)
 
 
+def gaussian_blur(m, sigma):
+    """Separable Gaussian on the patch grid; `sigma` is in PATCHES, not pixels.
+
+    Edge-padded rather than zero-padded. The outer ring carries real mass in every
+    Qwen3-VL map -- the encoder stamps it -- and zero padding would dim exactly the ring
+    that the border numbers are about, turning a render knob into a silent edit of the
+    thing being shown.
+    """
+    m = np.asarray(m, dtype=np.float64)
+    if sigma <= 0:
+        return m
+    r = int(np.ceil(3 * sigma))
+    k = np.exp(-np.arange(-r, r + 1, dtype=np.float64) ** 2 / (2 * sigma ** 2))
+    k /= k.sum()
+    p = np.pad(m, r, mode="edge")
+    p = np.apply_along_axis(np.convolve, 1, p, k, "valid")
+    return np.apply_along_axis(np.convolve, 0, p, k, "valid")
+
+
+def upsample_map(x, size, mode):
+    """A normalised [0,1] patch grid resampled to `size`, still as a scalar field."""
+    resample = Image.NEAREST if mode == "nearest" else Image.BICUBIC
+    big = Image.fromarray(x.astype(np.float32), mode="F").resize(size, resample)
+    # bicubic overshoots at a sharp edge; the colormap's domain is [0, 1]
+    return np.clip(np.asarray(big, dtype=np.float64), 0.0, 1.0)
+
+
 def overlay(img, m, cmap, args):
-    x = normalize_map(m, args.norm, args.norm_lo, args.norm_hi)
-    rgb = (np.asarray(cmap(x))[..., :3] * 255).astype(np.uint8)
-    heat = Image.fromarray(rgb).resize(img.size, Image.BILINEAR)
+    x = normalize_map(gaussian_blur(m, args.smooth), args.norm, args.norm_lo, args.norm_hi)
+    if args.upsample == "rgb":
+        rgb = (np.asarray(cmap(x))[..., :3] * 255).astype(np.uint8)
+        heat = Image.fromarray(rgb).resize(img.size, Image.BILINEAR)
+    else:
+        x = upsample_map(x, img.size, args.upsample)
+        heat = Image.fromarray((np.asarray(cmap(x))[..., :3] * 255).astype(np.uint8))
     if args.overlay_mode == "alpha":
-        a = Image.fromarray((x * 255 * args.alpha).astype(np.uint8)).resize(
-            img.size, Image.BILINEAR)
+        a = Image.fromarray((x * 255 * args.alpha).astype(np.uint8))
+        if a.size != img.size:
+            a = a.resize(img.size, Image.BILINEAR)
         out = img.convert("RGB").copy()
         out.paste(heat, (0, 0), a)
         return out
@@ -155,6 +203,15 @@ def main():
     ap.add_argument("--norm", default="percentile", choices=["percentile", "minmax", "rank"])
     ap.add_argument("--norm-lo", type=float, default=1.0)
     ap.add_argument("--norm-hi", type=float, default=99.0)
+    ap.add_argument("--smooth", type=float, default=0.0, metavar="SIGMA",
+                    help="Gaussian blur on the patch grid before normalising, sigma in "
+                         "PATCHES. Cosmetic only -- no reported number is computed here. "
+                         "1.0 is what the benchmark panels use; 0 = off")
+    ap.add_argument("--upsample", default="map", choices=["map", "rgb", "nearest"],
+                    help="`map` interpolates the scalar field and colours it after "
+                         "(default); `rgb` colours the patch grid first and interpolates "
+                         "the colours, which is the older order and invents off-ramp "
+                         "hues; `nearest` does not interpolate at all")
     ap.add_argument("--cmap", default="jet")
     ap.add_argument("--alpha", type=float, default=0.5)
     ap.add_argument("--overlay-mode", default="blend", choices=["blend", "alpha"])

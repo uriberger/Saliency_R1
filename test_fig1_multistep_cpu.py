@@ -19,10 +19,16 @@ from pathlib import Path
 import numpy as np
 
 REPO = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location("_fig1ms", REPO / "fig1_multistep.py")
-M = importlib.util.module_from_spec(_spec)
-sys.modules["_fig1ms"] = M
-_spec.loader.exec_module(M)
+def _load(name: str, relpath: str):
+    spec = importlib.util.spec_from_file_location(name, REPO / relpath)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+M = _load("_fig1ms", "fig1_multistep.py")
+F = _load("_fig1sf", "fig1_steps_figure.py")    # the render knobs live here
 
 FAILED = []
 
@@ -148,8 +154,46 @@ def test_answers():
                   span="The cup is on a shelf. It is underneath it.")["soft"] is True)
 
 
+def test_render_smoothing():
+    """fig1_steps_figure.py's render knobs, which can edit the claim silently.
+
+    A blur is cosmetic only as long as it treats the outer ring like everywhere else.
+    Zero padding would not: it would pull the border towards zero, and the border is the
+    one region of a Qwen3-VL map that carries a claim of its own.
+    """
+    print("render smoothing")
+    rng = np.random.default_rng(0)
+    m = rng.random((16, 16))
+    check("sigma 0 is the identity, byte for byte",
+          np.array_equal(F.gaussian_blur(m, 0.0), m))
+
+    flat = np.full((16, 16), 0.7)
+    blurred = F.gaussian_blur(flat, 1.0)
+    check("a constant map stays constant, so the border is not dimmed",
+          float(blurred.max() - blurred.min()) < 1e-9,
+          f"spread {float(blurred.max() - blurred.min()):.2e}")
+
+    spike = np.zeros((16, 16))
+    spike[9, 4] = 1.0
+    check("an isolated peak keeps its location",
+          np.unravel_index(np.argmax(F.gaussian_blur(spike, 1.0)), (16, 16)) == (9, 4))
+    # The point of the knob: one hot patch alone loses to a cluster of warm ones.
+    two = np.zeros((16, 16))
+    two[2, 2] = 1.0
+    two[10:13, 10:13] = 0.4
+    sm = F.gaussian_blur(two, 1.0)
+    check("a cluster outranks a lone spike after blurring",
+          sm[11, 11] > sm[2, 2], f"{sm[11, 11]:.3f} vs {sm[2, 2]:.3f}")
+
+    big = F.upsample_map(np.clip(m, 0, 1), (64, 48), "map")
+    check("the scalar upsample lands on the image size", big.shape == (48, 64), str(big.shape))
+    check("and stays inside the colormap's domain despite bicubic overshoot",
+          big.min() >= 0.0 and big.max() <= 1.0, f"[{big.min():.3f}, {big.max():.3f}]")
+
+
 def main():
-    for t in (test_raster, test_tight_referent, test_crossover_sign, test_answers):
+    for t in (test_raster, test_tight_referent, test_crossover_sign, test_answers,
+              test_render_smoothing):
         t()
     print()
     if FAILED:

@@ -265,6 +265,31 @@ Ours answers `C. Two`. The cold start answers `D. One`. Its second step asserts 
 nobody else while its attention never leaves the foreground, and its referents cover a
 third of the picture each where ours are 4-8%.
 
+### Making it legible
+
+A 32x32 glimpse map painted over a 1024px photograph is speckle: the regions are there,
+but they are scattered single patches and the eye cannot assemble them.
+`figB-hrb-count-smooth/` is the same figure with `--smooth 1.0`, a Gaussian on the patch
+grid with sigma in patches, and it is the one to put in the paper -- the hat becomes one
+blob, the second person becomes one blob, and the cold start's diffuse wash over the
+foreground becomes visibly diffuse rather than merely busy. Above about 1.5 the regions
+bleed into each other and the quiet background stops being quiet.
+
+`--upsample map`, now the default, is the other half. Colouring the 32x32 grid and then
+resizing the *RGB* -- which `saliency_viz.py` and `fig1_panel.py` still do -- interpolates
+along a straight line between two colours of a ramp that is not straight, so a red patch
+beside a blue one yields muddy purples that jet does not contain and that read as a
+mid value which is not there. Interpolating the scalar field and colouring afterwards
+costs nothing and removes them. `--upsample rgb` reproduces the old figures.
+
+**The blur does not belong in a number.** It is a Gaussian smoother applied to the very
+statistic being scored, and it flatters us in both directions -- on the four panels above
+AUROC goes 0.684 -> 0.858, 0.703 -> 0.909, 0.559 -> 0.668 and 0.437 -> 0.379 at sigma 1.0.
+That is a real signal-to-noise statement (a region's attention is better estimated by a
+local average than by one patch) and it is not the statement the table makes. Every AUROC,
+`mean_in` and v2 in this document is `fig1_multistep.py` on the raw grid; the table above
+stays as it is, and the smoothed picture is a rendering of it, not a second measurement.
+
 Two more worth keeping, both with the cold start failing on attention but matching on the
 answer: `figB-wemath/` (WeMath, a parallelogram diagram -- five consecutive steps at
 AUROC 0.85-0.92, each on the dimension label its sentence names: 30 cm, then 14 cm, then
@@ -313,6 +338,14 @@ python fig1_panel.py --json outputs/fig1-multistep/all.json \
     --sample sample_167_row000167 --out outputs/fig1-multistep/panel-motorcycle
 python fig1_panel.py --json outputs/fig1-multistep/all.json \
     --sample sample_007_row000007 --chain 2,3,4,5 --out outputs/fig1-multistep/panel-clevr
+
+# the counting panel, smoothed. Drop --smooth to get figB-hrb-count/ back
+python fig1_steps_figure.py --run-dir outputs/saliency_viz/fig1b-hrbench \
+    --model ours --model coldstart --sample sample_029_row000029 \
+    --map glimpse --boxes outputs/fig1-multistep/bench_b.json \
+    --cols 3 --scale 0.8 --smooth 1.0 \
+    --question "HR-Bench 4K:  How many people are there in the image?   A. Three   B. Four   C. Two   D. One    (gold: C)" \
+    --out outputs/fig1-multistep/figB-hrb-count-smooth
 ```
 
 `--chain` is the N-object mode and `--rank`/`--sample` the two-region one; the second
