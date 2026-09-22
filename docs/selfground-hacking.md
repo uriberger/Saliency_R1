@@ -19,8 +19,10 @@ moved to meet the attention.
 ## The answer in five lines
 
 1. **The grounding loop itself was not gamed.** Grounding succeeds on 100% of observation
-   sentences before and after training, the boxes barely move, and every box statistic
-   that does move moves further in the two arms whose reward cannot see the text at all.
+   sentences before and after training, the boxes barely move, the detector's confidence
+   goes *down* (0.496 → 0.481) while the own-image-vs-wrong-image gap goes *up*
+   (0.082 → 0.097), and every box statistic that does move moves further in the two arms
+   whose reward cannot see the text at all.
 2. **But the reward was gamed, through the text.** Teacher-forcing each arm's completions
    through each model shows the whole reward gain is carried by the sentences:
    text +0.0134 [+0.0102, +0.0167], attention −0.0005 [−0.0015, +0.0005], total +0.0130.
@@ -284,7 +286,38 @@ at r ≈ 0. The lever on this reward is the shape of the attention map, not the 
 the boxes — which is both why the language route is weak and why the reward is a weaker
 measure of grounding than it looks.
 
-<!-- FILLED BY THE dino STAGE -->
+## Grounding confidence, and the wrong-image control
+
+The reward throws away two things Grounding-DINO returns: the per-box score, and the
+phrase each box matched. `--stage dino` re-grounds every distinct (image, sentence) —
+14,676 of them — and keeps both, then repeats the call on **three other holdout images**.
+The re-grounding reproduces the mask the probe stored (union IoU 0.985 on average, median
+1.000, box count median Δ 0), so this is the reward's own detector call with its receipts
+kept. Distributions in `fig_confidence.png`.
+
+| arm | boxes | best box's confidence | mean confidence | best confidence on a WRONG image | own − wrong |
+|---|---|---|---|---|---|
+| `base_coldstart` | 19.6 | 0.496 [0.483, 0.507] | 0.216 | 0.413 | 0.082 [0.071, 0.093] |
+| `no_sal` | 19.6 | 0.498 | 0.218 | 0.411 | 0.086 |
+| `ours` | 26.0 | **0.481 [0.463, 0.499]** | 0.206 | 0.384 | **0.097 [0.085, 0.110]** |
+| `center_rect` | 28.9 | 0.461 | 0.200 | 0.352 | 0.109 |
+| `question_boxes` | 23.3 | 0.451 | 0.205 | 0.361 | 0.090 |
+| `ease` / `dapo` / `saliency_r1` | 19.1–19.7 | 0.489–0.495 | 0.215–0.219 | 0.407–0.412 | 0.082–0.083 |
+
+Both columns point away from the objection:
+
+* **The trained model's sentences ground slightly *less* confidently**, 0.496 → 0.481, not
+  more. If the policy had learned to name things the detector finds easily, this is the
+  column that would have risen.
+* **They are *more* image-specific, not less.** Every sentence grounds on a wrong image
+  too — at a 0.1 threshold Grounding-DINO always returns something, which is worth
+  knowing on its own — but the own-image advantage grows from 0.082 to 0.097. A policy
+  drifting toward "say things that would ground anywhere" would have shrunk it.
+
+The detector's matched phrases explain the enormous unions: for the sentence *"Based on the
+image provided, there are cups with beverages on the table"* the returned `text_labels` are
+spans like *"based on the image provided, there are cups with beverages on the"* — it is
+grounding the sentence, not the nouns in it.
 
 ## Is the grounded phrase actually supported by the image?
 

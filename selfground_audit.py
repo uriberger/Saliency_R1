@@ -90,6 +90,18 @@ def decode_map(b64, gh, gw, mx):
     return _u8(b64).astype(np.float64).reshape(gh, gw) * (float(mx) / 255.0)
 
 
+def _raster(boxes, gh=10, gw=16):
+    """Relative boxes -> the patch mask, the way overlap_rewards._raster_union does it
+    (a patch is in if any box covers any of it). Only used to compare two box lists."""
+    m = np.zeros((gh, gw), bool)
+    for b in boxes or []:
+        x1, y1, x2, y2 = [float(v) for v in b]
+        c0, c1 = int(np.floor(x1 * gw)), int(np.ceil(x2 * gw))
+        r0, r1 = int(np.floor(y1 * gh)), int(np.ceil(y2 * gh))
+        m[max(r0, 0):min(r1, gh), max(c0, 0):min(c1, gw)] = True
+    return m
+
+
 def ring_mask(gh, gw):
     m = np.zeros((gh, gw), dtype=bool)
     m[0, :] = m[-1, :] = True
@@ -1571,27 +1583,30 @@ def stage_report(args, out_dir):
 
     if dino:
         L += ["", "## 8. Grounding confidence, and the wrong-image control", ""]
-        # The re-grounding must reproduce the boxes the probe stored, or it is measuring a
-        # different detector call from the one the reward made.
-        same, close, tot = 0, 0, 0
+        # The re-grounding must reproduce the MASK the probe stored, or it is measuring a
+        # different detector call from the one the reward made. Box-for-box identity is
+        # the wrong test: this stage batches by (step, control image) where the probe
+        # batched a sample's steps on one image, and Grounding-DINO's processor pads a
+        # batch to a common canvas, so borderline boxes cross the 0.1 threshold either
+        # way. What has to survive is the union.
+        dn, ious = [], []
         for v in dino["steps"].values():
             own = (v.get("runs") or {}).get("own") or {}
-            st = v.get("stored")
-            if st is None:
+            st, got = v.get("stored"), own.get("boxes")
+            if st is None or got is None:
                 continue
-            tot += 1
-            got = own.get("boxes") or []
-            same += int(len(got) == len(st))
-            if got and st:
-                g = np.asarray(got[: min(len(got), len(st))], float)
-                s = np.asarray(st[: min(len(got), len(st))], float)
-                close += int(np.abs(g - s).max() < 1e-3)
-        if tot:
-            L += [f"Reproduction of the probe's own call: same box count on "
-                  f"{100.0*same/tot:.1f}% of {tot} steps, and where the count matches the "
-                  f"coordinates agree to 1e-3 on {100.0*close/tot:.1f}%. The residue is "
-                  f"GPU-vs-GPU nondeterminism at the 0.1 score threshold, where a box "
-                  f"crosses in or out.", ""]
+            dn.append(len(got) - len(st))
+            a, b = _raster(st), _raster(got)
+            u = float(np.logical_or(a, b).sum())
+            ious.append(float(np.logical_and(a, b).sum() / u) if u else 1.0)
+        if ious:
+            dn, ious = np.array(dn), np.array(ious)
+            L += [f"Reproduction of the probe's own call, over {len(ious)} steps: union "
+                  f"IoU on a 10x16 raster is {ious.mean():.3f} on average "
+                  f"({100.0*np.mean(ious > 0.9):.1f}% above 0.9, median "
+                  f"{np.median(ious):.3f}), and the box count differs by a median of "
+                  f"{np.median(dn):+.0f} ({100.0*np.mean(np.abs(dn) <= 2):.0f}% within "
+                  f"two).", ""]
         rec = []
         for k, v in dino["steps"].items():
             own = (v.get("runs") or {}).get("own") or {}
