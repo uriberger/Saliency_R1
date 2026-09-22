@@ -212,8 +212,19 @@ def flatten(arms):
                 dup = 1.0 - (len(set(norm)) / len(norm)) if norm else float("nan")
                 phis = [r.get("mean_in_raw") for r in osteps
                         if r.get("grounded") and r.get("mean_in_raw") is not None]
+                toks = [r.get("n_tokens") for r in osteps if r.get("grounded")]
+                unions = [r.get("union_frac_uncapped") for r in osteps
+                          if r.get("grounded") and r.get("union_frac_uncapped") is not None]
+                flats = [(r.get("map_mean") / r.get("map_max")) for r in osteps
+                         if r.get("grounded") and r.get("map_max")]
                 comps.append(dict(
                     arm=arm, qid=qid, sample=s.get("sample_index"), comp=c.get("index"),
+                    # per-completion aggregates of the scored steps, so the within-group
+                    # correlations below are over the same unit as the reward
+                    mean_step_tokens=float(np.mean(toks)) if toks else float("nan"),
+                    n_scored=len(toks),
+                    mean_union=float(np.mean(unions)) if unions else float("nan"),
+                    mean_flatness=float(np.mean(flats)) if flats else float("nan"),
                     image=s.get("image_file"), question=s.get("question"),
                     gt=s.get("gt_answer"), text=c.get("text"),
                     n_tokens=c.get("n_completion_tokens"),
@@ -324,6 +335,33 @@ def boot_diff(rows_a, rows_b, value, where=None, n_boot=N_BOOT, seed=SEED):
           - sb[idx].sum(1) / np.maximum(nb[idx].sum(1), 1))
     lo, hi = np.percentile(bs, [2.5, 97.5])
     return point, float(lo), float(hi), len(keys)
+
+
+def within_group_corr(rows, field, reward="reward"):
+    """Group-centred correlation of `field` with the reward, inside a prompt's rollouts.
+
+    This is the only signal GRPO has. The advantage subtracts the group mean, so a
+    property that does not vary BETWEEN the 8 rollouts of one prompt contributes nothing
+    however large it is; what the policy can learn is exactly what this correlates with.
+    Measured on the COLD START it is a prediction about which way the run will drift.
+    """
+    groups = defaultdict(list)
+    for r in rows:
+        groups[r["qid"]].append(r)
+    xs, ys = [], []
+    for g in groups.values():
+        a = np.array([r.get(field, np.nan) if r.get(field) is not None else np.nan
+                      for r in g], float)
+        b = np.array([r.get(reward, np.nan) if r.get(reward) is not None else np.nan
+                      for r in g], float)
+        ok = np.isfinite(a) & np.isfinite(b)
+        if ok.sum() < 3:
+            continue
+        xs.append(a[ok] - a[ok].mean())
+        ys.append(b[ok] - b[ok].mean())
+    if not xs:
+        return float("nan"), 0
+    return pearson(np.concatenate(xs), np.concatenate(ys)), int(sum(len(v) for v in xs))
 
 
 def pearson(x, y):
@@ -452,6 +490,12 @@ def stage_text(args, out_dir):
             arm.setdefault("phi_corr", {})[k] = [
                 pearson([r["phi"] for r in gs], [r[k] for r in gs]),
                 spearman([r["phi"] for r in gs], [r[k] for r in gs])]
+        # what does the reward PAY FOR, inside a prompt's eight rollouts? -- the only
+        # direction GRPO can move in, and on the cold start a prediction about the drift
+        for k in ("mean_step_tokens", "n_scored", "mean_union", "mean_flatness",
+                  "n_tokens", "n_observe_total"):
+            r, n = within_group_corr(C, k)
+            arm.setdefault("within_group", {})[k] = [r, n]
         # generic sentence frames
         for name, pat in GENERIC_FRAMES.items():
             rx = re.compile(pat, re.I)
@@ -1407,6 +1451,17 @@ def stage_report(args, out_dir):
                 for r in tab:
                     L.append(f"| {r['bin']} | {r['n_base']} | {_c(r['base'], 4)} | " +
                              " | ".join(_d(r.get(a), 4) for a in order[1:]) + " |")
+
+        if "within_group" in text["arms"][order[0]]:
+            wg = list(text["arms"][order[0]]["within_group"])
+            L += ["", "### what the reward pays for inside a prompt's rollouts", "",
+                  "GRPO subtracts the group mean, so only what varies BETWEEN the eight "
+                  "rollouts of one prompt can be learned. Read the base row as a "
+                  "prediction about which way a run will drift.", "",
+                  "| arm | " + " | ".join(wg) + " |", "|---" * (len(wg) + 1) + "|"]
+            for a in order:
+                L.append(f"| {a} | " + " | ".join(
+                    f"{text['arms'][a]['within_group'][k][0]:+.3f}" for k in wg) + " |")
 
         L += ["", "## 5. What is phi riding on, inside each arm?", "",
               "Pearson (Spearman) of the per-step score against the step's own geometry.", "",

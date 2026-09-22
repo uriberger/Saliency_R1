@@ -16,6 +16,24 @@ Companion page: [reasoning-alignment.md](reasoning-alignment.md) asks whether th
 attention lands on the region the current step names. This page asks whether the *step*
 moved to meet the attention.
 
+## The answer in five lines
+
+1. **The grounding loop itself was not gamed.** Grounding succeeds on 100% of observation
+   sentences before and after training, the boxes barely move, and every box statistic
+   that does move moves further in the two arms whose reward cannot see the text at all.
+2. **But the reward was gamed, through the text.** Teacher-forcing each arm's completions
+   through each model shows the whole reward gain is carried by the sentences:
+   text +0.0134 [+0.0102, +0.0167], attention −0.0005 [−0.0015, +0.0005], total +0.0130.
+3. **The channel is not groundability, it is span geometry.** 88% of the text effect lands
+   on `map mean / map max`, a statistic with no boxes in it: trained observation sentences
+   are 60% longer, a step's map is the mean over its tokens, and `phi` divides by that
+   map's own peak.
+4. **What is left over is real but small and still anti-localised**: union enrichment
+   0.774 → 0.838, i.e. the named region still receives *less* attention than the image
+   average.
+5. **The weights did move the attention** — the top-left sink shrinks 17% with the text
+   held fixed — but that movement is worth nothing on the reward.
+
 ## The arms, and why these controls
 
 | arm | what it is | can its text move its reward target? |
@@ -32,10 +50,10 @@ the sharper control: they are trained by an attention reward whose mask **cannot
 on what the policy writes, so any text change they also show is not the self-grounding
 loop.
 
-## The four ways the loop could be gamed
+## The five ways the loop could be gamed
 
 `phi(s) = mean(map over the union) / max(map over the image)`, averaged over the observe
-steps, is the reward. Four routes raise it without moving any attention:
+steps, is the reward. Five routes raise it without the model looking anywhere new:
 
 | | route | measured by | verdict |
 |---|---|---|---|
@@ -43,6 +61,10 @@ steps, is the reward. Four routes raise it without moving any attention:
 | H2 | ground bigger — a union that swallows the image regresses phi to a box-blind ratio | union area, box area | small move, and the controls move more |
 | H3 | ground where the attention already is — the map peaks on the border ring | union ring share/coverage, eccentricity | small move, wrong sign for "more central" |
 | H4 | say less — the reward is a mean over the steps | observe steps per completion | real, and every RL arm does it |
+| H5 | **say each thing at greater length** — a step's map is the mean over its tokens, so a longer span is a flatter map, and phi divides by the map's own peak | flatness with the text held fixed | **this is the one that fires: 88% of the effect** |
+
+H1–H3 are the reviewer's hypotheses and none of them survives. H5 is not in the
+objection, is worse than the objection, and is what the data show.
 
 ## H1. Grounding success does not move
 
@@ -200,14 +222,37 @@ Matching on step length does not remove the text effect (+0.006 to +0.015 in fou
 length quintiles), so length is the largest single ingredient rather than the whole story;
 where in the chain the step sits, and what it talks about, carry the rest.
 
+### the drift was predictable from the reward at step 0
+
+GRPO subtracts the group mean, so the only thing a run can learn is what varies between
+the eight rollouts of one prompt. Measure that on the **cold start**, before any training:
+
+| within a prompt, the overlap reward correlates with | cold start | ours |
+|---|---|---|
+| mean observation-step length | **+0.205** | +0.171 |
+| number of scored observation steps | **−0.102** | −0.047 |
+| mean map flatness (box-blind) | +0.704 | +0.691 |
+| mean union area | +0.069 | +0.207 |
+| completion length | −0.016 | +0.059 |
+
+The reward, as sampled from the untrained policy, already paid for **longer** observation
+sentences and **fewer** of them — and that is exactly what the trained policy does: 18.9 →
+29.9 tokens per step, 3.48 → 1.93 steps per completion. Nothing here needed the boxes to
+move, and the boxes did not move. The dominant term, flatness at +0.70, is the same one
+the cross pass isolates.
+
 ### and the weights did move the attention — just not in a way `phi` sees
 
 With the text held fixed, the trained model's maps are not flatter (Δ −0.0006, n.s.) and
 their border-ring enrichment is unchanged (−0.012), but the **top-left sink does shrink**:
 enrichment 9.77 → 8.13 on the cold start's own sentences, −1.64 [−1.93, −1.34], about
-−17%, and the same on every arm's text. So Figure 5's corner effect is partly a real
-weight change — and partly the same text artifact, since the arms' own generations differ
-by −35% rather than −17%. It is worth about **zero** on the reward.
+−17%, and the same on every arm's text. Compare the same two models each reading their
+*own* generations: 9.77 → 6.34, −35%. So the corner effect is half a weight change and
+half the text artifact above — and it is worth about **zero** on the reward.
+
+Two caveats before mapping that onto Figure 5: the figure's "before" is the vanilla model
+rather than the cold start, and these numbers are over observe-step tokens at the two
+rewarded heads — the reward's own view — not over all generated tokens.
 
 ### why the cheaper version of this test gets it backwards
 
@@ -217,6 +262,18 @@ stand-in for its per-step map, which needs no GPU. It reports the opposite: text
 image is computed *while that arm reads its own sentences*, so the text effect is inside
 the "attention" term. Do not use it; it is kept in the tool only because its disagreement
 with the exact pass is worth being able to reproduce.
+
+## Did the accuracy rewards constrain it?
+
+They did not have to fight it. On the same holdout the exact-match `accuracy_reward` goes
+0.166 → 0.324 for `ours`, +0.157 [+0.099, +0.221] — and the same +0.157 to +0.188 for
+`no_sal`, `center_rect`, `saliency_r1` and `question_boxes`, so it is a GRPO effect rather
+than a saliency-reward effect. The language drift documented above is not costing
+accuracy, and it is nothing like the `set_a` collapse (HANDOFF result 1), where the policy
+reached a 75–98% background-phrase share and lost 11.5% on lmms-eval. Free-form answers
+make exact match a floor rather than a measure, so the judged version of this column is
+still owed; the benchmark table in the paper is the real accuracy statement and this page
+does not touch it.
 
 ## What phi actually responds to
 
