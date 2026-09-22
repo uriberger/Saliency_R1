@@ -353,6 +353,38 @@ nor fixes it.
 (two images per item: plain and boxed). It needs `NVIDIA_API_KEY` in the environment and
 has not been run.
 
+## What this means for the paper
+
+The reviewer asked for six statistics and for the possibility to be studied rather than
+assumed away. All six are above, and on all six the self-grounding loop comes out clean:
+the policy did not learn to name easier objects, more central objects, or objects the
+attention was already on. That part of the answer can go in a rebuttal as it stands.
+
+The harder half is that the study turned up a different hack. `R_sal` can be raised by
+writing longer observation sentences, because a step's map is the mean over its tokens and
+`phi` is normalised by that map's own peak — and that is where essentially all of the
+measured gain comes from. Three consequences:
+
+1. **`phi` is not evidence of alignment.** Any claim of the form "training raised the
+   saliency score, therefore attention aligned" needs the flatness column beside it
+   ([reasoning-alignment.md](reasoning-alignment.md) makes the same point from the
+   translation null).
+2. **A length-normalised score would close this route.** Scoring the step's map after
+   subtracting or dividing out `map mean / map max` — or scoring per token and averaging
+   the scores rather than averaging the maps — removes the lever without changing the
+   reward's intent. Neither has been run.
+3. **What the weights did learn is still worth reporting**: a 17% cut in the top-left
+   sink with the text held fixed, which is a clean statement and does not depend on the
+   reward at all.
+
+None of this touches Table 1. The benchmark gains are measured on benchmarks, and the
+ablation ordering there (`center_rect` below `ours`) is a separate fact from the reward
+mechanism.
+
+Figures: `fig_boxes.png` (the box distributions), `fig_phi_flatness.png` (phi against the
+box-blind statistic, per arm), `fig_confidence.png` (detector confidence, own image vs a
+wrong one).
+
 ## Reproducing
 
 ```fish
