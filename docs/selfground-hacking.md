@@ -286,7 +286,39 @@ measure of grounding than it looks.
 
 <!-- FILLED BY THE dino STAGE -->
 
-<!-- FILLED BY THE sheet STAGE -->
+## Is the grounded phrase actually supported by the image?
+
+`--stage sheet` writes `outputs/selfground/holdout/sheet.html`: 120 steps, 30 per arm, one
+step per prompt, each rendered with the boxes the reward's mask was built from, in random
+order with the arm hidden behind a button. That is the instrument for the manual pass and
+it is ready to score.
+
+Pending a human, two things have been done on it. A **blind 40-item spot check** (10 per
+arm, graded by this assistant from the image and the sentence alone, arm hidden):
+
+| arm | sentence supported: yes / partly / no | boxes on the referent: yes / partly / no |
+|---|---|---|
+| `base_coldstart` | 80% / 20% / 0% | 80% / 10% / 10% |
+| `no_sal` | 80% / 10% / 10% | 70% / 20% / 10% |
+| `center_rect` | 70% / 30% / 0% | 60% / 40% / 0% |
+| `ours` | 60% / 40% / 0% | 70% / 20% / 10% |
+
+39 of 40 sentences were at least partly supported and the one that was not came from
+`no_sal`, so there is no hallucination signal here. The fully-supported rate is lower for
+`ours` (60% vs 80%) but at n = 10 per arm that is inside the noise, and the movement is
+`yes` → `partly` rather than into `no`: the trained arm's sentences are 60% longer and
+make more claims per sentence, so more of them have one claim that cannot be confirmed.
+
+The three cases where the boxes landed on nothing are one per arm and share a cause: the
+sentence names no object at all — *"the key points are focused, attentive, active
+participation"*, *"there are no visible walls, fences, or enclosed structures"*, *"the
+scene is daytime with clear weather"*. The detector still returns boxes for these, and the
+reward still scores them. That failure is in the cold start too; training neither creates
+nor fixes it.
+
+`--stage sheet --judge` scores the same sheet with GPT-4o mini through the NVIDIA gateway
+(two images per item: plain and boxed). It needs `NVIDIA_API_KEY` in the environment and
+has not been run.
 
 ## Reproducing
 
