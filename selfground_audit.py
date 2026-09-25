@@ -70,6 +70,7 @@ import math
 import os
 import re
 import sys
+import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -126,6 +127,60 @@ def mean_in(smap, mask):
     if mx <= 0 or mask is None or not mask.any():
         return float("nan")
     return float(smap[mask].mean() / mx)
+
+
+_ROLL_NULL = None
+
+
+def roll_null_mod():
+    """trl/rewards/roll_null.py by path -- it is numpy-only, and importing the package
+    would pull torch into a report that has no business needing it."""
+    global _ROLL_NULL
+    if _ROLL_NULL is None:
+        _ROLL_NULL = _load_probe_module("_sg_roll_null", "trl/rewards/roll_null.py")
+    return _ROLL_NULL
+
+
+def null_stats(smap, mask, sib_masks=(), seed=0, n_offsets=16):
+    """The two matched nulls for `share_in`, both read off the SAME map.
+
+    A union covering half the grid scores well on any map that is not uniform, and the
+    named regions of this corpus sit nearer the centre than the attention does -- so "more
+    mass inside the union" is not on its own evidence that the map followed the sentence.
+    Two controls hold everything that is not the sentence:
+
+      roll  the step's OWN union translated over the grid (the repo's roll null, in-frame
+            offsets when there are enough). Area and shape fixed, only the position
+            moves, so `enr - enr_roll` is what survives the region's geometry.
+      sib   the union of ANOTHER observe step of the same completion. Picture, chain and
+            weights fixed, only the region changes, so `enr - enr_sib` is
+            step-specificity: does this map follow the STEP or just the image?
+
+    `seed` fixes the offsets, so the same step draws the same translates under both
+    models and the cross-model comparison stays paired.
+    """
+    RN = roll_null_mod()
+    smap = np.asarray(smap, dtype=np.float64)
+    mask = np.asarray(mask, dtype=bool)
+    tot, nan = float(smap.sum()), float("nan")
+    out = {"share_roll": nan, "enr_roll": nan, "n_roll": 0,
+           "share_sib": nan, "enr_sib": nan, "n_sib": 0}
+    if tot <= 0 or not mask.any():
+        return out
+    offs, _ = RN.sample_offsets(mask, int(n_offsets), np.random.default_rng(seed))
+    if offs:
+        sh = [float(smap[np.roll(mask, o, axis=(0, 1))].sum() / tot) for o in offs]
+        out["share_roll"] = float(np.mean(sh))
+        out["enr_roll"] = float(np.mean(sh)) / float(mask.mean())
+        out["n_roll"] = len(offs)
+    sibs = [np.asarray(s, dtype=bool) for s in sib_masks
+            if np.asarray(s).shape == mask.shape and np.asarray(s).any()]
+    if sibs:
+        sh = [float(smap[s].sum() / tot) for s in sibs]
+        out["share_sib"] = float(np.mean(sh))
+        out["enr_sib"] = float(np.mean([v / float(s.mean()) for v, s in zip(sh, sibs)]))
+        out["n_sib"] = len(sibs)
+    return out
 
 
 def map_stats(smap, mask):
@@ -1062,13 +1117,21 @@ def stage_crosspass(args, out_dir):
                     vis_chain=float(span[sel].mean(axis=(0, 1)).sum()),
                     vis_chain_all=(float(span.mean(axis=(0, 1)).sum())
                                    if args.all_heads else float("nan"))))
-            for (_, tok_a, tok_b), st in zip(steps, owner):
+            # every step's mask up front: a step's null is the OTHER steps of its own
+            # completion, so the whole chain's masks have to be in hand before scoring one
+            masks = [decode_mask(st["mask_q"], *st["grid"]) for st in owner]
+            for i, ((_, tok_a, tok_b), st) in enumerate(zip(steps, owner)):
                 m = by_text.get(_norm_step(st["text"]))
                 if m is None or list(m.shape) != list(st["grid"]):
                     skipped["grid_mismatch"] += 1
                     continue
-                gh_, gw_ = st["grid"]
-                mask = decode_mask(st["mask_q"], gh_, gw_)
+                mask = masks[i]
+                # A sibling that IS this step's union measures nothing -- two sentences
+                # that grounded to the same patches -- so it is not a sibling here.
+                sibs = [s for j, s in enumerate(masks)
+                        if j != i and s.shape == mask.shape and not np.array_equal(s, mask)]
+                seed = zlib.crc32(
+                    f"{w['qid']}|{w['sample']}|{w['comp']}|{st['step']}".encode())
                 # The map's own shape, recorded alongside phi: with the text held fixed,
                 # these say whether the trained weights moved the attention at all -- the
                 # corner sink of Figure 5 and the flatness phi mostly rides on.
@@ -1076,10 +1139,16 @@ def stage_crosspass(args, out_dir):
                            sample=w["sample"], comp=w["comp"], step=st["step"],
                            phi_stored=st["phi_stored"], union_frac=float(mask.mean()),
                            n_tokens=int(tok_b - tok_a))
-                row.update(map_stats(m, mask))
+                st_rw = map_stats(m, mask)
+                if args.nulls:
+                    st_rw.update(null_stats(m, mask, sibs, seed=seed))
+                row.update(st_rw)
                 m_all = by_text_all.get(_norm_step(st["text"]))
                 if m_all is not None and list(m_all.shape) == list(st["grid"]):
-                    row.update({k + "_all": v for k, v in map_stats(m_all, mask).items()})
+                    st_all = map_stats(m_all, mask)
+                    if args.nulls:
+                        st_all.update(null_stats(m_all, mask, sibs, seed=seed))
+                    row.update({k + "_all": v for k, v in st_all.items()})
                 rows.append(row)
             del per_tok
             if wi % 25 == 0:
@@ -1547,6 +1616,14 @@ def _fixed_chain_tables(cpass, by, t_arms, m_arms):
          "much attention reaches the image; `enrichment` divides that by the union's area "
          "share, so 1.0 is chance; `visual attention` is the share of the step's attention "
          "that lands on image tokens at all.", ""]
+    fields = list(FIXED_CHAIN_FIELDS)
+    if any(r.get("enr_roll") is not None for r in rows):
+        fields += [("enr_vroll", "enr − roll null", 3), ("enr_vsib", "enr − sibling", 3)]
+        L += ["`enr − roll null` subtracts the same union translated over the grid (area "
+              "and shape held fixed, chance 0), and `enr − sibling` subtracts the other "
+              "observe steps' unions on the same picture (chance 0), so neither can be "
+              "bought by the map drifting toward wherever the named regions tend to sit.",
+              ""]
     blocks = [("", f"layer {layer}, heads {heads} -- the rewarded heads")]
     if any(r.get("phi_all") is not None for r in rows):
         n_heads = cpass.get("n_heads")
@@ -1554,18 +1631,18 @@ def _fixed_chain_tables(cpass, by, t_arms, m_arms):
     for suffix, label in blocks:
         L += [f"**{label}**", "",
               "| chains from | attention from | steps | " +
-              " | ".join(lbl for _, lbl, _ in FIXED_CHAIN_FIELDS) + " |",
-              "|---" * (len(FIXED_CHAIN_FIELDS) + 3) + "|"]
+              " | ".join(lbl for _, lbl, _ in fields) + " |",
+              "|---" * (len(fields) + 3) + "|"]
         for t in t_arms:
             present = [m for m in m_arms if by[(t, m)]]
             for m in present:
                 L.append(f"| {t} | {m} | {len(by[(t, m)])} | " + " | ".join(
                     _c(boot_mean(by[(t, m)], f + suffix), d)
-                    for f, _, d in FIXED_CHAIN_FIELDS) + " |")
+                    for f, _, d in fields) + " |")
             for m in present[1:]:
                 L.append(f"| {t} | Δ ({m} − {present[0]}) | — | " + " | ".join(
                     _d(boot_diff(by[(t, m)], by[(t, present[0])], f + suffix), d)
-                    for f, _, d in FIXED_CHAIN_FIELDS) + " |")
+                    for f, _, d in fields) + " |")
         L += [""]
 
     crows = cpass.get("comp_rows") or []
@@ -1763,6 +1840,12 @@ def stage_report(args, out_dir):
                             if r.get("flat") and r.get("phi") is not None else float("nan"))
             if r.get("share_in") is None:
                 r["share_in"] = r["enr"] * r["union_frac"]
+            # what is left of the in-region enrichment once the region's own geometry
+            # (roll) and the picture the chain is about (sibling) are held fixed
+            for suf in ("", "_all"):
+                for null in ("roll", "sib"):
+                    if r.get(f"enr_{null}{suf}") is not None:
+                        r[f"enr_v{null}{suf}"] = r[f"enr{suf}"] - r[f"enr_{null}{suf}"]
             by[(r["text_arm"], r["map_arm"])].append(r)
         t_arms = sorted({r["text_arm"] for r in rows})
         m_arms = sorted({r["map_arm"] for r in rows})
@@ -1963,6 +2046,11 @@ def main():
     p.add_argument("--map-arm", action="append", default=[])
     p.add_argument("--overlap-layer", type=int, default=22)
     p.add_argument("--overlap-heads", default="28,31")
+    p.add_argument("--nulls", action="store_true",
+                   help="also score each step's map against the two matched nulls -- its "
+                        "own union translated, and the other observe steps' unions -- so "
+                        "an in-region gain can be told apart from the map drifting "
+                        "toward where the named regions happen to sit")
     p.add_argument("--all-heads", action="store_true",
                    help="also score every statistic on the mean over ALL heads of the "
                         "layer (fields suffixed `_all`), off the same capture -- so "

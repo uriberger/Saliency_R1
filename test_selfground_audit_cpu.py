@@ -128,6 +128,40 @@ check("an empty mask leaves the mask-free columns alive",
       not np.isfinite(SG.map_stats(m, np.zeros_like(mask))["share_in"])
       and np.isclose(SG.map_stats(m, np.zeros_like(mask))["vis_mass"], m.sum()))
 
+print("\n1c. the two matched nulls")
+# A map that peaks exactly on the union must beat both nulls; a map that is flat, or that
+# peaks somewhere the union does not cover, must not.
+grid = np.zeros((8, 10))
+union = np.zeros((8, 10), bool)
+union[2:5, 3:6] = True
+sib = np.zeros((8, 10), bool)
+sib[5:8, 0:3] = True
+grid[union] = 1.0
+grid += 0.01
+n = SG.null_stats(grid, union, [sib], seed=7)
+s = SG.map_stats(grid, union)
+check("a map that peaks on the union beats its own translates",
+      s["enr"] - n["enr_roll"] > 1.0, f"{s['enr']:.3f} vs roll {n['enr_roll']:.3f}")
+check("...and beats the sibling step's union",
+      s["enr"] - n["enr_sib"] > 1.0, f"sib {n['enr_sib']:.3f}")
+check("the roll null used offsets and the sibling was counted",
+      n["n_roll"] > 0 and n["n_sib"] == 1, str((n["n_roll"], n["n_sib"])))
+flat = np.full((8, 10), 0.01)
+nf = SG.null_stats(flat, union, [sib], seed=7)
+sf = SG.map_stats(flat, union)
+check("a flat map scores 1.0 against every union, so both gaps are 0",
+      np.isclose(sf["enr"], 1.0) and np.isclose(nf["enr_roll"], 1.0)
+      and np.isclose(nf["enr_sib"], 1.0))
+elsewhere = np.full((8, 10), 0.01)
+elsewhere[sib] = 1.0
+ne = SG.null_stats(elsewhere, union, [sib], seed=7)
+se = SG.map_stats(elsewhere, union)
+check("a map that peaks on the SIBLING's region scores below it",
+      se["enr"] - ne["enr_sib"] < -1.0, f"{se['enr']:.3f} vs {ne['enr_sib']:.3f}")
+check("the same seed draws the same translates, so two models stay paired",
+      SG.null_stats(grid, union, [sib], seed=7)["enr_roll"] == n["enr_roll"]
+      and SG.null_stats(grid, union, [sib], seed=8)["enr_roll"] != n["enr_roll"])
+
 # and the table the whole stage exists for: rows in, markdown out, deltas down a block
 def _cp_row(t, mp, q, phi, share, vis):
     return dict(text_arm=t, map_arm=mp, qid=q, phi=phi, flat=0.05, union_frac=0.5,
