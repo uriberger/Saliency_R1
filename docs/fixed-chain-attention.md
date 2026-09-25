@@ -174,6 +174,22 @@ heads is a coin flip for this arm.
 (map mean/max 0.1352 → 0.1298 \*), and φ divides by the peak. One more reason not to read φ
 as a localisation measure.
 
+**Is the in-region gain significant?** Tested on the 100 prompt means rather than the 4,155
+steps — the 8 rollouts of a prompt see one picture, so they are not 8 draws:
+
+| | cold start's chains | SELF-SALIENCY's chains |
+|---|---|---|
+| mean paired difference | +0.0082 | +0.0087 |
+| paired *t* | t(99) = 8.61, p = 1.2e-13 | t(98) = 7.84, p = 5.6e-12 |
+| Wilcoxon signed-rank | p = 1.3e-11 | p = 2.2e-10 |
+| sign test over prompts | 82/100 up, p = 6.2e-11 | 77/99 up, p = 2.5e-08 |
+| cluster sign-flip permutation | p < 5e-06 (200k draws) | p < 5e-06 |
+| Cohen's *d* over prompts | 0.86 | 0.79 |
+
+Counting each prompt once: +0.0084, t(98) = 8.47, p = 2.5e-13. The tiny p-values come from
+**consistency, not size** — 0.0084 on a base of 0.612 is a 1.4% relative move, which is the
+15% figure only because chance eats most of the baseline.
+
 ## 4. The map's own shape, chain held fixed
 
 | statistic (cold start's chains) | cold start | SELF-SALIENCY | Δ |
@@ -190,6 +206,47 @@ the text held fixed — but it is **local to the two rewarded heads**. At the fu
 corner is barely enriched to begin with (1.21 vs 9.77) and training nudges it *up*. The
 same asymmetry runs through the whole page: the reward's own heads are where φ, the corner
 and the flattening live; the localisation gain lives everywhere else.
+
+## 5. One number per model
+
+A 2×2 is the right design but the wrong table for a paper. To collapse it without
+favouring either side, average each model over the two chain sources with **equal weight**,
+per prompt: both models then read the same corpus — half the cold start's prose, half
+SELF-SALIENCY's — so nothing in the number depends on whose sentences they are. (Do *not*
+pool by concatenating all 4,155 steps: 64% of them come from the cold start's chains,
+because it writes more observation steps per completion, so that mix silently favours one
+side.) 99 prompts; one holdout prompt has no usable step in both chain sets.
+
+**Rewarded heads, layer 22 h28+31**
+
+| model | φ | in-region share | overall visual attention |
+|---|---|---|---|
+| cold start | 0.0533 | 0.4620 | 0.0096 |
+| SELF-SALIENCY | 0.0529 | 0.4622 | **0.0119** |
+| Δ | −0.0004 [−0.0014, +0.0006] | +0.0002 [−0.0014, +0.0019] | **+0.0022 [+0.0019, +0.0025]** |
+| | p = 0.45 | p = 0.8 | p = 1.4e-25, 99/99 prompts |
+
+**All 32 heads of layer 22**
+
+| model | φ | in-region share | overall visual attention |
+|---|---|---|---|
+| cold start | 0.1574 | 0.6117 | 0.0647 |
+| SELF-SALIENCY | 0.1528 | **0.6201** | **0.0726** |
+| Δ | −0.0046 \* | **+0.0084 [+0.0064, +0.0103]** | **+0.0078 [+0.0074, +0.0082]** |
+| | | p = 2.5e-13, 78/99 | p = 1.5e-60, 99/99 |
+
+Read the last two columns together and the whole page is in one place. At the rewarded
+heads the trained model sends **1.23× more** attention to the image — the most consistent
+effect anywhere here, 99 prompts out of 99 — and **none of it** is aimed: the in-region
+share is 0.4620 against 0.4622. At the full layer the volume rises 1.12× *and* the region
+gets more than its share on top of that. Volume is the column that moves most and says
+least.
+
+A stronger version of this table, if it is worth another ~8-minute job: chains written by
+**neither** model. `no_sal` — the same GRPO run with `R_sal` removed — already has 800
+completions on these same 100 prompts in `align-A`, so `--text-arm no_sal --map-arm
+base_coldstart --map-arm ours` gives one number per model off a third-party corpus, with no
+averaging argument needed at all.
 
 ## What this means for the paper
 
