@@ -40,6 +40,12 @@ STAGES
   crossmap  CPU. The decomposition: score each arm's OWN boxes under ANOTHER arm's
             attention on the same image, and under the image-independent border prior.
             Text effect and attention effect, separated.
+  crosspass GPU, ~an hour on 8. The same decomposition WITHOUT the proxy: teacher-force
+            each arm's completions through each model and score the stored boxes with the
+            map that model actually produces while reading those exact tokens. The
+            off-diagonal cells are the fixed-chain comparison -- same sentences, same
+            boxes, different weights -- so anything they show is attention alone.
+            `--all-heads` adds every statistic on the layer's full-head mean.
   dino      GPU, minutes. Re-grounds every observe step to record what the reward's DINO
             call throws away -- the box confidences and the phrase each box matched --
             plus the wrong-image control that says whether a sentence grounds because of
@@ -120,6 +126,39 @@ def mean_in(smap, mask):
     if mx <= 0 or mask is None or not mask.any():
         return float("nan")
     return float(smap[mask].mean() / mx)
+
+
+def map_stats(smap, mask):
+    """Everything the fixed-chain comparison reads off ONE step map.
+
+    The capture keeps the attention weights themselves -- a completion token's row sums to
+    1 over the whole prefix, and the map is the slice of that row on the image tokens --
+    so `vis_mass`, the map's sum, is the share of the step's attention that reached the
+    image AT ALL. That makes `share_in` a within-visual-token normalisation: it says where
+    on the image the mass went, and cannot be raised by sending more mass to the image.
+
+        phi       mean(union) / max(image)          the trained reward; no chance level
+        share_in  mass(union) / mass(image)         redistribution only
+        enr       share_in / union's area share     chance 1.0, scale-free (= mean_in_v2)
+        vis_mass  mass(image) / mass(everything)    the confound share_in divides out
+    """
+    smap = np.asarray(smap, dtype=np.float64)
+    tot, mx, nan = float(smap.sum()), float(smap.max()), float("nan")
+    ok = tot > 0 and mask is not None and mask.any()
+    ring = ring_mask(*smap.shape)
+    m_in = float(smap[mask].sum()) if ok else nan
+    return dict(
+        phi=mean_in(smap, mask),
+        flat=(float(smap.mean() / mx) if mx > 0 else nan),
+        vis_mass=tot,
+        mass_in=m_in,
+        share_in=(m_in / tot) if ok else nan,
+        enr=((m_in / tot) / float(mask.mean())) if ok else nan,
+        ring_mass=(float(smap[ring].sum() / tot) if tot > 0 else nan),
+        ring_en=(float((smap[ring].sum() / tot) / (ring.sum() / ring.size))
+                 if tot > 0 else nan),
+        tl_en=(float((smap[0, 0] / tot) * smap.size) if tot > 0 else nan),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -935,13 +974,20 @@ def stage_crosspass(args, out_dir):
         work = work[: args.limit]
 
     heads = [int(h) for h in args.overlap_heads.split(",")]
-    rows = []
+    rows, comp_rows = [], []
     skipped = Counter()
     for m_arm in map_arms:
         rec = arms[m_arm]
         base = rec["model_path"] or rec["config"]["base_model"]
         processor, model = PROBE.load_model(base, rec.get("adapter"), args.device, "sdpa")
         attn_mod = PROBE.find_attn_module(model, args.overlap_layer)
+        # One capture, two head sets. The rewarded heads are the lens R_sal was trained
+        # through; the layer's full-head mean is "where the model looks" without that lens,
+        # and it costs nothing because the eager re-run already materialises every head.
+        n_heads = int(getattr(attn_mod.config, "num_attention_heads", 0)
+                      or model.config.text_config.num_attention_heads)
+        cap_heads = list(range(n_heads)) if args.all_heads else heads
+        sel = [cap_heads.index(h) for h in heads]
         tok = processor.tokenizer
         for wi, w in enumerate(work):
             image = Image.open(w["image"]).convert("RGB")
@@ -997,9 +1043,25 @@ def stage_crosspass(args, out_dir):
             gh = int(inputs["image_grid_thw"][0, 1].item()) // 2
             gw = int(inputs["image_grid_thw"][0, 2].item()) // 2
             per_tok = PROBE.capture_layer_attention(
-                model, attn_mod, inputs, prompt_len, comp_ids, heads, args.device)
-            maps = PROBE.step_maps_from_attention(per_tok, steps, gh, gw, "mean")
+                model, attn_mod, inputs, prompt_len, comp_ids, cap_heads, args.device)
+            maps = PROBE.step_maps_from_attention(per_tok[sel], steps, gh, gw, "mean")
             by_text = {_norm_step(m["text"]): m["map"] for m in maps}
+            by_text_all = {}
+            if args.all_heads:
+                by_text_all = {_norm_step(m["text"]): m["map"] for m in
+                               PROBE.step_maps_from_attention(per_tok, steps, gh, gw, "mean")}
+            # How much of the chain's attention reaches the image at all, over the WHOLE
+            # think span rather than the observe steps: the quantity a "the trained model
+            # simply looks at the image more" objection is about, with the text held fixed.
+            hi = min(t_end + 1, per_tok.shape[1])
+            if hi > t_start:
+                span = per_tok[:, t_start:hi, :]
+                comp_rows.append(dict(
+                    text_arm=w["arm"], map_arm=m_arm, qid=w["qid"], sample=w["sample"],
+                    comp=w["comp"], n_span_tokens=int(hi - t_start),
+                    vis_chain=float(span[sel].mean(axis=(0, 1)).sum()),
+                    vis_chain_all=(float(span.mean(axis=(0, 1)).sum())
+                                   if args.all_heads else float("nan"))))
             for (_, tok_a, tok_b), st in zip(steps, owner):
                 m = by_text.get(_norm_step(st["text"]))
                 if m is None or list(m.shape) != list(st["grid"]):
@@ -1007,27 +1069,18 @@ def stage_crosspass(args, out_dir):
                     continue
                 gh_, gw_ = st["grid"]
                 mask = decode_mask(st["mask_q"], gh_, gw_)
-                smap = np.asarray(m, dtype=np.float64)
-                tot = float(smap.sum())
-                ring = ring_mask(gh_, gw_)
                 # The map's own shape, recorded alongside phi: with the text held fixed,
                 # these say whether the trained weights moved the attention at all -- the
                 # corner sink of Figure 5 and the flatness phi mostly rides on.
-                rows.append(dict(text_arm=w["arm"], map_arm=m_arm, qid=w["qid"],
-                                 sample=w["sample"], comp=w["comp"], step=st["step"],
-                                 phi=mean_in(smap, mask),
-                                 phi_stored=st["phi_stored"],
-                                 flat=(float(smap.mean() / smap.max())
-                                       if smap.max() > 0 else float("nan")),
-                                 ring_mass=(float(smap[ring].sum() / tot) if tot > 0
-                                            else float("nan")),
-                                 ring_en=(float((smap[ring].sum() / tot)
-                                                / (ring.sum() / ring.size))
-                                          if tot > 0 else float("nan")),
-                                 tl_en=(float((smap[0, 0] / tot) * smap.size)
-                                        if tot > 0 else float("nan")),
-                                 union_frac=float(mask.mean()),
-                                 n_tokens=int(tok_b - tok_a)))
+                row = dict(text_arm=w["arm"], map_arm=m_arm, qid=w["qid"],
+                           sample=w["sample"], comp=w["comp"], step=st["step"],
+                           phi_stored=st["phi_stored"], union_frac=float(mask.mean()),
+                           n_tokens=int(tok_b - tok_a))
+                row.update(map_stats(m, mask))
+                m_all = by_text_all.get(_norm_step(st["text"]))
+                if m_all is not None and list(m_all.shape) == list(st["grid"]):
+                    row.update({k + "_all": v for k, v in map_stats(m_all, mask).items()})
+                rows.append(row)
             del per_tok
             if wi % 25 == 0:
                 torch.cuda.empty_cache()
@@ -1036,23 +1089,27 @@ def stage_crosspass(args, out_dir):
         torch.cuda.empty_cache()
 
     f = out_dir / f"crosspass_shard{args.shard:02d}.json"
-    f.write_text(json.dumps({"rows": rows, "shard": args.shard,
+    f.write_text(json.dumps({"rows": rows, "comp_rows": comp_rows, "shard": args.shard,
                              "num_shards": args.num_shards, "base": args.base,
-                             "skipped": dict(skipped),
+                             "skipped": dict(skipped), "all_heads": bool(args.all_heads),
+                             "n_heads": n_heads if map_arms else None,
                              "layer": args.overlap_layer, "heads": args.overlap_heads}))
-    print(f"[crosspass] {len(rows)} (step, map arm) scores, skipped {dict(skipped)} -> {f}")
+    print(f"[crosspass] {len(rows)} (step, map arm) scores over {len(comp_rows)} "
+          f"(completion, map arm) pairs, skipped {dict(skipped)} -> {f}")
 
 
 def merge_crosspass(out_dir):
-    rows, meta, skipped = [], None, Counter()
+    rows, comp_rows, meta, skipped = [], [], None, Counter()
     for f in sorted(out_dir.glob("crosspass_shard*.json")):
         d = json.load(open(f))
-        meta = meta or {k: v for k, v in d.items() if k not in ("rows", "skipped")}
+        meta = meta or {k: v for k, v in d.items()
+                        if k not in ("rows", "comp_rows", "skipped")}
         skipped.update(d.get("skipped") or {})
         rows += d["rows"]
+        comp_rows += d.get("comp_rows") or []
     if not rows:
         return None
-    payload = dict(meta or {}, rows=rows, skipped=dict(skipped))
+    payload = dict(meta or {}, rows=rows, comp_rows=comp_rows, skipped=dict(skipped))
     (out_dir / "crosspass.json").write_text(json.dumps(payload))
     return payload
 
@@ -1465,6 +1522,77 @@ def union_bin_table(steps_rows, base, arms, n_bins=5, field="phi", by="union_fra
     return out
 
 
+FIXED_CHAIN_FIELDS = [("phi", "phi", 4), ("share_in", "in-region share", 4),
+                      ("enr", "enrichment", 3), ("vis_mass", "visual attention", 4)]
+
+
+def _fixed_chain_tables(cpass, by, t_arms, m_arms):
+    """The one table the whole cross pass exists for: same chain, same boxes, new weights.
+
+    Every row of a block is the SAME sentences scored against the SAME masks, so a
+    difference down a block is attention and nothing else. `in-region share` and
+    `enrichment` normalise within the visual tokens, which is what separates "the model
+    redistributed its attention over the image" from "the model sends more attention to
+    the image", the last column.
+    """
+    rows = cpass["rows"]
+    if not any(r.get("vis_mass") is not None for r in rows):
+        return []
+    layer, heads = cpass.get("layer"), cpass.get("heads")
+    L = ["", "### the fixed-chain table", "",
+         "Each block holds the chain and the boxes fixed and swaps only the weights, so "
+         "every difference inside a block is attention. `in-region share` is the step's "
+         "attention mass inside the union over its mass on the image -- normalised WITHIN "
+         "the visual tokens, so it measures redistribution across the image and not how "
+         "much attention reaches the image; `enrichment` divides that by the union's area "
+         "share, so 1.0 is chance; `visual attention` is the share of the step's attention "
+         "that lands on image tokens at all.", ""]
+    blocks = [("", f"layer {layer}, heads {heads} -- the rewarded heads")]
+    if any(r.get("phi_all") is not None for r in rows):
+        n_heads = cpass.get("n_heads")
+        blocks.append(("_all", f"layer {layer}, all {n_heads or ''} heads".replace("  ", " ")))
+    for suffix, label in blocks:
+        L += [f"**{label}**", "",
+              "| chains from | attention from | steps | " +
+              " | ".join(lbl for _, lbl, _ in FIXED_CHAIN_FIELDS) + " |",
+              "|---" * (len(FIXED_CHAIN_FIELDS) + 3) + "|"]
+        for t in t_arms:
+            present = [m for m in m_arms if by[(t, m)]]
+            for m in present:
+                L.append(f"| {t} | {m} | {len(by[(t, m)])} | " + " | ".join(
+                    _c(boot_mean(by[(t, m)], f + suffix), d)
+                    for f, _, d in FIXED_CHAIN_FIELDS) + " |")
+            for m in present[1:]:
+                L.append(f"| {t} | Δ ({m} − {present[0]}) | — | " + " | ".join(
+                    _d(boot_diff(by[(t, m)], by[(t, present[0])], f + suffix), d)
+                    for f, _, d in FIXED_CHAIN_FIELDS) + " |")
+        L += [""]
+
+    crows = cpass.get("comp_rows") or []
+    if crows:
+        cby = defaultdict(list)
+        for r in crows:
+            cby[(r["text_arm"], r["map_arm"])].append(r)
+        L += ["### how much attention reaches the image at all", "",
+              "Mean over the whole `<think>` span rather than the observe steps, one row "
+              "per completion. Same chains, so a difference here is the weights sending "
+              "more (or less) of the chain's attention to the image.", "",
+              "| chains from | attention from | completions | rewarded heads | all heads |",
+              "|---|---|---|---|---|"]
+        for t in sorted({r["text_arm"] for r in crows}):
+            present = [m for m in sorted({r["map_arm"] for r in crows}) if cby[(t, m)]]
+            for m in present:
+                L.append(f"| {t} | {m} | {len(cby[(t, m)])} | "
+                         f"{_c(boot_mean(cby[(t, m)], 'vis_chain'), 4)} | "
+                         f"{_c(boot_mean(cby[(t, m)], 'vis_chain_all'), 4)} |")
+            for m in present[1:]:
+                L.append(f"| {t} | Δ ({m} − {present[0]}) | — | "
+                         f"{_d(boot_diff(cby[(t, m)], cby[(t, present[0])], 'vis_chain'), 4)} | "
+                         f"{_d(boot_diff(cby[(t, m)], cby[(t, present[0])], 'vis_chain_all'), 4)} |")
+        L += [""]
+    return L
+
+
 def stage_report(args, out_dir):
     text = json.loads((out_dir / "text_stats.json").read_text()) \
         if (out_dir / "text_stats.json").exists() else None
@@ -1627,9 +1755,14 @@ def stage_report(args, out_dir):
         by = defaultdict(list)
         for r in rows:
             # phi = flatness x enrichment, and enrichment is exactly mean_in_v2: the same
-            # map on both sides of the ratio, so it cannot be moved by flattening.
-            r["enr"] = (r["phi"] / r["flat"]
-                        if r.get("flat") and r.get("phi") is not None else float("nan"))
+            # map on both sides of the ratio, so it cannot be moved by flattening. Shards
+            # written before `map_stats` existed carry neither, so derive both here; a
+            # newer shard already has them and must not be overwritten.
+            if r.get("enr") is None:
+                r["enr"] = (r["phi"] / r["flat"]
+                            if r.get("flat") and r.get("phi") is not None else float("nan"))
+            if r.get("share_in") is None:
+                r["share_in"] = r["enr"] * r["union_frac"]
             by[(r["text_arm"], r["map_arm"])].append(r)
         t_arms = sorted({r["text_arm"] for r in rows})
         m_arms = sorted({r["map_arm"] for r in rows})
@@ -1649,6 +1782,7 @@ def stage_report(args, out_dir):
             L += ["", f"Diagonal reproduction: n = {len(diag)}, mean re-read "
                   f"{np.nanmean(a):.4f} vs stored {np.nanmean(b):.4f}, "
                   f"r = {pearson(a, b):.3f}."]
+        L += _fixed_chain_tables(cpass, by, t_arms, m_arms)
         base = cpass.get("base") or (t_arms[0] if t_arms else None)
         if base:
             for field, label, dec in (("phi", "phi", 4), ("enr", "enrichment", 3)):
@@ -1829,6 +1963,11 @@ def main():
     p.add_argument("--map-arm", action="append", default=[])
     p.add_argument("--overlap-layer", type=int, default=22)
     p.add_argument("--overlap-heads", default="28,31")
+    p.add_argument("--all-heads", action="store_true",
+                   help="also score every statistic on the mean over ALL heads of the "
+                        "layer (fields suffixed `_all`), off the same capture -- so "
+                        "'the attention did not move' cannot hide in the 34 heads the "
+                        "reward never read")
     # humanbox
     p.add_argument("--human-box-dataset", default="peterant330/saliency-r1-8k",
                    help="the corpus whose `bbox` column is the annotated region")

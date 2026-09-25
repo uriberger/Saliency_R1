@@ -97,6 +97,60 @@ check("200 random (map, mask) pairs agree with trl/rewards/overlap_rewards._mean
 check("an empty mask is nan, not 0",
       not np.isfinite(SG.mean_in(np.ones((4, 4)), np.zeros((4, 4), bool))))
 
+print("\n1b. the fixed-chain statistics")
+# The cross pass asks whether the WEIGHTS moved the attention, so its statistics have to
+# separate two things the same map can do: send more mass to the image (vis_mass), and
+# move mass around inside it (share_in / enr). If `share_in` were not normalised by the
+# map's own sum, doubling the attention on every patch would read as a gain.
+m = rng.random((10, 16)) * 0.002
+mask = rng.random((10, 16)) < 0.35
+s = SG.map_stats(m, mask)
+check("phi is mean_in", np.isclose(s["phi"], SG.mean_in(m, mask)))
+check("vis_mass is the map's sum -- the share of the row that reached the image",
+      np.isclose(s["vis_mass"], m.sum()))
+check("share_in is the in-region share of the VISUAL mass",
+      np.isclose(s["share_in"], m[mask].sum() / m.sum()))
+check("enrichment is that share over the union's area share, so chance is 1.0",
+      np.isclose(s["enr"], (m[mask].sum() / m.sum()) / mask.mean()))
+check("enrichment is also phi / flatness, the two routes agree",
+      np.isclose(s["enr"], s["phi"] / s["flat"]))
+s2 = SG.map_stats(m * 2.0, mask)
+check("doubling every patch moves vis_mass and nothing else",
+      np.isclose(s2["vis_mass"], 2 * s["vis_mass"])
+      and np.isclose(s2["share_in"], s["share_in"])
+      and np.isclose(s2["enr"], s["enr"]) and np.isclose(s2["phi"], s["phi"]),
+      f"{s2['share_in']:.6f} vs {s['share_in']:.6f}")
+flat_map = np.full((8, 8), 0.001)
+check("a uniform map is enrichment 1.0 and phi 1.0 against any union",
+      np.isclose(SG.map_stats(flat_map, mask[:8, :8])["enr"], 1.0)
+      and np.isclose(SG.map_stats(flat_map, mask[:8, :8])["phi"], 1.0))
+check("an empty mask leaves the mask-free columns alive",
+      not np.isfinite(SG.map_stats(m, np.zeros_like(mask))["share_in"])
+      and np.isclose(SG.map_stats(m, np.zeros_like(mask))["vis_mass"], m.sum()))
+
+# and the table the whole stage exists for: rows in, markdown out, deltas down a block
+def _cp_row(t, mp, q, phi, share, vis):
+    return dict(text_arm=t, map_arm=mp, qid=q, phi=phi, flat=0.05, union_frac=0.5,
+                enr=share / 0.5, share_in=share, vis_mass=vis, n_tokens=20)
+
+
+cp_rows = []
+for q in range(20):
+    for j in range(8):
+        cp_rows.append(_cp_row("cold", "cold", f"q{q}", 0.04, 0.40, 0.30))
+        cp_rows.append(_cp_row("cold", "ours", f"q{q}", 0.04, 0.40, 0.45))
+cp = {"rows": cp_rows, "layer": 22, "heads": "28,31", "base": "cold",
+      "comp_rows": [dict(text_arm="cold", map_arm=m, qid=f"q{q}", vis_chain=v,
+                         vis_chain_all=float("nan"))
+                    for q in range(20) for m, v in (("cold", 0.30), ("ours", 0.45))]}
+_by = {}
+for r in cp_rows:
+    _by.setdefault((r["text_arm"], r["map_arm"]), []).append(r)
+md = "\n".join(SG._fixed_chain_tables(cp, _by, ["cold"], ["cold", "ours"]))
+check("the fixed-chain table finds the visual-attention move", "+0.1500" in md, md[-600:])
+check("and reports no in-region redistribution", "+0.0000 [+0.0000, +0.0000]" in md)
+check("the chain-level block is there", "reaches the image at all" in md)
+
 print("\n2. the stored bytes decode back")
 m = rng.random((10, 16)) * 0.003
 q = quantize(m)
