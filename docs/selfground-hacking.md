@@ -16,6 +16,13 @@ Companion page: [reasoning-alignment.md](reasoning-alignment.md) asks whether th
 attention lands on the region the current step names. This page asks whether the *step*
 moved to meet the attention.
 
+[fixed-chain-attention.md](fixed-chain-attention.md) takes §7's cross pass further: the
+same teacher-forced design, with the in-region score normalised inside the visual tokens
+and scored at every head of the layer rather than the two the reward reads. The φ null
+below survives both, but the full-head map **does** move onto the named region — 15% more
+enrichment with the chain and the boxes held fixed — so "the weights did nothing" is too
+strong a reading of this page on its own.
+
 ## The answer in six lines
 
 1. **Grounding did not get easier.** It succeeds on 100% of observation sentences before
