@@ -154,7 +154,7 @@ setting                          fits 80GB   step (training side)   peak GPU   3
 16-bit, no recompute                    NO                      -      > 79              -
 16-bit + recompute                     yes    34.0s  (sd 0.5)     73.3 GB           38 h
  8-bit, no recompute                   yes    68.1s  (sd 3.3)     63.8 GB           75 h
- 8-bit + recompute                     yes    ~93s                       -          ~103 h
+ 8-bit + recompute                     yes    85.3s  (sd 3.2)     48.6 GB           95 h
 ```
 
 **16 bits with recompute is twice as fast as anything involving 8 bits**, and it needs no
