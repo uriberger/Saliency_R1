@@ -343,7 +343,7 @@ def read_manifest(out_dir, types=None):
 # ---------------------------------------------------------------------------
 # one measured picture
 # ---------------------------------------------------------------------------
-def load_model(path, adapter, device, attn_impl="sdpa"):
+def load_model(path, adapter, device, attn_impl="sdpa", quant=None):
     """`overlap_probe.load_model`, plus the remote-code path it cannot take.
 
     That one resolves the architecture as `getattr(transformers, config.architectures[0])`,
@@ -376,14 +376,23 @@ def load_model(path, adapter, device, attn_impl="sdpa"):
     cfg._attn_implementation = impl
     processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
     _shim_tied_weights_keys(cfg, path)
+    kw = {}
+    if quant is not None:
+        # bitsandbytes swaps the Linear modules out DURING `from_pretrained` and places
+        # them itself, so `device_map` replaces the `.to(device)` below -- calling both
+        # raises. The vision tower is left alone by `llm_int8_skip_modules` at the call
+        # site: it is ~600M of the 33B and it is the thing whose output geometry every
+        # patch statistic is defined on, so shrinking it would confound the very
+        # comparison this argument is for.
+        kw = {"quantization_config": quant, "device_map": device}
     model = AutoModel.from_pretrained(path, config=cfg, dtype=torch.bfloat16,
-                                      trust_remote_code=True)
+                                      trust_remote_code=True, **kw)
     _repair_radio_summary_idxs(model, cfg)
     _shim_masking_api()
     _shim_single_process_group()
     _shim_cache_params_alias(model)
     _shim_cache_position(model)
-    return processor, model.to(device).eval()
+    return processor, (model.eval() if quant is not None else model.to(device).eval())
 
 
 def _shim_cache_position(model):
