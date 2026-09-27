@@ -143,6 +143,58 @@ fidelity one: if you ever do quantise, 8 bits is the setting that does not move 
 attention. But the first thing to try is **16-bit with gradient checkpointing on one
 card**, which avoids the whole question.
 
+## The answer: 16 bits with recompute, and no quantization at all
+
+Recompute = gradient checkpointing, throwing the forward pass's intermediates away and
+re-running them during the backward. The launcher does not use it. Turning it on is what
+the activation finding above pointed at, and it settles the question.
+
+```
+setting                          fits 80GB   step (training side)   peak GPU   3,990 steps
+16-bit, no recompute                    NO                      -      > 79              -
+16-bit + recompute                     yes    34.0s  (sd 0.5)     73.3 GB           38 h
+ 8-bit, no recompute                   yes    68.1s  (sd 3.3)     63.8 GB           75 h
+ 8-bit + recompute                     yes    ~93s                       -          ~103 h
+```
+
+**16 bits with recompute is twice as fast as anything involving 8 bits**, and it needs no
+quantization, so the fidelity question disappears with it. Recompute costs ~36% more
+compute, and 16-bit arithmetic is 2.4x faster than 8-bit; the second wins easily. Adding
+8-bit and recompute together is the worst of both.
+
+**The catch is headroom: 5.9 GB.** That is measured on a 1,327-position sequence
+(303 prompt + 1,024 completion). The launcher allows `max_prompt_length 2048` on top of
+the same completion, so a long prompt is roughly 3,000 positions, and with recompute the
+remaining activation cost still grows with length -- 73.3 GB minus ~62 GB of weights is
+~11 GB of activations here, and twice the length would not fit. Before committing: cap
+the prompt, or keep 8 bits for the headroom, or give the trainer two cards.
+
+## Recomputation is safe here, but the first test said otherwise and was wrong
+
+The first version compared the gradients with recompute off and on, got a worst relative
+difference of 5.16e-01, and concluded recomputation was broken. It had no control.
+
+With the control -- two passes with recompute OFF, to establish what the same computation
+twice costs on this model -- at both precisions:
+
+```
+                       off vs off (control)        off vs on (signal)
+16-bit                 6.50e-01, cos 0.768         3.09e-01, cos 0.955
+ 8-bit                 4.89e-01, cos 0.874         5.88e-01, cos 0.861
+```
+
+**The model does not reproduce its own gradients run to run**, at 16 bits as well as 8, so
+this is not a bitsandbytes artefact. The recompute difference is the same size as the
+noise, and at 16 bits it is smaller. So there is no evidence against recomputation -- and
+none for it either; this test cannot resolve it while the baseline is that loud.
+
+Two things worth saying about that number before anyone quotes it. It is a **worst
+per-tensor relative** difference over 36 tensors, so whichever tensor has the smallest
+gradient norm dominates it, and the minimum norms here are ~2e-04 against a median of
+~3e-02. A global metric over the concatenated gradient would very likely be far smaller.
+And GRPO is comparatively robust to gradient noise. Neither of those has been measured;
+they are the reason not to treat the nondeterminism as alarming, not a reason to ignore it.
+
 ## Caveats
 
 - 8 pictures. Enough to see a 3–5% systematic shift; not enough for a confidence interval
