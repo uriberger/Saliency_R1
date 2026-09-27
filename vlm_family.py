@@ -851,6 +851,34 @@ class NemotronVLV2(NemotronVL):
             tok.pad_token = tok.eos_token
         return self
 
+    def build_inputs(self, processor, images, question, device, **proc_kwargs):
+        """The parent's inputs, with `pixel_values` cast to the vision tower's dtype.
+
+        NVIDIA's own line, from the release that has it. The Omni's `extract_feature`
+        opens with
+
+            pixel_values = pixel_values.to(dtype=self.vision_model.config.torch_dtype)
+
+        and this checkpoint's does not -- it casts only inside `generate`, which is the
+        path its model card demonstrates. Everything this module measures goes through
+        `forward` instead, where a float32 processor output meets a bfloat16 RADIO and
+        dies in the patch embedder's `F.linear` with "mat1 and mat2 have the same
+        dtype".
+
+        Cast HERE rather than by patching the remote module, for the reason
+        `_shim_masking_api` gives: the modules cache is re-downloaded whenever the repo
+        changes, so an edit on disk is silently lost.
+        """
+        out = super().build_inputs(processor, images, question, device, **proc_kwargs)
+        vc = getattr(self.config, "vision_config", None)
+        dt = getattr(vc, "torch_dtype", None) if vc is not None else None
+        if isinstance(dt, str):
+            import torch
+            dt = getattr(torch, dt, None)
+        if dt is not None and out.get("pixel_values") is not None:
+            out["pixel_values"] = out["pixel_values"].to(dtype=dt)
+        return out
+
     def grids_for(self, runs, inputs):
         """The fixed-grid answer, NOT the Omni's `imgs_sizes` one.
 
