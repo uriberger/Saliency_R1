@@ -409,11 +409,20 @@ def _shim_cache_position(model):
     `get_seq_length()` reads the attention layers, which is the only part of a
     HybridMambaAttentionDynamicCache that has a sequence dimension at all.
     """
+    import functools
+
     lm = getattr(model, "language_model", None)
     fn = getattr(lm, "prepare_inputs_for_generation", None)
     if fn is None or getattr(fn, "_sr1_cache_pos_shim", False):
         return
 
+    # `wraps` is load-bearing, not tidiness. `generate` decides whether a model can take
+    # `inputs_embeds` by INSPECTING THE SIGNATURE of this very method, and the wrapper is
+    # `(*args, **kwargs)` -- which reads as "no such parameter" and makes generate refuse
+    # the wrapper's own `inputs_embeds` call with "doesn't have its forwarding
+    # implemented". `wraps` sets `__wrapped__`, which `inspect.signature` follows back to
+    # the real parameter list.
+    @functools.wraps(fn)
     def prepare_inputs_for_generation(*args, **kwargs):
         if kwargs.get("cache_position") is None:
             ids = kwargs.get("input_ids", args[0] if args else None)
