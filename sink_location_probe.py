@@ -375,12 +375,49 @@ def load_model(path, adapter, device, attn_impl="sdpa"):
             c._attn_implementation = impl
     cfg._attn_implementation = impl
     processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
+    _shim_tied_weights_keys(cfg, path)
     model = AutoModel.from_pretrained(path, config=cfg, dtype=torch.bfloat16,
                                       trust_remote_code=True)
     _repair_radio_summary_idxs(model, cfg)
     _shim_masking_api()
     _shim_single_process_group()
     return processor, model.to(device).eval()
+
+
+def _shim_tied_weights_keys(cfg, path):
+    """The tied-weights bookkeeping the 12B's wrapper predates -- NVIDIA's own fix.
+
+    transformers 5.13 finishes `from_pretrained` in `mark_tied_weights_as_initialized`,
+    which reads `self.all_tied_weights_keys`. `PreTrainedModel` fills that in during
+    `post_init()`, and this wrapper never calls it: it assembles a vision tower, an
+    `mlp1` projector and a language model and ties nothing. So loading dies with
+    AttributeError AFTER all 25 GB of weights are on the device.
+
+    `{}` is not a guess. The Omni's copy of the same wrapper sets exactly
+    `self.all_tied_weights_keys = {}` in its own `__init__` -- NVIDIA already fixed this
+    in the newer of the two releases, and this applies their fix to the older one.
+
+    Wrapping `__init__` rather than setting a class attribute, because the loader
+    UPDATES and POPS this mapping: a class-level dict would be shared by every instance
+    built in the process. `hasattr` first, so a repo that grows its own copy keeps it.
+    """
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    ref = (getattr(cfg, "auto_map", None) or {}).get("AutoModel")
+    if not ref:
+        return
+    cls = get_class_from_dynamic_module(ref, path)
+    if getattr(cls, "_sr1_tied_shim", False):
+        return
+    orig = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        orig(self, *args, **kwargs)
+        if not hasattr(self, "all_tied_weights_keys"):
+            self.all_tied_weights_keys = {}
+
+    cls.__init__ = __init__
+    cls._sr1_tied_shim = True
 
 
 def _vendor_mamba_rmsnorm():
