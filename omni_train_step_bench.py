@@ -99,6 +99,25 @@ def enable_grad_ckpt(model):
         type(lm).supports_gradient_checkpointing = True
 
     lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+    # And undo the hook it installs on the way out. `gradient_checkpointing_enable` ends
+    # with `enable_input_require_grads()` whenever `main_input_name == "input_ids"`,
+    # which forces the embedding output to require grad. That is right for a plain
+    # decoder and fatal here: the VL wrapper takes those embeddings and scatters the
+    # picture into them IN PLACE --
+    #
+    #     inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds...
+    #
+    # -- which on a leaf that requires grad raises "a view of a leaf Variable that
+    # requires grad is being used in an in-place operation", every forward.
+    #
+    # The hook exists for REENTRANT checkpointing, which needs a grad-requiring input to
+    # build a graph at all. This uses `use_reentrant=False`, which tracks the parameters
+    # inside the segment directly and does not. Dropping it is only safe if the gradients
+    # still arrive and still match, which is what `--verify-ckpt` measures rather than
+    # assumes.
+    lm.disable_input_require_grads()
+
     on = sum(1 for m in lm.modules() if getattr(m, "gradient_checkpointing", False))
     print(f"gradient checkpointing ON for {on} decoder blocks")
     if on == 0:
