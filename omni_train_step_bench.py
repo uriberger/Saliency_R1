@@ -80,6 +80,24 @@ def enable_grad_ckpt(model):
     lm = getattr(model, "language_model", None)
     if lm is None:
         raise SystemExit("no .language_model to enable gradient checkpointing on")
+
+    # `supports_gradient_checkpointing` is a plain class flag, default False, and
+    # `NemotronHPreTrainedModel` never sets it -- so `gradient_checkpointing_enable`
+    # refuses with "does not support gradient checkpointing" on a model whose blocks
+    # ARE `GradientCheckpointingLayer`s. The machinery is present and the declaration is
+    # missing, the same shape as the other gaps in these checkpoints. Flipping the flag
+    # is not enough on its own to trust it, which is what `--verify-ckpt` is for.
+    if not type(lm).supports_gradient_checkpointing:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+
+        blocks = [m for m in lm.modules() if isinstance(m, GradientCheckpointingLayer)]
+        if not blocks:
+            raise SystemExit("no GradientCheckpointingLayer in the decoder: the flag is "
+                             "False because the machinery really is absent")
+        print(f"declaring gradient-checkpointing support ({len(blocks)} "
+              "GradientCheckpointingLayer blocks found; the class flag was unset)")
+        type(lm).supports_gradient_checkpointing = True
+
     lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     on = sum(1 for m in lm.modules() if getattr(m, "gradient_checkpointing", False))
     print(f"gradient checkpointing ON for {on} decoder blocks")
@@ -87,6 +105,66 @@ def enable_grad_ckpt(model):
         raise SystemExit("gradient_checkpointing_enable() left every block untouched -- "
                          "it silently did nothing, and the memory would be unchanged")
     return on
+
+
+def set_ckpt(model, on):
+    """Toggle recomputation on every block that has the switch. -> how many."""
+    n = 0
+    for m in model.modules():
+        if hasattr(m, "gradient_checkpointing"):
+            m.gradient_checkpointing = on
+            n += 1
+    return n
+
+
+def verify_ckpt(model, case, prompt_len, opt):
+    """Do the SAME gradients come back with recomputation on and off?
+
+    The point of recomputation is that the backward pass re-runs the forward instead of
+    remembering it, which is only sound if the re-run is identical. In a Mamba layer that
+    is not free: it walks the sequence and carries state, and anything it mutated in
+    place the first time would be applied twice. A wrong gradient here is still finite
+    and still non-zero, so the existing check cannot see it -- only comparing against the
+    same model with the switch off can.
+
+    Run at 8 bits, because that is the setting where BOTH fit on the card. What is being
+    tested is the recomputation, which does not know what dtype the weights are stored
+    in, so the answer carries to the 16-bit run.
+    """
+    def grads():
+        opt.zero_grad(set_to_none=True)
+        loss_of(model, case, prompt_len).backward()
+        return {n: p.grad.detach().float().clone()
+                for n, p in model.named_parameters() if p.requires_grad}
+
+    n_off = set_ckpt(model, False)
+    off = grads()
+    n_on = set_ckpt(model, True)
+    on = grads()
+    opt.zero_grad(set_to_none=True)
+    print(f"\nrecomputation check ({n_off} blocks toggled)")
+
+    worst_rel, worst_name, cosines = 0.0, "", []
+    for k in off:
+        a, b = off[k], on[k]
+        denom = max(float(a.norm()), 1e-12)
+        rel = float((a - b).norm()) / denom
+        if rel > worst_rel:
+            worst_rel, worst_name = rel, k
+        if a.norm() > 0 and b.norm() > 0:
+            cosines.append(float((a * b).sum() / (a.norm() * b.norm())))
+    print(f"    tensors compared   : {len(off)}")
+    print(f"    worst relative diff: {worst_rel:.2e}  ({worst_name.split('.')[-4:][0] if worst_name else '-'})")
+    print(f"    min cosine         : {min(cosines):.6f}")
+    # bfloat16 with a different summation order will not agree to the bit; a recomputation
+    # that double-applied a state update would not agree to two decimal places either.
+    if worst_rel > 1e-2 or min(cosines) < 0.999:
+        raise SystemExit(
+            "recomputation changes the gradients. Not a rounding difference -- something "
+            "in the re-run is not identical to the first pass, and the likeliest suspect "
+            "is in-place state in the Mamba mixers. Do NOT train with this on.")
+    print("    PASS: recomputation reproduces the gradients to bf16 rounding")
+    return n_on
 
 
 def build(device, bits, grad_ckpt=False):
@@ -190,6 +268,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--bits", type=int, default=8)
+    ap.add_argument("--verify-ckpt", type=int, default=0,
+                    help="check recomputation reproduces the gradients, then stop")
     ap.add_argument("--grad-ckpt", type=int, default=0,
                     help="recompute the decoder's intermediates instead of storing them")
     ap.add_argument("--reforward", type=int, default=1,
@@ -244,6 +324,10 @@ def main():
     print("    PASS: the signal reaches every LoRA tensor, finite and non-zero,")
     print("          which means the backward pass through the 23 Mamba layers works")
     opt.zero_grad(set_to_none=True)
+
+    if args.verify_ckpt:
+        verify_ckpt(model, case, prompt_len, opt)
+        return 0
 
     # --- the timing ---------------------------------------------------------
     print(f"\n{args.steps} steps of {GRAD_ACCUM} micro-steps"
