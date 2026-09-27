@@ -29,10 +29,19 @@ The vision tower is deliberately NOT shrunk. It is ~600M parameters, it is where
 border stamp comes from, and the geometry every patch statistic is defined on is its
 output. Shrinking it would confound the measurement with the thing being measured.
 
-    python omni_quant_probe.py --n 12 --modes bf16,int8,nf4
+ONE MODE PER PROCESS, deliberately. bf16 peaks at 66.8 GB of an 80 GB card, so the next
+load has to start from a genuinely empty GPU -- and it does not, because
+`SinkScan.install` registers a closure over itself in transformers'
+`ALL_ATTENTION_FUNCTIONS`, which is module-global and outlives any `del model`. The first
+attempt died exactly there: "this process has 65.21 GiB in use" while loading the second
+model. Chasing that reference is the wrong fix when process exit is free and total.
+
+    python omni_quant_probe.py --mode bf16 --n 8 --save out/bf16.npz
+    python omni_quant_probe.py --mode int8 --n 8 --save out/int8.npz
+    python omni_quant_probe.py --compare out/bf16.npz,out/int8.npz,out/nf4.npz
 """
 import argparse
-import gc
+
 import json
 import time
 from pathlib import Path
@@ -114,13 +123,38 @@ def run_mode(mode, picked, device="cuda:0"):
                     "maps": np.asarray(got["maps"], dtype=np.float64)})
     measure_s = (time.time() - t1) / max(1, len(picked))
     peak_gb = torch.cuda.max_memory_allocated(device) / 2**30
-
     scan.uninstall()
-    del model, proc, scan
-    gc.collect()
-    torch.cuda.empty_cache()
     return out, {"load_s": load_s, "measure_s": measure_s, "peak_gb": peak_gb,
                  "layers": layers}
+
+
+def save(path, per_picture, cost, mode):
+    """One npz, one entry PER PICTURE per field.
+
+    Not stacked. The Omni is native-resolution -- it resizes each picture to its own
+    aspect-matched size, so the grids differ (14x19, 13x21, 18x15 ...) and `maps` has a
+    different width per picture. Stacking raised, which is the right failure; storing
+    them separately is the fix.
+    """
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    blob = {"mode": np.asarray([mode]),
+            "keys": np.asarray([p["key"] for p in per_picture]),
+            "grid": np.asarray([p["grid"] for p in per_picture]),
+            "cost": np.asarray([json.dumps(cost, default=str)])}
+    for i, p in enumerate(per_picture):
+        for f in ("stats", "peak", "maps"):
+            blob[f"{f}_{i}"] = p[f]
+    np.savez_compressed(path, **blob)
+    print(f"wrote {path}")
+
+
+def load_saved(path):
+    z = np.load(path, allow_pickle=False)
+    cost = json.loads(str(z["cost"][0]))
+    per = [{"key": str(k), "grid": tuple(g),
+            "stats": z[f"stats_{i}"], "peak": z[f"peak_{i}"], "maps": z[f"maps_{i}"]}
+           for i, (k, g) in enumerate(zip(z["keys"], z["grid"]))]
+    return str(z["mode"][0]), per, cost
 
 
 def compare(ref, got, mode):
@@ -168,45 +202,47 @@ def compare(ref, got, mode):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=12)
-    ap.add_argument("--modes", default="bf16,int8,nf4")
-    ap.add_argument("--out", default="")
+    ap.add_argument("--mode", default="", help="bf16 | int8 | nf4 -- measure and save")
+    ap.add_argument("--n", type=int, default=8)
+    ap.add_argument("--save", default="")
+    ap.add_argument("--compare", default="",
+                    help="comma-separated npz files; the FIRST is the reference")
     args = ap.parse_args()
 
-    modes = args.modes.split(",")
-    if modes[0] != "bf16":
-        raise SystemExit("bf16 must come first: it is the reference everything else is "
-                         "compared against")
-    picked = rows(args.n)
-    print(f"{len(picked)} pictures, types: "
-          f"{sorted({r['type'] for r in picked})}\nmodel: {MODEL}\n")
+    if args.mode:
+        picked = rows(args.n)
+        print(f"{len(picked)} pictures, types: {sorted({r['type'] for r in picked})}")
+        print(f"model: {MODEL}\n[{args.mode}] loading...", flush=True)
+        per, cost = run_mode(args.mode, picked)
+        print(f"[{args.mode}] peak GPU {cost['peak_gb']:.1f} GB | "
+              f"load {cost['load_s']:.0f}s | {cost['measure_s']:.1f}s per picture | "
+              f"attention layers {cost['layers']}", flush=True)
+        if args.save:
+            save(args.save, per, cost, args.mode)
+        return 0
 
-    results, cost, summary = {}, {}, {}
-    for m in modes:
-        print(f"[{m}] loading...", flush=True)
-        results[m], cost[m] = run_mode(m, picked)
-        c = cost[m]
-        print(f"[{m}] peak GPU {c['peak_gb']:.1f} GB | load {c['load_s']:.0f}s | "
-              f"{c['measure_s']:.1f}s per picture | attention layers {c['layers']}",
-              flush=True)
-
-    for m in modes[1:]:
-        summary[m] = compare(results["bf16"], results[m], m)
+    if not args.compare:
+        raise SystemExit("pass --mode to measure, or --compare to read the saved runs")
+    paths = args.compare.split(",")
+    loaded = [load_saved(p) for p in paths]
+    ref_mode, ref, ref_cost = loaded[0]
+    if ref_mode != "bf16":
+        raise SystemExit(f"the first file is {ref_mode!r}; bf16 is the reference "
+                         "everything else is compared against")
+    for mode, per, _c in loaded[1:]:
+        if [p["key"] for p in per] != [p["key"] for p in ref]:
+            raise SystemExit(f"{mode} measured different pictures from the reference")
+        compare(ref, per, mode)
 
     print(f"\n{'='*78}\nCOST\n{'='*78}")
-    print(f"{'mode':<8} {'peak GPU':>10} {'fits 80GB':>11} {'s/picture':>11} "
-          f"{'vs bf16':>9}")
-    base = cost["bf16"]["measure_s"]
-    for m in modes:
-        c = cost[m]
-        print(f"{m:<8} {c['peak_gb']:>9.1f}G {'yes' if c['peak_gb'] < 78 else 'NO':>11} "
+    print(f"{'mode':<8} {'peak GPU':>10} {'fits 80GB':>11} {'load s':>8} "
+          f"{'s/picture':>11} {'vs bf16':>9}")
+    base = ref_cost["measure_s"]
+    for mode, _per, c in loaded:
+        print(f"{mode:<8} {c['peak_gb']:>9.1f}G "
+              f"{'yes' if c['peak_gb'] < 78 else 'NO':>11} {c['load_s']:>8.0f} "
               f"{c['measure_s']:>11.1f} {c['measure_s']/base:>8.2f}x")
-
-    if args.out:
-        Path(args.out).write_text(json.dumps(
-            {"cost": {k: {kk: vv for kk, vv in v.items()} for k, v in cost.items()},
-             "summary": summary, "n": len(picked)}, indent=2, default=str))
-        print(f"\nwrote {args.out}")
+    return 0
 
 
 if __name__ == "__main__":
