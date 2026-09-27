@@ -1,0 +1,5 @@
+Metadata-Version: 2.1
+Name: mamba-ssm
+Version: 0.0.0+layernorm.only
+Summary: NOT mamba-ssm. One upstream Triton file, vendored so NVIDIA-Nemotron-Nano-12B-v2-VL can be imported.
+License: Apache-2.0

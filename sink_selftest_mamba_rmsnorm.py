@@ -45,17 +45,43 @@ def check_verbatim():
 
 
 def check_absent_to_transformers():
-    """The whole reason it is a path and not an install."""
+    """The whole reason it is a path and not an install -- tested on the GPU branch.
+
+    `is_mamba_2_ssm_available()` is
+
+        is_torch_cuda_available() and is_available and parse(version) >= parse("2.0.4")
+
+    and `and` short-circuits, so on a CPU-only box it returns False at the FIRST operand
+    and never touches the rest. That is not the question: the model always runs on a GPU,
+    where the third operand is evaluated. Asking this on the login node as-is passes for
+    a reason that has nothing to do with the vendored package -- which is exactly how the
+    first attempt shipped a version string of 'N/A' straight into `packaging.parse` and
+    died on the node, having 'passed' here. So CUDA is forced true and the cache cleared.
+    """
     sys.path.append(str(VENDOR))
     import importlib.util
 
-    from transformers.utils.import_utils import is_mamba_2_ssm_available
+    from transformers.utils import import_utils as iu
 
     assert importlib.util.find_spec("mamba_ssm") is not None, \
         "vendored mamba_ssm is not importable -- the path append did not take"
-    available = is_mamba_2_ssm_available()
-    print(f"  importable                    : True")
-    print(f"  is_mamba_2_ssm_available()    : {available}")
+    found, ver = iu._is_package_available("mamba_ssm", return_version=True)
+    print(f"  importable                    : {found}")
+    print(f"  version metadata              : {ver!r}")
+    if ver == "N/A":
+        raise SystemExit(
+            "the vendored package has no dist-info, so transformers reports its version "
+            "as 'N/A' and `packaging.version.parse` raises InvalidVersion on any GPU -- "
+            "the model cannot load at all. Restore "
+            "vendor/mamba_ssm_min/mamba_ssm-*.dist-info/METADATA.")
+
+    iu.is_torch_cuda_available = lambda: True          # the branch a GPU node takes
+    iu.is_mamba_2_ssm_available.cache_clear()
+    try:
+        available = iu.is_mamba_2_ssm_available()
+    except Exception as e:
+        raise SystemExit(f"is_mamba_2_ssm_available() raises on a GPU: {e!r}")
+    print(f"  is_mamba_2_ssm_available()    : {available}  (CUDA forced true)")
     if available:
         raise SystemExit(
             "transformers now reports mamba_ssm as available from a path-vendored "
