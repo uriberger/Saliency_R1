@@ -58,10 +58,16 @@ def check_absent_to_transformers():
     first attempt shipped a version string of 'N/A' straight into `packaging.parse` and
     died on the node, having 'passed' here. So CUDA is forced true and the cache cleared.
     """
-    sys.path.append(str(VENDOR))
     import importlib.util
 
+    # ORDER MATTERS, and it is the job's order: transformers is imported (and builds its
+    # `PACKAGE_DISTRIBUTION_MAPPING` once) BEFORE the vendored directory joins sys.path.
+    # Appending first would test a mapping that already knows about the package, which is
+    # a situation no real run is ever in.
     from transformers.utils import import_utils as iu
+
+    iu._is_package_available("mamba_ssm", return_version=True)
+    sys.path.append(str(VENDOR))
 
     assert importlib.util.find_spec("mamba_ssm") is not None, \
         "vendored mamba_ssm is not importable -- the path append did not take"
