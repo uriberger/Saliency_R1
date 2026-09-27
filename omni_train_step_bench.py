@@ -61,7 +61,35 @@ GRAD_ACCUM = 8
 COMPLETION_LEN = 1024
 
 
-def build(device, bits):
+def enable_grad_ckpt(model):
+    """Recompute the decoder's intermediates instead of storing them.
+
+    Worth doing because the measured footprint says the weights are not the problem: at 8
+    bits the model is 34.8 GB and a training step peaks at 63.8, so ~30 GB is
+    intermediate results held for the backward pass. That 30 GB is what puts a 16-bit run
+    over an 80 GB card, not the 62 GB of weights.
+
+    `NemotronHBlock` inherits `GradientCheckpointingLayer`, so transformers' own switch
+    reaches it -- a plain grep for "gradient_checkpointing" in that file finds nothing and
+    says otherwise, which is why this is asserted rather than assumed.
+
+    Enabled on the LANGUAGE MODEL, not the wrapper: the vision tower runs under
+    `no_grad` and has nothing to recompute, and narrowing it keeps the switch away from
+    code whose behaviour under recomputation nobody here has checked.
+    """
+    lm = getattr(model, "language_model", None)
+    if lm is None:
+        raise SystemExit("no .language_model to enable gradient checkpointing on")
+    lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    on = sum(1 for m in lm.modules() if getattr(m, "gradient_checkpointing", False))
+    print(f"gradient checkpointing ON for {on} decoder blocks")
+    if on == 0:
+        raise SystemExit("gradient_checkpointing_enable() left every block untouched -- "
+                         "it silently did nothing, and the memory would be unchanged")
+    return on
+
+
+def build(device, bits, grad_ckpt=False):
     from peft import LoraConfig, get_peft_model
     from transformers import BitsAndBytesConfig
 
@@ -76,6 +104,8 @@ def build(device, bits):
     t0 = time.time()
     proc, model = SLP.load_model(MODEL, None, device, "sdpa", quant=quant)
     load_s = time.time() - t0
+    if grad_ckpt:
+        enable_grad_ckpt(model)
 
     # Only the LoRA trains. Everything else is frozen, which is what licenses shrinking
     # the base at all -- nothing is ever written back into it.
@@ -160,6 +190,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--bits", type=int, default=8)
+    ap.add_argument("--grad-ckpt", type=int, default=0,
+                    help="recompute the decoder's intermediates instead of storing them")
     ap.add_argument("--reforward", type=int, default=1,
                     help="the no-grad saliency forward the run does each micro-step")
     ap.add_argument("--out", default="")
@@ -172,7 +204,7 @@ def main():
     torch.cuda.init()
     torch.cuda.set_device(device)
     torch.cuda.reset_peak_memory_stats(device)
-    proc, model, load_s = build(device, args.bits)
+    proc, model, load_s = build(device, args.bits, bool(args.grad_ckpt))
     case, prompt_len = one_batch(proc, model, device)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LR)
 
@@ -238,8 +270,9 @@ def main():
 
     t = np.array(times)
     peak = torch.cuda.max_memory_allocated(device) / 2**30
+    ck = "recompute ON" if args.grad_ckpt else "recompute OFF"
     print(f"\n{'='*70}\nTRAINING SIDE OF ONE STEP, {args.bits}-bit base, one card, "
-          f"no weight-splitting\n{'='*70}")
+          f"no weight-splitting, {ck}\n{'='*70}")
     print(f"    median   {np.median(t):.1f}s")
     print(f"    mean     {t.mean():.1f}s   sd {t.std():.1f}s")
     print(f"    min/max  {t.min():.1f}s / {t.max():.1f}s")
@@ -252,7 +285,7 @@ def main():
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(
-            {"bits": args.bits, "steps": args.steps, "reforward": bool(args.reforward),
+            {"bits": args.bits, "grad_ckpt": bool(args.grad_ckpt), "steps": args.steps, "reforward": bool(args.reforward),
              "median_s": float(np.median(t)), "mean_s": float(t.mean()),
              "sd_s": float(t.std()), "peak_gb": float(peak), "load_s": load_s,
              "prompt_len": prompt_len, "completion_len": COMPLETION_LEN,
