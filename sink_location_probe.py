@@ -381,7 +381,38 @@ def load_model(path, adapter, device, attn_impl="sdpa"):
     _repair_radio_summary_idxs(model, cfg)
     _shim_masking_api()
     _shim_single_process_group()
+    _shim_cache_params_alias(model)
     return processor, model.to(device).eval()
+
+
+def _shim_cache_params_alias(model):
+    """`past_key_values` as a read-only alias of `cache_params`, for the 12B's forward.
+
+    `NVIDIA-Nemotron-Nano-12B-v2-VL`'s wrapper ends `forward` with
+
+        return CausalLMOutputWithPast(..., past_key_values=outputs.past_key_values, ...)
+
+    but its language model returns `NemotronHCausalLMOutput`, whose cache field is called
+    `cache_params` -- a Mamba hybrid carries convolution and SSM state, not a KV cache.
+    There is no such attribute, so every `forward()` on this checkpoint raises
+    AttributeError after the whole model has run. Only `generate()` works as shipped,
+    which is the one path the model card demonstrates; this module measures the forward.
+
+    An alias, not a value: it renames the field the wrapper is reaching for and touches
+    no arithmetic. `cache_params` keeps working and stays the only real dict key, so
+    anything reading the output as a mapping sees exactly what it saw before.
+
+    Patched on the class in the loaded module rather than in the file on disk, because
+    the modules cache is re-downloaded whenever the repo changes.
+    """
+    lm = getattr(model, "language_model", None)
+    mod = sys.modules.get(type(lm).__module__) if lm is not None else None
+    out_cls = getattr(mod, "NemotronHCausalLMOutput", None) if mod is not None else None
+    if out_cls is None or "past_key_values" in vars(out_cls):
+        return
+    if "cache_params" not in getattr(out_cls, "__dataclass_fields__", {}):
+        return
+    out_cls.past_key_values = property(lambda self: self.cache_params)
 
 
 def _shim_tied_weights_keys(cfg, path):
