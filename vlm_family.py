@@ -766,6 +766,107 @@ class NemotronVL(Family):
 
 
 # ---------------------------------------------------------------------------
+@register
+class NemotronVLV2(NemotronVL):
+    """`NVIDIA-Nemotron-Nano-12B-v2-VL` -- the same decoder, a DIFFERENT geometry.
+
+    Structurally this is its Omni sibling: a RADIO tower, an `mlp1` projector, an
+    `image_flags` forward, and a Nemotron-H hybrid decoder whose pattern
+
+        M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M-
+        M = Mamba (28)      - = MLP (28)      * = attention (6)
+
+    again leaves only 6 of 62 layers with an attention matrix, so `attention_layers`
+    and the "192 cells, labelled, never pooled" caveat carry over verbatim.
+
+    THE GEOMETRY DOES NOT CARRY OVER, AND THAT IS THE WHOLE REASON THIS IS A SEPARATE
+    CLASS. The Omni is native-resolution: it buckets a picture to an aspect-matched
+    size, emits ONE grid, and reports it in `imgs_sizes`. This checkpoint is InternVL:
+    `image_processing.dynamic_preprocess` picks the closest aspect ratio up to
+    `max_num_tiles: 12`, cuts the resize into 512x512 tiles, and -- because
+    `use_thumbnail` is true -- appends a thumbnail of the WHOLE picture whenever there
+    is more than one tile. On the boxed corpus that is 12 tiles plus a thumbnail for
+    most pictures, 3,328 visual tokens against the Omni's 269, and no `imgs_sizes` key
+    at all: `NemotronVL.grids_for` would raise on the first picture.
+
+    SO TILING IS OFF, for exactly the reason it is off for `InternVL`. With thirteen
+    16x16 sub-grids "the outer ring" is ambiguous -- the ring of a tile is an interior
+    edge of the picture -- and the thumbnail covers the picture a second time at a
+    different scale, so a peak could be counted twice at two different places. Forcing
+    one tile gives one 16x16 grid over the whole picture, which is the geometry
+    Qwen3-VL, InternVL3.5 and the Omni rows were all measured on. The tiled
+    configuration is a separate, clearly labelled arm, not the primary comparison.
+
+    HOW tiling is switched off matters. `max_num_tiles` is not declared in
+    `NemotronNanoVLV2ImagesKwargs`, so passing it to `processor(...)` is silently
+    dropped rather than honoured -- the failure mode `InternVL.proc_defaults` documents,
+    and the reason it is set on the image processor as an ATTRIBUTE here. That is also
+    what NVIDIA's own `processing.py` does to force single-tile video frames, and it is
+    what keeps the text side consistent: the placeholder run is
+    `num_patches * num_image_token`, read back from the same object.
+    """
+
+    name = "nemotron_vl_v2"
+    model_types = ("NemotronH_Nano_VL_V2",)
+    #: 512px tile / 16px patch = 32, pixel-shuffled by `downsample_ratio` 0.5 -> 16x16.
+    #: Re-derived from the config in `bind`, so a checkpoint that changes either one
+    #: fails loudly instead of mislabelling every patch.
+    fixed_grid = (16, 16)
+    encoder_px = 32
+    #: This processor reports tile COUNTS, not sizes: `imgs_sizes` and `num_tokens` are
+    #: Omni-only keys. `num_patches` is still not a forward kwarg.
+    drop_inputs = ("num_patches",)
+
+    def bind(self, model=None, processor=None, config=None):
+        super().bind(model=model, processor=processor, config=config)
+        cfg = self.config
+        if cfg is not None:
+            px = int(getattr(cfg, "force_image_size", 512))
+            patch = int(getattr(cfg, "patch_size", 16))
+            ratio = float(getattr(cfg, "downsample_ratio", 0.5))
+            side = int(round(px / patch * ratio))
+            if side <= 0 or abs(px / patch * ratio - side) > 1e-6:
+                raise SystemExit(
+                    f"nemotron_vl_v2: a {px}px tile at patch {patch} downsampled by "
+                    f"{ratio} is not a whole grid")
+            self.fixed_grid = (side, side)
+            self.encoder_px = px // side
+        ip = getattr(processor, "image_processor", None)
+        if ip is not None:
+            # See the class docstring: an attribute, not a call kwarg.
+            ip.max_num_tiles = 1
+            n = int(getattr(ip, "num_image_token", self.fixed_grid[0] ** 2))
+            if n != self.fixed_grid[0] * self.fixed_grid[1]:
+                raise SystemExit(
+                    f"nemotron_vl_v2: the processor emits {n} tokens per tile but the "
+                    f"config implies {self.fixed_grid[0]}x{self.fixed_grid[1]}")
+        tok = getattr(processor, "tokenizer", None)
+        if tok is not None and tok.pad_token is None:
+            # This repo ships no pad token where the Omni ships `<|im_end|>`, and
+            # `Family.build_inputs` asks for `padding=True` unconditionally. The module
+            # is batch size 1 throughout -- `batch_needs_equal_size` exists because two
+            # pictures in ONE sample is as wide as it gets -- so nothing is ever padded
+            # and this cannot move a measured number; it only stops the tokenizer
+            # refusing a request that has no work in it.
+            tok.pad_token = tok.eos_token
+        return self
+
+    def grids_for(self, runs, inputs):
+        """The fixed-grid answer, NOT the Omni's `imgs_sizes` one.
+
+        `Family.grids_for` already divides a run into whole tiles, so this stays correct
+        if the tiled arm is ever run -- it would report 13 grids rather than raising.
+        """
+        return Family.grids_for(self, runs, inputs)
+
+    def grid_of(self, processor, image):
+        return tuple(self.fixed_grid)
+
+    def patch_px(self, image):
+        return Family.patch_px(self, image)
+
+
+# ---------------------------------------------------------------------------
 # geometry helpers that need the view box
 # ---------------------------------------------------------------------------
 def _size_get(size, key):

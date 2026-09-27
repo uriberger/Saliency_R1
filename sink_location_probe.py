@@ -378,7 +378,32 @@ def load_model(path, adapter, device, attn_impl="sdpa"):
                                       trust_remote_code=True)
     _repair_radio_summary_idxs(model, cfg)
     _shim_masking_api()
+    _shim_single_process_group()
     return processor, model.to(device).eval()
+
+
+def _shim_single_process_group():
+    """A world of one, so the 12B's forward can ask which rank it is.
+
+    `NVIDIA-Nemotron-Nano-12B-v2-VL`'s forward logs its ViT batch size under a bare
+
+        if torch.distributed.get_rank() == 0:
+
+    which raises "Default process group has not been initialized" on a single process.
+    Its Omni sibling guards the same line with `is_initialized()`; this checkpoint does
+    not, so every picture would fail at the first forward.
+
+    Initialising a real one-rank group is the smaller lie than stubbing `get_rank`: it
+    is the state the model's own code is written against, it leaves the forward's
+    arithmetic untouched, and `HashStore` keeps it in-process so the probe's per-GPU
+    shards cannot collide on a rendezvous port. A group that already exists -- the
+    trainer's, under accelerate -- is left exactly as it is.
+    """
+    import torch.distributed as dist
+
+    if dist.is_available() and not dist.is_initialized():
+        dist.init_process_group(backend="gloo", store=dist.HashStore(),
+                                rank=0, world_size=1)
 
 
 def _shim_masking_api():
