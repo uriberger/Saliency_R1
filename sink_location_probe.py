@@ -365,6 +365,7 @@ def load_model(path, adapter, device, attn_impl="sdpa"):
     cfg = AutoConfig.from_pretrained(path, trust_remote_code=True)
     if not getattr(cfg, "auto_map", None):
         return PROBE.load_model(path, adapter, device, attn_impl)
+    _vendor_mamba_rmsnorm()
     if adapter:
         raise SystemExit("--adapter is not supported on a remote-code model")
     impl = "eager"
@@ -380,6 +381,29 @@ def load_model(path, adapter, device, attn_impl="sdpa"):
     _shim_masking_api()
     _shim_single_process_group()
     return processor, model.to(device).eval()
+
+
+def _vendor_mamba_rmsnorm():
+    """Put `vendor/mamba_ssm_min` on the path, so the 12B can be imported at all.
+
+    `NVIDIA-Nemotron-Nano-12B-v2-VL`'s decoder raises at IMPORT time without
+    `mamba_ssm.ops.triton.layernorm_gated.rmsnorm_fn`, and every Mamba layer's
+    `MambaRMSNormGated.forward` is a call to it -- so this is not a fast path that
+    degrades. `vendor/mamba_ssm_min/README.md` is why it is one vendored upstream file
+    rather than a `pip install` into a SHARED env, and why having no dist-info is the
+    point: `is_mamba_2_ssm_available()` keeps reading False, the fused SSM kernels stay
+    off, and the 12B runs the same torch-native Mamba path the Omni row was measured on.
+
+    A real installation wins: this appends, so an installed `mamba_ssm` is found first
+    and nothing here shadows it.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("mamba_ssm") is not None:
+        return
+    here = Path(__file__).resolve().parent / "vendor" / "mamba_ssm_min"
+    if here.is_dir() and str(here) not in sys.path:
+        sys.path.append(str(here))
 
 
 def _shim_single_process_group():
