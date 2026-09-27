@@ -129,16 +129,24 @@ def drop_input_grad_hooks(model):
     checkpointing; `use_reentrant=False` tracks the parameters inside each segment
     directly and does not need it.
     """
+    # `m.__dict__` rather than `getattr`/`hasattr`, because peft's wrapper DELEGATES
+    # attribute lookup to the model it wraps. `hasattr(peft_model, "_require_grads_hook")`
+    # is therefore True for an attribute that lives on the base model, and the matching
+    # `del` then raises AttributeError on a name the wrapper never owned. Asking each
+    # module what it actually holds sidesteps the whole delegation question.
     n = 0
     for m in model.modules():
-        hooks = getattr(m, "_require_grads_hooks", None)
-        if hooks:
-            for h in hooks:
-                h.remove()
-            m._require_grads_hooks = []
-            if hasattr(m, "_require_grads_hook"):
-                del m._require_grads_hook
-            n += 1
+        hooks = m.__dict__.get("_require_grads_hooks")
+        single = m.__dict__.get("_require_grads_hook")
+        if not hooks and single is None:
+            continue
+        for h in (hooks or []):
+            h.remove()
+        if single is not None and not hooks:
+            single.remove()
+        m.__dict__["_require_grads_hooks"] = []
+        m.__dict__.pop("_require_grads_hook", None)
+        n += 1
     return n
 
 
