@@ -382,7 +382,52 @@ def load_model(path, adapter, device, attn_impl="sdpa"):
     _shim_masking_api()
     _shim_single_process_group()
     _shim_cache_params_alias(model)
+    _shim_cache_position(model)
     return processor, model.to(device).eval()
+
+
+def _shim_cache_position(model):
+    """Hand `prepare_inputs_for_generation` the `cache_position` 5.13 stopped passing.
+
+    The same API drift `_shim_masking_api` covers, one function further on. The Base
+    repo's `prepare_inputs_for_generation` slices the new tokens out of `input_ids` with
+
+        input_ids = input_ids[:, cache_position]
+
+    and transformers 5.13 no longer supplies the argument -- it derives positions from
+    `past_key_values` and `position_ids` instead -- so it arrives None and `generate`
+    dies on the first step. `forward` is unaffected, which is why the measured pass got
+    through and only the selftest's greedy decode did not.
+
+    Derived, not guessed, and it reproduces the original contract exactly: the cache
+    knows how many tokens it has already seen, `input_ids` carries everything so far, and
+    the difference is what is new.
+
+        prefill  past=0,  L new       -> arange(0, L)     -> the slice is a no-op
+        decode   past=L,  1 new       -> arange(L, L+1)   -> selects the last token
+
+    `get_seq_length()` reads the attention layers, which is the only part of a
+    HybridMambaAttentionDynamicCache that has a sequence dimension at all.
+    """
+    lm = getattr(model, "language_model", None)
+    fn = getattr(lm, "prepare_inputs_for_generation", None)
+    if fn is None or getattr(fn, "_sr1_cache_pos_shim", False):
+        return
+
+    def prepare_inputs_for_generation(*args, **kwargs):
+        if kwargs.get("cache_position") is None:
+            ids = kwargs.get("input_ids", args[0] if args else None)
+            cache = kwargs.get("past_key_values")
+            if ids is not None:
+                past = cache.get_seq_length() if cache is not None else 0
+                n_new = int(ids.shape[1]) - int(past)
+                if n_new > 0:
+                    kwargs["cache_position"] = torch.arange(
+                        past, past + n_new, device=ids.device)
+        return fn(*args, **kwargs)
+
+    prepare_inputs_for_generation._sr1_cache_pos_shim = True
+    lm.prepare_inputs_for_generation = prepare_inputs_for_generation
 
 
 def _shim_cache_params_alias(model):
