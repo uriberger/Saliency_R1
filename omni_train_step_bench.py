@@ -100,30 +100,46 @@ def enable_grad_ckpt(model):
 
     lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    # And undo the hook it installs on the way out. `gradient_checkpointing_enable` ends
-    # with `enable_input_require_grads()` whenever `main_input_name == "input_ids"`,
-    # which forces the embedding output to require grad. That is right for a plain
-    # decoder and fatal here: the VL wrapper takes those embeddings and scatters the
-    # picture into them IN PLACE --
-    #
-    #     inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds...
-    #
-    # -- which on a leaf that requires grad raises "a view of a leaf Variable that
-    # requires grad is being used in an in-place operation", every forward.
-    #
-    # The hook exists for REENTRANT checkpointing, which needs a grad-requiring input to
-    # build a graph at all. This uses `use_reentrant=False`, which tracks the parameters
-    # inside the segment directly and does not. Dropping it is only safe if the gradients
-    # still arrive and still match, which is what `--verify-ckpt` measures rather than
-    # assumes.
-    lm.disable_input_require_grads()
-
+    # This call also installs an `enable_input_require_grads` hook, which is fatal for
+    # this wrapper -- see `drop_input_grad_hooks`, which strips it AFTER the peft wrap,
+    # because peft puts it straight back.
     on = sum(1 for m in lm.modules() if getattr(m, "gradient_checkpointing", False))
     print(f"gradient checkpointing ON for {on} decoder blocks")
     if on == 0:
         raise SystemExit("gradient_checkpointing_enable() left every block untouched -- "
                          "it silently did nothing, and the memory would be unchanged")
     return on
+
+
+def drop_input_grad_hooks(model):
+    """Strip every `enable_input_require_grads` hook in the tree. -> how many modules.
+
+    Two separate things install it and both have to be undone, which is why this walks
+    the tree instead of calling `disable_input_require_grads()` once:
+
+      * `gradient_checkpointing_enable` does, whenever `main_input_name == "input_ids"`;
+      * and then **peft does it again**. `get_peft_model` sees checkpointing is already
+        on and calls `_prepare_model_for_gradient_checkpointing`, which re-registers the
+        hook on the OUTER wrapper -- after the first removal, so removing it before
+        wrapping accomplishes nothing. That is exactly what happened: the in-place error
+        survived a `disable_input_require_grads()` that had genuinely run.
+
+    The hook forces the embedding output to require grad, and this wrapper then scatters
+    the picture into those embeddings in place, which raises. It exists for REENTRANT
+    checkpointing; `use_reentrant=False` tracks the parameters inside each segment
+    directly and does not need it.
+    """
+    n = 0
+    for m in model.modules():
+        hooks = getattr(m, "_require_grads_hooks", None)
+        if hooks:
+            for h in hooks:
+                h.remove()
+            m._require_grads_hooks = []
+            if hasattr(m, "_require_grads_hook"):
+                del m._require_grads_hook
+            n += 1
+    return n
 
 
 def set_ckpt(model, on):
@@ -250,6 +266,16 @@ def build(device, bits, grad_ckpt=False):
     if stray:
         raise SystemExit(f"LoRA landed outside the decoder on {len(stray)} modules, "
                          f"e.g. {stray[:3]} -- those never run on an image-only batch")
+    if grad_ckpt:
+        # AFTER the peft wrap, not before: see drop_input_grad_hooks.
+        n_hooks = drop_input_grad_hooks(model)
+        print(f"removed enable_input_require_grads hooks from {n_hooks} modules")
+        n_on = sum(1 for m in model.modules()
+                   if getattr(m, "gradient_checkpointing", False))
+        if n_on == 0:
+            raise SystemExit("the peft wrap lost the gradient-checkpointing switch")
+        print(f"gradient checkpointing still ON for {n_on} blocks after wrapping")
+
     want = [5, 12, 19, 26, 33, 42]
     if layers != want:
         raise SystemExit(f"LoRA is on decoder layers {layers}, not the attention layers "
