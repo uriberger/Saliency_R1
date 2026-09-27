@@ -97,6 +97,52 @@ of the same model, and a flattening that hits all eight equally largely cancels.
 baseline, never against the full-size cross-model table. `corner_share` falling 5% is not
 negligible next to the effects this project measures.
 
+## The step time, measured — and it says don't quantize
+
+20 steps, `omni_train_step_bench.py`, the real settings: LoRA r=16 on
+q/k/v_proj in the six attention layers, lr 1e-5, 8 micro-steps of one sequence of
+303 + 1024 = 1,327 positions, a no-grad saliency re-forward each micro-step, beta 0 so no
+reference forward, no gradient checkpointing (the launcher does not use it).
+
+```
+8-bit base, one card, NO weight-splitting
+    median   68.1s      mean 66.4s   sd 3.3s   min/max 59.5 / 70.7
+    peak GPU 63.8 GB of 79.2        headroom 15.4 GB
+    3,990 steps = 75 h, training side only
+
+16-bit base, one card              OUT OF MEMORY
+    76.8 GB in use, needed 2.75 GB more
+```
+
+**The gradient check passed first.** All 36 LoRA tensors finite and non-zero after one
+optimizer step, gradient norms 3.0e-04 to 6.3e-01. The learning signal does travel back
+through the 23 Mamba layers on the torch fallback. That was the riskiest unknown on the
+list and it is answered: the plan is not dead on correctness.
+
+**But quantising does not buy the step time.** 68 s on the training side alone is 75
+hours for a 3,990-step run, before generation and reward. The 8-bit matmul is 2.4x slower
+than bfloat16, and that penalty is larger than the weight-splitting it was meant to
+replace. Trading a communication cost for a bigger compute cost is not a trade.
+
+**And the memory is not where I said it was.** Peak training memory at 8 bits is 63.8 GB
+against 34.8 GB at inference — so roughly **30 GB is activations, not weights**. That is
+what actually put 16-bit over the edge: 62 GB of weights plus the same 30 GB of
+activations is 92 GB, and the run died 2.75 GB short of finishing an allocation.
+
+Which reframes the whole thing. The launcher does not use gradient checkpointing —
+recomputing intermediate results during the backward pass instead of storing them. Turning
+it on typically cuts activation memory by an order of magnitude, for about 30% more
+compute. At 16 bits that would be roughly 62 GB of weights plus a few GB of activations:
+**it would fit on one card, at full compute speed, with no quantization and no fidelity
+question at all.** Scaling the measured 68 s by 1/2.42 for bfloat16 compute and 1.3 for
+the recomputation lands near 37 s — an estimate, not a measurement, and the obvious thing
+to measure next.
+
+So the recommendation above is superseded on the training question, though not on the
+fidelity one: if you ever do quantise, 8 bits is the setting that does not move the
+attention. But the first thing to try is **16-bit with gradient checkpointing on one
+card**, which avoids the whole question.
+
 ## Caveats
 
 - 8 pictures. Enough to see a 3–5% systematic shift; not enough for a confidence interval
