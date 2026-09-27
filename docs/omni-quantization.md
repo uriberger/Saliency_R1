@@ -162,12 +162,22 @@ quantization, so the fidelity question disappears with it. Recompute costs ~36% 
 compute, and 16-bit arithmetic is 2.4x faster than 8-bit; the second wins easily. Adding
 8-bit and recompute together is the worst of both.
 
-**The catch is headroom: 5.9 GB.** That is measured on a 1,327-position sequence
-(303 prompt + 1,024 completion). The launcher allows `max_prompt_length 2048` on top of
-the same completion, so a long prompt is roughly 3,000 positions, and with recompute the
-remaining activation cost still grows with length -- 73.3 GB minus ~62 GB of weights is
-~11 GB of activations here, and twice the length would not fit. Before committing: cap
-the prompt, or keep 8 bits for the headroom, or give the trainer two cards.
+**The headroom is 5.9 GB, and that turns out to be enough.** Measured on a 1,327-position
+sequence, and `max_prompt_length 2048` made that look risky. It is not: on `set_a`'s
+50,000 rows the questions are **8-24 tokens** (p50 8, p100 24) and the Omni's pictures
+come to **266-286 tokens** (200 real images, none over 512x512). So the longest real
+sequence is
+
+    286 picture + ~48 text + 1024 completion = 1,358 positions
+
+against the 1,327 benchmarked -- a 2% difference. `max_prompt_length 2048` is a cap
+nothing approaches. **No second card is needed for the trainer, and asking for one would
+cost roughly 2x in step time** (see `docs/omni-gpu-layout.md`).
+
+The variable to watch is not the question length but the PICTURE: the Omni is
+native-resolution and climbs to 3,328 tokens on a large image. This corpus is capped at
+512x512. A training set with bigger pictures would change this conclusion and nothing
+else in this file.
 
 ## Recomputation is safe here, but the first test said otherwise and was wrong
 
