@@ -156,33 +156,57 @@ def verify_ckpt(model, case, prompt_len, opt):
         return {n: p.grad.detach().float().clone()
                 for n, p in model.named_parameters() if p.requires_grad}
 
+    def diff(a_all, b_all):
+        worst, name, cos = 0.0, "", []
+        for k in a_all:
+            a, b = a_all[k], b_all[k]
+            rel = float((a - b).norm()) / max(float(a.norm()), 1e-12)
+            if rel > worst:
+                worst, name = rel, k
+            if a.norm() > 0 and b.norm() > 0:
+                cos.append(float((a * b).sum() / (a.norm() * b.norm())))
+        return worst, (min(cos) if cos else float("nan")), name
+
+    # THE CONTROL, and the first version of this test did not have it. Two passes with
+    # the switch OFF establish what "the same computation twice" costs on this model. A
+    # disagreement between off and on only means something if it is bigger than that:
+    # without the baseline, any run-to-run wobble reads as a recomputation bug. It is not
+    # a hypothetical here -- the 8-bit matmul keeps state across calls.
     n_off = set_ckpt(model, False)
-    off = grads()
+    off1 = grads()
+    off2 = grads()
+    base_rel, base_cos, _ = diff(off1, off2)
+
     n_on = set_ckpt(model, True)
     on = grads()
+    ck_rel, ck_cos, ck_name = diff(off1, on)
     opt.zero_grad(set_to_none=True)
-    print(f"\nrecomputation check ({n_off} blocks toggled)")
 
-    worst_rel, worst_name, cosines = 0.0, "", []
-    for k in off:
-        a, b = off[k], on[k]
-        denom = max(float(a.norm()), 1e-12)
-        rel = float((a - b).norm()) / denom
-        if rel > worst_rel:
-            worst_rel, worst_name = rel, k
-        if a.norm() > 0 and b.norm() > 0:
-            cosines.append(float((a * b).sum() / (a.norm() * b.norm())))
-    print(f"    tensors compared   : {len(off)}")
-    print(f"    worst relative diff: {worst_rel:.2e}  ({worst_name.split('.')[-4:][0] if worst_name else '-'})")
-    print(f"    min cosine         : {min(cosines):.6f}")
-    # bfloat16 with a different summation order will not agree to the bit; a recomputation
-    # that double-applied a state update would not agree to two decimal places either.
-    if worst_rel > 1e-2 or min(cosines) < 0.999:
+    print(f"\nrecomputation check ({n_off} blocks toggled, {len(off1)} tensors)")
+    print(f"    off vs off (control) : worst rel {base_rel:.2e}   min cos {base_cos:.6f}")
+    print(f"    off vs on  (signal)  : worst rel {ck_rel:.2e}   min cos {ck_cos:.6f}"
+          f"   ({ck_name.split('.')[-4] if '.' in ck_name else ck_name})")
+
+    if base_rel > 1e-3:
+        print("    the model is NOT deterministic run to run, so this test cannot see a "
+              "recomputation bug at all.")
+        if ck_rel <= max(3 * base_rel, 1e-3):
+            print("    Recomputation is within that noise: no evidence against it, and "
+                  "no evidence for it either.")
+            return n_on
         raise SystemExit(
-            "recomputation changes the gradients. Not a rounding difference -- something "
-            "in the re-run is not identical to the first pass, and the likeliest suspect "
-            "is in-place state in the Mamba mixers. Do NOT train with this on.")
-    print("    PASS: recomputation reproduces the gradients to bf16 rounding")
+            f"recomputation disagrees ({ck_rel:.2e}) by more than the run-to-run noise "
+            f"({base_rel:.2e}). Find the nondeterminism first -- on an 8-bit base the "
+            "first suspect is the int8 matmul's cached outlier state, so re-run this at "
+            "--bits 16 before blaming the Mamba layers.")
+
+    if ck_rel > max(10 * base_rel, 1e-3) or ck_cos < 0.999:
+        raise SystemExit(
+            "the model is deterministic, and recomputation changes the gradients. "
+            "Something in the re-run is not identical to the first pass; in-place state "
+            "in the Mamba mixers is the first place to look. Do NOT train with this on.")
+    print("    PASS: recomputation reproduces the gradients, on a model that is "
+          "deterministic run to run")
     return n_on
 
 
@@ -235,7 +259,7 @@ def build(device, bits, grad_ckpt=False):
     return proc, model, load_s
 
 
-def one_batch(proc, model, device):
+def one_batch(proc, model, device, completion_len=COMPLETION_LEN):
     """One real picture, one real question, and a completion of the real length.
 
     The completion ids are sampled rather than generated: this is a timing and gradient
@@ -255,7 +279,7 @@ def one_batch(proc, model, device):
 
     g = torch.Generator(device="cpu").manual_seed(0)
     vocab = int(model.base_model.model.config.llm_config.vocab_size)
-    comp = torch.randint(0, vocab, (1, COMPLETION_LEN), generator=g).to(device)
+    comp = torch.randint(0, vocab, (1, completion_len), generator=g).to(device)
     ids = torch.cat([inputs["input_ids"], comp], dim=1)
 
     case = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
@@ -264,7 +288,7 @@ def one_batch(proc, model, device):
             case[k] = inputs[k]
     n_img = int((inputs["input_ids"] == fam.image_token_id).sum())
     print(f"batch: prompt {prompt_len} ({n_img} picture tokens) + completion "
-          f"{COMPLETION_LEN} = {ids.shape[1]} positions")
+          f"{completion_len} = {ids.shape[1]} positions")
     return case, prompt_len
 
 
@@ -287,6 +311,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--bits", type=int, default=8)
+    ap.add_argument("--completion", type=int, default=COMPLETION_LEN,
+                    help="shorten the completion so a 16-bit pass fits without recompute")
     ap.add_argument("--verify-ckpt", type=int, default=0,
                     help="check recomputation reproduces the gradients, then stop")
     ap.add_argument("--grad-ckpt", type=int, default=0,
@@ -304,7 +330,7 @@ def main():
     torch.cuda.set_device(device)
     torch.cuda.reset_peak_memory_stats(device)
     proc, model, load_s = build(device, args.bits, bool(args.grad_ckpt))
-    case, prompt_len = one_batch(proc, model, device)
+    case, prompt_len = one_batch(proc, model, device, args.completion)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LR)
 
     # --- the gradient test, before any timing -------------------------------
@@ -391,7 +417,7 @@ def main():
             {"bits": args.bits, "grad_ckpt": bool(args.grad_ckpt), "steps": args.steps, "reforward": bool(args.reforward),
              "median_s": float(np.median(t)), "mean_s": float(t.mean()),
              "sd_s": float(t.std()), "peak_gb": float(peak), "load_s": load_s,
-             "prompt_len": prompt_len, "completion_len": COMPLETION_LEN,
+             "prompt_len": prompt_len, "completion_len": args.completion,
              "grad_accum": GRAD_ACCUM, "times": [float(x) for x in t]}, indent=2))
         print(f"\nwrote {args.out}")
 
