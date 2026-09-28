@@ -60,6 +60,12 @@ from ..models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generatio
 from ..models.utils import _ForwardRedirection
 from .callbacks import SyncRefModelCallback
 from .grpo_config import GRPOConfig
+# The per-family seam. Every place below that used to read `image_grid_thw` or assume a
+# 2x2 spatial merge now asks this instead -- see `docs/omni-training-harness.md`. It is a
+# copy of the repo-root `vlm_family.py` (patch_trl_nemotron.sh keeps them in step), which
+# is also what the measuring side imports, so the trainer and the probes cannot disagree
+# about where a patch is.
+from .vlm_family import family_for
 from .utils import (
     disable_dropout_in_model,
     entropy_from_logits,
@@ -629,9 +635,32 @@ class GRPOTrainer(Trainer):
                     f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
                 )
             # Disable caching if gradient checkpointing is enabled (not supported)
-            config = AutoConfig.from_pretrained(model_id)
-            architecture = getattr(transformers, config.architectures[0])
-            model = architecture.from_pretrained(model_id, **model_init_kwargs)
+            #
+            # `trust_remote_code=True` is a no-op for a natively supported checkpoint and
+            # the only way to read the config of one that ships its own modelling code.
+            config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+            if getattr(config, "auto_map", None):
+                # A remote-code checkpoint -- every Nemotron VLM here. `getattr(
+                # transformers, config.architectures[0])` below raises AttributeError on
+                # one, and it would not be enough anyway: these need the attention
+                # implementation pinned on every SUB-config before construction, a
+                # vendored `rmsnorm_fn` to import at all, and four more repairs applied
+                # after. `nemotron_loader` is that set, shared with the measuring side so
+                # the two cannot drift. `place=False` because accelerate moves the model
+                # and `.eval()` before `get_peft_model` is one more thing to undo.
+                from .nemotron_loader import load_model as _load_remote_code
+
+                _dtype = model_init_kwargs.get("torch_dtype") or torch.bfloat16
+                if not isinstance(_dtype, torch.dtype):
+                    _dtype = torch.bfloat16
+                _proc, model = _load_remote_code(
+                    model_id, device=None, quant=model_init_kwargs.get("quantization_config"),
+                    dtype=_dtype, place=False)
+                if processing_class is None:
+                    processing_class = _proc
+            else:
+                architecture = getattr(transformers, config.architectures[0])
+                model = architecture.from_pretrained(model_id, **model_init_kwargs)
         else:
             model_id = model.config._name_or_path
             if args.model_init_kwargs is not None:
@@ -648,15 +677,55 @@ class GRPOTrainer(Trainer):
             else inspect.signature(model.get_base_model().forward).parameters.keys()
         )
 
+        # THE FAMILY, resolved here because everything below needs it and because two of
+        # the three things it decides happen before the PEFT wrap. Bound off the bare
+        # model: `family_for` reads `config.model_type`, and the processor is not resolved
+        # until further down (it is re-bound there, once, when it is).
+        self.family = family_for(model=model)
+
+        # Gradient checkpointing, and the ORDER is the whole content of this block.
+        #
+        # A Nemotron needs it enabled on the LANGUAGE MODEL before the wrap, because
+        # `NemotronHPreTrainedModel` never declares `supports_gradient_checkpointing` and
+        # transformers' own switch therefore refuses on a model whose blocks ARE
+        # `GradientCheckpointingLayer`s. Doing it here rather than in
+        # `_enable_gradient_checkpointing` also keeps that method's reach away from a
+        # wrapper whose behaviour under recomputation nobody has checked.
+        #
+        # Then `get_peft_model` sees checkpointing already on and re-installs the
+        # `enable_input_require_grads` hook that `after_peft_wrap` has to take back off --
+        # which is why that call is AFTER the wrap and not before. See its docstring: the
+        # hook makes the embedding output require grad and this wrapper scatters the
+        # picture into those embeddings in place.
+        _family_ckpt = None
+        if args.gradient_checkpointing:
+            _family_ckpt = self.family.enable_gradient_checkpointing(model)
+            if _family_ckpt:
+                print(f"[grad-ckpt] recompute ON for {_family_ckpt} decoder blocks "
+                      f"({self.family.name})", flush=True)
+
         if peft_config is not None:
             if not is_peft_available():
                 raise ImportError("PEFT is required to use `peft_config`. Run `pip install peft`.")
             model = get_peft_model(model, peft_config)
 
         # Enable gradient checkpointing if requested
-        if args.gradient_checkpointing:
+        if args.gradient_checkpointing and _family_ckpt is None:
             model = self._enable_gradient_checkpointing(model, args)
+        elif args.gradient_checkpointing:
+            # The family already turned it on; only `use_cache` is still ours to set.
+            model.config.use_cache = False
         self.is_gradient_checkpointing = args.gradient_checkpointing
+
+        if args.gradient_checkpointing:
+            _dropped = self.family.after_peft_wrap(model)
+            if _dropped:
+                print(f"[grad-ckpt] removed enable_input_require_grads hooks from "
+                      f"{_dropped} modules", flush=True)
+            _still_on = sum(1 for m in model.modules()
+                            if getattr(m, "gradient_checkpointing", False))
+            if _family_ckpt and _still_on == 0:
+                raise RuntimeError("the peft wrap lost the gradient-checkpointing switch")
 
         # FA2 cannot return attention weights, so reforward_saliency is required with it.
         if getattr(model.config, "_attn_implementation", None) == "flash_attention_2" and not self.reforward_saliency:
@@ -671,16 +740,30 @@ class GRPOTrainer(Trainer):
         # Qwen3-VL (transformers 5.13): `language_model` lives inside the Qwen3VLModel
         # (`raw_model.model.language_model`). After get_peft_model(), `model.model` resolves
         # via PEFT's __getattr__ to `base_model.model` (Qwen3VLForConditionalGeneration), which
-        # has no `.language_model`. Unwrap one level first, then navigate uniformly.
+        # has no `.language_model`. Unwrap one level first, then ask the family -- a
+        # Nemotron hangs `language_model` off the wrapper itself and puts the stack one
+        # level further down again, and guessing lands on `None.layers`.
         _raw = model.base_model.model if is_peft_model(model) else model
-        lang_model = _raw.model.language_model
+        lang_model = self.family.decoder(_raw)
         self.NUM_LAYER = len(lang_model.layers)
-        self.NUM_GROUP = lang_model.layers[0].self_attn.k_proj.in_features // lang_model.layers[
-            0].self_attn.k_proj.out_features
-        self.DIMS = model.lm_head.in_features
         # Cache a direct module reference so the training loop can reach language_model
         # submodules without repeating this PEFT-aware unwrapping on every step.
         self._qwen3_lang_model = lang_model
+        # NUM_GROUP and DIMS are read ONLY by the original Saliency-R1 value-propagation
+        # readout, which multiplies every layer's attention by that layer's value states.
+        # A hybrid has no such object at 46 of its 52 positions -- `self_attn` does not
+        # exist on a Mamba or MoE block -- so this is guarded rather than computed, and
+        # `supports_saliency_r1()` is what refuses the readout itself further down.
+        if self.family.supports_saliency_r1():
+            _k = lang_model.layers[0].self_attn.k_proj
+            self.NUM_GROUP = _k.in_features // _k.out_features
+            self.DIMS = model.lm_head.in_features
+        else:
+            self.NUM_GROUP = self.DIMS = None
+        # The decoder layers that HAVE an attention matrix. None on a dense decoder (every
+        # layer does); the real list on a hybrid, where the saliency layer has to be one
+        # of them or the capture hook silently attaches to nothing.
+        self._attention_layers = self.family.attention_layers(_raw)
 
         # Processing class
         if processing_class is None:
@@ -700,10 +783,48 @@ class GRPOTrainer(Trainer):
         self.pad_token = tokenizer.pad_token
         self.pad_token_id = tokenizer.pad_token_id
         self.eos_token_id = tokenizer.eos_token_id
+        # Re-bind the family now that the processor exists: `bind` is where a family that
+        # resolves its image token off the TOKENIZER (Nemotron reads
+        # `config.img_context_token_id`, or falls back to converting `<image>`) gets the
+        # chance to, and where the hybrid's decoder attention class is read off the text
+        # config rather than guessed.
+        self.family.bind(model=_raw, processor=processing_class, config=_raw.config)
+
         self.image_token = getattr(processing_class, "image_token", None)
         self.image_token_id = getattr(processing_class, "image_token_id", None)
         self.vision_start_token_id = getattr(model.config, "vision_start_token_id", None)
         self.vision_end_token_id = getattr(model.config, "vision_end_token_id", None)
+        # The family is the fallback, not the override: on Qwen3-VL the processor answers
+        # all four and these are no-ops, which is what keeps an existing run identical.
+        # On a Nemotron the processor answers none of them -- its image token is
+        # `<image>` (id 18) named in the CONFIG, and its `<img>` / `</img>` delimiters are
+        # tokenizer lookups -- and without this the prompt-truncation guard would protect
+        # nothing and the saliency read would mask on token id None.
+        if self.image_token_id is None:
+            self.image_token_id = self.family.image_token_id
+        if self.image_token is None and self.image_token_id is not None:
+            self.image_token = tokenizer.decode([self.image_token_id])
+        if self.vision_start_token_id is None and self.family.vision_start_ids:
+            self.vision_start_token_id = self.family.vision_start_ids[0]
+        if self.vision_end_token_id is None and self.family.vision_end_ids:
+            self.vision_end_token_id = self.family.vision_end_ids[0]
+        if self.image_token_id is None:
+            raise ValueError(
+                f"no image token id for family {self.family.name!r}: the saliency read "
+                "masks the prompt's image columns with it, and `== None` would select no "
+                "columns and report an empty map as a result")
+
+        # A hybrid has an attention matrix at only a few of its layers, and
+        # --overlap_layer is an index into ALL of them. Pointing it at a Mamba or MoE
+        # layer attaches the capture hook to nothing, and the run then trains on a reward
+        # that is silently zero everywhere.
+        if self._per_step_reward and self._attention_layers is not None:
+            if self.overlap_layer not in self._attention_layers:
+                raise ValueError(
+                    f"--overlap_layer {self.overlap_layer} is not an attention layer of "
+                    f"this model. {self.family.name} has attention at "
+                    f"{self._attention_layers} and state-space / MLP blocks everywhere "
+                    "else, so there is no attention matrix to read at that index.")
 
         # Reward functions
         if not isinstance(reward_funcs, list):
@@ -1129,6 +1250,52 @@ class GRPOTrainer(Trainer):
 
         return model
 
+    def _refuse_qwen3_only(self, what, why):
+        """Stop a readout that is defined only on Qwen3-VL's geometry. Never returns.
+
+        Three of the maps this trainer can build are not portable and saying so is the
+        point. The overlap map is a slice of one attention matrix over the image-token
+        COLUMNS, which any family has; these three reach further in:
+
+          * `grad` differentiates w.r.t. `pixel_values` and folds the result back onto
+            patches using Qwen3-VL's `patch_size` x `temporal_patch_size` packing;
+          * `glimpse` propagates gradient-weighted attention across EVERY layer;
+          * the original Saliency-R1 readout multiplies each layer's attention by that
+            layer's value states and pushes it through `o_proj`.
+
+        On a Nemotron-H hybrid the last two have no object at 46 of 52 layers, and the
+        first has a different pixel packing. Each would produce a number rather than an
+        error, which is the failure worth refusing.
+        """
+        raise NotImplementedError(
+            f"{what} is not implemented for family {self.family.name!r}: {why}. "
+            "Use --saliency-method attention, whose map is a slice of one attention "
+            "matrix and is defined wherever there is an attention layer.")
+
+    def _mm_forward_kwargs(self, mm_source, lo, hi, seq_len=None):
+        """The multimodal kwargs for samples [lo, hi), as `forward()` wants them.
+
+        The family decides which processor outputs those are and how to cut them: Qwen3-VL
+        stacks a batch's patches into ONE flat `pixel_values` and needs `image_grid_thw`
+        to find a sample's slice of it, and the Omni emits one row per picture and needs
+        nothing. Geometry-only keys (`imgs_sizes`) are never in here -- the model rejects
+        them -- and the batch keeps them separately for `token_grid`.
+        """
+        mm = dict(self.family.forward_defaults)
+        if not mm_source:
+            return mm
+        mm.update(self.family.mm_slice(mm_source, lo, hi))
+        # mm_token_type_ids comes from prompt_inputs only; pad with zeros (text type) to
+        # cover completion tokens.
+        t = mm.get("mm_token_type_ids")
+        if t is not None and seq_len is not None and t.size(1) < seq_len:
+            mm["mm_token_type_ids"] = torch.cat(
+                [t, torch.zeros(t.size(0), seq_len - t.size(1), dtype=t.dtype,
+                                device=t.device)],
+                dim=1,
+            )
+        return mm
+
     @profiling_decorator
     def _get_last_hidden_state(
         self,
@@ -1136,41 +1303,16 @@ class GRPOTrainer(Trainer):
         input_ids,
         attention_mask,
         logits_to_keep,
-        pixel_values=None,
-        image_grid_thw=None,
-        pixel_attention_mask=None,
-        image_sizes=None,
-        mm_token_type_ids=None,
+        mm_source=None,
     ):
         if is_peft_model(unwrapped_model):
             unwrapped_model = unwrapped_model.base_model.model
 
-        # mm_token_type_ids comes from prompt_inputs only; pad with zeros (text type) to cover completion tokens
-        if mm_token_type_ids is not None and mm_token_type_ids.size(1) < input_ids.size(1):
-            pad_len = input_ids.size(1) - mm_token_type_ids.size(1)
-            mm_token_type_ids = torch.cat(
-                [mm_token_type_ids, torch.zeros(mm_token_type_ids.size(0), pad_len, dtype=mm_token_type_ids.dtype, device=mm_token_type_ids.device)],
-                dim=1,
-            )
-
         # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
-
-        # For Qwen models:
-        if image_grid_thw is not None and pixel_values is not None:
-            model_inputs["image_grid_thw"] = image_grid_thw
-        # For Gemma, SmolVLM2, LLaVa-Next etc.:
-        if pixel_values is not None:
-            model_inputs["pixel_values"] = pixel_values
-        # For SmolVLM2
-        if pixel_attention_mask is not None:
-            model_inputs["pixel_attention_mask"] = pixel_attention_mask
-        # For LLaVa-Next
-        if image_sizes is not None:
-            model_inputs["image_sizes"] = image_sizes
-        # For Qwen3-VL M-RoPE
-        if mm_token_type_ids is not None:
-            model_inputs["mm_token_type_ids"] = mm_token_type_ids
+        model_inputs.update(
+            self._mm_forward_kwargs(mm_source, 0, input_ids.size(0), input_ids.size(1))
+        )
 
         # Only add logits_to_keep if the model supports it
         if "logits_to_keep" in self.model_kwarg_keys:
@@ -1222,43 +1364,22 @@ class GRPOTrainer(Trainer):
         logits_to_keep,
         batch_size=None,
         compute_entropy=False,
-        pixel_values=None,
-        image_grid_thw=None,
-        pixel_attention_mask=None,
-        image_sizes=None,
-        mm_token_type_ids=None,
+        mm_source=None,
     ) -> dict[str, Optional[torch.Tensor]]:
         """Compute log-probs and (optionally) entropies for each token."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
-        # mm_token_type_ids comes from prompt_inputs only; pad with zeros (text type) to cover completion tokens
-        if mm_token_type_ids is not None and mm_token_type_ids.size(1) < input_ids.size(1):
-            pad_len = input_ids.size(1) - mm_token_type_ids.size(1)
-            mm_token_type_ids = torch.cat(
-                [mm_token_type_ids, torch.zeros(mm_token_type_ids.size(0), pad_len, dtype=mm_token_type_ids.dtype, device=mm_token_type_ids.device)],
-                dim=1,
-            )
         all_logps = []
         all_entropies = []
         for start in range(0, input_ids.size(0), batch_size):
-            input_ids_batch = input_ids[start : start + batch_size]
-            attention_mask_batch = attention_mask[start : start + batch_size]
+            stop = start + batch_size
+            input_ids_batch = input_ids[start:stop]
+            attention_mask_batch = attention_mask[start:stop]
 
             # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
             model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch}
-
-            if image_grid_thw is not None and pixel_values is not None:
-                model_inputs["image_grid_thw"] = image_grid_thw[start : start + batch_size]
-                start_pixel_idx = image_grid_thw[:start].prod(-1).sum().item()
-                end_pixel_idx = image_grid_thw[: start + batch_size].prod(-1).sum().item()
-                model_inputs["pixel_values"] = pixel_values[start_pixel_idx:end_pixel_idx]
-            elif pixel_values is not None:
-                model_inputs["pixel_values"] = pixel_values[start : start + batch_size]
-            if pixel_attention_mask is not None:
-                model_inputs["pixel_attention_mask"] = pixel_attention_mask[start : start + batch_size]
-            if image_sizes is not None:
-                model_inputs["image_sizes"] = image_sizes[start : start + batch_size]
-            if mm_token_type_ids is not None:
-                model_inputs["mm_token_type_ids"] = mm_token_type_ids[start : start + batch_size]
+            model_inputs.update(
+                self._mm_forward_kwargs(mm_source, start, stop, input_ids.size(1))
+            )
 
             # Only add logits_to_keep if the model supports it
             if "logits_to_keep" in self.model_kwarg_keys:
@@ -1334,6 +1455,59 @@ class GRPOTrainer(Trainer):
                 llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                 llm_model.load_weights([(name, param)])
 
+    def _lora_touched_prefixes(self):
+        """Module paths whose weights a merged LoRA actually changes. -> set or None.
+
+        WHY THIS EXISTS. `_move_model_to_vllm` pushes EVERY named parameter to the
+        generation server, one HTTP round trip and one NCCL broadcast each. On Qwen3-VL-8B
+        that is ~700 tensors and costs about a second. The Omni is a 33B mixture of
+        experts: 7,349 tensors, of which 5,934 are expert weights, and at a few
+        milliseconds of round trip apiece the sync alone would be tens of seconds on a
+        step whose whole budget is ~47 s.
+
+        Under LoRA the base is FROZEN, and the server loaded that same base from the same
+        checkpoint at startup. So after `merge_adapter()` the only weights that differ
+        from the server's copy are the ones a LoRA sits on -- 18 tensors here, the q/k/v
+        projections of the six attention layers -- plus anything in `modules_to_save`,
+        which is trained outright. Everything else is a re-send of bytes the server
+        already has.
+
+        Returns None when that argument does not hold (no PEFT model, or a base parameter
+        that still requires grad), in which case the caller pushes everything. `None` is
+        also what `SR1_VLLM_SYNC_ALL=1` forces, to take the optimisation back out without
+        editing anything.
+        """
+        if os.environ.get("SR1_VLLM_SYNC_ALL") == "1":
+            return None
+        if os.environ.get("SR1_VLLM_SYNC_LORA_ONLY") != "1":
+            return None          # off unless a launcher asks: existing runs stay identical
+        model = self.model
+        if not is_peft_model(model):
+            return None
+        prefixes = set()
+        for name, module in model.named_modules():
+            if hasattr(module, "lora_A") or "modules_to_save" in name:
+                prefixes.add(self._fix_param_name_to_vllm(
+                    name.removeprefix("base_model.model.").replace(".base_layer", ""),
+                    extra_prefixes=["modules_to_save.default."]))
+        if not prefixes:
+            return None
+        # A trainable weight OUTSIDE the adapter means the base is not frozen after all
+        # and the server's copy of it is going stale. Refuse the shortcut rather than
+        # training against a generator that silently drifts.
+        for name, param in model.named_parameters():
+            if not param.requires_grad or model.prefix in name:
+                continue
+            clean = self._fix_param_name_to_vllm(
+                name.removeprefix("base_model.model.").replace(".base_layer", ""))
+            if not any(clean.startswith(p) for p in prefixes):
+                warnings.warn(
+                    f"SR1_VLLM_SYNC_LORA_ONLY is set but {clean!r} is trainable and sits "
+                    "outside every adapter, so the base is not frozen. Pushing every "
+                    "parameter instead.")
+                return None
+        return prefixes
+
     @profiling_decorator
     def _move_model_to_vllm(self):
         # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
@@ -1367,6 +1541,8 @@ class GRPOTrainer(Trainer):
                         self._sync_fsdp2_params_to_vllm(self.model)
                 else:
                     # DeepSpeed ZeRO-3 with PEFT
+                    touched = self._lora_touched_prefixes()
+                    n_sent = 0
                     for name, param in self.model.named_parameters():
                         # When using PEFT, we need to recover the original parameter name and discard some parameters
                         name = name.removeprefix("base_model.model.").replace(".base_layer", "")
@@ -1376,12 +1552,24 @@ class GRPOTrainer(Trainer):
                         if "original_module" in name:
                             continue
                         name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
+                        # Skip the frozen base: the server loaded it from the same
+                        # checkpoint and nothing has written to it. See
+                        # `_lora_touched_prefixes`.
+                        if touched is not None and not any(name.startswith(p) for p in touched):
+                            continue
+                        n_sent += 1
 
                         if self.vllm_mode == "server" and self.accelerator.is_main_process:
                             self.vllm_client.update_named_param(name, param.data)
                         elif self.vllm_mode == "colocate":
                             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                             llm_model.load_weights([(name, param.data)])
+                if touched is not None and self.state.global_step == 0 and \
+                        self.accelerator.is_main_process:
+                    print(f"[vllm-sync] pushing {n_sent} adapted tensors per step, not "
+                          f"{sum(1 for _ in self.model.named_parameters())} "
+                          "(SR1_VLLM_SYNC_LORA_ONLY=1; the frozen base is already on the "
+                          "server)", flush=True)
                 # Unmerge adapters while parameters are still gathered
                 self.model.unmerge_adapter()
                 # Parameters will automatically be repartitioned when exiting the context
@@ -1587,11 +1775,7 @@ class GRPOTrainer(Trainer):
         heads = self.overlap_heads
         tr = self.token_reduction
 
-        thw = prompt_inputs.get("image_grid_thw")  # [batch, 3]
-        patch_offsets = [0]
-        if thw is not None:
-            for _i in range(thw.shape[0]):
-                patch_offsets.append(patch_offsets[-1] + int(thw[_i].prod().item()))
+        fam = self.family
 
         results = [[] for _ in range(len(images))]
 
@@ -1621,15 +1805,29 @@ class GRPOTrainer(Trainer):
 
             _attn_mod = None
             for _m in _unwrapped.modules():
-                if type(_m).__name__ == "Qwen3VLTextAttention" and getattr(_m, "layer_idx", None) == L:
+                if type(_m).__name__ in fam.attn_classes and getattr(_m, "layer_idx", None) == L:
                     _attn_mod = _m
                     break
+
+            # A family loaded EAGER throughout already has the softmax weights in the
+            # module's own output, so the capture is a plain read and the re-entrant
+            # re-run below is unnecessary work on a layer that is not free. A Nemotron is
+            # that case: `nemotron_loader` pins eager because the wrapper declares no SDPA
+            # support, and `NemotronHAttention.forward` returns (output, weights). If the
+            # weights come back None anyway the hook falls through to the re-run, so this
+            # is a fast path and not a second implementation.
+            _native = fam.attention_weights_are_returned
 
             def _capture_hook(module, args, kwargs, output):
                 # Re-run this single attention module in eager mode to recover its
                 # softmax weights (the base flash/sdpa forward returns None for them).
                 if _reentry["in"]:
                     return
+                if _native:
+                    _w = output[1] if isinstance(output, (tuple, list)) and len(output) > 1 else None
+                    if _w is not None:
+                        _cap["attn"] = _w
+                        return
                 _reentry["in"] = True
                 _kw = dict(kwargs)
                 _kw["attention_mask"] = _mask_holder["m"]
@@ -1675,20 +1873,13 @@ class GRPOTrainer(Trainer):
                     "input_ids": prompt_completion_ids[case_id:case_id + 1],
                     "attention_mask": attention_mask[case_id:case_id + 1],
                 }
-                if thw is not None:
-                    _case_inputs["pixel_values"] = prompt_inputs["pixel_values"][
-                        patch_offsets[case_id]:patch_offsets[case_id + 1]
-                    ]
-                    _case_inputs["image_grid_thw"] = thw[case_id:case_id + 1]
-                if prompt_inputs.get("mm_token_type_ids") is not None:
-                    _compl_zeros = torch.zeros(1, completion_ids.size(1), dtype=torch.long, device=device)
-                    _case_inputs["mm_token_type_ids"] = torch.cat(
-                        [prompt_inputs["mm_token_type_ids"][case_id:case_id + 1], _compl_zeros], dim=1
-                    )
+                _case_inputs.update(self._mm_forward_kwargs(
+                    prompt_inputs, case_id, case_id + 1,
+                    seq_len=prompt_completion_ids.size(1)))
 
                 if _prof:
                     torch.cuda.synchronize(device); _ts = _time.perf_counter()
-                if _hook_handle is not None:
+                if _hook_handle is not None and not _native:
                     # Build the additive causal+padding mask the eager re-run needs
                     # (0 where attended, finfo.min where masked): the fast forward may
                     # hand layer L a None mask.
@@ -1705,6 +1896,20 @@ class GRPOTrainer(Trainer):
                     _unwrapped(**_case_inputs)  # triggers _capture_hook at layer L
                     _attn_L = _cap["attn"]
                     del _add, _masked
+                elif _hook_handle is not None:
+                    # The eager family: the module's own output already carries the
+                    # weights, and the mask the base forward built for it is the right
+                    # one. Nothing to rebuild and nothing to re-run.
+                    _cap["attn"] = None
+                    _unwrapped(**_case_inputs)
+                    _attn_L = _cap["attn"]
+                    if _attn_L is None:
+                        raise RuntimeError(
+                            f"{fam.name} declares its attention weights are returned, but "
+                            f"layer {L} handed back None. The model is not running an "
+                            "eager attention implementation -- check "
+                            "config._attn_implementation on the LANGUAGE model's config, "
+                            "which is a sub-config here and is set separately.")
                 else:
                     _fwd = _unwrapped(**_case_inputs, output_attentions=True, output_hidden_states=False)
                     _attn_L = _fwd.attentions[L]
@@ -1725,7 +1930,7 @@ class GRPOTrainer(Trainer):
                     del _attn_L
                     continue
 
-                _image_mask = prompt_ids[case_id] == 151655
+                _image_mask = prompt_ids[case_id] == self.image_token_id
                 # [1, heads, think_len, n_patches] : observe-token query rows -> image-patch key cols
                 raw = _attn_L[
                     :, heads,
@@ -1738,8 +1943,12 @@ class GRPOTrainer(Trainer):
                 if _prof:
                     torch.cuda.synchronize(device); _t_fwd += _time.perf_counter() - _ts; _n_fwd += 1
 
-                gh = int(thw[case_id, 1].item()) // 2
-                gw = int(thw[case_id, 2].item()) // 2
+                # The token grid, from whatever field THIS family reports it in --
+                # Qwen3-VL's `image_grid_thw` over a 2x2 merge, the Omni's `imgs_sizes`
+                # over a 32px token. Asking rather than computing is the whole point of
+                # the seam: the Omni has no `image_grid_thw` and its grid is a different
+                # shape for every picture.
+                gh, gw = fam.token_grid(prompt_inputs, case_id)
 
                 question = inputs[case_id].get("problem", "") if isinstance(inputs[case_id], dict) else ""
                 if _prof:
@@ -1838,6 +2047,12 @@ class GRPOTrainer(Trainer):
         ps = int(getattr(ip, "patch_size", 16))
         tps = int(getattr(ip, "temporal_patch_size", 2))
 
+        if not self.family.supports_saliency_r1():
+            self._refuse_qwen3_only(
+                "reward_variant='grad'",
+                "it folds a pixel gradient back onto patches with Qwen3-VL's "
+                "patch_size x temporal_patch_size packing, which this processor does not "
+                "use")
         thw = prompt_inputs.get("image_grid_thw")  # [batch, 3]
         if thw is None:
             raise RuntimeError(
@@ -2001,6 +2216,11 @@ class GRPOTrainer(Trainer):
         clf = self._get_overlap_classifier()
         tokenizer = getattr(self.processing_class, "tokenizer", self.processing_class)
 
+        if not self.family.supports_saliency_r1():
+            self._refuse_qwen3_only(
+                "reward_variant='glimpse'",
+                "it propagates gradient-weighted attention across every decoder layer, "
+                "and a hybrid has no attention matrix at most of its layers")
         thw = prompt_inputs.get("image_grid_thw")  # [batch, 3]
         if thw is None:
             raise RuntimeError(
@@ -2138,7 +2358,10 @@ class GRPOTrainer(Trainer):
         has_images = "image" in inputs[0]
         if has_images:
             images = [example.get("image") for example in inputs]
-            kwargs = {"images": [[img] for img in images]}
+            # How THIS processor wants the pictures. Qwen3-VL's batches them one list per
+            # sample; the Omni's walks a flat list, replacing each `<image>` in the text
+            # rows in order, and a nested list is not iterable the way it expects.
+            kwargs = {"images": self.family.batch_image_arg(images)}
             for prompt in prompts:
                 if isinstance(prompt, list):
                     for message in prompt:
@@ -2163,6 +2386,10 @@ class GRPOTrainer(Trainer):
             **kwargs,
         )
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        # Anything `forward()` requires that the processor does not emit. A no-op for
+        # every family but Nemotron, whose forward opens with `image_flags.squeeze(-1)`
+        # on a key its own processor never produces.
+        prompt_inputs = self.family.after_processor(prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
         if self.max_prompt_length is not None:
@@ -2452,11 +2679,7 @@ class GRPOTrainer(Trainer):
                     attention_mask,
                     logits_to_keep,
                     batch_size,
-                    pixel_values=prompt_inputs.get("pixel_values"),
-                    image_grid_thw=prompt_inputs.get("image_grid_thw"),
-                    pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
-                    image_sizes=prompt_inputs.get("image_sizes"),
-                    mm_token_type_ids=prompt_inputs.get("mm_token_type_ids"),
+                    mm_source=prompt_inputs,
                 )
             else:
                 old_per_token_logps = None
@@ -2470,11 +2693,7 @@ class GRPOTrainer(Trainer):
                         attention_mask,
                         logits_to_keep,
                         batch_size=batch_size,
-                        pixel_values=prompt_inputs.get("pixel_values"),
-                        image_grid_thw=prompt_inputs.get("image_grid_thw"),
-                        pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
-                        image_sizes=prompt_inputs.get("image_sizes"),
-                        mm_token_type_ids=prompt_inputs.get("mm_token_type_ids"),
+                        mm_source=prompt_inputs,
                     )
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
@@ -2484,11 +2703,7 @@ class GRPOTrainer(Trainer):
                             attention_mask,
                             logits_to_keep,
                             batch_size=batch_size,
-                            pixel_values=prompt_inputs.get("pixel_values"),
-                            image_grid_thw=prompt_inputs.get("image_grid_thw"),
-                            pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
-                            image_sizes=prompt_inputs.get("image_sizes"),
-                            mm_token_type_ids=prompt_inputs.get("mm_token_type_ids"),
+                            mm_source=prompt_inputs,
                         )
             else:
                 ref_per_token_logps = None
@@ -2608,6 +2823,12 @@ class GRPOTrainer(Trainer):
         elif self.reforward_saliency:
             # --- Re-forward path: generate without output_attentions, then do a cheap
             # per-case forward pass to extract attention slices for saliency. ---
+            if not self.family.supports_saliency_r1():
+                self._refuse_qwen3_only(
+                    "the original Saliency-R1 readout (--reward_variant saliency_r1)",
+                    "it multiplies every layer's attention by that layer's value states "
+                    "and pushes the result through `o_proj`, and a hybrid decoder has no "
+                    "`self_attn` at most of its layers")
             thw = prompt_inputs.get("image_grid_thw")  # [batch, 3]
             patch_offsets = [0]
             if thw is not None:
@@ -2710,6 +2931,12 @@ class GRPOTrainer(Trainer):
 
         else:
             # --- Original path: attentions stored during generate (output_attentions=True). ---
+            if not self.family.supports_saliency_r1():
+                self._refuse_qwen3_only(
+                    "the original Saliency-R1 readout (--reward_variant saliency_r1)",
+                    "it multiplies every layer's attention by that layer's value states "
+                    "and pushes the result through `o_proj`, and a hybrid decoder has no "
+                    "`self_attn` at most of its layers")
             with torch.no_grad():
                 for case_id in range(len(images)):
                     logits = 0
@@ -3035,16 +3262,14 @@ class GRPOTrainer(Trainer):
             output["old_per_token_logps"] = old_per_token_logps
         if ref_per_token_logps is not None:
             output["ref_per_token_logps"] = ref_per_token_logps
-        if "pixel_values" in prompt_inputs:
-            output["pixel_values"] = prompt_inputs["pixel_values"]
-        if "image_grid_thw" in prompt_inputs:
-            output["image_grid_thw"] = prompt_inputs["image_grid_thw"]
-        if "pixel_attention_mask" in prompt_inputs:
-            output["pixel_attention_mask"] = prompt_inputs["pixel_attention_mask"]
-        if "image_sizes" in prompt_inputs:
-            output["image_sizes"] = prompt_inputs["image_sizes"]
-        if "mm_token_type_ids" in prompt_inputs:
-            output["mm_token_type_ids"] = prompt_inputs["mm_token_type_ids"]
+        # Carry the family's multimodal inputs forward to the loss pass, plus its
+        # GEOMETRY keys -- `imgs_sizes` is not a forward kwarg and `token_grid` reads it,
+        # so dropping it here would leave the loss pass unable to say how big the picture
+        # was. Every one of these is row-aligned with the batch except the ones the family
+        # declares packed, which is what lets `shuffle_sequence_dict` reorder them.
+        for key in (*self.family.mm_inputs, *self.family.geometry_inputs):
+            if key in prompt_inputs:
+                output[key] = prompt_inputs[key]
         return output
 
     def compute_liger_loss(self, unwrapped_model, inputs):
@@ -3061,11 +3286,7 @@ class GRPOTrainer(Trainer):
             input_ids,
             attention_mask,
             logits_to_keep,
-            inputs.get("pixel_values"),
-            inputs.get("image_grid_thw"),
-            inputs.get("pixel_attention_mask"),
-            inputs.get("image_sizes"),
-            inputs.get("mm_token_type_ids"),
+            mm_source=inputs,
         )
 
         # compute loss and metrics using liger grpo loss
@@ -3116,11 +3337,7 @@ class GRPOTrainer(Trainer):
             attention_mask,
             logits_to_keep,
             compute_entropy=True,
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            pixel_attention_mask=inputs.get("pixel_attention_mask"),
-            image_sizes=inputs.get("image_sizes"),
-            mm_token_type_ids=inputs.get("mm_token_type_ids"),
+            mm_source=inputs,
         )
 
         if self.top_entropy_quantile < 1.0:

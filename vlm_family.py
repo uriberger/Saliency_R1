@@ -246,10 +246,24 @@ class Family:
     #: `drop_inputs` says the same thing for the measuring side; this is the subset the
     #: trainer still has to keep, because `grids_for` reads it after the forward.
     geometry_inputs = ()
+    #: forward arguments this family always wants, on every pass the trainer makes.
+    forward_defaults = {}
     #: True when the decoder's attention modules already return their softmax weights, so
     #: the saliency capture is a plain forward hook. False means the hook has to re-run
     #: the module in eager mode -- see `_compute_overlap_step_maps`.
     attention_weights_are_returned = False
+
+    def batch_image_arg(self, images):
+        """A BATCH of one-picture samples, as this processor wants it.
+
+        Not `image_arg`, and the difference is the axis. `image_arg` answers "one sample,
+        these pictures" -- which is the measuring side's question, where the batch is
+        always 1 and a sample may hold two pictures. This is the trainer's: N samples of
+        one picture each. Qwen3-VL wants them nested one list per sample; a processor that
+        walks a FLAT list replacing each `<image>` placeholder in order (the Omni's) gets
+        a list it cannot iterate if they are nested.
+        """
+        return list(images)
 
     def mm_lengths(self, inputs):
         """Rows of each packed input belonging to each sample. -> list[int] or None."""
@@ -486,6 +500,10 @@ class Qwen3VL(Family):
                     "grid: the patch merge assumption is wrong for this model")
             out.append((t, gh, gw))
         return out
+
+    def batch_image_arg(self, images):
+        # one list per sample, which is what this processor's batching expects
+        return [[img] for img in images]
 
     def mm_lengths(self, inputs):
         thw = inputs.get("image_grid_thw")
@@ -800,6 +818,12 @@ class NemotronVL(Family):
     # an ordinary slice and nothing has to be cut by a grid.
     mm_inputs = ("pixel_values", "image_flags")
     packed_inputs = ()
+    #: `use_cache` on the OUTER wrapper only reaches the language model as an argument;
+    #: its `llm_config.use_cache` is True and is a separate object, so a trainer that
+    #: leaves this unset builds a hybrid Mamba+KV cache on every no-grad re-forward and
+    #: every checkpointed training forward, and throws it away. The benchmark that
+    #: measured 34.0 s a step passed it on every call.
+    forward_defaults = {"use_cache": False}
     #: `imgs_sizes` is the resized (H, W) the grid is derived from. It is not a forward
     #: kwarg (`drop_inputs` says so) and `token_grid` reads it, so the trainer has to
     #: carry it through the batch without ever passing it to the model.

@@ -177,6 +177,21 @@ echo "  copied length-guard reward file (length_guard_rewards)"
 cp "$REPO/trl/models/utils.py"            "$TRL_REPO/trl/models/utils.py"
 echo "  copied ZeRO-3 generation-hook fix (models/utils)"
 
+# ── 2j. the per-family geometry seam ────────────────────────────────────────
+# LOAD-BEARING FOR EVERY RUN, Qwen3-VL ones included. grpo_trainer_qwen3.py imports
+# `from .vlm_family import family_for` at module scope -- it asks the family for a
+# sample's token grid and for which multimodal inputs are row-aligned, instead of reading
+# `image_grid_thw` and assuming a 2x2 merge. Qwen3VL's answers are exactly what the file
+# used to hardcode, so nothing about a Qwen3-VL run changes; omitting this copy is not
+# "the Omni is unavailable", it is an ImportError before the first step.
+#
+# nemotron_loader.py is imported lazily (only a `trust_remote_code` checkpoint reaches it)
+# and is copied anyway, so the two clones hold the same files and
+# test_import_layout_cpu.py can check one list against the other.
+cp "$REPO/vlm_family.py"                  "$TRL_REPO/trl/trainer/vlm_family.py"
+cp "$REPO/nemotron_loader.py"             "$TRL_REPO/trl/trainer/nemotron_loader.py"
+echo "  copied the geometry seam (vlm_family, nemotron_loader)"
+
 # ── 3a. trl/trainer/__init__.py ─────────────────────────────────────────────
 TINIT="$TRL_REPO/trl/trainer/__init__.py"
 [ -f "$TINIT" ] || { echo "MISSING: $TINIT"; exit 1; }
