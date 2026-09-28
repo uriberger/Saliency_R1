@@ -6,7 +6,10 @@
 # grad_accum 8, num_generations 8, max_completion_length 1024, beta 0. Five things differ,
 # and each one is here because the Omni forced it:
 #
-#   the accelerate config   multi_gpu.yaml, not deepspeed_zero3.yaml -- see PLAN A
+#   the accelerate config   accelerate_omni_plan_a.yaml, not deepspeed_zero3.yaml. It is
+#                           TRL's multi_gpu.yaml with mixed_precision 'no' -- the model is
+#                           already bf16 and autocast would promote every log-softmax over
+#                           a 131k vocabulary to fp32. See PLAN A and the file's header
 #   the conda envs          `nemotron` trains, `nemotron_vllm` generates -- see TWO ENVS
 #   the harness             trl_repo_nemotron/, so trl_repo is not rewritten under the
 #                           Qwen3-VL runs that are using it
@@ -561,7 +564,7 @@ fi
 
 cd "$HARNESS"
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
-    --config_file examples/accelerate_configs/multi_gpu.yaml \
+    --config_file "$REPO/accelerate_omni_plan_a.yaml" \
     --num_processes "$TRAIN_N" \
     --main_process_port "$MASTER_PORT" \
     examples/scripts/grpo_vlm_qwen3.py \

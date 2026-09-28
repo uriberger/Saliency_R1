@@ -1,0 +1,38 @@
+# Plan A: six training processes, one WHOLE copy of the Omni each, no sharding.
+#
+# This is TRL's `examples/accelerate_configs/multi_gpu.yaml` with ONE field changed, and
+# the change is the reason the file exists:
+#
+#     mixed_precision: 'bf16'   ->   'no'
+#
+# The Omni is LOADED in bfloat16 (`nemotron_loader.load_model(dtype=torch.bfloat16)`), so
+# there is no fp32 master copy for autocast to mix with -- every matmul would already run
+# in bf16. What autocast still does is promote the ops on its fp32 list, and the two that
+# matter here are enormous: `log_softmax` over a 131,072-token vocabulary, and the eager
+# attention softmax. At ~1,400 positions the log-softmax output alone goes from 367 MB in
+# bf16 to 734 MB in fp32, and it is kept for the backward.
+#
+# On a card already at 73.9 of 79.2 GB that is not a margin, it is the difference between
+# running and `torch.OutOfMemoryError: Tried to allocate 5.50 GiB ... 5.31 GiB is free`.
+# It is also what `omni_train_step_bench.py` measured 34.0 s and 73.3 GB against: plain
+# bf16, no autocast. Running the real thing under autocast would have been measuring one
+# configuration and training another.
+#
+# Everything else is multi_gpu.yaml verbatim. `num_processes` is overridden on the command
+# line (accelerate launch --num_processes), so the 8 below is never used.
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: MULTI_GPU
+downcast_bf16: 'no'
+gpu_ids: all
+machine_rank: 0
+main_training_function: main
+mixed_precision: 'no'
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
