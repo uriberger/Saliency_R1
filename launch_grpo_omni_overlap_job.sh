@@ -106,6 +106,42 @@
 # run has to say so. `--overlap-heads` takes a list; passing all 32 is the alternative.
 #
 # ---------------------------------------------------------------------------
+# THE MEMORY CEILING, and the one hyper-parameter that could not be carried over.
+#
+# A training rank measures (SR1_MEM_REPORT, before a micro-step's forward):
+#
+#     allocated 62.4 GB    reserved 62.5 GB    peak 74.1 GB    of 79.2
+#
+# 62.4 is the weights. The forward adds 0.3 GB of saved activations -- every one of the 52
+# blocks recomputes, so checkpointing is doing exactly what it should. What does not fit is
+# the WORKING SET: a mixture of experts with 128 experts materialises ~11.4 GB of
+# intermediates for a 1,397-position sequence, and the backward then asks for one further
+# ~5.5 GB block. 62.4 + 11.4 + 5.5 = 79.3 against 79.18, and the run dies at step 12-15,
+# always on the micro-step carrying a completion that reached the cap.
+#
+# Everything free was spent first, and each is still in the file because each helped:
+# no autocast (a bf16 model does not need it and it promotes log-softmax over a 131k
+# vocabulary to fp32), expandable segments, the allocator's cache released before each
+# micro-step (9.4 GB of it was held and owned by nothing), `logits_to_keep` forwarded so
+# the lm_head stops running over the prompt, the T5 classifier moved to CPU, NCCL bound to
+# each rank's own device (five 520 MB contexts belonging to ranks 1-5 sat on rank 0's
+# card), DDP's unused-parameter search off, and the completion padding the loss already
+# masks no longer forwarded. Together they moved the failure from step 0 to step 15. None
+# of them can close a gap that scales with the sequence.
+#
+# So `--max-completion-length` is the deviation, it is the ONLY one, and it is in the run
+# name. The working set is linear in tokens: at 768 the sequence is 1,141 positions and the
+# peak lands near 76 GB. It is chosen to cost as little as possible -- the policy's longest
+# TERMINATED completion measured 594 tokens, so nothing that finishes is truncated; what
+# changes is where a runaway chain is cut off, and `completions/clipped_ratio` is the number
+# to read it off. Any comparison with a Qwen3-VL run has to state it.
+#
+# The routes that would restore 1024 are all ruled out elsewhere: Plan B (one copy across a
+# pair of cards) halves the process count and roughly doubles the step, and 8-bit is 2.4x
+# slower per matmul -- docs/omni-gpu-layout.md and docs/omni-quantization.md. What WOULD
+# work and is untried: a card with more than 80 GB.
+#
+# ---------------------------------------------------------------------------
 # THE PREFLIGHT, which is the thing to run first -- not the step time.
 #
 # The learning signal has to travel back through 23 Mamba layers on a torch fallback to
@@ -278,7 +314,11 @@ if (( GEN_BATCH % NUM_GENERATIONS != 0 )); then
     exit 1
 fi
 
+# The completion cap is in the name whenever it is not the Qwen3-VL runs' 1024, because
+# it is the ONE training hyper-parameter that could not be carried over and a run that
+# differs in it must never be mistaken for one that does not. See THE MEMORY CEILING.
 RUN_NAME="grpo-omni30b-overlap__wov${W_OVERLAP}_L${OVERLAP_LAYER}_h${OVERLAP_HEADS//,/-}_${OVERLAP_METRIC}"
+[ "$MAX_COMPLETION_LENGTH" = 1024 ] || RUN_NAME="${RUN_NAME}_c${MAX_COMPLETION_LENGTH}"
 [ -n "$OUTPUT_DIR" ] || OUTPUT_DIR="$REPO/outputs/omni_grpo_plan_a/$RUN_NAME"
 
 # ---------- submit, or run here ----------
