@@ -189,6 +189,14 @@ VLLM_GPUS_N=1                 # 2 = Plan A'
 # and `omni_vllm_probe.py` is what measured it rather than assuming it.
 VLLM_GPU_MEM=${VLLM_GPU_MEM:-0.90}
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-4096}
+# torch.compile + CUDA-graph capture on a 52-layer mixture of experts is minutes of
+# startup that a 1-2 h allocation pays again on every requeue. Eager by default for that
+# reason alone; VLLM_ENFORCE_EAGER=False buys back generation throughput on a long run.
+VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-True}
+# A Mamba hybrid needs ONE state block per concurrently decoding sequence, and this card
+# has ~914. vLLM's default max_num_seqs is 1024, so it refuses before anything runs. One
+# GRPO step asks for gen_batch sequences at most (48 here); 64 leaves margin.
+VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-64}
 OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cuda}
 OVERLAP_STEPS_CKPT=${OVERLAP_STEPS_CKPT:-$REPO/checkpoint/steps_classifier/best}
 PREFLIGHT=${PREFLIGHT:-true}
@@ -397,6 +405,11 @@ wait_for_health() {
     echo "[health] $name is up (after ${waited}s)."
 }
 
+VLLM_EAGER_FLAG=""
+case "$VLLM_ENFORCE_EAGER" in
+    True|true|1) VLLM_EAGER_FLAG="--enforce_eager True" ;;
+esac
+
 # ---------- 1. Grounding-DINO on GPU 0 ----------
 echo "[start] Grounding-DINO on cuda:$DINO_GPU -> 127.0.0.1:$DINO_PORT"
 (
@@ -415,6 +428,20 @@ echo "[start] vLLM server on cuda:[$VLLM_GPUS] -> 127.0.0.1:$VLLM_PORT ($VLLM_EN
     # shellcheck disable=SC1090
     source "$CONDA_SH"; conda activate "$VLLM_ENV"
     cd "$HARNESS"
+    # TWO THINGS THAT ARE NOT OPTIONAL ON THIS CLUSTER, both found by omni_vllm_probe.py.
+    #
+    # VLLM_ENABLE_V1_MULTIPROCESSING=0 runs the engine in the worker process instead of
+    # spawning an EngineCore child. That child HANGS here: it gets as far as the worker's
+    # memory snapshot and then sits in a futex with 43 sleeping threads, while the parent
+    # prints "Waiting for 1 local core engine proc(s) to start" forever. In-process it
+    # loads normally. (ptrace is off on these nodes, so py-spy and gdb cannot see into the
+    # child at all -- `omni_vllm_probe.py --watchdog` exists because of that.)
+    #
+    # The triton MoE backend, because the default `auto` picks FlashInfer's CUTLASS path,
+    # which JIT-compiles on first use and dies in `get_cuda_path()`: there is no
+    # /usr/local/cuda on these nodes and the only system toolkit is CUDA 12.4 against a
+    # torch built on 13. Triton ships its own compiler and needs none.
+    export VLLM_ENABLE_V1_MULTIPROCESSING=0
     CUDA_VISIBLE_DEVICES=$VLLM_GPUS \
         exec python -m trl.scripts.vllm_serve \
             --model "$MODEL" \
@@ -424,6 +451,9 @@ echo "[start] vLLM server on cuda:[$VLLM_GPUS] -> 127.0.0.1:$VLLM_PORT ($VLLM_EN
             --dtype bfloat16 \
             --max_model_len "$VLLM_MAX_MODEL_LEN" \
             --enable_prefix_caching True \
+            --max_num_seqs "$VLLM_MAX_NUM_SEQS" \
+            --kernel_config '{"moe_backend": "triton", "enable_flashinfer_autotune": false}' \
+            $VLLM_EAGER_FLAG \
             --trust_remote_code True
 ) > "$LOG_DIR/vllm.log" 2>&1 &
 VLLM_PID=$!

@@ -66,6 +66,46 @@ def one_real_prompt():
     return text, im, int(got["input_ids"].shape[1]), n_img, row["question"]
 
 
+def kernel_config():
+    """Keep vLLM off the kernels that want a CUDA toolkit this cluster does not have.
+
+    The Omni is a mixture of experts, and vLLM's MoE backend `auto` picks FlashInfer's
+    CUTLASS path, which JIT-COMPILES it on first use:
+
+        flashinfer/jit/cpp_ext.py  get_cuda_path()
+        RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda'
+                      doesn't exist
+
+    The nodes have no `/usr/local/cuda`; the only system toolkit is CUDA 12.4, against a
+    torch built on 13. Triton's fused-MoE kernels need no toolkit at all -- triton ships
+    its own compiler -- so that is what this asks for. Autotuning is off for the same
+    reason: it is FlashInfer's.
+
+    Worth knowing rather than silently avoiding: `triton` is the portable MoE backend, not
+    the fastest one. If generation ever needs to be faster than it is, installing a CUDA 13
+    `nvcc` into `nemotron_vllm` and dropping this is the lever.
+    """
+    return {"moe_backend": "triton", "enable_flashinfer_autotune": False}
+
+
+def arm_watchdog(seconds):
+    """Dump EVERY thread's Python stack after `seconds`, then exit.
+
+    Engine startup on this model went quiet for 15 minutes with the process asleep in a
+    futex, and none of the usual ways in were available: py-spy and gdb both need ptrace,
+    which is off here. `faulthandler` is the one that needs no permission at all -- it is
+    inside the process already -- and `dump_traceback_later` is a timer on it. With
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 the engine runs in THIS process, so the dump covers
+    the thread that is actually stuck instead of a parent waiting on a pipe.
+    """
+    import faulthandler
+
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(seconds, exit=True)
+    print(f"[watchdog] armed: every thread's stack will be dumped after {seconds}s",
+          flush=True)
+
+
 def stage_engine(args):
     import torch
     from vllm import LLM, SamplingParams
@@ -92,6 +132,12 @@ def stage_engine(args):
         trust_remote_code=True,
         enable_prefix_caching=True,
         limit_mm_per_prompt={"image": 1},
+        # A Mamba hybrid needs ONE state block per concurrently decoding sequence, and on
+        # this card there are 914 of them. vLLM's default `max_num_seqs` is 1024, so CUDA
+        # graph capture refuses before anything runs. A GRPO step asks for 48 at most (6
+        # prompts x 8 rollouts); 64 leaves margin and is nowhere near the cap.
+        max_num_seqs=args.max_num_seqs,
+        kernel_config=kernel_config(),
     )
     load_s = time.time() - t0
     print(f"engine up in {load_s:.0f}s")
@@ -143,8 +189,14 @@ def main():
     ap.add_argument("--n", type=int, default=8, help="rollouts per prompt, as GRPO does")
     ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--trials", type=int, default=3)
+    ap.add_argument("--max-num-seqs", type=int, default=64,
+                    help="concurrent sequences; one Mamba state block each")
+    ap.add_argument("--watchdog", type=int, default=0,
+                    help="seconds before dumping every thread's stack and exiting; 0 off")
     args = ap.parse_args()
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    if args.watchdog:
+        arm_watchdog(args.watchdog)
     stage_engine(args)
 
 

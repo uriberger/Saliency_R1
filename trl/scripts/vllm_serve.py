@@ -14,6 +14,7 @@
 
 import argparse
 import base64
+import json
 import logging
 import os
 from collections.abc import Sequence
@@ -324,6 +325,27 @@ class ScriptArguments:
             "'trace'."
         },
     )
+    max_num_seqs: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Maximum concurrent sequences. A Mamba hybrid needs ONE state block "
+                    "per decoding sequence and there are far fewer of those than vLLM's "
+                    "default 1024, so leaving it unset makes CUDA-graph capture refuse "
+                    "with 'max_num_seqs exceeds available Mamba cache blocks'. A GRPO "
+                    "step asks for num_generations x prompts-per-step at most."
+        },
+    )
+    kernel_config: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "JSON handed to vLLM's KernelConfig, e.g. "
+                    "'{\"moe_backend\": \"triton\", \"enable_flashinfer_autotune\": false}'. "
+                    "Needed for a mixture-of-experts model on a node with no CUDA "
+                    "toolkit: the default MoE backend is FlashInfer's CUTLASS path, "
+                    "which JIT-compiles and dies in `get_cuda_path()` looking for nvcc. "
+                    "Ignored on a vLLM old enough not to have KernelConfig."
+        },
+    )
     vllm_model_impl: str = field(
         default="vllm",
         metadata={
@@ -332,6 +354,23 @@ class ScriptArguments:
             "model implementation."
         },
     )
+
+
+def extra_engine_kwargs(script_args) -> dict:
+    """Engine arguments that only exist on newer vLLM. -> a dict to splat into `LLM(...)`.
+
+    `kernel_config` arrived with vLLM 0.12 and is what keeps an MoE model off FlashInfer's
+    CUTLASS path, which JIT-compiles on first use and needs an `nvcc` these nodes do not
+    have. `max_num_seqs` is older but upstream's server does not expose it, and a Mamba
+    hybrid needs it. Both are included only when asked for, so one copy of this file keeps
+    working on a vLLM that has never heard of either.
+    """
+    out = {}
+    if getattr(script_args, "max_num_seqs", None):
+        out["max_num_seqs"] = script_args.max_num_seqs
+    if getattr(script_args, "kernel_config", None):
+        out["kernel_config"] = json.loads(script_args.kernel_config)
+    return out
 
 
 def llm_worker(
@@ -359,6 +398,7 @@ def llm_worker(
         worker_extension_cls="trl.scripts.vllm_serve.WeightSyncWorkerExtension",
         trust_remote_code=script_args.trust_remote_code,
         model_impl=script_args.vllm_model_impl,
+        **extra_engine_kwargs(script_args),
     )
 
     # Send ready signal to parent process

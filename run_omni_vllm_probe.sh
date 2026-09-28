@@ -30,6 +30,12 @@ if [ "${SR1_VLLM_DEBUG:-0}" = "1" ]; then
     export VLLM_LOGGING_LEVEL=DEBUG
     export NCCL_DEBUG=INFO
     export NCCL_DEBUG_SUBSYS=INIT,ENV
+    # Run the engine IN THIS PROCESS. The engine normally lives in a child, and a child
+    # that goes quiet leaves the parent printing "Waiting for 1 local core engine proc"
+    # forever with no way in -- ptrace is off here, so py-spy and gdb both refuse. In-
+    # process, `--watchdog` can dump the stack of the thread that is actually stuck.
+    export VLLM_ENABLE_V1_MULTIPROCESSING=0
+    export PYTHONFAULTHANDLER=1
 fi
 
 cd "$REPO"
