@@ -306,6 +306,15 @@ class Family:
         """Anything the processor does not emit but `forward()` requires. -> inputs."""
         return inputs
 
+    def lora_target_modules(self, targets):
+        """What to hand peft, given the launcher's bare `q_proj,k_proj,v_proj`.
+
+        Unchanged for a model where those names occur only where they are meant to.
+        `NemotronVL` overrides it, and its docstring is the reason this method exists at
+        all rather than the launcher spelling a regex.
+        """
+        return targets
+
     def protected_token_ids(self):
         """Token ids `truncate_with_protected_tokens` must never drop."""
         ids = [self.image_token_id, *self.vision_start_ids, *self.vision_end_ids]
@@ -862,6 +871,28 @@ class NemotronVL(Family):
         n = int(pv.shape[0])
         inputs["image_flags"] = torch.ones(n, 1, dtype=torch.long, device=pv.device)
         return inputs
+
+    def lora_target_modules(self, targets):
+        """Scope the bare names to the DECODER. -> a regex string for peft.
+
+        THE TRAP THIS EXISTS FOR, and it cost a whole run. peft matches a list of bare
+        names by SUFFIX, anywhere in the model. That is safe on Qwen3-VL, whose vision
+        tower uses a fused `qkv`, and on RADIO, which uses one too. It is not safe on an
+        OMNI: it carries a 24-layer AUDIO encoder whose layers use exactly `q_proj`,
+        `k_proj` and `v_proj`. An image-only batch never runs that tower, so the first run
+        put 144 of its 180 LoRA tensors there and they came back with no gradient at all
+        -- a configuration that trains almost nothing while every log line looks right.
+
+        A single string is a REGEX to peft (`re.fullmatch` against the whole parameter
+        path); a list of strings is suffix matching. So this returns a string, and the
+        trainer then asserts the adapters landed on the six attention layers.
+        """
+        if isinstance(targets, str):
+            targets = [targets]
+        names = sorted({str(t).split(".")[-1] for t in targets if str(t).strip()})
+        if not names:
+            raise SystemExit("nemotron_vl: no LoRA target names to scope")
+        return r"language_model\..*\.(" + "|".join(names) + r")"
 
     def decoder(self, model):
         """`language_model` hangs off the WRAPPER here, not off a `.model` inside it.

@@ -195,6 +195,13 @@ echo "  copied ZeRO-3 generation-hook fix (models/utils)"
 # `image_grid_thw`, its grid is native-resolution and per-picture, and the trainer asks
 # the family for it instead of reading the field. The same two files at the REPO ROOT are
 # what the measuring side imports -- one source, two copies, kept in step here.
+# The generation server, which has to run under vLLM 0.20 here and 0.11 in trl_repo. Its
+# header says what the three differences are; nothing in it is Nemotron-specific. Copied
+# only by THIS patcher, so the shared clone's server is left exactly as upstream shipped
+# it while in-flight Qwen3-VL runs are using it.
+cp "$REPO/trl/scripts/vllm_serve.py"      "$TRL_REPO/trl/scripts/vllm_serve.py"
+echo "  copied the version-tolerant generation server (scripts/vllm_serve)"
+
 cp "$REPO/vlm_family.py"                  "$TRL_REPO/trl/trainer/vlm_family.py"
 cp "$REPO/nemotron_loader.py"             "$TRL_REPO/trl/trainer/nemotron_loader.py"
 echo "  copied the geometry seam (vlm_family, nemotron_loader)"

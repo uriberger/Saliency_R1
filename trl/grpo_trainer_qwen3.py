@@ -707,7 +707,18 @@ class GRPOTrainer(Trainer):
         if peft_config is not None:
             if not is_peft_available():
                 raise ImportError("PEFT is required to use `peft_config`. Run `pip install peft`.")
+            # Scope the launcher's bare `q_proj,k_proj,v_proj` to where they are meant to
+            # land. A no-op on Qwen3-VL; on an Omni it is what keeps 144 of 180 adapters
+            # off a 24-layer AUDIO tower that an image-only batch never runs. See
+            # `NemotronVL.lora_target_modules`.
+            if getattr(peft_config, "target_modules", None):
+                _scoped = self.family.lora_target_modules(peft_config.target_modules)
+                if _scoped != peft_config.target_modules:
+                    print(f"[lora] targets scoped for {self.family.name}: "
+                          f"{peft_config.target_modules} -> {_scoped!r}", flush=True)
+                    peft_config.target_modules = _scoped
             model = get_peft_model(model, peft_config)
+            self._report_lora_landing(model)
 
         # Enable gradient checkpointing if requested
         if args.gradient_checkpointing and _family_ckpt is None:
@@ -1454,6 +1465,32 @@ class GRPOTrainer(Trainer):
             elif self.vllm_mode == "colocate":
                 llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                 llm_model.load_weights([(name, param)])
+
+    def _report_lora_landing(self, model):
+        """Where the adapters actually went, and a refusal if it is not where they belong.
+
+        Asserted rather than trusted because the failure is silent: a LoRA bolted onto a
+        tower the batch never runs produces no gradient, no error and a perfectly normal
+        loss curve. `docs/omni-training-blockers.md` records the run that did it.
+        """
+        trained = [n for n, p in model.named_parameters() if p.requires_grad]
+        if not trained:
+            raise RuntimeError("no trainable parameters after the peft wrap")
+        hit = sorted({n.split(".lora_")[0].split(".")[-1] for n in trained})
+        layers = sorted({int(n.split("layers.")[1].split(".")[0])
+                         for n in trained if "layers." in n})
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in model.parameters())
+        print(f"[lora] {len(trained)} tensors, {n_train/1e6:.2f}M of {n_total/1e9:.2f}B "
+              f"({n_train/n_total*100:.4f}%) on {hit}", flush=True)
+        print(f"[lora] decoder layers: {layers}", flush=True)
+        want = self._attention_layers
+        if want is not None and layers != sorted(want):
+            raise RuntimeError(
+                f"the LoRA landed on decoder layers {layers}, not this model's attention "
+                f"layers {sorted(want)}. q/k/v_proj exist only inside attention, so "
+                "anything else means the match went somewhere unintended -- an audio "
+                "tower, most likely, which an image-only batch never runs.")
 
     def _lora_touched_prefixes(self):
         """Module paths whose weights a merged LoRA actually changes. -> set or None.

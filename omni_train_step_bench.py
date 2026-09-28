@@ -349,6 +349,12 @@ def main():
                     help="shorten the completion so a 16-bit pass fits without recompute")
     ap.add_argument("--verify-ckpt", type=int, default=0,
                     help="check recomputation reproduces the gradients, then stop")
+    ap.add_argument("--grads-only", type=int, default=0,
+                    help="run the LoRA landing + gradient checks and stop, skipping the "
+                         "timing. This is what launch_grpo_omni_overlap_job.sh runs as a "
+                         "preflight: the signal has to travel back through 23 Mamba "
+                         "layers on a torch fallback, and a run that starts without "
+                         "checking that trains a reward-shaped nothing for an hour")
     ap.add_argument("--grad-ckpt", type=int, default=0,
                     help="recompute the decoder's intermediates instead of storing them")
     ap.add_argument("--reforward", type=int, default=1,
@@ -403,6 +409,11 @@ def main():
     print("    PASS: the signal reaches every LoRA tensor, finite and non-zero,")
     print("          which means the backward pass through the 23 Mamba layers works")
     opt.zero_grad(set_to_none=True)
+
+    if args.grads_only:
+        print("\nPREFLIGHT PASS: the LoRA is on the attention layers, gradient "
+              "checkpointing is on, and every adapter tensor carries signal.")
+        return 0
 
     if args.verify_ckpt:
         verify_ckpt(model, case, prompt_len, opt)
