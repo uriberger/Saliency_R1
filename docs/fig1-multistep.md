@@ -429,13 +429,21 @@ this is § 5's *where you look is not what you conclude*, not a grounding failur
 0.532. An anti-example, and the one to check a filter against.
 
 **`video-cmp-count/` is the paper's Figure 1, animated**, in
-`portrait/` (`--layout rows`, 1266x1398) and `landscape/` (`--layout columns`,
-1666x1216). It matches the figure rather than the scan: the question loses its option
+`portrait/` (`--layout rows`, 1286x1416) and `landscape/` (`--layout columns`,
+2066x1546). It matches the figure rather than the scan: the question loses its option
 list, the four step captions are the figure's paraphrases, the answers read `One` and
 `Two` instead of `D. One` and `C. Two`, and a red cross and a green tick sit beside
 them. **Each of those is a `--label` / `--step-text` / `--answer` / `--gold` override,
 and every one is written to `<out>/chain.json` next to the text it replaced** -- the map
 under each step is untouched and is still that step's.
+
+Both are set at `--font-size 42`, and raising it is not free: the chain's height grows
+with the type size while the picture's does not, so a bigger font walks **both** layouts
+towards square. Raising it from 30 to 42 needed `--text-width` to come *down* (600, not
+580 -> 760) to keep `rows` portrait at 0.91, and `--image-width` to go *up* (1000) to
+keep `columns` at 1.34 rather than 1.18. In `rows` the type size is also a ceiling, not a
+request: the chain has to fit beside the picture, so past a point `Canvas` silently
+shrinks it back. It does not in `columns`, where the chain hangs below.
 
 One thing to carry from it: the figure labels the top row **Vanilla**, and the row is the
 **cold start**. `outputs/saliency_viz/fig1b-hrbench/` only ever scanned `ours` and
@@ -515,9 +523,10 @@ python fig1_steps_video.py --run-dir outputs/saliency_viz/fig1b-hrbench \
     --step-text "ours:1=Second person partially seen in the background." \
     --answer "coldstart=One" --answer "ours=Two" --gold Two \
     --question "How many people are there in the image?" \
-    --smooth 1.0 --overlay-mode alpha --alpha 0.8 --font-size 30 --map-label "" \
-    --layout rows --image-width 620 --text-width 580 \
+    --smooth 1.0 --overlay-mode alpha --alpha 0.8 --font-size 42 --map-label "" \
+    --layout rows --image-width 620 --text-width 600 \
     --out outputs/fig1-multistep/video-cmp-count/portrait
+# ...and `--layout columns --image-width 1000 --gif-scale 0.4` for the landscape cut
 
 # the three-step one. No --step-text: its captions are the model's own, and they are
 # the option strings, which is the honest thing to show
