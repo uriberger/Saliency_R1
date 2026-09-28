@@ -3457,6 +3457,24 @@ class GRPOTrainer(Trainer):
               f"(of 79.2 GB)", flush=True)
 
     def _compute_loss(self, model, inputs):
+        if os.environ.get("SR1_EMPTY_CACHE_PER_MICROSTEP") == "1":
+            # RELEASE THE CACHE BEFORE THE BIGGEST ALLOCATION OF THE STEP, and the numbers
+            # are why. On the Omni a training rank sits at
+            #
+            #     allocated 62.4 GB   reserved 71.9 GB   peak 74.1 GB   of 79.2
+            #
+            # before the forward -- so 9.2 GB is held by the ALLOCATOR and owned by
+            # nothing, left over from the transients of generation and the saliency
+            # capture. The backward then asks for one ~5.5 GB block (an MoE recompute; 128
+            # experts) and fails with ~5.3 GB free, on a card whose real occupancy is 62.
+            # Fragmentation, not a shortfall, and this is what it is for.
+            #
+            # Only the forward's own activations survive it -- 0.3 GB, because every one of
+            # the 52 blocks is recomputing -- so nothing needed is thrown away.
+            #
+            # OFF by default: it is a sync per micro-step, and a run with room does not
+            # need it.
+            torch.cuda.empty_cache()
         self._mem_report("before the forward")
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]

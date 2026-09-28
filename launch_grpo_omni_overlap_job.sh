@@ -329,6 +329,11 @@ mkdir -p "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR"
 # CUDA accounting for the first few micro-steps. Cheap, and the only thing that separates
 # "the allocator is holding it" from "something owns it" on a card this full.
 export SR1_MEM_REPORT=${SR1_MEM_REPORT:-6}
+# Release the allocator's cache before each micro-step's forward. Measured on this model:
+# a rank sits at 62.4 GB allocated and 71.9 GB RESERVED, so 9.2 GB is held and owned by
+# nothing, and the backward's one ~5.5 GB block then fails with 5.3 GB free. The forward
+# saves only 0.3 GB of its own (52 blocks recomputing), so nothing needed is discarded.
+export SR1_EMPTY_CACHE_PER_MICROSTEP=${SR1_EMPTY_CACHE_PER_MICROSTEP:-1}
 # The vendored layernorm-only mamba_ssm. Without it the Nemotron decoder raises at IMPORT
 # -- `MambaRMSNormGated.forward` IS a call to `rmsnorm_fn` -- and having no dist-info is
 # deliberate: `is_mamba_2_ssm_available()` keeps reading False, so the fused SSM kernels
