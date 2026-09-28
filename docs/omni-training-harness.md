@@ -254,3 +254,75 @@ head-selection probe behind it. The head pair carries over even less: 28 and 31 
 on Qwen3-VL-8B by a probe, and on any other model the same two indices name two arbitrary
 heads. They are kept so the command line differs in as little as possible. **Any attention
 number read off this run has to say so.**
+
+## 9. What actually stopped it, in the order it stopped
+
+Every one of these was a hard failure on a run that looked correct up to it. They are
+listed because each is invisible from the code and expensive from the logs.
+
+| where | what | fix |
+|---|---|---|
+| engine start | vLLM's EngineCore child hangs in a futex, 43 sleeping threads, forever | `VLLM_ENABLE_V1_MULTIPROCESSING=0` |
+| engine start | MoE backend `auto` JIT-compiles FlashInfer CUTLASS, no `nvcc` on the node | `--kernel_config` triton |
+| engine start | `max_num_seqs` 1024 exceeds the 914 Mamba state blocks the card has | `--max_num_seqs 64` |
+| engine start | kernel warmup calls DeepGEMM's FP8 path on a bf16 model | `VLLM_USE_DEEP_GEMM=0` |
+| trainer init | `accelerate.is_peft_model` imports deepspeed, which needs a toolkit | `setup_cuda_home.sh` |
+| trainer init | `Trainer.train()` re-enables checkpointing on a wrapper that refuses it | tell it not to |
+| weight sync | NCCL 2.27.3 (torch 2.8) cannot pair with 2.28.9 (torch 2.11) | `VLLM_NCCL_SO_PATH` |
+| step 1 | **format 0.000 on every rollout** -- the prompt already opens `<think>` | §6 below |
+| every step | **each rank built its own Grounding-DINO on its own full card** | `--dino_api_base` |
+
+The last two are the ones worth remembering, because both produce a run that looks healthy.
+
+**The format one.** The Omni's chat template ends the generation prompt at
+`<|im_start|>assistant\n<think>\n`. The assistant turn starts INSIDE the reasoning block,
+so the completion carries only `</think>`, and `judge_format` -- which wants exactly one of
+each tag -- scored every rollout of a perfectly well-behaved model as malformed. The
+overlap reward then came back NaN on all of them, because the per-step maps are only built
+where the format is valid. Nothing in the logs says "template": it says `format 0.000`.
+The trainer now reads the fact off the actual prompt (`<think>\s*$`, anchored so the system
+prompt's own tags stay out of it) rather than declaring it per family.
+
+**The detector one.** The launcher started the Grounding-DINO server on GPU 0 and never
+passed `--dino_api_base`, so every training rank built its own detector on the card already
+holding 62 GB of Omni. It cost **~8 GB per rank** -- peak 74.1 GB against 66.4 with the flag
+-- and the visible symptom was 123 `[dino] CUDA OOM; retrying batch at ... size 7` lines in
+thirty minutes, one step completed, while the detector's own card sat idle at 1.4 GB with
+nothing but a health check in its log.
+
+## 10. The memory, measured
+
+Per training rank, from `SR1_MEM_REPORT`, before a micro-step's forward:
+
+```
+                              allocated   reserved   peak      of 79.2 GB
+with a per-rank DINO             62.4       62.5     74.1
+through the DINO server          61.6       61.6     66.4
+```
+
+The forward itself adds **0.3 GB** of saved activations -- all 52 blocks recompute, so
+gradient checkpointing is doing exactly what `docs/omni-quantization.md` measured. What
+fills the card is the WORKING SET: a 128-expert mixture materialises ~11 GB of
+intermediates for a ~1,400-position sequence and the backward asks for one further ~5.5 GB
+block, and both are linear in tokens.
+
+Six other levers were applied and each is still in place because each helped, in rough
+order of size: no autocast (the model is already bf16, and autocast promotes a log-softmax
+over 131,072 classes to fp32), the allocator's cache released before each micro-step (9.4 GB
+was held and owned by nothing), `logits_to_keep` forwarded so the lm_head stops running over
+the prompt, the completion padding the loss already masks no longer forwarded, the T5
+classifier moved to CPU, and NCCL bound to each rank's own device (five 520 MB contexts
+belonging to ranks 1-5 were sitting on rank 0's card).
+
+Two were tried and REMOVED because they made it fail earlier:
+`garbage_collection_threshold` (does not compose with expandable segments) and capped NCCL
+channels.
+
+**`--max-completion-length` is the one training hyper-parameter that did not carry over.**
+At 1024 the run reaches step 12-15 and then dies on whichever micro-step is carrying a
+completion that reached the cap -- and it gets there later, not never, because this reward
+lengthens chains, so the peak grows with them. 768 is the value the runs use; the policy's
+longest TERMINATED completion measured 594 tokens, so nothing that finishes is truncated,
+and what changes is where a runaway chain is cut. It is in the run name (`_c768`) so a run
+that differs in it can never be mistaken for one that does not, and any comparison against a
+Qwen3-VL run has to state it.
