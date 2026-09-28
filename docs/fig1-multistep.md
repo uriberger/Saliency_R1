@@ -366,6 +366,36 @@ at 0.5 greys out the attic's furniture and the CLEVR background, and the frame h
 show *what* is under the hot blob. Sigma follows the grid, not a default -- 1.0 on the
 attic's 24x32, 0.6 on the other two, which is ~3% of the width in all three.
 
+### ...against a baseline that looks in the wrong place and gets it wrong
+
+`--model` repeats, and then each model gets a row and the rows advance together on one
+picture. The search for a picture worth putting in those two rows -- **ours right, every
+step above chance; the other model wrong, with at least one step below chance** -- has to
+drop any chain that hit `--max-new-tokens`, because a cut-off chain has no answer and
+"it got it wrong" would be a statement about the budget. That filter matters: the
+highest-contrast candidate before it (SalBench P3 357, ours at AUROC 0.97-1.00 against
+the cold start's 0.405) is **ours** truncating at 12 steps and being scored correct
+because the gold word appears somewhere in the ramble.
+
+After it, against the **cold start**, four pictures survive across every search:
+
+| out | picture | ours | the cold start |
+|---|---|---|---|
+| `video-cmp-soccer/` | mmstar 54, *"how many soccer players are on the field?"*, gold **C. 4** | 0.625 foreground / 0.636 on the two background players; answers **C** | step 1 at **0.426** over 32% of the frame -- "there are three soccer players visible"; answers **D** |
+| `video-cmp-count/` | hrbench4k 29, *"how many people?"*, gold **C. Two** | 0.684 on the man, 0.703 on the second person through the window; answers **C. Two** | step 2 at **0.437** over 37.8% -- "There are no other people visible in the image"; answers **D. One** |
+| — | mathvision 59, plums and apples, gold **3** | 0.745 / 0.509; answers **3** | reads *five* plums off the right pan at **0.353**; answers **4** |
+| — | hrbench8k 85, *"what is in the middle of the water?"*, gold **C. a tree** | 0.513-0.654; answers **C** | "a structure that appears to be a gazebo" at 0.567, then 0.414; answers **D** |
+
+`video-cmp-soccer` is the better of the two rendered: the cold start's second step lands
+on the goalkeeper's chest in the foreground while its sentence enumerates the background,
+and both background players are visible to a reader.
+
+**Against vanilla Qwen3-VL there is no such example.** The same filter over `all.json`
+returns four pictures and all four are grading, not attention: base answers *"Cabinets"*
+to gold `cabinet`, or in prose that the extractor cannot read. That is the same thing
+§3 reports at scale -- over 667 shared pictures ours wins 48 and loses 63 -- and it is
+why §5b's comparison is against the cold start.
+
 ## 6. Reproducing it
 
 ```fish
@@ -413,6 +443,13 @@ python fig1_steps_video.py --run-dir outputs/saliency_viz/fig1d-search --model o
     --sample sample_167_row000167 --smooth 1.0 --overlay-mode alpha --alpha 0.8 \
     --question "Estimate the real-world distances between objects in this image. Which object is closer to the chair (red box), the bookcase (blue box) or the table (green box)?   (A) bookcase   (B) table" \
     --out outputs/fig1-multistep/video-attic
+
+# two models, one picture, one row each. Two rows want a smaller --image-width
+python fig1_steps_video.py --run-dir outputs/saliency_viz/fig1b-realworld \
+    --model ours --model coldstart --sample sample_054_row000054 \
+    --smooth 0.6 --overlay-mode alpha --alpha 0.8 --image-width 560 --text-width 520 \
+    --question "MMStar:  Based on the image, how many soccer players are on the field?    A. 1    B. 2    C. 4    D. 3" \
+    --out outputs/fig1-multistep/video-cmp-soccer
 ```
 
 `--chain` is the N-object mode and `--rank`/`--sample` the two-region one; the second

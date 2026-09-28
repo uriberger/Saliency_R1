@@ -15,6 +15,13 @@ A talk or a project page wants the second one; a paper wants the first.
     <out>/chain.mp4          the same at --fps, H.264, if PyAV can encode it
     <out>/frames/000.png     every distinct frame, in order, for a slide deck
 
+`--model` repeats, and then each model gets a row and the rows advance together on one
+picture -- which is how the "ours looked there and was right, the baseline looked here
+and was wrong" claim is shown rather than asserted. The chains are different objects:
+step k of one is not step k of the other, they are only being played at the same tempo,
+and a model that runs out of steps first shows its answer while the other keeps going.
+Two rows want a smaller `--image-width` (~560) than one.
+
 The map is rendered by `fig1_steps_figure.overlay` rather than by a copy of it, so
 `--smooth`, `--upsample`, `--overlay-mode`, `--norm` and `--alpha` mean exactly what they
 mean there and a frame here is the same image as that figure's panel. In particular
@@ -84,7 +91,8 @@ class Canvas:
     against the longest step text, and each frame only repaints it.
     """
 
-    def __init__(self, img, question, steps, args):
+    def __init__(self, img, question, chains, args):
+        """`chains` is [(model name, [step text, ...])], one row of the frame each."""
         self.args = args
         pad = self.pad = int(args.pad)
         self.img_w = args.image_width
@@ -93,57 +101,73 @@ class Canvas:
         self.w = pad * 3 + self.img_w + self.text_w
 
         self.f_q = font(args.font_size + 2, bold=True)
-        self.f_meta = font(args.font_size - 1)
         self.q_lines = []
         for para in question.splitlines():
             self.q_lines += wrap(para, self.f_q, self.w - 2 * pad) or [""]
         self.q_lh = int(self.f_q.size * 1.42)
         self.head_h = pad + self.q_lh * len(self.q_lines) + pad
 
-        # the chain column: shrink until the whole chain fits beside the picture, so no
-        # step is ever cut off and the text never reflows between frames
+        # one font for every row, shrunk until the LONGEST chain fits beside the picture:
+        # no step is ever cut off, the text never reflows between frames, and two models
+        # are not compared at two different type sizes
         size = args.font_size
         while True:
             self.f_step = font(size)
             self.f_lbl = font(max(10, size - 2), bold=True)
             self.lh = int(self.f_step.size * 1.45)
-            self.blocks = [wrap(f"{i + 1}. {s}", self.f_step, self.text_w - pad - 14)
-                           for i, s in enumerate(steps)]
-            need = (int(self.f_lbl.size * 2.2)
-                    + sum(len(b) * self.lh + self.lh // 2 for b in self.blocks))
+            self.blocks = {name: [wrap(f"{i + 1}. {s}", self.f_step, self.text_w - pad - 14)
+                                  for i, s in enumerate(steps)]
+                           for name, steps in chains}
+            need = max(int(self.f_lbl.size * 2.2) + self.lh      # label, chain, footer
+                       + sum(len(b) * self.lh + self.lh // 2 for b in bl)
+                       for bl in self.blocks.values())
             if need <= self.img_h or size <= 11:
                 break
             size -= 1
-        self.h = self.head_h + self.img_h + pad
+        self.row_h = self.img_h + pad
+        self.h = self.head_h + self.row_h * len(chains) + pad
         if self.w % 2:
             self.w += 1
         if self.h % 2:
             self.h += 1
 
-    def frame(self, panel, cur, steps, label, footer=None):
-        """One frame: header, `panel` on the left, the chain on the right, `cur` lit."""
+    def frame(self, rows):
+        """One frame: the question on top, then `(name, panel, cur, label, footer)` a row.
+
+        `cur` is the index of the step to light, or None for a row whose chain has not
+        started or has finished -- the answer card and a model that ran out of steps
+        before the other did both land there.
+        """
         pad = self.pad
         out = Image.new("RGB", (self.w, self.h), BG)
         d = ImageDraw.Draw(out)
         for i, ln in enumerate(self.q_lines):
             d.text((pad, pad + i * self.q_lh), ln, fill=FG, font=self.f_q)
-        out.paste(panel, (pad, self.head_h))
 
-        x = pad * 2 + self.img_w
-        y = self.head_h
-        d.text((x, y), label, fill=ACCENT if cur is not None else DIM, font=self.f_lbl)
-        y += int(self.f_lbl.size * 2.2)
-        for i, block in enumerate(self.blocks):
-            live = cur is not None and i == cur
-            done = cur is not None and i < cur
-            colour = FG if live else (DIM if done else MUTED)
-            if live:
-                d.rectangle([x, y + 2, x + 3, y + len(block) * self.lh - 4], fill=ACCENT)
-            for j, ln in enumerate(block):
-                d.text((x + 14, y + j * self.lh), ln, fill=colour, font=self.f_step)
-            y += len(block) * self.lh + self.lh // 2
-        if footer:
-            d.text((x + 14, y + self.lh // 2), footer, fill=ACCENT, font=self.f_lbl)
+        for r, (name, panel, cur, label, footer) in enumerate(rows):
+            top = self.head_h + r * self.row_h
+            out.paste(panel, (pad, top))
+            x = pad * 2 + self.img_w
+            # centred against the picture: a two-step chain beside a tall photograph
+            # otherwise hangs off the top of its row with a column of nothing under it.
+            # Measured on the block, not on the frame, so it does not shift when a step
+            # lights up or the footer appears.
+            need = (int(self.f_lbl.size * 2.2) + self.lh   # the footer's line, always
+                    + sum(len(b) * self.lh + self.lh // 2 for b in self.blocks[name]))
+            y = top + max(0, (self.img_h - need) // 2)
+            d.text((x, y), label, fill=ACCENT if cur is not None else DIM, font=self.f_lbl)
+            y += int(self.f_lbl.size * 2.2)
+            for i, block in enumerate(self.blocks[name]):
+                live = cur is not None and i == cur
+                done = cur is not None and i < cur
+                colour = FG if live else (DIM if done else MUTED)
+                if live:
+                    d.rectangle([x, y + 2, x + 3, y + len(block) * self.lh - 4], fill=ACCENT)
+                for j, ln in enumerate(block):
+                    d.text((x + 14, y + j * self.lh), ln, fill=colour, font=self.f_step)
+                y += len(block) * self.lh + self.lh // 2
+            if footer:
+                d.text((x + 14, y + self.lh // 2), footer, fill=ACCENT, font=self.f_lbl)
         return out
 
 
@@ -184,7 +208,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run-dir", required=True, help="a saliency_viz output root")
-    ap.add_argument("--model", required=True, help="the subdirectory under it")
+    ap.add_argument("--model", required=True, action="append",
+                    help="the subdirectory under it; repeatable, and then each model gets "
+                         "its own row and the rows step together. A model whose chain is "
+                         "shorter finishes early and shows its answer while the other "
+                         "keeps going -- step k of one is NOT step k of the other")
     ap.add_argument("--sample", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--map", default="glimpse")
@@ -232,52 +260,70 @@ def main():
     matplotlib.use("Agg")
     cmap = matplotlib.colormaps[args.cmap]
 
-    sdir = Path(args.run_dir) / args.model / "samples" / args.sample
-    if not (sdir / "maps.npz").exists():
-        raise SystemExit(f"no maps.npz under {sdir}")
-    meta = json.loads((sdir / "meta.json").read_text())
-    z = np.load(sdir / "maps.npz")
-    if args.map not in z.files:
-        raise SystemExit(f"{sdir}/maps.npz has no `{args.map}` map (has {z.files})")
-    maps = np.clip(z[args.map], 0, None).astype(np.float64)
-    img = Image.open(sdir / "original.png").convert("RGB")
+    boxes_blob = json.loads(Path(args.boxes).read_text())["steps"] if args.boxes else []
+    wanted = ([int(x) for x in args.steps.split(",") if x != ""] if args.steps else None)
 
-    want = ([int(x) for x in args.steps.split(",") if x != ""] if args.steps
-            else list(range(len(meta["steps"]))))
-    bad = [s for s in want if not 0 <= s < maps.shape[0]]
-    if bad:
-        raise SystemExit(f"step(s) {bad} outside 0..{maps.shape[0] - 1}")
+    loaded = []
+    for model in args.model:
+        sdir = Path(args.run_dir) / model / "samples" / args.sample
+        if not (sdir / "maps.npz").exists():
+            raise SystemExit(f"no maps.npz under {sdir}")
+        meta = json.loads((sdir / "meta.json").read_text())
+        z = np.load(sdir / "maps.npz")
+        if args.map not in z.files:
+            raise SystemExit(f"{sdir}/maps.npz has no `{args.map}` map (has {z.files})")
+        maps = np.clip(z[args.map], 0, None).astype(np.float64)
+        want = wanted if wanted is not None else list(range(len(meta["steps"])))
+        bad = [s for s in want if not 0 <= s < maps.shape[0]]
+        if bad:
+            raise SystemExit(f"{model}: step(s) {bad} outside 0..{maps.shape[0] - 1}")
+        boxes_for = {s["step"]: s.get("tight_boxes") or [] for s in boxes_blob
+                     if s["sample"] == args.sample and s["model"] == model}
+        loaded.append(dict(model=model, sdir=sdir, meta=meta, maps=maps, want=want,
+                           boxes=boxes_for,
+                           texts=[meta["steps"][s]["text"] for s in want]))
 
-    boxes_for = {}
-    if args.boxes:
-        for s in json.loads(Path(args.boxes).read_text())["steps"]:
-            if s["sample"] == args.sample and s["model"] == args.model:
-                boxes_for[s["step"]] = s.get("tight_boxes") or []
-
-    texts = [meta["steps"][s]["text"] for s in want]
-    shown_q = (args.question or str(meta.get("question", ""))).strip()
-    canvas = Canvas(img, shown_q, texts, args)
+    # the picture is the sample's, so every row shows the same one and it is read once
+    img = Image.open(loaded[0]["sdir"] / "original.png").convert("RGB")
+    meta0 = loaded[0]["meta"]
+    shown_q = (args.question or str(meta0.get("question", ""))).strip()
+    canvas = Canvas(img, shown_q, [(m["model"], m["texts"]) for m in loaded], args)
     plain = fit_image(img, canvas.img_w, canvas.img_h)
+    multi = len(loaded) > 1
 
-    grid = tuple(meta.get("grid") or maps.shape[1:])
-    print(f"[grid] {grid[0]}x{grid[1]} patches"
-          + (f"  --smooth {args.smooth} = {args.smooth / grid[1]:.1%} of the width"
-             if args.smooth else "  (unsmoothed)"))
+    for m in loaded:
+        grid = tuple(m["meta"].get("grid") or m["maps"].shape[1:])
+        print(f"[grid] {m['model']}: {grid[0]}x{grid[1]} patches"
+              + (f"  --smooth {args.smooth} = {args.smooth / grid[1]:.1%} of the width"
+                 if args.smooth else "  (unsmoothed)"))
+        # every step's overlay up front: a state needs one row per model at once
+        m["panels"] = []
+        for si in m["want"]:
+            ov = overlay(img, m["maps"][si], cmap, args)
+            if m["boxes"].get(si):
+                ov = draw_boxes(ov, m["boxes"][si], args.box_colour, width=2)
+            m["panels"].append(fit_image(ov, canvas.img_w, canvas.img_h))
+        said, gold = answer_of(m["meta"]), m["meta"].get("gt_answer")
+        m["footer"] = f"{said}      (gold: {gold})"
+
+    def row(m, k):
+        """Model `m` at position `k`; past the end of its chain it shows its answer."""
+        name = f"{m['model']}  ·  " if multi else ""
+        if k is None or k >= len(m["want"]):
+            return (m["model"], plain, None,
+                    f"{name}answer" if k is not None else f"{name}input",
+                    m["footer"] if k is not None else None)
+        return (m["model"], m["panels"][k], k,
+                f"{name}step {k + 1} of {len(m['want'])}  ·  {args.map}", None)
 
     # (image, seconds) per state, before the dissolves are inserted
-    states = [(canvas.frame(plain, None, texts, "input"), args.hold_title)]
-    for k, si in enumerate(want):
-        ov = overlay(img, maps[si], cmap, args)
-        if boxes_for.get(si):
-            ov = draw_boxes(ov, boxes_for[si], args.box_colour, width=2)
-        states.append((canvas.frame(fit_image(ov, canvas.img_w, canvas.img_h), k, texts,
-                                    f"step {k + 1} of {len(want)}  ·  {args.map}"),
-                       args.hold_step))
+    states = [(canvas.frame([row(m, None) for m in loaded]), args.hold_title)]
+    for k in range(max(len(m["want"]) for m in loaded)):
+        states.append((canvas.frame([row(m, k) for m in loaded]), args.hold_step))
     if args.hold_answer > 0:
-        gold, said = meta.get("gt_answer"), answer_of(meta)
-        states.append((canvas.frame(plain, None, texts, "answer",
-                                    footer=f"{said}      (gold: {gold})"),
-                       args.hold_answer))
+        states.append((canvas.frame([(m["model"], plain, None,
+                                      f"{m['model']}  ·  answer" if multi else "answer",
+                                      m["footer"]) for m in loaded]), args.hold_answer))
 
     timed = []
     for i, (im, secs) in enumerate(states):

@@ -252,22 +252,54 @@ def test_video_frames():
 
     args = types.SimpleNamespace(pad=22, image_width=320, text_width=240, font_size=16)
     img = Image.new("RGB", (640, 480), (30, 30, 30))
-    steps = ["The chair is on the right.",
-             "The table is in the foreground, closer to the chair, and this one runs on "
-             "for long enough to wrap over several lines of the column.",
-             "The bookcase is on the left wall."]
-    c = V.Canvas(img, "Which object is closer to the chair?", steps, args)
-    frames = [c.frame(img.resize((c.img_w, c.img_h)), None, steps, "input")]
-    frames += [c.frame(img.resize((c.img_w, c.img_h)), i, steps, f"step {i + 1}")
-               for i in range(len(steps))]
-    frames.append(c.frame(img.resize((c.img_w, c.img_h)), None, steps, "answer",
-                          footer="B      (gold: B)"))
+    ours = ["The chair is on the right.",
+            "The table is in the foreground, closer to the chair, and this one runs on "
+            "for long enough to wrap over several lines of the column.",
+            "The bookcase is on the left wall."]
+    cold = ["There is one chair."]                  # a shorter chain, the two-row case
+    chains = [("ours", ours), ("coldstart", cold)]
+    q = "Which object is closer to the chair?"
+    panel = img.resize((320, 240))
+
+    c = V.Canvas(img, q, chains[:1], args)
+    panel = img.resize((c.img_w, c.img_h))
+    frames = [c.frame([("ours", panel, None, "input", None)])]
+    frames += [c.frame([("ours", panel, i, f"step {i + 1}", None)])
+               for i in range(len(ours))]
+    frames.append(c.frame([("ours", panel, None, "answer", "B      (gold: B)")]))
     check("every frame is the same size, whatever step is lit",
           len({f.size for f in frames}) == 1, str({f.size for f in frames}))
     check("and both dimensions are even, which libx264 requires",
           c.w % 2 == 0 and c.h % 2 == 0, f"{c.w}x{c.h}")
     check("the whole chain fits beside the picture",
           c.head_h + c.img_h <= c.h and c.f_step.size >= 11, f"font {c.f_step.size}")
+
+    # Two rows, and the second chain is shorter: it has to run out without resizing
+    # anything, or the gif's canvas changes halfway through and the mp4 will not encode.
+    c2 = V.Canvas(img, q, chains, args)
+    panel2 = img.resize((c2.img_w, c2.img_h))
+    two = [c2.frame([("ours", panel2, None, "input", None),
+                     ("coldstart", panel2, None, "input", None)])]
+    for k in range(max(len(ours), len(cold))):
+        two.append(c2.frame(
+            [("ours", panel2, k if k < len(ours) else None, f"step {k + 1}", None),
+             ("coldstart", panel2, k if k < len(cold) else None, "step", "D  (gold: B)")]))
+    check("a two-model frame is the same size whichever chain has run out",
+          len({f.size for f in two}) == 1, str({f.size for f in two}))
+    check("two rows are taller than one, by a whole picture",
+          c2.h - c.h == c.row_h, f"{c.h} -> {c2.h}, row {c.row_h}")
+    check("and the rows share one type size, so they are comparable",
+          set(c2.blocks) == {"ours", "coldstart"} and c2.f_step.size <= c.f_step.size,
+          f"{c2.f_step.size} vs {c.f_step.size}")
+
+    # The chain is centred against the picture, so its offset must not depend on whether
+    # the footer is drawn -- otherwise the whole column jumps on the closing frame.
+    from PIL import ImageChops
+    lit = c.frame([("ours", panel, 0, "step 1", None)])
+    lit_footer = c.frame([("ours", panel, 0, "step 1", "B      (gold: B)")])
+    box = (0, 0, c.w, c.head_h + c.img_h // 2)
+    check("the chain does not shift when the answer footer appears",
+          ImageChops.difference(lit.crop(box), lit_footer.crop(box)).getbbox() is None)
 
     gen = "<think> Looking at it. The chair is right. </think> B. table <|im_end|>"
     check("the answer card is what follows the chain, not the chain",
