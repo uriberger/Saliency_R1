@@ -334,6 +334,38 @@ does not depend on two referents being disjoint, still separates them.
 
 And `direct` is unchanged: median AUROC 0.387 / 0.364, 51% of its mass on the border ring.
 
+## 5c. Playing one chain
+
+`fig1_steps_video.py` animates what §5's panels lay out side by side: frame 0 is the
+picture and the question, and each frame after it holds one step's attention over the
+picture while that step's own sentence lights up in the chain on the right. It renders
+through `fig1_steps_figure.overlay` rather than through a copy of it, so a frame is the
+same image as that figure's panel and `--smooth` means the same thing.
+
+The ask it answers -- *a chain of at least three steps that correctly attends to a
+different place each time* -- is a filter on the `chains` block the search already writes:
+`n_scored >= 3`, `n_regions >= 3` (the referents are clustered at IoU 0.05, so restating
+one object three times counts once), every step above chance, and the answer right.
+**Ten chains in 1,980 pass it**, all from `bench_c.json` and `bench_d.json`:
+
+| out | sample | steps, raw-grid AUROC | what moves |
+|---|---|---|---|
+| `video-clevr-vehicles/` | mmstar_mini 69, `fig1b-realworld` | 0.87 / 0.89 / 0.73 / 0.86 / 0.74 / 0.85 | six named vehicles, one per step, on a plain background and with nothing drawn into the picture |
+| `video-attic/` | cv_bench_mini 167, `fig1d-search` | 0.80 / 0.84 / 0.89 | chair (right) -> table (centre) -> bookcase (left), the widest spatial spread of the three |
+| `video-shelf/` | cv_bench_mini 149, `fig1d-search` | 0.83 / 0.93 / 0.85 | top shelf -> middle shelf -> the desk below it, a vertical sweep |
+
+Two caveats a caption has to carry. **CV-Bench draws its red/blue/green boxes into the
+pixels**, and both `video-attic` and `video-shelf` are questions about those boxes, so a
+reviewer can say the attention is landing on a salient painted rectangle rather than on
+the object -- `video-clevr-vehicles` is the one with no such confound, at the cost of
+being a rendered scene. And the **blur is cosmetic**: every AUROC in the table is
+`fig1_multistep.py` on the raw grid, as everywhere else on this page.
+
+All three use `--overlay-mode alpha`, for the reason "Making it legible" gives: `blend`
+at 0.5 greys out the attic's furniture and the CLEVR background, and the frame has to
+show *what* is under the hot blob. Sigma follows the grid, not a default -- 1.0 on the
+attic's 24x32, 0.6 on the other two, which is ~3% of the width in all three.
+
 ## 6. Reproducing it
 
 ```fish
@@ -372,6 +404,15 @@ python fig1_steps_figure.py --run-dir outputs/saliency_viz/fig1b-hrbench \
     --cols 3 --scale 0.8 --smooth 1.0 \
     --question "HR-Bench 4K:  How many people are there in the image?   A. Three   B. Four   C. Two   D. One    (gold: C)" \
     --out outputs/fig1-multistep/figB-hrb-count-smooth
+```
+
+```fish
+# the animation. CPU, seconds; --question replaces the benchmark's own scaffolding
+# ("Answer with the option letter only.", the empty "nan" choices) in the header only
+python fig1_steps_video.py --run-dir outputs/saliency_viz/fig1d-search --model ours \
+    --sample sample_167_row000167 --smooth 1.0 --overlay-mode alpha --alpha 0.8 \
+    --question "Estimate the real-world distances between objects in this image. Which object is closer to the chair (red box), the bookcase (blue box) or the table (green box)?   (A) bookcase   (B) table" \
+    --out outputs/fig1-multistep/video-attic
 ```
 
 `--chain` is the N-object mode and `--rank`/`--sample` the two-region one; the second

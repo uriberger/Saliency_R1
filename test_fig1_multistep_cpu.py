@@ -230,9 +230,55 @@ def test_panel_render_knobs():
     check("a path that resolves is returned unchanged", P.rerooted(REPO) == REPO)
 
 
+def test_video_frames():
+    """fig1_steps_video.py's layout, which has one hard constraint: every frame is the
+    same size.
+
+    A GIF whose canvas changes between frames and an H.264 stream whose resolution does
+    are both broken, and neither fails loudly -- the encoder crops or the player shows
+    garbage. The geometry is therefore solved once against the longest step and reused,
+    so what is gated here is that a long step really does not move it, and that the size
+    stays even for the encoder. `answer_of` is the same trap `test_answers` is about: the
+    closing card claims what the model said.
+    """
+    print("video frames")
+    import types
+    from PIL import Image
+    sys.modules["fig1_steps_figure"] = F      # so `V` imports the module loaded above
+    V = _load("_fig1sv", "fig1_steps_video.py")
+
+    check("the render knobs are fig1_steps_figure's, not a copy",
+          V.overlay is F.overlay and V.wrap is F.wrap)
+
+    args = types.SimpleNamespace(pad=22, image_width=320, text_width=240, font_size=16)
+    img = Image.new("RGB", (640, 480), (30, 30, 30))
+    steps = ["The chair is on the right.",
+             "The table is in the foreground, closer to the chair, and this one runs on "
+             "for long enough to wrap over several lines of the column.",
+             "The bookcase is on the left wall."]
+    c = V.Canvas(img, "Which object is closer to the chair?", steps, args)
+    frames = [c.frame(img.resize((c.img_w, c.img_h)), None, steps, "input")]
+    frames += [c.frame(img.resize((c.img_w, c.img_h)), i, steps, f"step {i + 1}")
+               for i in range(len(steps))]
+    frames.append(c.frame(img.resize((c.img_w, c.img_h)), None, steps, "answer",
+                          footer="B      (gold: B)"))
+    check("every frame is the same size, whatever step is lit",
+          len({f.size for f in frames}) == 1, str({f.size for f in frames}))
+    check("and both dimensions are even, which libx264 requires",
+          c.w % 2 == 0 and c.h % 2 == 0, f"{c.w}x{c.h}")
+    check("the whole chain fits beside the picture",
+          c.head_h + c.img_h <= c.h and c.f_step.size >= 11, f"font {c.f_step.size}")
+
+    gen = "<think> Looking at it. The chair is right. </think> B. table <|im_end|>"
+    check("the answer card is what follows the chain, not the chain",
+          V.answer_of({"generation": gen}) == "B. table", V.answer_of({"generation": gen}))
+    check("a chain with no closing tag still yields something",
+          V.answer_of({"generation": "no tags here"}) == "no tags here")
+
+
 def main():
     for t in (test_raster, test_tight_referent, test_crossover_sign, test_answers,
-              test_render_smoothing, test_panel_render_knobs):
+              test_render_smoothing, test_panel_render_knobs, test_video_frames):
         t()
     print()
     if FAILED:
