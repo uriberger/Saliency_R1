@@ -384,11 +384,49 @@ After it, against the **cold start**, four pictures survive across every search:
 | `video-cmp-soccer/` | mmstar 54, *"how many soccer players are on the field?"*, gold **C. 4** | 0.625 foreground / 0.636 on the two background players; answers **C** | step 1 at **0.426** over 32% of the frame -- "there are three soccer players visible"; answers **D** |
 | `video-cmp-count/` | hrbench4k 29, *"how many people?"*, gold **C. Two** | 0.684 on the man, 0.703 on the second person through the window; answers **C. Two** | step 2 at **0.437** over 37.8% -- "There are no other people visible in the image"; answers **D. One** |
 | — | mathvision 59, plums and apples, gold **3** | 0.745 / 0.509; answers **3** | reads *five* plums off the right pan at **0.353**; answers **4** |
-| — | hrbench8k 85, *"what is in the middle of the water?"*, gold **C. a tree** | 0.513-0.654; answers **C** | "a structure that appears to be a gazebo" at 0.567, then 0.414; answers **D** |
+| `video-cmp-island/` | hrbench8k 85, *"what is in the middle of the water?"*, gold **C. a tree** | 0.513 / 0.654 / 0.617 on 3-4% referents; answers **C** | "a structure that appears to be a gazebo" at 0.567 over 19%, then **0.414** over 23.5%; answers **D** |
 
-`video-cmp-soccer` is the better of the two rendered: the cold start's second step lands
+`video-cmp-soccer` is the better of the three rendered: the cold start's second step lands
 on the goalkeeper's chest in the foreground while its sentence enumerates the background,
 and both background players are visible to a reader.
+
+### The same thing at more than two steps
+
+Asked for the version of this with a **longer chain** -- ours writing more than two
+grounded steps -- the pool is one picture, and it is `video-cmp-island/`. Nothing else in
+any search clears `n_scored >= 3`, all above chance, answer right, other model wrong and
+below chance somewhere, both chains complete. **Against vanilla Qwen3-VL it is zero**, at
+any length.
+
+That is a fact about chain length rather than about attention, and it is the shortening
+§ 5b's write-up reports from the other side. Over 1,980 of our chains the median is **2**
+scored steps and 29% reach three, against 49% of the cold start's 2,139. The funnel:
+583 of ours have >= 3 scored steps, 199 of those have every step above chance, 90 of
+those also answer correctly, and one of *those* has a cold start that is both wrong and
+ungrounded.
+
+`video-cmp-island/` is rendered in `side-by-side/` (`--layout columns`, 1506x978) and
+`stacked/`. The picture is good -- ours holds a tight blob on the tree on the island at
+all three steps while the cold start spreads from the island across the right bank and
+the building, inventing a gazebo and then describing its surroundings -- but two things
+make it weaker than the counting panel, and a caption has to survive both:
+
+- **Our three steps are the option strings verbatim** ("A small island with a statue",
+  "...a bench", "...a tree"). That is the model enumerating the choices, not observing
+  the picture, and it is the same shape as the panels in § 5 where the chain text is
+  recitation rather than description.
+- **All three land on the same island** (`n_regions` 1). This is *stayed tight on the
+  right thing*, not *moved between places*; the crossover claim of § 2 is not in it.
+
+Three near-misses, each failing for a reason worth knowing, because two of them look like
+hits in a table. **OmniSpatial 6** (net folding): the cold start writes six steps at
+median 0.457 and answers wrong, but every referent is 36-58% of the grid and ours has a
+step below chance -- neither model is grounded on a rendered net. **MMStar 17** (a wheelie,
+*"what will happen next?"*): ours writes five steps at 0.83/0.84/0.75/0.79/0.57 and the
+cold start answers D, but the cold start's map is **as good as ours** (median 0.803) --
+this is § 5's *where you look is not what you conclude*, not a grounding failure.
+**HR-Bench 4K 23**: the cold start is wrong with a *better* map than ours, 0.882 against
+0.532. An anti-example, and the one to check a filter against.
 
 **`video-cmp-count/` is the paper's Figure 1, animated**, in
 `portrait/` (`--layout rows`, 1266x1398) and `landscape/` (`--layout columns`,
@@ -480,6 +518,17 @@ python fig1_steps_video.py --run-dir outputs/saliency_viz/fig1b-hrbench \
     --smooth 1.0 --overlay-mode alpha --alpha 0.8 --font-size 30 --map-label "" \
     --layout rows --image-width 620 --text-width 580 \
     --out outputs/fig1-multistep/video-cmp-count/portrait
+
+# the three-step one. No --step-text: its captions are the model's own, and they are
+# the option strings, which is the honest thing to show
+python fig1_steps_video.py --run-dir outputs/saliency_viz/fig1e-r01 \
+    --sample sample_085_row000085 --model coldstart --model ours \
+    --label "coldstart=Vanilla" --label "ours=Self-Saliency (ours)" \
+    --answer "coldstart=a gazebo" --answer "ours=a tree" --gold "a tree" \
+    --question "What's located in the middle of the water?    A. a statue    B. a bench    C. a tree    D. a gazebo" \
+    --smooth 1.0 --overlay-mode alpha --alpha 0.8 --font-size 26 --map-label "" \
+    --layout columns --image-width 720 \
+    --out outputs/fig1-multistep/video-cmp-island/side-by-side
 ```
 
 `--chain` is the N-object mode and `--rank`/`--sample` the two-region one; the second
