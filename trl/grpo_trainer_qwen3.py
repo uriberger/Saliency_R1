@@ -3479,6 +3479,30 @@ class GRPOTrainer(Trainer):
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+
+        if os.environ.get("SR1_TRIM_COMPLETION_PADDING") == "1":
+            # DON'T FORWARD PADDING THE LOSS ALREADY MASKS.
+            #
+            # `completion_ids` is padded to the longest completion in the whole GENERATION
+            # batch -- 1,024 whenever any one rollout hits the cap -- and a micro-batch is
+            # ONE sequence, whose own completion averages ~300 tokens. Every position past
+            # its EOS has `completion_mask == 0`, contributes nothing to the loss, and is
+            # forwarded and back-propagated anyway. On a 33B mixture of experts that is not
+            # a rounding error: the backward's transients scale with tokens, and the single
+            # allocation that decides whether a step fits is ~5.5 GB at 1,397 positions.
+            #
+            # Exact, not an approximation: the dropped columns are masked everywhere they
+            # appear (`per_token_logps * completion_mask`, the entropy mask, the length
+            # normaliser), and the advantage is per SEQUENCE. Off by default, because the
+            # shapes change and a matmul of a different shape is not bit-identical.
+            _keep = int(completion_mask.sum(dim=1).max().item())
+            if 0 < _keep < completion_ids.size(1):
+                completion_ids = completion_ids[:, :_keep]
+                completion_mask = completion_mask[:, :_keep]
+                for _k in ("old_per_token_logps", "ref_per_token_logps"):
+                    if inputs.get(_k) is not None:
+                        inputs[_k] = inputs[_k][:, :_keep]
+
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens

@@ -68,6 +68,7 @@ import os
 import time
 
 import torch
+import torch.distributed  # noqa: F401
 
 # PIN THIS RANK'S DEVICE BEFORE ANYTHING ELSE TOUCHES CUDA.
 #
@@ -80,7 +81,20 @@ import torch
 # Harmless everywhere else -- `LOCAL_RANK` is exactly the device accelerate is about to
 # choose, so this only makes it the default earlier.
 if "LOCAL_RANK" in os.environ and torch.cuda.is_available():
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    _lr = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(_lr)
+    # And BIND the process group to this device when it is created. `set_device` alone is
+    # not enough: NCCL picks its device at the first collective, and until then torch warns
+    # "using GPU N as device used by this process is currently unknown" and every rank
+    # lands a context on index 0 of CUDA_VISIBLE_DEVICES -- which is the SAME physical card
+    # for all of them. `nvidia-smi --query-compute-apps` shows it plainly: five 520 MB
+    # entries belonging to ranks 1-5, all on rank 0's GPU, 2.6 GB owned by nobody.
+    #
+    # Initialising it here rather than leaving it to accelerate is what makes `device_id`
+    # reachable; accelerate sees an initialised group and reuses it.
+    if os.environ.get("WORLD_SIZE") and not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            backend="nccl", device_id=torch.device("cuda", _lr))
 
 from datasets import load_dataset, load_from_disk
 from latex2sympy2_extended import NormalizationConfig

@@ -334,6 +334,9 @@ export SR1_MEM_REPORT=${SR1_MEM_REPORT:-6}
 # nothing, and the backward's one ~5.5 GB block then fails with 5.3 GB free. The forward
 # saves only 0.3 GB of its own (52 blocks recomputing), so nothing needed is discarded.
 export SR1_EMPTY_CACHE_PER_MICROSTEP=${SR1_EMPTY_CACHE_PER_MICROSTEP:-1}
+# And do not forward the padding the loss already masks: a micro-batch is ONE sequence
+# whose completion averages ~300 tokens, padded to the 1,024 some other rollout reached.
+export SR1_TRIM_COMPLETION_PADDING=${SR1_TRIM_COMPLETION_PADDING:-1}
 # The vendored layernorm-only mamba_ssm. Without it the Nemotron decoder raises at IMPORT
 # -- `MambaRMSNormGated.forward` IS a call to `rmsnorm_fn` -- and having no dist-info is
 # deliberate: `is_mamba_2_ssm_available()` keeps reading False, so the fused SSM kernels
