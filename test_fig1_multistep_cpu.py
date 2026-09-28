@@ -250,23 +250,27 @@ def test_video_frames():
     check("the render knobs are fig1_steps_figure's, not a copy",
           V.overlay is F.overlay and V.wrap is F.wrap)
 
-    args = types.SimpleNamespace(pad=22, image_width=320, text_width=240, font_size=16)
+    def cfg(**kw):
+        base = dict(pad=22, image_width=320, text_width=240, font_size=16, layout="rows")
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
     img = Image.new("RGB", (640, 480), (30, 30, 30))
     ours = ["The chair is on the right.",
             "The table is in the foreground, closer to the chair, and this one runs on "
             "for long enough to wrap over several lines of the column.",
             "The bookcase is on the left wall."]
-    cold = ["There is one chair."]                  # a shorter chain, the two-row case
+    cold = ["There is one chair."]                  # a shorter chain, the two-panel case
     chains = [("ours", ours), ("coldstart", cold)]
     q = "Which object is closer to the chair?"
-    panel = img.resize((320, 240))
+    foot = ("B", "B", True)
 
-    c = V.Canvas(img, q, chains[:1], args)
+    c = V.Canvas(img, q, chains[:1], cfg())
     panel = img.resize((c.img_w, c.img_h))
-    frames = [c.frame([("ours", panel, None, "input", None)])]
-    frames += [c.frame([("ours", panel, i, f"step {i + 1}", None)])
+    frames = [c.frame([(("ours", "input"), panel, None, None)])]
+    frames += [c.frame([(("ours", f"step {i + 1}"), panel, i, None)])
                for i in range(len(ours))]
-    frames.append(c.frame([("ours", panel, None, "answer", "B      (gold: B)")]))
+    frames.append(c.frame([(("ours", "answer"), panel, None, foot)]))
     check("every frame is the same size, whatever step is lit",
           len({f.size for f in frames}) == 1, str({f.size for f in frames}))
     check("and both dimensions are even, which libx264 requires",
@@ -274,32 +278,60 @@ def test_video_frames():
     check("the whole chain fits beside the picture",
           c.head_h + c.img_h <= c.h and c.f_step.size >= 11, f"font {c.f_step.size}")
 
-    # Two rows, and the second chain is shorter: it has to run out without resizing
+    # Two panels, and the second chain is shorter: it has to run out without resizing
     # anything, or the gif's canvas changes halfway through and the mp4 will not encode.
-    c2 = V.Canvas(img, q, chains, args)
+    c2 = V.Canvas(img, q, chains, cfg())
     panel2 = img.resize((c2.img_w, c2.img_h))
-    two = [c2.frame([("ours", panel2, None, "input", None),
-                     ("coldstart", panel2, None, "input", None)])]
+    two = [c2.frame([(("ours", "input"), panel2, None, None),
+                     (("coldstart", "input"), panel2, None, None)])]
     for k in range(max(len(ours), len(cold))):
         two.append(c2.frame(
-            [("ours", panel2, k if k < len(ours) else None, f"step {k + 1}", None),
-             ("coldstart", panel2, k if k < len(cold) else None, "step", "D  (gold: B)")]))
+            [(("ours", f"step {k + 1}"), panel2, k if k < len(ours) else None, None),
+             (("coldstart", "step"), panel2, k if k < len(cold) else None,
+              ("D", "B", False))]))
     check("a two-model frame is the same size whichever chain has run out",
           len({f.size for f in two}) == 1, str({f.size for f in two}))
     check("two rows are taller than one, by a whole picture",
           c2.h - c.h == c.row_h, f"{c.h} -> {c2.h}, row {c.row_h}")
-    check("and the rows share one type size, so they are comparable",
+    check("and the panels share one type size, so they are comparable",
           set(c2.blocks) == {"ours", "coldstart"} and c2.f_step.size <= c.f_step.size,
           f"{c2.f_step.size} vs {c.f_step.size}")
 
     # The chain is centred against the picture, so its offset must not depend on whether
     # the footer is drawn -- otherwise the whole column jumps on the closing frame.
     from PIL import ImageChops
-    lit = c.frame([("ours", panel, 0, "step 1", None)])
-    lit_footer = c.frame([("ours", panel, 0, "step 1", "B      (gold: B)")])
+    lit = c.frame([(("ours", "step 1"), panel, 0, None)])
+    lit_footer = c.frame([(("ours", "step 1"), panel, 0, foot)])
     box = (0, 0, c.w, c.head_h + c.img_h // 2)
     check("the chain does not shift when the answer footer appears",
           ImageChops.difference(lit.crop(box), lit_footer.crop(box)).getbbox() is None)
+
+    # `columns` is the landscape half: the two models side by side, chain underneath.
+    cc = V.Canvas(img, q, chains, cfg(layout="columns"))
+    panel3 = img.resize((cc.img_w, cc.img_h))
+    wide = [cc.frame([(("ours", "ours"), panel3, k if k < len(ours) else None, None),
+                      (("coldstart", "Vanilla"), panel3,
+                       k if k < len(cold) else None, ("D", "B", False))])
+            for k in range(max(len(ours), len(cold)))]
+    check("columns is wider than rows and rows is taller than columns",
+          cc.w > c2.w and cc.h < c2.h, f"{cc.w}x{cc.h} vs {c2.w}x{c2.h}")
+    check("and its frames are one size too",
+          len({f.size for f in wide}) == 1 and wide[0].size == (cc.w, cc.h))
+    # In columns the chain hangs below the picture, so it must NOT be shrunk to fit it.
+    check("columns keeps the requested type size, rows may shrink it",
+          cc.f_step.size == 16 and cc.f_step.size >= c2.f_step.size,
+          f"{cc.f_step.size} vs {c2.f_step.size}")
+
+    # Two verdicts side by side under chains of different lengths have to line up, or
+    # the eye reads the shorter chain's model as having answered first.
+    card = cc.frame([(("ours", "ours"), panel3, None, ("Two", "Two", True)),
+                     (("coldstart", "Vanilla"), panel3, None, ("One", "Two", False))])
+    a = np.asarray(card).astype(int)
+    rows_ok = {int(r) for r in np.where((np.abs(a - np.array(V.OK)).sum(2) < 60).any(1))[0]}
+    rows_bad = {int(r) for r in np.where((np.abs(a - np.array(V.BAD)).sum(2) < 60).any(1))[0]}
+    check("the tick and the cross sit on the same line",
+          bool(rows_ok) and rows_ok == rows_bad,
+          f"{len(rows_ok)} green rows, {len(rows_bad)} red")
 
     gen = "<think> Looking at it. The chair is right. </think> B. table <|im_end|>"
     check("the answer card is what follows the chain, not the chain",

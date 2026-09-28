@@ -390,6 +390,21 @@ After it, against the **cold start**, four pictures survive across every search:
 on the goalkeeper's chest in the foreground while its sentence enumerates the background,
 and both background players are visible to a reader.
 
+**`video-cmp-count/` is the paper's Figure 1, animated**, in
+`portrait/` (`--layout rows`, 1266x1398) and `landscape/` (`--layout columns`,
+1666x1216). It matches the figure rather than the scan: the question loses its option
+list, the four step captions are the figure's paraphrases, the answers read `One` and
+`Two` instead of `D. One` and `C. Two`, and a red cross and a green tick sit beside
+them. **Each of those is a `--label` / `--step-text` / `--answer` / `--gold` override,
+and every one is written to `<out>/chain.json` next to the text it replaced** -- the map
+under each step is untouched and is still that step's.
+
+One thing to carry from it: the figure labels the top row **Vanilla**, and the row is the
+**cold start**. `outputs/saliency_viz/fig1b-hrbench/` only ever scanned `ours` and
+`coldstart`, the step sentences under it are the cold start's verbatim, and § 5b's
+Baselines list vanilla Qwen3-VL-8B-Instruct and the cold-start checkpoint as two
+different models. The video reproduces the paper's label; the paper's label is wrong.
+
 **Against vanilla Qwen3-VL there is no such example.** The same filter over `all.json`
 returns four pictures and all four are grading, not attention: base answers *"Cabinets"*
 to gold `cabinet`, or in prose that the extractor cannot read. That is the same thing
@@ -450,6 +465,21 @@ python fig1_steps_video.py --run-dir outputs/saliency_viz/fig1b-realworld \
     --smooth 0.6 --overlay-mode alpha --alpha 0.8 --image-width 560 --text-width 520 \
     --question "MMStar:  Based on the image, how many soccer players are on the field?    A. 1    B. 2    C. 4    D. 3" \
     --out outputs/fig1-multistep/video-cmp-soccer
+
+# the paper's Figure 1. --layout columns instead for the landscape cut; the captions,
+# the names and the answers are the figure's, and chain.json records what each replaced
+python fig1_steps_video.py --run-dir outputs/saliency_viz/fig1b-hrbench \
+    --sample sample_029_row000029 --model coldstart --model ours \
+    --label "coldstart=Vanilla" --label "ours=Self-Saliency (ours)" \
+    --step-text "coldstart:0=A person wearing a brown jacket and a hat." \
+    --step-text "coldstart:1=There are no other people in the image." \
+    --step-text "ours:0=A person wearing a hat and a tan jacket." \
+    --step-text "ours:1=Second person partially seen in the background." \
+    --answer "coldstart=One" --answer "ours=Two" --gold Two \
+    --question "How many people are there in the image?" \
+    --smooth 1.0 --overlay-mode alpha --alpha 0.8 --font-size 30 \
+    --layout rows --image-width 620 --text-width 580 \
+    --out outputs/fig1-multistep/video-cmp-count/portrait
 ```
 
 `--chain` is the N-object mode and `--rank`/`--sample` the two-region one; the second
