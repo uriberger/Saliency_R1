@@ -326,6 +326,12 @@ export PYTHONPATH="$REPO/vendor/mamba_ssm_min:${PYTHONPATH:-}"
 # So a copy of nemotron_loader.py living inside trl_repo_nemotron can still find
 # vendor/mamba_ssm_min: walking up from its own __file__ lands in the TRL clone.
 export SR1_REPO="$REPO"
+# 73.3 GB of an 80 GB card, and the one allocation that decides it is ~5.5 GB contiguous
+# in the backward. The first attempt died with 5.17 GiB free and 5.50 GiB asked for -- not
+# short of memory, short of one unfragmented block. Expandable segments let the allocator
+# grow a segment instead of needing a new one that size, which is exactly this case.
+# Exported before every child, so the preflight and all six training ranks get it.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 [ -d "$OVERLAP_STEPS_CKPT/encoder" ] || {
     echo "ERROR: steps-classifier ckpt not found at $OVERLAP_STEPS_CKPT" >&2; exit 1; }
