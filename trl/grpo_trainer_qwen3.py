@@ -2498,6 +2498,25 @@ class GRPOTrainer(Trainer):
                         # If vision_end_token_id is None, just remove the image tokens
                         prompts_text = [re.sub(rf"({escaped_img_token})+", "", text) for text in prompts_text]
 
+        # DOES THE PROMPT ALREADY OPEN THE REASONING BLOCK?
+        #
+        # Qwen3-VL's chat template ends the generation prompt at `<|im_start|>assistant\n`
+        # and the policy writes `<think>` itself, so a completion carries both tags. The
+        # Omni's ends at `<|im_start|>assistant\n<think>\n` -- the assistant turn starts
+        # INSIDE the block, and the completion carries only the closing tag.
+        #
+        # Nothing downstream knows that. `judge_format` requires exactly one of each, so
+        # every completion of a perfectly well-behaved model reads as malformed: format
+        # 0.000, and then the overlap reward NaN on all of them, because the per-step maps
+        # are only computed for completions whose format is valid. That is the whole
+        # failure, and it looks like a broken reward rather than a template.
+        #
+        # Read off the ACTUAL prompt rather than declared per family, because it is a fact
+        # about the chat template and a template can change under a checkpoint. The
+        # anchored `$` is what keeps the system prompt's own `<think></think>` out of it.
+        self._prompt_opens_think = bool(
+            prompts_text and re.search(r"<think>\s*$", prompts_text[0]))
+
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
             # First, update the vLLM weights if needed
@@ -2791,12 +2810,25 @@ class GRPOTrainer(Trainer):
         pattern = r"^<think>\s*([^\s].*?)\s*</think>\s*([^\s].*?)\s*$"
         completion_contents = [completion[0]["content"] for completion in completions]
 
+        # When the prompt opened the block, the completion is judged as the continuation
+        # it is: the opening tag is real, it just lives in the prompt. Prepending it here
+        # rather than loosening the pattern keeps ONE definition of the format, and keeps
+        # a model that writes a second `<think>` failing, which it should.
+        _opener = "<think>\n" if self._prompt_opens_think else ""
+
         def judge_format(pattern, response):
+            response = _opener + response
             return re.match(pattern, response, re.DOTALL | re.MULTILINE) is not None and \
                 response.count('<think>') == 1 and response.count('</think>') == 1
         invalid = [judge_format(pattern, content) for content in completion_contents]
 
-        think_start_idx = [re.search(r"<think>\s*(\S\S*)", i, re.DOTALL | re.MULTILINE) for i in output_text]
+        if self._prompt_opens_think:
+            # The reasoning starts at the completion's first non-space character, because
+            # everything before it is in the prompt.
+            think_start_idx = [re.search(r"\s*(\S)", i, re.DOTALL | re.MULTILINE)
+                               for i in output_text]
+        else:
+            think_start_idx = [re.search(r"<think>\s*(\S\S*)", i, re.DOTALL | re.MULTILINE) for i in output_text]
         think_end_idx = [re.search(r"(\S)\s*</think>", i, re.DOTALL | re.MULTILINE) for i in output_text]
         answer_start_idx = [re.search(r"</think>\s*(\S\S*)", i, re.DOTALL | re.MULTILINE) for i in output_text]
         answer_end_idx = [re.search(r"(\S)\s*<\|im_end\|>", i, re.DOTALL | re.MULTILINE) for i in output_text]
