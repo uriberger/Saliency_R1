@@ -24,6 +24,24 @@ export PYTHONPATH="$REPO/vendor/mamba_ssm_min:${PYTHONPATH:-}"
 source "$CONDA_SH"
 conda activate nemotron_vllm
 
+# The environment the Omni's generation server needs on THIS cluster. Every one of these
+# is a hard failure without it, and omni_vllm_probe.py is what found each:
+#
+#   VLLM_ENABLE_V1_MULTIPROCESSING=0   the EngineCore CHILD hangs -- it reaches the
+#                                      worker's memory snapshot and then sits in a futex
+#                                      with 43 sleeping threads while the parent prints
+#                                      "Waiting for 1 local core engine proc" forever.
+#                                      In-process it loads normally.
+#   VLLM_USE_DEEP_GEMM=0               kernel warmup calls DeepGEMM's FP8 path on a
+#                                      bfloat16 model and raises "DeepGEMM backend is not
+#                                      available or outdated".
+#
+# The other two are arguments rather than variables: `--kernel_config` picks the triton
+# MoE backend (the default `auto` JIT-compiles FlashInfer CUTLASS and needs an nvcc these
+# nodes do not have), and `--max_num_seqs` stays under the Mamba state-block count.
+export VLLM_ENABLE_V1_MULTIPROCESSING=${VLLM_ENABLE_V1_MULTIPROCESSING:-0}
+export VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM:-0}
+
 # Startup diagnostics are opt-in: SR1_VLLM_DEBUG=1 turns on vLLM's own DEBUG log and
 # NCCL's, which is what tells a slow 62 GB load apart from a hang in the collective setup.
 if [ "${SR1_VLLM_DEBUG:-0}" = "1" ]; then

@@ -2455,8 +2455,13 @@ class GRPOTrainer(Trainer):
                 escaped_img_token = re.escape(self.image_token)
                 # Search for the image token in the chat template
                 if re.search(escaped_img_token, self.processing_class.chat_template):
+                    # The family folds the run back to the CHAT TEMPLATE's spelling, which
+                    # is what the generation server expands from. For Qwen3-VL that is the
+                    # `re.sub` this replaces, verbatim; a processor that also wraps the run
+                    # in `<img>`/`</img>` has to shed those or the server re-wraps it.
                     prompts_text = [
-                        re.sub(rf"({escaped_img_token})+", self.image_token, text) for text in prompts_text
+                        self.family.collapse_image_run(text, self.image_token)
+                        for text in prompts_text
                     ]
                 else:
                     # If the chat template doesn't use the image token, we remove all instances of it + vision_end_token_id

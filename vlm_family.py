@@ -315,6 +315,22 @@ class Family:
         """
         return targets
 
+    def collapse_image_run(self, text, image_token):
+        """A DECODED prompt, with its expanded image run folded back to one placeholder.
+
+        The trainer decodes `prompt_ids` back to text to send to the generation server,
+        and by then the processor has already expanded one placeholder into hundreds of
+        image tokens. The server expands it again from the CHAT TEMPLATE's spelling, so
+        what has to go across is the template's spelling and not the processor's.
+
+        For Qwen3-VL that is simply the image token collapsed to one occurrence, which is
+        what this does and what the trainer did inline. A family whose processor also
+        wraps the run in delimiters has to shed those too -- see `NemotronVL`.
+        """
+        import re
+
+        return re.sub(rf"({re.escape(image_token)})+", image_token, text)
+
     def protected_token_ids(self):
         """Token ids `truncate_with_protected_tokens` must never drop."""
         ids = [self.image_token_id, *self.vision_start_ids, *self.vision_end_ids]
@@ -893,6 +909,37 @@ class NemotronVL(Family):
         if not names:
             raise SystemExit("nemotron_vl: no LoRA target names to scope")
         return r"language_model\..*\.(" + "|".join(names) + r")"
+
+    def collapse_image_run(self, text, image_token):
+        """Shed the `<img>` ... `</img>` wrapper as well as the run inside it.
+
+        This processor turns the template's single `<image>` into
+
+            <img> <image> x N </img>
+
+        and vLLM's own processor does the SAME substitution on the target `<image>`. So a
+        decoded prompt that still carries the wrapper comes out of the server as
+        `<img><img>...</img></img>`: an extra pair of indicator tokens that the training
+        forward never sees, on every prompt. Folding the whole run -- delimiters included
+        -- back to one `<image>` puts exactly the chat template's own text across the wire,
+        which is what both sides expand from.
+
+        Falls back to the parent's collapse when the delimiters are not resolvable, so a
+        checkpoint whose tokenizer lacks them degrades to Qwen3-VL's behaviour rather than
+        dropping the picture.
+        """
+        import re
+
+        tok = getattr(self.processor, "tokenizer", None) or self.processor
+        if tok is None or not (self.vision_start_ids and self.vision_end_ids):
+            return Family.collapse_image_run(self, text, image_token)
+        start = tok.decode(list(self.vision_start_ids))
+        end = tok.decode(list(self.vision_end_ids))
+        pat = (re.escape(start) + rf"(?:{re.escape(image_token)})+" + re.escape(end))
+        out, n = re.subn(pat, image_token, text)
+        # No wrapper in the text (a family member whose processor does not add one, or a
+        # prompt with no picture): fall through rather than leaving an expanded run.
+        return out if n else Family.collapse_image_run(self, text, image_token)
 
     def decoder(self, model):
         """`language_model` hangs off the WRAPPER here, not off a `.model` inside it.

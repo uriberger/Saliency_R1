@@ -118,6 +118,12 @@ def test_qwen_is_unchanged():
           fam.lora_target_modules(["q_proj", "k_proj", "v_proj"])
           == ["q_proj", "k_proj", "v_proj"])
     check("after_processor is a no-op", fam.after_processor(batch) is batch)
+    # was: re.sub(rf"({escaped_img_token})+", self.image_token, text)
+    check("collapse_image_run folds the run and touches nothing else",
+          fam.collapse_image_run(
+              "a<|vision_start|>" + "<|image_pad|>" * 5 + "<|vision_end|>b",
+              "<|image_pad|>")
+          == "a<|vision_start|><|image_pad|><|vision_end|>b")
     check("the Saliency-R1 readout is still available", fam.supports_saliency_r1())
 
 
@@ -169,6 +175,37 @@ def test_omni_geometry():
     check("an existing image_flags is left alone", int(kept["image_flags"][0, 0]) == 7)
 
 
+def test_omni_prompt_goes_over_as_the_template_wrote_it():
+    """The decoded prompt must carry the CHAT TEMPLATE's `<image>`, not the processor's.
+
+    The trainer decodes `prompt_ids` back to text for the generation server, and by then
+    the HF processor has expanded one `<image>` into `<img>` + N + `</img>`. vLLM's own
+    processor then substitutes its replacement onto the target `<image>` -- so a wrapper
+    left in the text comes back out as `<img><img>...</img></img>`, two indicator tokens
+    the training forward never sees, on every prompt of every step.
+    """
+    print("\nThe prompt that crosses to the generation server")
+    fam = VF._REGISTRY["NemotronH_Nano_Omni_Reasoning_V3"]()
+
+    class Tok:
+        def decode(self, ids):
+            return {(0,): "<img>", (1,): "</img>"}[tuple(ids)]
+
+    fam.processor = type("P", (), {"tokenizer": Tok()})()
+    fam.vision_start_ids, fam.vision_end_ids = (0,), (1,)
+
+    got = fam.collapse_image_run("a<img>" + "<image>" * 270 + "</img>\nb", "<image>")
+    check("the whole run, delimiters included, folds to one placeholder",
+          got == "a<image>\nb", repr(got))
+    check("a text with no wrapper still collapses",
+          fam.collapse_image_run("a<image><image>b", "<image>") == "a<image>b")
+    # A tokenizer that cannot resolve the delimiters must degrade to the parent's
+    # behaviour rather than dropping the picture.
+    bare = VF._REGISTRY["NemotronH_Nano_Omni_Reasoning_V3"]()
+    check("no delimiters -> the plain collapse, picture intact",
+          bare.collapse_image_run("a<image><image>b", "<image>") == "a<image>b")
+
+
 def test_lora_scope_keeps_the_audio_tower_out():
     print("\nThe trap: peft matches bare names by suffix, anywhere in the model")
     import re
@@ -211,6 +248,7 @@ def test_v2_does_not_inherit_the_omni_grid():
 def main():
     test_qwen_is_unchanged()
     test_omni_geometry()
+    test_omni_prompt_goes_over_as_the_template_wrote_it()
     test_lora_scope_keeps_the_audio_tower_out()
     test_v2_does_not_inherit_the_omni_grid()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

@@ -442,6 +442,9 @@ echo "[start] vLLM server on cuda:[$VLLM_GPUS] -> 127.0.0.1:$VLLM_PORT ($VLLM_EN
     # /usr/local/cuda on these nodes and the only system toolkit is CUDA 12.4 against a
     # torch built on 13. Triton ships its own compiler and needs none.
     export VLLM_ENABLE_V1_MULTIPROCESSING=0
+    # And kernel warmup calls DeepGEMM's FP8 path on a bfloat16 model, which
+    # raises "DeepGEMM backend is not available or outdated".
+    export VLLM_USE_DEEP_GEMM=0
     CUDA_VISIBLE_DEVICES=$VLLM_GPUS \
         exec python -m trl.scripts.vllm_serve \
             --model "$MODEL" \
