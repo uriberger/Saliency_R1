@@ -2019,6 +2019,22 @@ class GRPOTrainer(Trainer):
                 if _prof:
                     _t_seg += _time.perf_counter() - _tg
 
+                # WHY THIS PRINT EXISTS. Everything downstream of here is silent about
+                # its own failures: a completion whose format does not parse is skipped,
+                # a chain with no observe step yields no maps, and a map whose length
+                # disagrees with the grid is dropped by `continue`. All three end as
+                # `think_overlap_reward = nan` and nothing says which. On a new model
+                # that is the first thing to know, so the first call reports it once.
+                if not getattr(self, "_overlap_shape_logged", False) and \
+                        self.accelerator.is_main_process:
+                    self._overlap_shape_logged = True
+                    print(f"[overlap] first scored case: {int(sum(bool(v) for v in invalid))}"
+                          f"/{len(invalid)} completions format-valid, think tokens "
+                          f"{ts}-{te}, {len(steps)} observe steps, map {per_tok.shape[-1]} "
+                          f"patches against grid {gh}x{gw}={gh * gw}"
+                          f"{'  <-- MISMATCH, every map will be dropped' if per_tok.shape[-1] != gh * gw else ''}",
+                          flush=True)
+
                 step_maps = []
                 for step_text, tok_a, tok_b in steps:
                     la = tok_a - ts

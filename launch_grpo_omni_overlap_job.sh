@@ -197,7 +197,12 @@ VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-True}
 # has ~914. vLLM's default max_num_seqs is 1024, so it refuses before anything runs. One
 # GRPO step asks for gen_batch sequences at most (48 here); 64 leaves margin.
 VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-64}
-OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cuda}
+# The FLAN-T5 observe-step classifier. The Qwen3-VL launcher puts it on the training GPU
+# because CPU was the dominant per-step cost there; here the training card is at 65-73 GB
+# of 79 and the first attempt died in NCCL's allreduce with "Cuda failure 2 'out of
+# memory'". A 110M-parameter encoder is not worth one of the ~6 GB that are left. It costs
+# step time, and the node has 96 cores for six ranks to spend.
+OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cpu}
 OVERLAP_STEPS_CKPT=${OVERLAP_STEPS_CKPT:-$REPO/checkpoint/steps_classifier/best}
 PREFLIGHT=${PREFLIGHT:-true}
 SYNC_LORA_ONLY=true
@@ -350,7 +355,10 @@ echo "LoRA:             r=16 alpha=32 targets=$LORA_TARGETS (scoped to the decod
 echo "Steps:            max_steps=$MAX_STEPS save_steps=$SAVE_STEPS"
 echo "Output:           $OUTPUT_DIR"
 echo "=============================================================="
-nvidia-smi --query-gpu=index,name,memory.total --format=csv || true
+# memory.used as well as total: a previous job's vLLM worker can outlive its allocation
+# for a few seconds, and starting six 65 GB ranks beside one is an OOM with no other
+# symptom.
+nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv || true
 
 # ---------- 0. the preflight ----------
 # Before any sidecar takes a card, so it has a whole one to itself. See THE PREFLIGHT.
@@ -593,6 +601,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --logging_steps 1 \
     --save_steps "$SAVE_STEPS" \
     --temperature 1 \
+    --ddp_find_unused_parameters False \
     --val_sets_dir "" \
     $RESUME_FLAG \
     $EXTRA_ARGS
