@@ -477,7 +477,7 @@ python fig1_steps_video.py --run-dir outputs/saliency_viz/fig1b-hrbench \
     --step-text "ours:1=Second person partially seen in the background." \
     --answer "coldstart=One" --answer "ours=Two" --gold Two \
     --question "How many people are there in the image?" \
-    --smooth 1.0 --overlay-mode alpha --alpha 0.8 --font-size 30 \
+    --smooth 1.0 --overlay-mode alpha --alpha 0.8 --font-size 30 --map-label "" \
     --layout rows --image-width 620 --text-width 580 \
     --out outputs/fig1-multistep/video-cmp-count/portrait
 ```
