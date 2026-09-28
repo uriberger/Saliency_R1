@@ -133,6 +133,7 @@ def apply_runtime_shims(model, cfg=None):
     _shim_single_process_group()
     _shim_cache_params_alias(model)
     _shim_cache_position(model)
+    _shim_logits_to_keep(model)
     return model
 
 
@@ -397,3 +398,62 @@ def _repair_radio_summary_idxs(model, cfg):
                 return
     raise SystemExit(f"RADIO's summary_idxs was newly initialised and {repo} is not "
                      "cached, so the real value cannot be recovered. Fetch it first.")
+
+
+def _shim_logits_to_keep(model):
+    """Let the VLM wrapper pass `logits_to_keep` through to its language model.
+
+    `NemotronHForCausalLM.forward` takes `logits_to_keep: int | torch.Tensor = 0` and the
+    VLM wrapper around it does not, so it never reaches the decoder: the lm_head runs over
+    the WHOLE sequence, prompt included, and the backward runs over all of it too. On a
+    131,072-token vocabulary at ~1,400 positions that is a 369 MB logits tensor plus its
+    graph, against 269 MB for the completion alone -- and the trainer already knows how to
+    ask for less. It checks `"logits_to_keep" in inspect.signature(model.forward)` and
+    quietly skips the argument when it is absent, so the cost is invisible.
+
+    The wrapper's forward calls `self.language_model(...)` with a fixed kwarg list, which
+    cannot be edited from outside. So this is two wrappers and a box: the outer one accepts
+    the argument and puts it in the box, the inner one takes it out on the way past.
+
+    `functools.wraps` is deliberately NOT used on the outer forward. It would set
+    `__wrapped__`, `inspect.signature` would follow it back to the original parameter list,
+    and the trainer would go on believing the argument is unsupported -- which is the one
+    thing this exists to change.
+    """
+    import inspect
+
+    cls = type(model)
+    if getattr(cls, "_sr1_logits_to_keep_shim", False):
+        return
+    lm = getattr(model, "language_model", None)
+    if lm is None:
+        return
+    try:
+        if "logits_to_keep" not in inspect.signature(lm.forward).parameters:
+            return                      # the decoder cannot take it either; nothing to do
+        if "logits_to_keep" in inspect.signature(cls.forward).parameters:
+            return                      # a release that already forwards it
+    except (TypeError, ValueError):
+        return
+
+    pending = {"n": 0}
+    outer = cls.forward
+    inner = type(lm).forward
+
+    def forward(self, *args, logits_to_keep=0, **kwargs):
+        pending["n"] = logits_to_keep
+        try:
+            return outer(self, *args, **kwargs)
+        finally:
+            pending["n"] = 0
+
+    def lm_forward(self, *args, **kwargs):
+        if pending["n"] and "logits_to_keep" not in kwargs:
+            kwargs["logits_to_keep"] = pending["n"]
+        return inner(self, *args, **kwargs)
+
+    cls.forward = forward
+    type(lm).forward = lm_forward
+    cls._sr1_logits_to_keep_shim = True
+    print("[load] the wrapper now forwards logits_to_keep to the language model",
+          flush=True)

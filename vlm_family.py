@@ -848,7 +848,11 @@ class NemotronVL(Family):
     #: leaves this unset builds a hybrid Mamba+KV cache on every no-grad re-forward and
     #: every checkpointed training forward, and throws it away. The benchmark that
     #: measured 34.0 s a step passed it on every call.
-    forward_defaults = {"use_cache": False}
+    #: `logits_to_keep` 1 is for the passes that want the ATTENTION and not the logits --
+    #: the saliency capture re-forward. Without it the lm_head runs over ~1,400 positions
+    #: of a 131,072-token vocabulary for a tensor nothing reads. The training pass sets its
+    #: own value afterwards, so this is a floor and not a cap.
+    forward_defaults = {"use_cache": False, "logits_to_keep": 1}
     #: `imgs_sizes` is the resized (H, W) the grid is derived from. It is not a forward
     #: kwarg (`drop_inputs` says so) and `token_grid` reads it, so the trainer has to
     #: carry it through the batch without ever passing it to the model.
