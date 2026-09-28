@@ -3612,6 +3612,22 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
         gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+
+        if os.environ.get("SR1_EMPTY_CACHE_PER_MICROSTEP") == "1":
+            # AND AGAIN HERE, which is the release that matters. `training_step` calls
+            # `accelerator.backward(loss)` on the very next line, and the measurement
+            # across this boundary is
+            #
+            #     before the forward   allocated 61.6   reserved 61.6
+            #     after  the forward   allocated 61.9   reserved 67.8
+            #
+            # so the forward leaves 5.9 GB cached and owned by nothing -- and the
+            # allocation the backward then fails on is 5.5 GB. Releasing it here is
+            # handing the backward almost exactly the block it is about to ask for.
+            #
+            # Safe: `empty_cache` frees only blocks nothing references, and everything
+            # autograd saved is referenced by the graph `loss` still holds.
+            torch.cuda.empty_cache()
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
