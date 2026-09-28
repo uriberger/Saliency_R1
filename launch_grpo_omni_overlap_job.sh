@@ -326,6 +326,9 @@ mkdir -p "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR"
 [ -n "${OPENAI_BASE_URL:-}" ] && export OPENAI_BASE_URL
 [ -n "${JUDGE_MODEL:-}" ] && export JUDGE_MODEL
 [ "$SYNC_LORA_ONLY" = true ] && export SR1_VLLM_SYNC_LORA_ONLY=1
+# CUDA accounting for the first few micro-steps. Cheap, and the only thing that separates
+# "the allocator is holding it" from "something owns it" on a card this full.
+export SR1_MEM_REPORT=${SR1_MEM_REPORT:-6}
 # The vendored layernorm-only mamba_ssm. Without it the Nemotron decoder raises at IMPORT
 # -- `MambaRMSNormGated.forward` IS a call to `rmsnorm_fn` -- and having no dist-info is
 # deliberate: `is_mamba_2_ssm_available()` keeps reading False, so the fused SSM kernels
@@ -339,15 +342,12 @@ export SR1_REPO="$REPO"
 # short of memory, short of one unfragmented block. Expandable segments let the allocator
 # grow a segment instead of needing a new one that size, which is exactly this case.
 # Exported before every child, so the preflight and all six training ranks get it.
-# `garbage_collection_threshold` is the second half of it: at 74 of 79 GB the allocator is
-# holding cached blocks it will not reuse for the one 5.5 GB request the backward makes, and
-# 0.8 tells it to release them rather than fail.
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}
-# Two NCCL communicators live on rank 0's card -- DDP's and the vLLM weight sync's -- and
-# each takes buffers per channel. The collectives here are 2.4 MB of LoRA gradients and 18
-# small tensors, so channels buy nothing and the memory is worth more than the bandwidth.
-export NCCL_MAX_NCHANNELS=${NCCL_MAX_NCHANNELS:-4}
-export NCCL_BUFFSIZE=${NCCL_BUFFSIZE:-2097152}
+# `garbage_collection_threshold` and capped NCCL channels were both tried here and both
+# made it FAIL EARLIER (step 0 instead of step 12), so neither is in: the first is
+# documented as not composing with expandable segments, and the second retunes a collective
+# that was never the problem. The lever that works is `--mem-report`, which says where the
+# 8 GB the backward adds actually goes.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 [ -d "$OVERLAP_STEPS_CKPT/encoder" ] || {
     echo "ERROR: steps-classifier ckpt not found at $OVERLAP_STEPS_CKPT" >&2; exit 1; }

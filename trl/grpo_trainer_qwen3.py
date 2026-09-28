@@ -3434,7 +3434,30 @@ class GRPOTrainer(Trainer):
         else:
             return self._compute_loss(model, inputs)
 
+    def _mem_report(self, where):
+        """One line of CUDA accounting, for the first few micro-steps of a run.
+
+        SR1_MEM_REPORT=N prints it for the first N calls and then goes quiet. It exists
+        because "73.84 GB in use and it wants 5.50 more" says nothing about WHICH 73.84:
+        the weights are 62 GB, the measured single-process benchmark peaked at 73.3 GB
+        INCLUDING that request, and the gap between those two numbers is the whole
+        question. `reserved - allocated` separates "the allocator is holding it" from
+        "something owns it", which is what decides whether the fix is a knob or a design.
+        """
+        n = int(os.environ.get("SR1_MEM_REPORT", "0"))
+        if not n or getattr(self, "_mem_reports", 0) >= n:
+            return
+        if not self.accelerator.is_main_process:
+            return
+        self._mem_reports = getattr(self, "_mem_reports", 0) + 1
+        g = 2 ** 30
+        print(f"[mem] {where:<22} allocated {torch.cuda.memory_allocated()/g:5.1f}  "
+              f"reserved {torch.cuda.memory_reserved()/g:5.1f}  "
+              f"peak {torch.cuda.max_memory_allocated()/g:5.1f}  "
+              f"(of 79.2 GB)", flush=True)
+
     def _compute_loss(self, model, inputs):
+        self._mem_report("before the forward")
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -3451,6 +3474,8 @@ class GRPOTrainer(Trainer):
             compute_entropy=True,
             mm_source=inputs,
         )
+
+        self._mem_report("after the forward")
 
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
