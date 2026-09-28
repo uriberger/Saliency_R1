@@ -682,6 +682,11 @@ class GRPOTrainer(Trainer):
         # model: `family_for` reads `config.model_type`, and the processor is not resolved
         # until further down (it is re-bound there, once, when it is).
         self.family = family_for(model=model)
+        # Which decoder layers HAVE an attention matrix. None on a dense decoder (every
+        # layer does); the real list on a hybrid, where 46 of 52 layers are state-space or
+        # MoE blocks. Read here, off the bare model, because `_report_lora_landing` asserts
+        # against it BEFORE the decoder navigation further down would have set it.
+        self._attention_layers = self.family.attention_layers(model)
 
         # Gradient checkpointing, and the ORDER is the whole content of this block.
         #
@@ -771,10 +776,6 @@ class GRPOTrainer(Trainer):
             self.DIMS = model.lm_head.in_features
         else:
             self.NUM_GROUP = self.DIMS = None
-        # The decoder layers that HAVE an attention matrix. None on a dense decoder (every
-        # layer does); the real list on a hybrid, where the saliency layer has to be one
-        # of them or the capture hook silently attaches to nothing.
-        self._attention_layers = self.family.attention_layers(_raw)
 
         # Processing class
         if processing_class is None:
