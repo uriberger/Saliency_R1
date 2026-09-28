@@ -22,6 +22,11 @@ step k of one is not step k of the other, they are only being played at the same
 and a model that runs out of steps first shows its answer while the other keeps going.
 Two rows want a smaller `--image-width` (~560) than one.
 
+Each step's header reads `step k of n  ·  <map>`, which names the map the frame is drawn
+from. That name is internal: `glimpse` means nothing to anyone outside this repo, so a
+clip that leaves it -- a project page, a talk -- wants `--map-label ""` to drop the
+suffix, or a name a reader will recognise.
+
 The map is rendered by `fig1_steps_figure.overlay` rather than by a copy of it, so
 `--smooth`, `--upsample`, `--overlay-mode`, `--norm` and `--alpha` mean exactly what they
 mean there and a frame here is the same image as that figure's panel. In particular
@@ -216,6 +221,12 @@ def main():
     ap.add_argument("--sample", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--map", default="glimpse")
+    ap.add_argument("--map-label", default=None,
+                    help="what to call the map in each step's header; defaults to the "
+                         "value of --map. Pass an empty string to print just 'step k of "
+                         "n'. The map names are internal -- a reader outside this repo "
+                         "does not know what `glimpse` is, so a video that leaves this "
+                         "repo wants an empty string or a real name")
     ap.add_argument("--steps", default=None,
                     help="comma-separated; default every observe step")
     ap.add_argument("--question", default=None,
@@ -306,6 +317,8 @@ def main():
         said, gold = answer_of(m["meta"]), m["meta"].get("gt_answer")
         m["footer"] = f"{said}      (gold: {gold})"
 
+    map_label = args.map if args.map_label is None else args.map_label
+
     def row(m, k):
         """Model `m` at position `k`; past the end of its chain it shows its answer."""
         name = f"{m['model']}  ·  " if multi else ""
@@ -313,8 +326,10 @@ def main():
             return (m["model"], plain, None,
                     f"{name}answer" if k is not None else f"{name}input",
                     m["footer"] if k is not None else None)
-        return (m["model"], m["panels"][k], k,
-                f"{name}step {k + 1} of {len(m['want'])}  ·  {args.map}", None)
+        label = f"{name}step {k + 1} of {len(m['want'])}"
+        if map_label:
+            label += f"  ·  {map_label}"
+        return (m["model"], m["panels"][k], k, label, None)
 
     # (image, seconds) per state, before the dissolves are inserted
     states = [(canvas.frame([row(m, None) for m in loaded]), args.hold_title)]
