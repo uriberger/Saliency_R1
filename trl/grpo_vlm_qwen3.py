@@ -68,6 +68,20 @@ import os
 import time
 
 import torch
+
+# PIN THIS RANK'S DEVICE BEFORE ANYTHING ELSE TOUCHES CUDA.
+#
+# Without it every process's DEFAULT device is index 0 of whatever
+# `CUDA_VISIBLE_DEVICES` says, so any library that runs a CUDA op before accelerate calls
+# `set_device` creates a full context on RANK 0's card. It is 520 MB, it belongs to nobody,
+# and on the Omni it is the entire margin: the backward asks for one ~5.5 GB block with
+# 5.34 GB free on a card whose own occupancy is 62 of 79.2 GB.
+#
+# Harmless everywhere else -- `LOCAL_RANK` is exactly the device accelerate is about to
+# choose, so this only makes it the default earlier.
+if "LOCAL_RANK" in os.environ and torch.cuda.is_available():
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
 from datasets import load_dataset, load_from_disk
 from latex2sympy2_extended import NormalizationConfig
 from PIL import Image
