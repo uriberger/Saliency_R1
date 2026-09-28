@@ -230,6 +230,99 @@ class Family:
 
     passthrough_inputs = ("pixel_values",)
 
+    # -- the TRAINER's view of the same facts -----------------------------
+    # `trl/grpo_trainer_qwen3.py` asks these instead of reading `image_grid_thw`. It is
+    # the same seam one level up: the trainer slices a batch's pixels per micro-batch and
+    # maps attention columns back onto patches, and both of those are geometry.
+    #
+    #: multimodal processor outputs the trainer carries from the prompt batch into every
+    #: forward. Row-aligned with the batch unless named in `packed_inputs`.
+    mm_inputs = ("pixel_values",)
+    #: of those, the ones whose first dimension is NOT the batch. Qwen3-VL stacks a
+    #: batch's patches into ONE flat tensor, so cutting a micro-batch out of it needs
+    #: `mm_lengths`; every other family here emits one row per picture and needs nothing.
+    packed_inputs = ()
+    #: outputs the trainer carries for GEOMETRY and must never hand to `forward()`.
+    #: `drop_inputs` says the same thing for the measuring side; this is the subset the
+    #: trainer still has to keep, because `grids_for` reads it after the forward.
+    geometry_inputs = ()
+    #: True when the decoder's attention modules already return their softmax weights, so
+    #: the saliency capture is a plain forward hook. False means the hook has to re-run
+    #: the module in eager mode -- see `_compute_overlap_step_maps`.
+    attention_weights_are_returned = False
+
+    def mm_lengths(self, inputs):
+        """Rows of each packed input belonging to each sample. -> list[int] or None."""
+        return None
+
+    def mm_slice(self, inputs, lo, hi):
+        """The multimodal kwargs for samples [lo, hi), ready to hand to `forward()`.
+
+        Geometry-only keys are deliberately absent: they are not forward kwargs, and the
+        trainer keeps them in the batch dict rather than in this.
+        """
+        out = {}
+        lengths = self.mm_lengths(inputs)
+        for k in self.mm_inputs:
+            v = inputs.get(k)
+            if v is None:
+                continue
+            if k in self.packed_inputs:
+                if lengths is None:
+                    raise RuntimeError(
+                        f"{self.name}: {k!r} is declared packed but mm_lengths() gave "
+                        "nothing to cut it with")
+                a = sum(lengths[:lo])
+                b = sum(lengths[:hi])
+                out[k] = v[a:b]
+            else:
+                out[k] = v[lo:hi]
+        return out
+
+    def token_grid(self, inputs, i):
+        """The (gh, gw) patch grid of sample `i`'s picture, from the batch's own fields.
+
+        One picture per sample, which is what the trainer's corpora hold. `grids_for` is
+        the general version (it returns one entry per TILE) and this is the trainer's
+        question, which is only ever about a single grid.
+        """
+        raise NotImplementedError
+
+    def after_processor(self, inputs):
+        """Anything the processor does not emit but `forward()` requires. -> inputs."""
+        return inputs
+
+    def protected_token_ids(self):
+        """Token ids `truncate_with_protected_tokens` must never drop."""
+        ids = [self.image_token_id, *self.vision_start_ids, *self.vision_end_ids]
+        return [int(i) for i in ids if i is not None]
+
+    # -- the model's own shape, for the trainer's __init__ ----------------
+    def decoder(self, model):
+        """The module that owns `.layers` -- the stack the saliency read indexes into."""
+        return model.model.language_model
+
+    def supports_saliency_r1(self):
+        """Can this family run the ORIGINAL Saliency-R1 readout (`--reward_variant
+        saliency_r1` and the `reforward_saliency` value-propagation path)?
+
+        False for everything but Qwen3-VL. That readout multiplies per-layer attention by
+        the layer's own value states and pushes the result through `o_proj` for EVERY
+        layer, which is only defined on a dense transformer decoder -- a hybrid whose
+        layers are mostly Mamba or MoE has no such object at 46 of its 52 positions.
+        Saying so here is what keeps a wrong number from being produced quietly.
+        """
+        return False
+
+    def enable_gradient_checkpointing(self, model):
+        """Recompute the decoder's intermediates. -> how many blocks, or None if the
+        family has nothing special to do and transformers' own switch is enough."""
+        return None
+
+    def after_peft_wrap(self, model):
+        """Anything that must happen AFTER `get_peft_model`. -> a note, or None."""
+        return None
+
     # -- the grid --------------------------------------------------------
     #: tokens per tile as (gh, gw), for families whose grid does not depend on the
     #: picture. `grids_for` uses it and never has to ask the processor.
@@ -355,6 +448,12 @@ class Qwen3VL(Family):
     vision_start_ids = (151652,)
     vision_end_ids = (151653,)
     passthrough_inputs = ("pixel_values", "image_grid_thw")
+    # The trainer's incumbent behaviour, restated as data. `mm_token_type_ids` is in the
+    # list because it is row-aligned and carried like the rest; the trainer still pads it
+    # to the completion length itself, which is a text-side fact and not geometry.
+    mm_inputs = ("pixel_values", "image_grid_thw", "pixel_attention_mask", "image_sizes",
+                 "mm_token_type_ids")
+    packed_inputs = ("pixel_values",)
 
     def image_arg(self, images):
         # one list per sample, which is what this processor's batching expects
@@ -387,6 +486,22 @@ class Qwen3VL(Family):
                     "grid: the patch merge assumption is wrong for this model")
             out.append((t, gh, gw))
         return out
+
+    def mm_lengths(self, inputs):
+        thw = inputs.get("image_grid_thw")
+        return None if thw is None else thw.prod(dim=1).tolist()
+
+    def token_grid(self, inputs, i):
+        thw = inputs.get("image_grid_thw")
+        if thw is None:
+            raise RuntimeError("qwen3_vl: this batch carries no image_grid_thw. "
+                               "It needs an image corpus.")
+        return (int(thw[i, 1].item()) // 2, int(thw[i, 2].item()) // 2)
+
+    def supports_saliency_r1(self):
+        # The family the original readout was written on, and the only one it is defined
+        # for. See Family.supports_saliency_r1.
+        return True
 
     def grid_of(self, processor, image):
         got = processor(text=["x"], images=[[image]], return_tensors="pt",
@@ -680,6 +795,147 @@ class NemotronVL(Family):
     #: this corpus that is nearly every pair: the A6 arm took down a whole 8-GPU run 8
     #: pictures in before this flag existed.
     batch_needs_equal_size = True
+    # -- the trainer's view. Simpler than Qwen3-VL's, and that is the whole difference:
+    # this processor emits ONE ROW PER PICTURE for every one of these, so a micro-batch is
+    # an ordinary slice and nothing has to be cut by a grid.
+    mm_inputs = ("pixel_values", "image_flags")
+    packed_inputs = ()
+    #: `imgs_sizes` is the resized (H, W) the grid is derived from. It is not a forward
+    #: kwarg (`drop_inputs` says so) and `token_grid` reads it, so the trainer has to
+    #: carry it through the batch without ever passing it to the model.
+    geometry_inputs = ("imgs_sizes",)
+    #: Loaded eager throughout (`nemotron_loader.load_model` pins it, because the wrapper
+    #: declares no SDPA support), and `NemotronHAttention.forward` returns
+    #: `(attn_output, attn_weights)`. So the saliency capture reads the module's own
+    #: output instead of re-running it.
+    attention_weights_are_returned = True
+
+    def token_grid(self, inputs, i):
+        sizes = inputs.get("imgs_sizes")
+        if sizes is None:
+            sizes = getattr(self, "_sizes", None)
+        if sizes is None:
+            raise RuntimeError(
+                "nemotron_vl: this batch carries no `imgs_sizes`, which is where this "
+                "family's grid comes from -- it has no `image_grid_thw` and will not "
+                "guess a grid")
+        h, w = (int(x) for x in sizes[i])
+        return (h // self.encoder_px, w // self.encoder_px)
+
+    def after_processor(self, inputs):
+        """Synthesise `image_flags`, which the forward requires and the processor omits.
+
+        `NemotronVL.build_inputs` does the same thing for the measuring side and for the
+        same reason; the shape matters identically here. [N, 1] ones, N being the number
+        of pictures the encoder was given -- `image_flags.squeeze(-1)` on the way in would
+        collapse a bare [N] to a 0-d tensor for a single image.
+        """
+        pv = inputs.get("pixel_values")
+        if pv is None or inputs.get("image_flags") is not None:
+            return inputs
+        import torch
+
+        n = int(pv.shape[0])
+        inputs["image_flags"] = torch.ones(n, 1, dtype=torch.long, device=pv.device)
+        return inputs
+
+    def decoder(self, model):
+        """`language_model` hangs off the WRAPPER here, not off a `.model` inside it.
+
+        And it is a `NemotronHForCausalLM`, so the stack is one level further down again:
+        `.backbone.layers` on this release. Both are tried rather than assumed, because
+        the two Nemotron VLM releases in this repo do not agree on the second one.
+        """
+        lm = getattr(model, "language_model", None)
+        if lm is None:
+            raise RuntimeError("nemotron_vl: no .language_model on this wrapper")
+        for attr in ("backbone", "model"):
+            inner = getattr(lm, attr, None)
+            if inner is not None and hasattr(inner, "layers"):
+                return inner
+        if hasattr(lm, "layers"):
+            return lm
+        raise RuntimeError("nemotron_vl: found .language_model but no layer stack under "
+                           "it (.backbone.layers / .model.layers / .layers all missing)")
+
+    def enable_gradient_checkpointing(self, model):
+        """Recompute the decoder's intermediates instead of storing them. -> n blocks.
+
+        The measured reason (`docs/omni-quantization.md`): at 8 bits the model is 34.8 GB
+        and a training step peaks at 63.8, so ~30 GB is intermediate results held for the
+        backward. That 30 GB is what puts a 16-bit run over an 80 GB card -- not the 62 GB
+        of weights -- and turning this on is what makes bfloat16 fit at 34.0 s a step.
+
+        `NemotronHPreTrainedModel` never sets `supports_gradient_checkpointing`, a plain
+        class flag defaulting to False, so `gradient_checkpointing_enable()` refuses on a
+        model whose blocks ARE `GradientCheckpointingLayer`s. The machinery is present and
+        the declaration is missing, the same shape as the other gaps in these checkpoints.
+        The flag is flipped only after the blocks are confirmed to exist.
+
+        Enabled on the LANGUAGE MODEL, not the wrapper: the vision tower runs under
+        `no_grad` and has nothing to recompute.
+        """
+        lm = getattr(model, "language_model", None)
+        if lm is None:
+            raise RuntimeError("nemotron_vl: no .language_model to checkpoint")
+        if not type(lm).supports_gradient_checkpointing:
+            from transformers.modeling_layers import GradientCheckpointingLayer
+
+            blocks = [m for m in lm.modules()
+                      if isinstance(m, GradientCheckpointingLayer)]
+            if not blocks:
+                raise RuntimeError(
+                    "nemotron_vl: no GradientCheckpointingLayer in the decoder, so the "
+                    "class flag is False because the machinery really is absent")
+            type(lm).supports_gradient_checkpointing = True
+        lm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+        on = sum(1 for m in lm.modules()
+                 if getattr(m, "gradient_checkpointing", False))
+        if on == 0:
+            raise RuntimeError(
+                "nemotron_vl: gradient_checkpointing_enable() left every block untouched "
+                "-- it silently did nothing, and the memory would be unchanged")
+        return on
+
+    def after_peft_wrap(self, model):
+        """Strip every `enable_input_require_grads` hook in the tree. -> n modules.
+
+        Two separate things install it and both have to be undone, which is why this walks
+        the tree instead of calling `disable_input_require_grads()` once:
+
+          * `gradient_checkpointing_enable` does, whenever `main_input_name` is
+            `input_ids`;
+          * and then **peft does it again**. `get_peft_model` sees checkpointing already
+            on and calls `_prepare_model_for_gradient_checkpointing`, which re-registers
+            the hook on the OUTER wrapper -- after the first removal, so removing it
+            before wrapping accomplishes nothing.
+
+        The hook forces the embedding output to require grad, and this wrapper then
+        scatters the picture into those embeddings IN PLACE, which raises "a view of a
+        leaf Variable that requires grad is being used in an in-place operation". It
+        exists for REENTRANT checkpointing; `use_reentrant=False` tracks the parameters
+        inside each segment directly and does not need it.
+
+        `m.__dict__` rather than `getattr`/`hasattr`, because peft's wrapper DELEGATES
+        attribute lookup to the model it wraps: `hasattr(peft_model,
+        "_require_grads_hook")` is True for an attribute living on the base model, and the
+        matching `del` then raises AttributeError on a name the wrapper never owned.
+        """
+        n = 0
+        for m in model.modules():
+            hooks = m.__dict__.get("_require_grads_hooks")
+            single = m.__dict__.get("_require_grads_hook")
+            if not hooks and single is None:
+                continue
+            for h in (hooks or []):
+                h.remove()
+            if single is not None and not hooks:
+                single.remove()
+            m.__dict__["_require_grads_hooks"] = []
+            m.__dict__.pop("_require_grads_hook", None)
+            n += 1
+        return n
 
     def build_inputs(self, processor, images, question, device, **proc_kwargs):
         out = super().build_inputs(processor, images, question, device, **proc_kwargs)
@@ -879,6 +1135,9 @@ class NemotronVLV2(NemotronVL):
             out["pixel_values"] = out["pixel_values"].to(dtype=dt)
         return out
 
+    #: No `imgs_sizes` here, so there is no geometry key to carry: the grid is fixed.
+    geometry_inputs = ()
+
     def grids_for(self, runs, inputs):
         """The fixed-grid answer, NOT the Omni's `imgs_sizes` one.
 
@@ -886,6 +1145,10 @@ class NemotronVLV2(NemotronVL):
         if the tiled arm is ever run -- it would report 13 grids rather than raising.
         """
         return Family.grids_for(self, runs, inputs)
+
+    def token_grid(self, inputs, i):
+        """The same fixed grid for every picture -- `imgs_sizes` is an Omni-only key."""
+        return tuple(self.fixed_grid)
 
     def grid_of(self, processor, image):
         return tuple(self.fixed_grid)

@@ -15,6 +15,7 @@ __pycache__/
 
 # Nested HuggingFace TRL clone — tracked as its own git repo, not a submodule.
 trl_repo
+trl_repo_nemotron
 
 # Nested EASE (EasyR1/verl fork) clone — same deal as trl_repo.
 ease_repo

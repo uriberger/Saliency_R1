@@ -10,6 +10,13 @@
 # which also means patch_trl_qwen3.sh from a worktree patches it for everyone.
 trl_repo
 
+# The SECOND TRL clone -- the one the Nemotron-Omni run executes. Same fork, same branch,
+# patched from the same tracked sources by patch_trl_nemotron.sh. It exists so that trying
+# a Nemotron change never rewrites trl_repo underneath six in-flight Qwen3-VL ranks.
+# Shared exactly like trl_repo, with the same caution: patching it from a worktree patches
+# it for every session that uses it.
+trl_repo_nemotron
+
 # The EASE (EasyR1/verl fork) clone that actually executes, shared the same way.
 # Upstream is github.com/Nrich-sunny/Attend-to-Evidence; ease/ holds our source
 # copy of anything we change on top of it.
