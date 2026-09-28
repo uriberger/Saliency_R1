@@ -359,6 +359,9 @@ if [ "$PREFLIGHT" = true ]; then
     (
         # shellcheck disable=SC1090
         source "$CONDA_SH"; conda activate "$TRAIN_ENV"
+        # CUDA_HOME: see the training block below for why a run that compiles nothing
+        # still needs one.
+        source "$REPO/setup_cuda_home.sh" >/dev/null
         cd "$REPO"
         CUDA_VISIBLE_DEVICES=$DINO_GPU python omni_train_step_bench.py \
             --bits 16 --grad-ckpt 1 --grads-only 1 --completion "$MAX_COMPLETION_LENGTH"
@@ -508,6 +511,27 @@ echo "$MODEL" > "$OUTPUT_DIR/bench_eval/base_model.txt"
 echo "[start] training on cuda:[$TRAIN_GPUS] ($TRAIN_N procs, $TRAIN_ENV)"
 # shellcheck disable=SC1090
 source "$CONDA_SH"; conda activate "$TRAIN_ENV"
+[ -n "${CONDA_PREFIX:-}" ] || { echo "ERROR: conda activate $TRAIN_ENV failed." >&2; exit 1; }
+export PATH="$CONDA_PREFIX/bin:$PATH"
+hash -r
+# CUDA_HOME, and it is not optional even though nothing here compiles a kernel.
+# `accelerate.utils.is_peft_model` -> `extract_model_from_parallel` does
+# `from deepspeed import DeepSpeedEngine` whenever deepspeed is INSTALLED, and importing
+# deepspeed probes every op builder, which needs a toolkit. So a run that uses no
+# deepspeed at all -- this one: multi_gpu.yaml, no ZeRO -- still dies at the peft check
+# with "CUDA_HOME does not exist, unable to compile CUDA op(s)". setup_cuda_home.sh is the
+# repo's resolver, and it also re-asserts the active env's bin at the front of PATH
+# because the toolkit it picks may itself be a conda env with its own python.
+#
+# Deliberately NOT sourced in the vLLM subshell above: that environment is a CUDA 13
+# build, and putting a 12.4 toolkit's lib64 ahead of its own libraries is a way to break
+# a server that currently works.
+source "$REPO/setup_cuda_home.sh"
+if [ "$(command -v python)" != "$CONDA_PREFIX/bin/python" ]; then
+    echo "ERROR: CUDA_HOME='$CUDA_HOME' shadowed the active env's python." >&2
+    exit 1
+fi
+bash "$REPO/check_cuda_home.sh" || exit 1
 cd "$HARNESS"
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --config_file examples/accelerate_configs/multi_gpu.yaml \
