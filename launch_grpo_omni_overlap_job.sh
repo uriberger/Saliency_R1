@@ -20,6 +20,9 @@
 # PLAN A -- one whole copy per card. docs/omni-gpu-layout.md is the argument.
 #
 #     GPU 0       Grounding-DINO reward server      (127.0.0.1:$DINO_PORT)
+#                 -- reached through --dino_api_base, and that flag is NOT optional:
+#                 without it every training rank loads its OWN detector onto its own
+#                 already-full card, thrashes, and retries at ever smaller batch sizes
 #     GPU 1       vLLM generation server            (127.0.0.1:$VLLM_PORT)
 #     GPU 2-7     6 training processes, each a WHOLE copy, bfloat16 + recompute
 #
@@ -641,6 +644,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --overlap_layer "$OVERLAP_LAYER" \
     --overlap_heads "$OVERLAP_HEADS" \
     --token_reduction "$TOKEN_REDUCTION" \
+    --dino_api_base "http://127.0.0.1:$DINO_PORT" \
     --box_threshold "$BOX_THRESHOLD" \
     --max_box_area "$MAX_BOX_AREA" \
     $BETA_FLAG \
