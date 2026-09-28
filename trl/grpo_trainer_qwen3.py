@@ -743,6 +743,27 @@ class GRPOTrainer(Trainer):
             if _family_ckpt and _still_on == 0:
                 raise RuntimeError("the peft wrap lost the gradient-checkpointing switch")
 
+        if _family_ckpt is not None:
+            # `Trainer.train()` opens with
+            #     if args.gradient_checkpointing:
+            #         self.model.gradient_checkpointing_enable(...)
+            # on the OUTER wrapper -- whose `supports_gradient_checkpointing` is False, so
+            # it raises "<Model> does not support gradient checkpointing" on a model whose
+            # blocks are already recomputing. Declaring support on the wrapper would only
+            # trade that for the other failure: the call re-installs the
+            # `enable_input_require_grads` hook that `after_peft_wrap` just removed, and
+            # the first forward then dies scattering the picture into a leaf that requires
+            # grad.
+            #
+            # Recompute is ON, on every block of the decoder, and asserted just above. So
+            # what is left to do is tell the Trainer it has nothing to do. DDP is
+            # unaffected: `find_unused_parameters` reads `model.is_gradient_checkpointing`
+            # first, which walks the modules and still answers True.
+            args.gradient_checkpointing = False
+            self.is_gradient_checkpointing = True
+            print(f"[grad-ckpt] {_still_on} blocks recomputing; Trainer.train() told not "
+                  "to re-enable it on the wrapper", flush=True)
+
         # FA2 cannot return attention weights, so reforward_saliency is required with it.
         if getattr(model.config, "_attn_implementation", None) == "flash_attention_2" and not self.reforward_saliency:
             import warnings
