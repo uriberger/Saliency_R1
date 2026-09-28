@@ -326,3 +326,35 @@ longest TERMINATED completion measured 594 tokens, so nothing that finishes is t
 and what changes is where a runaway chain is cut. It is in the run name (`_c768`) so a run
 that differs in it can never be mistaken for one that does not, and any comparison against a
 Qwen3-VL run has to state it.
+
+## 11. Where the run got to
+
+50 steps were asked for; **30 were done**, `checkpoint-30` is on disk, and every logged step
+carried a live reward:
+
+```
+                    first 5      last 5      (30 logged steps, overlap never NaN)
+overlap reward       0.0820      0.0770
+within-group sd      0.0298      0.0270
+total reward          1.058       1.180
+format reward         0.646       0.679
+mean length            375         340
+```
+
+Step time **215.7 s** on the submitted (container) path and **97-124 s** on a bare `srun`,
+against the 34.0 s training-side benchmark. The difference is the reward, not the model: the
+saliency capture is eight full teacher-forced forwards of a 33B model per generation batch,
+which is nothing like the ~13 s of generation and reward a Qwen3-VL step pays. Per-card
+memory 65-78 GB training, 74.2 GB generation, 1.8 GB detector.
+
+The 2-hour wall arrived at step 30 and the auto-resume worked -- a second node picked the
+checkpoint up and reached a backward -- but **every resume past step 30 OOMs on its first
+backward**, at 768 as at 1024. That is the §10 dynamic and not a new fault: the reward
+lengthens chains, the working set is linear in tokens, so a fixed cap is reached eventually
+rather than never. Three ways forward, none free:
+
+* `--length-guard`, which is this repo's own answer to "this reward lengthens chains" and
+  which the Omni launcher does not wire in. It is a reward term, so it is a second
+  hyper-parameter change -- but it is the one that makes the cap hold instead of drifting.
+* a lower cap (512), which truncates completions that finish.
+* a card bigger than 80 GB, which changes nothing else.
