@@ -532,6 +532,25 @@ if [ "$(command -v python)" != "$CONDA_PREFIX/bin/python" ]; then
     exit 1
 fi
 bash "$REPO/check_cuda_home.sh" || exit 1
+
+# BOTH ENDS OF THE WEIGHT-SYNC COMMUNICATOR MUST BE THE SAME NCCL.
+# The trainer's torch 2.8 ships NCCL 2.27.3 and the server's torch 2.11 ships 2.28.9, and
+# `ncclCommInitRank` rejects the pairing outright -- "NCCL error: invalid usage", raised
+# on both sides at once, because the bootstrap protocol changed between the two. That is
+# the price of the two-environment split (see TWO ENVS at the top), and this is the whole
+# of the fix: vLLM's pynccl is a CTYPES wrapper that honours VLLM_NCCL_SO_PATH, and the
+# libraries are self-contained -- they link nothing but libc and dlopen the driver -- so
+# loading the server's copy here disturbs nothing. In particular it does NOT touch torch's
+# own NCCL, which the six ranks use for DDP and which never talks to the server.
+_SERVER_NCCL=$(ls /home/uberger/scratch/miniconda3/envs/"$VLLM_ENV"/lib/python*/site-packages/nvidia/nccl/lib/libnccl.so.2 2>/dev/null | head -1)
+if [ -n "$_SERVER_NCCL" ]; then
+    export VLLM_NCCL_SO_PATH=${VLLM_NCCL_SO_PATH:-$_SERVER_NCCL}
+    echo "[nccl] weight sync will use $VLLM_NCCL_SO_PATH (the SERVER's copy, on both ends)"
+else
+    echo "[nccl] WARNING: no libnccl under $VLLM_ENV; the weight-sync communicator will" >&2
+    echo "[nccl]          try to pair NCCL 2.27 with 2.28 and fail in init_communicator." >&2
+fi
+
 cd "$HARNESS"
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --config_file examples/accelerate_configs/multi_gpu.yaml \
