@@ -52,6 +52,13 @@ STAGES
   report    per-(layer, head) causal table with paired bootstrap CIs.
   monitor   aggregate every shard's heartbeat into one ETA.
 
+WHICH MODELS EACH STAGE RUNS ON. `prepare` goes through `vlm_family`, so it builds cases
+for any family that module knows -- which is what lets `head_correlation_probe` select a
+saliency head pair on a model that is not Qwen3-VL. `run` and `selftest` do NOT: the
+`Intervener` rebuilds a module's output from its attention weights through `v_proj`, the
+GQA expansion and `o_proj`, which is a real port with its own gate rather than a rename.
+They refuse anything else by name instead of failing at the first hook.
+
 Stage 0 of the plan is `--head-mode layer` (all heads of a layer at once): it bounds
 the search, because if forcing every head at layer L does nothing, no single head
 there will. Stage 1 is `--head-mode each` on the layers Stage 0 flags.
@@ -109,10 +116,47 @@ def _load_module(name: str, relpath: str):
 
 
 PROBE = _load_module("_iv_overlap_probe", "overlap_probe.py")
+NL = _load_module("_iv_nemotron_loader", "nemotron_loader.py")
+sys.path.insert(0, str(REPO))
+import vlm_family as VF  # noqa: E402
+
 OSTEPS = PROBE.OSTEPS
 OREW = PROBE.OREW
 IMAGE_TOKEN_ID = PROBE.IMAGE_TOKEN_ID
 CONDITIONS = ("box", "roll", "shape", "image", "perm")
+
+
+def load_family(model, processor):
+    """The family adapter, with the prompt the chains are generated under.
+
+    Unconditionally the project's trainer prompt, for both families: these cases are the
+    reward's own view, and every GRPO run here -- Qwen3-VL's and the Omni's -- generates
+    under `grpo_vlm_qwen3.SYSTEM_PROMPT`. `head_correlation_probe.load_family` says the
+    same thing and the two must not drift, because one reads the chains the other wrote.
+    """
+    fam = VF.family_for(model, processor)
+    fam.system_prompt = PROBE.SYSTEM_PROMPT
+    return fam
+
+
+def prompt_opens_think(tok, prompt_ids) -> bool:
+    """Does the chat template start the assistant turn INSIDE the reasoning block?
+
+    Qwen3-VL's generation prompt ends at `<|im_start|>assistant\\n` and the policy writes
+    `<think>` itself, so a completion carries both tags. The Omni's ends at
+    `<|im_start|>assistant\\n<think>\\n`, and the completion carries only the closing one.
+
+    Nothing downstream knows that. `judge_format` wants exactly one of each, so every
+    completion of a perfectly well-behaved model reads as malformed and `prepare` drops
+    the whole corpus as `bad_format` -- 0 cases, no error, and nothing in the log saying
+    "template". This is `grpo_trainer_qwen3._prompt_opens_think`, verbatim and for the
+    same reason: read off the ACTUAL prompt rather than declared per family, because it is
+    a fact about the chat template and a template can change under a checkpoint. The
+    anchored `$` is what keeps the system prompt's own `<think></think>` out of it.
+    """
+    text = tok.decode(prompt_ids, skip_special_tokens=False,
+                      clean_up_tokenization_spaces=False)
+    return bool(re.search(r"<think>\s*$", text))
 
 
 def text_config(model):
@@ -268,12 +312,20 @@ def unb64u8(s, shape):
 
 
 @torch.no_grad()
-def greedy_chain(processor, model, image, question, max_new_tokens, device):
-    text = PROBE.build_prompt(processor, question)
-    inputs = processor(text=[text], images=[[image]], return_tensors="pt",
-                       padding=True, padding_side="left", add_special_tokens=False).to(device)
+def greedy_chain(processor, model, fam, image, question, max_new_tokens, device):
+    """One greedy completion. -> (the full processor output, prompt_len, completion ids).
+
+    The processor output is handed back UNFILTERED, because the caller needs the geometry
+    keys: the Omni's grid comes from `imgs_sizes`, which `model_inputs` has to strip
+    before any forward (the wrapper's signature has no such argument) and `token_grid`
+    reads afterwards. `generate` is fed the doubly-reduced view -- `model_inputs` drops
+    what `forward` rejects, `generate_inputs` drops what the LANGUAGE model's signature
+    rejects on top of that (`image_flags`, which the wrapper consumes itself).
+    """
+    inputs = fam.build_inputs(processor, [image], question, device)
     prompt_len = inputs["input_ids"].shape[1]
-    out = model.generate(**inputs, do_sample=False, max_new_tokens=max_new_tokens,
+    out = model.generate(**fam.generate_inputs(fam.model_inputs(inputs)),
+                         do_sample=False, max_new_tokens=max_new_tokens,
                          pad_token_id=processor.tokenizer.pad_token_id)
     ids = out[0, prompt_len:].tolist()
     eos = processor.tokenizer.eos_token_id
@@ -299,19 +351,26 @@ def prepare_shard(args, device):
                               exclude=exclude)
     rows = rows[args.shard::args.num_shards]
 
-    processor, model = PROBE.load_model(args.base_model, args.adapter or None, device,
-                                        args.attn_impl)
+    processor, model = NL.load_any(args.base_model, args.adapter or None, device,
+                                   args.attn_impl, PROBE.load_model)
+    fam = load_family(model, processor)
     clf = OSTEPS.OverlapStepsClassifier.load(args.steps_ckpt, device=device)
     tok = processor.tokenizer
+    # A per-shard Grounding-DINO is ~1 GB beside an 8B model and ~8 GB beside a 30B one,
+    # on a card that already holds the policy. `--dino-api-base` points every shard at one
+    # served detector instead; the Omni GRPO run pays the same toll without it.
     OREW.configure(box_threshold=args.box_threshold, max_box_area=args.max_box_area,
-                   dino_device=device, dino_batch_size=args.dino_batch_size)
+                   dino_device=device, dino_batch_size=args.dino_batch_size,
+                   dino_api_base=args.dino_api_base or None)
+    print(f"[prepare] shard {args.shard}: family {fam.name}, "
+          f"DINO {args.dino_api_base or 'local on ' + str(device)}", flush=True)
 
     prog = Progress(out / "progress" / f"prepare{args.shard:02d}.json", len(rows),
                     f"prepare{args.shard}", args.log_every)
     cases, dropped = [], defaultdict(int)
     for row in rows:
         try:
-            case = build_case(args, tok, processor, model, clf, row, device)
+            case = build_case(args, tok, processor, model, fam, clf, row, device)
         except Exception as e:                  # one bad sample must not kill a shard
             print(f"[prepare] row {row['row_index']} failed: {type(e).__name__}: {e}",
                   flush=True)
@@ -332,19 +391,31 @@ def prepare_shard(args, device):
     print(f"[prepare] -> {dest}")
 
 
-def build_case(args, tok, processor, model, clf, row, device):
+def build_case(args, tok, processor, model, fam, clf, row, device):
     """One case, or a string naming the reason it was dropped."""
     inputs, prompt_len, comp_ids = greedy_chain(
-        processor, model, row["image"], row["question"], args.max_new_tokens, device)
-    if not PROBE.judge_format(tok.decode(comp_ids, skip_special_tokens=True)):
+        processor, model, fam, row["image"], row["question"], args.max_new_tokens, device)
+    # When the prompt opened the block, the completion is judged as the continuation it
+    # is: the opening tag is real, it just lives in the prompt. Prepending it rather than
+    # loosening the pattern keeps ONE definition of the format, and keeps a model that
+    # writes a SECOND `<think>` failing, which it should. Same construction as the
+    # trainer's `_opener`.
+    opens = prompt_opens_think(tok, inputs["input_ids"][0])
+    opener = "<think>\n" if opens else ""
+    if not PROBE.judge_format(opener + tok.decode(comp_ids, skip_special_tokens=True)):
         return "bad_format"
     text = tok.decode(comp_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
 
     # Think span in the re-tokenised `out` space -- the space the reward's step spans
     # live in, and (the decode/encode round trip being idempotent here) the same
     # indices as the generated ids whose attention rows we will modify.
+    #
+    # The reasoning starts at the completion's first non-space character when the prompt
+    # already opened the block, because everything before it is in the prompt and there is
+    # no `<think>` in this text to anchor on.
     enc = tok(text)
-    ms = re.search(r"<think>\s*(\S\S*)", text, re.DOTALL | re.MULTILINE)
+    ms = re.search(r"\s*(\S)" if opens else r"<think>\s*(\S\S*)",
+                   text, re.DOTALL | re.MULTILINE)
     me = re.search(r"(\S)\s*</think>", text, re.DOTALL | re.MULTILINE)
     if not ms or not me:
         return "no_think_span"
@@ -393,8 +464,17 @@ def build_case(args, tok, processor, model, clf, row, device):
     if score_from is None:
         return "empty_gold"
 
-    gh = int(inputs["image_grid_thw"][0, 1].item()) // 2
-    gw = int(inputs["image_grid_thw"][0, 2].item()) // 2
+    # The model's OWN answer, kept because it is free here: this completion was generated
+    # in one pass, so the tokens after `</think>` ARE what this chain answered. Every
+    # consumer that needs it -- `head_correlation_probe` grades correctness with it --
+    # would otherwise re-derive it with a second greedy decode off a KV cache, which is a
+    # cache a hybrid decoder does not build on a plain forward.
+    answer_text = tok.decode(comp_ids[chain_len:], skip_special_tokens=True).strip()
+
+    # The patch grid, from whichever field this family keeps it in. Qwen3-VL merges 2x2
+    # patches per token so it is `image_grid_thw[0, 1:] // 2`; the Omni has no such key
+    # and derives it from `imgs_sizes` over a 32px token, a different size per picture.
+    gh, gw = fam.token_grid(inputs, 0)
     boxes = OREW._dino_boxes([row["image"]] * len(steps), [s[0] for s in steps])
     kept = []
     for (stext, a, b), bx in zip(steps, boxes):
@@ -411,7 +491,7 @@ def build_case(args, tok, processor, model, clf, row, device):
     return {"row_index": row["row_index"], "dataset": row.get("dataset"),
             "question": row["question"], "gold": gold, "sep": sep,
             "chain_text": text[:cut], "chain_ids": chain_ids, "gold_ids": gold_ids,
-            "score_from": int(score_from),
+            "score_from": int(score_from), "answer_text": answer_text,
             "grid": [gh, gw], "steps": kept}
 
 
@@ -764,8 +844,32 @@ def build_variants(args, n_heads):
     return variants
 
 
+def refuse_non_qwen3vl(stage, base_model):
+    """`run` and `selftest` are Qwen3-VL-only, and must say so before loading 60 GB.
+
+    `prepare` went through `vlm_family` so the Omni could be given a case corpus, and
+    `head_correlation_probe` reads those cases on any family. The INTERVENTION did not:
+    `Intervener` rebuilds a module's output from its attention weights through `v_proj`,
+    the GQA expansion and `o_proj`, `find_attn_module` looks for `Qwen3VLTextAttention` by
+    name, and `score_case` hardcodes Qwen3-VL's image token and `image_grid_thw`. Every
+    one of those is a real port with its own selftest, not a rename.
+
+    Refusing here rather than at the first hook means the message names the reason instead
+    of arriving as `no Qwen3VLTextAttention with layer_idx=22` after a model load.
+    """
+    remote, cfg = NL.is_remote_code(base_model)
+    if not remote and getattr(cfg, "model_type", None) == "qwen3_vl":
+        return
+    raise SystemExit(
+        f"--stage {stage} is implemented for Qwen3-VL only; {base_model} is "
+        f"model_type {getattr(cfg, 'model_type', '?')!r}. `prepare` and "
+        "head_correlation_probe run on any family in vlm_family.py -- the intervention "
+        "rebuilds attention through v_proj/o_proj and has not been ported.")
+
+
 def run_shard(args, device):
     out = Path(args.out_dir)
+    refuse_non_qwen3vl("run", args.base_model)
     cases, cfg, fp = load_cases(out, args.shard, args.num_shards, args.max_cases)
     processor, model = PROBE.load_model(args.base_model, args.adapter or None, device,
                                         args.attn_impl)
@@ -897,6 +1001,7 @@ def selftest(args, device):
     context, never as a gate.
     """
     out = Path(args.out_dir)
+    refuse_non_qwen3vl("selftest", args.base_model)
     cases, cfg, _fp = load_cases(out)
     rows = load_case_images(cfg, "_ivs", [c["row_index"] for c in cases])
     cases = [c for c in cases if c["row_index"] in rows]
@@ -1145,6 +1250,12 @@ def main():
     p.add_argument("--box-threshold", type=float, default=0.10)
     p.add_argument("--max-box-area", type=float, default=0.5)
     p.add_argument("--dino-batch-size", type=int, default=8)
+    p.add_argument("--dino-api-base", default=os.environ.get("OVERLAP_DINO_API_BASE", ""),
+                   help="--stage prepare: ground through a served Grounding-DINO "
+                        "(serve_grounding_dino.py) instead of building one per shard. A "
+                        "local detector costs ~8 GB on a card already holding a 30B "
+                        "policy, which shows up as CUDA OOM retries in the DINO batch "
+                        "and not as an error")
     p.add_argument("--layers", default="22", help="'22', '0-35', '12,18,22,26'")
     p.add_argument("--head-mode", default="layer",
                    help="'layer' (all heads at once, Stage 0), 'each' (one variant per "

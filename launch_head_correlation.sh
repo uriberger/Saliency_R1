@@ -9,6 +9,19 @@
 #
 # Resuming: re-run the identical command; a shard whose scan/shardNN.npz exists is
 # skipped (--overwrite to redo).
+#
+# A MODEL THAT IS NOT QWEN3-VL needs its own environment, and CONDA_ENV is how:
+#
+#   CONDA_ENV=nemotron bash launch_head_correlation.sh --gpus 8 --out-dir DIR \
+#       --cases-dir PROBE_DIR \
+#       --base-model nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+#   python head_correlation_probe.py --stage report --out-dir DIR \
+#       --max-union 0.5 --incumbent-layer 33 --incumbent-heads 28,31
+#
+# `nemotron` is the env that has transformers 5.13 and the shims; `nemotron_vllm` is the
+# generation server's and is not what the probe wants. The Omni has an attention matrix at
+# only 6 of its 52 layers, so the scan reports 192 cells rather than 1,152 and the LAYER is
+# selected here too -- see docs/omni-head-selection.md.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,6 +57,9 @@ set -u
 export HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export TOKENIZERS_PARALLELISM=false
+# So `nemotron_loader` can find vendor/mamba_ssm_min wherever it is imported from. The
+# Nemotron decoder raises at IMPORT without that vendored layernorm-only `mamba_ssm`.
+export SR1_REPO=${SR1_REPO:-$REPO}
 
 mkdir -p "$OUT_DIR/logs"
 echo "=========================================================================="

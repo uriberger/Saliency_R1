@@ -119,6 +119,32 @@ def load_model(path, device, attn_impl="eager", quant=None, dtype=torch.bfloat16
     return processor, model.to(device).eval()
 
 
+def load_any(path, adapter, device, attn_impl, native):
+    """A checkpoint of either kind. -> (processor, model).
+
+    THE DISPATCH, in one place. `overlap_probe.load_model` resolves the architecture as
+    `getattr(transformers, config.architectures[0])`, which is exactly right for a
+    natively supported model and raises AttributeError for a `trust_remote_code` one --
+    and every Nemotron VLM here is the latter. So every probe that wants to run on both
+    needs this four-line branch, and `sink_location_probe.load_model` was the first copy
+    of it. A second and a third would be three things to fix the next time either side
+    moves.
+
+    `native` is passed in rather than imported because the native loader lives in
+    `overlap_probe.py`, which pulls in the reward stack; this module is imported BY the
+    trainer and must not acquire that dependency.
+    """
+    remote, _cfg = is_remote_code(path)
+    if not remote:
+        return native(path, adapter, device, attn_impl)
+    if adapter:
+        raise SystemExit(f"--adapter is not supported on the remote-code checkpoint {path}")
+    # Eager, always: the wrapper declares no SDPA support and refuses it. It is also what
+    # makes `NemotronHAttention.forward` hand back real softmax weights, which is the whole
+    # of `Family.attention_weights_are_returned`.
+    return load_model(path, device, attn_impl="eager")
+
+
 def apply_runtime_shims(model, cfg=None):
     """The four repairs that only make sense on a CONSTRUCTED model.
 

@@ -36,6 +36,20 @@
 # (case, layer, head, variant) already in results/shard*.jsonl; `prepare` skips a
 # shard whose cases file exists (--overwrite to redo).
 #
+# A MODEL THAT IS NOT QWEN3-VL: only `prepare` runs there (the intervention rebuilds
+# attention through v_proj/o_proj and has not been ported; `run`/`selftest` refuse by
+# name). CONDA_ENV picks the environment, and the detector should be SERVED rather than
+# built per shard -- a local Grounding-DINO costs ~8 GB on a card already holding a 30B
+# policy, and the symptom is `[dino] CUDA OOM; retrying batch` and not an error:
+#
+#   bash serve_grounding_dino.sh --port 8100 --gpu 7 &    # the LAST card, on its own
+#   CONDA_ENV=nemotron bash launch_intervene_probe.sh --stage prepare \
+#       --n-samples 1000 --out-dir DIR --gpus 7 \
+#       --base-model nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 \
+#       --dino-api-base http://127.0.0.1:8100
+#
+# --gpus 7 is what keeps the shards on cards 0-6 and off the detector's.
+#
 # Anything after the recognised flags is forwarded verbatim to intervene_probe.py.
 set -euo pipefail
 
@@ -80,6 +94,9 @@ export HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export OVERLAP_STEPS_CKPT=${OVERLAP_STEPS_CKPT:-$REPO/checkpoint/steps_classifier/best}
 export TOKENIZERS_PARALLELISM=false
+# So `nemotron_loader` can find vendor/mamba_ssm_min: the Nemotron decoder raises at
+# IMPORT without that vendored layernorm-only `mamba_ssm`. Inert for Qwen3-VL.
+export SR1_REPO=${SR1_REPO:-$REPO}
 
 mkdir -p "$OUT_DIR/logs"
 TOTAL_SHARDS=$((GPUS * NUM_NODES))

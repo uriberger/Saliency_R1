@@ -357,13 +357,20 @@ def load_model(path, adapter, device, attn_impl="sdpa", quant=None):
     the same seven shims in the same order, eager attention pinned for the same reason
     (the wrapper declares no SDPA support), and `attn_impl` still only reaching the native
     path.
+
+    The branch itself moved on again, to `NL.load_any`, when `head_correlation_probe`
+    became the second probe that has to load either kind. `--quant` is the one thing this
+    still does itself: it is a sink-location argument (`docs/omni-quantization.md`) and no
+    other caller has one.
     """
-    remote, _cfg = NL.is_remote_code(path)
-    if not remote:
-        return PROBE.load_model(path, adapter, device, attn_impl)
-    if adapter:
-        raise SystemExit("--adapter is not supported on a remote-code model")
-    return NL.load_model(path, device, attn_impl="eager", quant=quant)
+    if quant is not None:
+        remote, _cfg = NL.is_remote_code(path)
+        if not remote:
+            raise SystemExit("--quant is only implemented for the remote-code path")
+        if adapter:
+            raise SystemExit("--adapter is not supported on a remote-code model")
+        return NL.load_model(path, device, attn_impl="eager", quant=quant)
+    return NL.load_any(path, adapter, device, attn_impl, PROBE.load_model)
 
 
 

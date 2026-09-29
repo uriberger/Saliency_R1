@@ -36,6 +36,15 @@ Selecting a winner from 1152 candidates is where a ranking becomes an artefact, 
 re-scored on the even. A head that survives that is a candidate; one that does not is
 selection noise.
 
+1152 IS A QWEN3-VL NUMBER. The scan asks `vlm_family` which layers have an attention
+matrix, and on a Mamba-Transformer hybrid most of them do not: the Omni's
+`hybrid_override_pattern` puts attention at 6 of its 52 decoder layers, so the search is
+6 x 32 = 192 cells and the parity split has far less multiplicity to survive. "The scan
+saw fewer layers than the model has" is the CORRECT outcome there and a bug anywhere
+else, so the count is printed against the decoder's own depth rather than assumed. It
+also dissolves the layer question: covering every attention layer means the LAYER is
+selected here too, not chosen by relative depth and defended afterwards.
+
 THE UNION IS UNCAPPED, here and in the `prepare` that built the cases -- only the
 per-BOX cap (0.5) ran, and N boxes each under it can cover the image between them. The
 median step's union covers 54% of the patch grid and the top decile 89%, and every map
@@ -91,7 +100,27 @@ def _load_module(name: str, relpath: str):
 PROBE = _load_module("_hc_overlap_probe", "overlap_probe.py")
 IV = _load_module("_hc_intervene", "intervene_probe.py")
 SHARP = _load_module("_hc_sharpness", "saliency_sharpness.py")
+NL = _load_module("_hc_nemotron_loader", "nemotron_loader.py")
+sys.path.insert(0, str(REPO))
+import vlm_family as VF  # noqa: E402
+
 IMAGE_TOKEN_ID = PROBE.IMAGE_TOKEN_ID
+
+
+def load_family(model, processor):
+    """The family adapter, with the prompt the REWARD was computed under.
+
+    `sink_location_probe.load_family` lets each family choose its own prompt, because the
+    question there is where a model looks when run the way it is normally run. The
+    question here is which head's reading of the reward's own map predicts correctness,
+    and every GRPO run in this repo -- Qwen3-VL's and the Omni's alike -- generates under
+    `grpo_vlm_qwen3.SYSTEM_PROMPT`. So the project prompt goes on unconditionally, and
+    `intervene_probe --stage prepare` does the same thing for the same reason: the chains
+    this reads were written under it.
+    """
+    fam = VF.family_for(model, processor)
+    fam.system_prompt = PROBE.SYSTEM_PROMPT
+    return fam
 
 
 # ---------------------------------------------------------------------------
@@ -100,13 +129,28 @@ IMAGE_TOKEN_ID = PROBE.IMAGE_TOKEN_ID
 class AllHeadCapture:
     """Hooks every attention layer; keeps only [heads, step_rows, image_patches].
 
-    Each hook re-runs its own module in eager to recover the softmax weights that
-    flash/sdpa discard -- the trainer's single-layer trick, installed on all 36. The
-    transient [1, H, S, S] is sliced immediately and dropped, so peak memory is one
-    layer's worth rather than 36.
+    TWO WAYS TO GET THE SOFTMAX WEIGHTS, and the family says which one this model needs.
+
+      * Qwen3-VL runs under sdpa, which never materialises them, so each hook re-runs its
+        own module in eager -- the trainer's single-layer trick, installed on all 36. The
+        transient [1, H, S, S] is sliced immediately and dropped, so peak memory is one
+        layer's worth rather than 36.
+      * The Omni is loaded eager throughout (`nemotron_loader` pins it, because the
+        wrapper declares no SDPA support) and `NemotronHAttention.forward` already returns
+        `(attn_output, attn_weights)`. Re-running it there would cost a second attention
+        per layer to recompute a tensor the module just handed over, and would have to
+        rebuild the causal mask to do it. `Family.attention_weights_are_returned` is that
+        fact, and this reads the module's own output instead.
+
+    Which layers exist is also the family's answer. On a hybrid most decoder layers have
+    no attention matrix at all, so the hook count is REPORTED against the decoder's depth
+    rather than assumed to equal it -- a scan that silently installed on 6 of 52 layers
+    and a scan that silently installed on nothing look the same from the outside.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, family):
+        self.family = family
+        self.returns_weights = bool(family.attention_weights_are_returned)
         self.mask = None
         self.rows = None
         self.cols = None
@@ -115,22 +159,48 @@ class AllHeadCapture:
         self.handles = []
         self.layers = []
         for m in model.modules():
-            if type(m).__name__ == "Qwen3VLTextAttention" and hasattr(m, "layer_idx"):
+            if type(m).__name__ in family.attn_classes and hasattr(m, "layer_idx"):
                 li = int(m.layer_idx)
                 self.layers.append(li)
                 self.handles.append(
                     m.register_forward_hook(self._make(li), with_kwargs=True))
         self.layers.sort()
         if not self.layers:
-            raise RuntimeError("no Qwen3VLTextAttention modules found")
+            raise RuntimeError(
+                f"no {'/'.join(family.attn_classes)} modules on this {family.name} model; "
+                "the scan would install on nothing and report empty cells as a result")
+        self.n_decoder_layers = None
+        try:
+            self.n_decoder_layers = len(family.decoder(model).layers)
+        except Exception:                 # a family whose decoder is shaped differently
+            pass
+
+    def describe(self):
+        n = len(self.layers)
+        of = ("" if self.n_decoder_layers is None
+              else f" of {self.n_decoder_layers} decoder layers")
+        return f"{n} attention layer(s){of}: {self.layers}"
 
     def close(self):
         for h in self.handles:
             h.remove()
 
+    def _keep(self, layer_idx, attn):
+        sl = attn[0][:, self.rows][:, :, self.cols]        # [H, n_rows, n_patches]
+        self.out[layer_idx] = torch.relu(sl).float().cpu().numpy()
+
     def _make(self, layer_idx):
         def hook(module, args, kwargs, output):
             if self._reentry or self.rows is None:
+                return None
+            if self.returns_weights:
+                attn = output[1] if isinstance(output, tuple) and len(output) > 1 else None
+                if attn is None:
+                    raise RuntimeError(
+                        f"{self.family.name} declares attention_weights_are_returned but "
+                        f"layer {layer_idx} handed back {type(output).__name__} with no "
+                        "weights -- the scan would have nothing to measure")
+                self._keep(layer_idx, attn)
                 return None
             self._reentry = True
             kw = dict(kwargs)
@@ -144,23 +214,20 @@ class AllHeadCapture:
             finally:
                 module.config._attn_implementation = prev
                 self._reentry = False
-            sl = attn[0][:, self.rows][:, :, self.cols]     # [H, n_rows, n_patches]
-            self.out[layer_idx] = torch.relu(sl).float().cpu().numpy()
-            del attn, sl
+            self._keep(layer_idx, attn)
+            del attn
             return None
         return hook
 
 
 @torch.no_grad()
-def scan_case(model, processor, cap, case, image, device, answer_max_tokens):
+def scan_case(model, processor, fam, cap, case, image, device, answer_max_tokens):
     """-> (maps [L,H,n_steps,n_patches], model's own answer, kept step indices)."""
-    text = PROBE.build_prompt(processor, case["question"])
-    inputs = processor(text=[text], images=[[image]], return_tensors="pt",
-                       padding=True, padding_side="left", add_special_tokens=False).to(device)
+    inputs = fam.build_inputs(processor, [image], case["question"], device)
     prompt_len = inputs["input_ids"].shape[1]
     chain = case["chain_ids"]
     gh, gw = case["grid"]
-    cols = (inputs["input_ids"][0] == IMAGE_TOKEN_ID).nonzero(as_tuple=True)[0]
+    cols = (inputs["input_ids"][0] == fam.image_token_id).nonzero(as_tuple=True)[0]
     if cols.numel() != gh * gw:
         return None                       # grid and image tokens disagree: skip, not guess
 
@@ -175,33 +242,47 @@ def scan_case(model, processor, cap, case, image, device, answer_max_tokens):
         return None
     rows = torch.cat([torch.arange(a, b, device=device) for a, b in spans])
 
-    ids = torch.tensor([inputs["input_ids"][0].tolist() + chain], device=device)
-    seq = ids.shape[1]
-    cap.mask = IV.causal_mask(seq, next(model.parameters()).dtype, device)
+    # prompt ++ chain, in whatever multimodal bookkeeping this family carries. Qwen3-VL's
+    # override extends `mm_token_type_ids` over the completion with zeros, which is what
+    # the two explicit `if` blocks here used to do; the Omni carries `image_flags`.
+    fwd = fam.teacher_forced_case(inputs, chain, device)
+    fwd.update(fam.forward_defaults)
+    seq = int(fwd["input_ids"].shape[1])
+    # Only the re-run path needs a mask handed to it; a family that returns its own
+    # weights already ran under the mask the model built.
+    cap.mask = (None if cap.returns_weights
+                else IV.causal_mask(seq, next(model.parameters()).dtype, device))
     cap.rows, cap.cols, cap.out = rows, cols, {}
-    fwd = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
-    if "pixel_values" in inputs:
-        fwd["pixel_values"] = inputs["pixel_values"]
-        fwd["image_grid_thw"] = inputs["image_grid_thw"]
-    if inputs.get("mm_token_type_ids") is not None:
-        pad = torch.zeros(1, seq - prompt_len, dtype=torch.long, device=device)
-        fwd["mm_token_type_ids"] = torch.cat([inputs["mm_token_type_ids"], pad], dim=1)
-    out = model(**fwd, use_cache=True)
+
+    # THE MODEL'S OWN ANSWER, two ways.
+    #
+    # `prepare` writes it into the case when it knows it -- it generated the whole
+    # completion in one pass, so the tokens after `</think>` ARE the answer this chain
+    # got, with no second forward and no second decoding rule. Cases prepared before that
+    # existed do not carry it, and for them this recovers it the way it always did: a
+    # greedy continuation of the chain off the same forward's KV cache.
+    #
+    # The fallback needs a cache, which is exactly the thing `forward_defaults` turns off
+    # on a hybrid (`use_cache=False`, so no Mamba+KV cache is built and thrown away on
+    # every pass) -- so it is overridden here, for that path only.
+    answer = case.get("answer_text")
+    if answer is None:
+        fwd["use_cache"] = True
+        fwd.pop("logits_to_keep", None)
+    out = model(**fwd)
     cap.rows = None                                # disarm before the decode
 
-    # The model's own answer: a greedy continuation of its own chain, so this
-    # reproduces what it generated at prepare time. Graded by the trainer's
-    # accuracy_reward rather than by a first-token match.
-    past, nxt = out.past_key_values, out.logits[0, -1].argmax().view(1, 1)
-    got = [int(nxt)]
-    eos = processor.tokenizer.eos_token_id
-    for _ in range(answer_max_tokens - 1):
-        if got[-1] == eos:
-            break
-        o = model(input_ids=nxt, past_key_values=past, use_cache=True)
-        past, nxt = o.past_key_values, o.logits[0, -1].argmax().view(1, 1)
-        got.append(int(nxt))
-    answer = processor.tokenizer.decode(got, skip_special_tokens=True)
+    if answer is None:
+        past, nxt = out.past_key_values, out.logits[0, -1].argmax().view(1, 1)
+        got = [int(nxt)]
+        eos = processor.tokenizer.eos_token_id
+        for _ in range(answer_max_tokens - 1):
+            if got[-1] == eos:
+                break
+            o = model(input_ids=nxt, past_key_values=past, use_cache=True)
+            past, nxt = o.past_key_values, o.logits[0, -1].argmax().view(1, 1)
+            got.append(int(nxt))
+        answer = processor.tokenizer.decode(got, skip_special_tokens=True)
 
     lens = [b - a for a, b in spans]
     H = cap.out[cap.layers[0]].shape[0]
@@ -264,11 +345,13 @@ def scan(args, device):
                          f"(e.g. row {missing[0]}); cases were prepared with {cfg}")
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    processor, model = PROBE.load_model(args.base_model, args.adapter or None, device,
-                                        args.attn_impl)
-    cap = AllHeadCapture(model)
-    print(f"[scan] shard {args.shard}: {len(cases)} cases x {len(cap.layers)} layers",
-          flush=True)
+    processor, model = NL.load_any(args.base_model, args.adapter or None, device,
+                                   args.attn_impl, PROBE.load_model)
+    fam = load_family(model, processor)
+    cap = AllHeadCapture(model, fam)
+    print(f"[scan] shard {args.shard}: {len(cases)} cases x {cap.describe()}   "
+          f"family {fam.name}, weights "
+          f"{'returned' if cap.returns_weights else 're-run in eager'}", flush=True)
     prog = IV.Progress(out / "progress" / f"scan{args.shard:02d}.json", len(cases),
                        f"scan{args.shard}", args.log_every)
 
@@ -278,7 +361,7 @@ def scan(args, device):
     try:
         for case in cases:
             try:
-                r = scan_case(model, processor, cap, case,
+                r = scan_case(model, processor, fam, cap, case,
                               imgs[case["row_index"]]["image"], device,
                               args.answer_max_tokens)
             except torch.cuda.OutOfMemoryError:
@@ -444,18 +527,32 @@ def report(args):
     layers = d[0]["layers"]
     N, Lc, Hc = v2.shape
 
+    # THE INCUMBENT is whatever the run being compared against rewarded, and on a model
+    # that is not Qwen3-VL-8B it may not exist: layer 22 is a Mamba layer on the Omni, so
+    # `np.where(layers == 22)[0][0]` raises. It defaults to L22 h28,31 so the published
+    # Qwen3-VL report is unchanged, and the rows are simply omitted when the layer has no
+    # attention matrix on this model -- rather than falling back to index 0, which would
+    # label some other layer's heads with the incumbent's name.
+    inc_layer = int(args.incumbent_layer)
+    inc_heads = [int(h) for h in str(args.incumbent_heads).split(",") if h.strip()]
+    has_inc = bool((layers == inc_layer).any())
+    li_inc = int(np.where(layers == inc_layer)[0][0]) if has_inc else None
+
     # The union curve is reported on everything, before any cap -- it is the thing the
     # cap is chosen from, so restricting it first would hide the tail being cut.
-    li22 = int(np.where(layers == 22)[0][0]) if (layers == 22).any() else 0
     bl, bh = divmod(int(np.nanargmax(np.nanmean(au.reshape(N, -1), axis=0))), Hc)
     curves = {f"mean {Lc * Hc}": np.nanmean(au.reshape(N, -1), axis=1),
               f"L{int(layers[bl])}H{bh}": au[:, bl, bh]}
-    for h in (28, 31):                       # the rewarded heads, when the run has them
-        if h < Hc:
-            curves[f"L{int(layers[li22])}H{h}"] = au[:, li22, h]
+    if has_inc:                          # the rewarded heads, when the run has them
+        for h in inc_heads:
+            if h < Hc:
+                curves[f"L{inc_layer}H{h}"] = au[:, li_inc, h]
     union_decile_table(uni, curves, null=0.5)
     print(f"   the rows are auroc: the mean over all {Lc * Hc} heads, the single "
-          f"head with the highest pooled level, and the two rewarded heads.")
+          f"head with the highest pooled level"
+          + (", and the rewarded heads." if has_inc else
+             f", and NO incumbent row -- layer {inc_layer} has no attention matrix on "
+             f"this model, whose attention layers are {[int(x) for x in layers]}."))
 
     (v2, au, row, cor, uni), keep = apply_union_cap(args.max_union, uni,
                                                     (v2, au, row, cor, uni))
@@ -509,11 +606,13 @@ def report(args):
                 l, h = divmod(int(t), Hc)
                 print(f"   {int(layers[l]):>5} {h:>5} {r_sel[l, h]:>+10.4f} "
                       f"{r_out[l, h]:>+12.4f} {r_all[l, h]:>+8.4f}")
-            for h22 in (28, 31):
-                li = int(np.where(layers == 22)[0][0])
-                rank = int((np.abs(np.nan_to_num(r_all)) > abs(r_all[li, h22])).sum()) + 1
-                print(f"   incumbent L22H{h22}: r(all) {r_all[li, h22]:>+.4f}  "
-                      f"rank {rank} of {Lc * Hc}")
+            for hh in (inc_heads if has_inc else []):
+                if hh >= Hc:
+                    continue
+                rank = int((np.abs(np.nan_to_num(r_all))
+                            > abs(r_all[li_inc, hh])).sum()) + 1
+                print(f"   incumbent L{inc_layer}H{hh}: r(all) "
+                      f"{r_all[li_inc, hh]:>+.4f}  rank {rank} of {Lc * Hc}")
             np.savez_compressed(out / f"corr_{name}_{setup}.npz",
                                 r_all=r_all, r_sel=r_sel, r_out=r_out, layers=layers,
                                 max_union=np.array(args.max_union))
@@ -540,6 +639,12 @@ def main():
     p.add_argument("--answer-max-tokens", type=int, default=16)
     p.add_argument("--top-layers", type=int, default=10)
     p.add_argument("--top-heads", type=int, default=15)
+    p.add_argument("--incumbent-layer", type=int, default=22,
+                   help="report stage: the (layer, heads) the run being compared against "
+                        "already rewards, printed with their rank among all cells. The "
+                        "default is the Qwen3-VL pair; on a model whose attention layers "
+                        "do not include it the rows are omitted rather than relabelled")
+    p.add_argument("--incumbent-heads", default="28,31")
     p.add_argument("--max-union", type=float, default=0.0,
                    help="report stage: drop steps whose DINO union covers more than "
                         "this fraction of the patch grid (0 = off, the default and "
