@@ -1,5 +1,17 @@
 # Handoff prompt: select the Omni's saliency head pair
 
+> **DONE, 2026-09-29 — `docs/omni-head-selection.md` is the result.** The pick is
+> `--overlap-layer 19 --overlap-heads 4,9`, the incumbent `33 / 28,31` ranks 148–176 of
+> 192, and the probes now go through the family seam with `test_probe_family_cpu.py`
+> holding Qwen3-VL still.
+>
+> **Read §4 of that doc before running the training arm.** The correctness label this
+> selection is built on is 52% disputed — the Omni is a base checkpoint and
+> `accuracy_reward`'s exact-string fallback cannot read the prose it writes — and the
+> honest next step is a cold-started Omni rather than an arm on `19 / 4,9`.
+>
+> Everything below is the original prompt, kept because §"The work" is still the procedure.
+
 Run the head-selection procedure on `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16`,
 so the overlap reward stops being defined on two arbitrary heads.
 
