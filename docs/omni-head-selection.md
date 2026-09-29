@@ -156,8 +156,98 @@ checks the three failures by name rather than by exit code.
 re-scored on the even ones. A head that survives is a candidate; one that does not is
 selection noise — and on 192 cells that is a far stronger statement than it was on 1,152.
 
-Then, and only then, re-run the training arm with what came out:
+# THE RESULT
+
+Job 7092099, 2026-09-29, `outputs/omni_head_select/setA/`. 1,000 samples of set_a →
+**746 cases, 3,795 grounded observe steps**, of which `--max-union 0.5` keeps 2,083 steps
+from 578 completions. (Qwen3-VL's arm: 1,157 cases, 3,471 steps, 807 completions kept.)
+242 rows dropped `bad_format` — 24%, against zero if the `<think>` fix were missing.
+
+## 1. The incumbent is near the bottom
+
+`--overlap-layer 33 --overlap-heads 28,31` ranks **148–176 of 192** in every report, and
+survives the parity split in 5 of 16 (setup × metric × label × controls) combinations —
+always with a NEGATIVE sign. Whatever the right heads are, these are not them, and that
+part of the question is settled.
+
+## 2. The pick: `--overlap-layer 19 --overlap-heads 4,9`
+
+Of all 192 cells, **layer 19 heads 4 and 9 are the only two that are positive on all four
+halves** — select and held-out, under both labels — with union size, patch count, step
+token count and answer length controlled:
+
+| cell | strict select | strict HELD OUT | soft select | soft HELD OUT |
+|---|---|---|---|---|
+| **L19 H4** | +0.0958 | **+0.1083** | +0.0948 | +0.0320 |
+| **L19 H9** | +0.0534 | **+0.1211** | +0.0756 | +0.0376 |
+| L19 H6 | +0.0734 | +0.0872 | +0.0618 | −0.0066 |
+| L33 H28 (incumbent) | — | — | — | −0.0062 |
+
+The held-out r being *larger* than the select-half r is the signature of an effect rather
+than of selection. Layer 19 is also the top layer by max|r| on `auroc`/step, raw and
+partial. L19H4 is the least union-confounded of the strong cells (r(auroc, union) = −0.134
+against −0.41 at L33H27), and adding the head's own image mass as a control moves it by
+0.0003.
+
+**This is the best-supported positive pair on this corpus. It is not a strong result**, and
+the next two sections are why.
+
+## 3. The largest reproducible structure in the scan is NEGATIVE and layer-wide
+
+All 32 heads of layer 26, and most of layer 42, survive the parity split under both labels
+with a negative sign: the more those heads attend to the objects a step names, the *less*
+likely the completion is right. Mean partial r ≈ −0.047 at layer 26.
+
+It is not the union confound (it survives residualising on union) and it is not image mass
+(controlling each head's own mass moves layer 26 from −0.0474 to −0.0427). A per-head
+statistic that is identical across all 32 heads of a layer is a LAYER property, so it is
+not a head-selection result — but it is the strongest thing in the scan, and an overlap
+reward pointed anywhere near layers 26 or 42 would be rewarding a statistic that predicts
+being wrong.
+
+## 4. The label is 52% disputed, and that is the real blocker
+
+**746 completions: strict 0.121, soft 0.638, 386 disagree.** Section "THE LABEL IS HALF
+GRADING NOISE" above is the mechanism; this is its size on the full corpus.
+
+The two labels do not agree on which heads look predictive. In the four reports' own
+survivor blocks, **no cell survives under both labels**: the positive family (L19, L12) is
+strict-only and the negative family (L26, L42) is soft-only. Only by widening to all 192
+cells and all 16 analysis variants does L19 H4/H9 come through both.
+
+The root cause is not the grader. It is that **the Omni is a base checkpoint**. Qwen3-VL's
+head selection ran on `coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged` — a model
+taught to emit `<think> … </think> <terse answer>`. The Omni was never cold-started, so it
+answers in prose, wraps its letters (`(C) working`, `\boxed{A}`), and echoes the system
+prompt's own illustration. `accuracy_reward`'s exact-string fallback cannot read any of
+that, and r(strict correctness, answer length) = **−0.251**: a quarter of "was it right" is
+"was it terse".
+
+**So the honest next step is a cold-started Omni, not a training arm.** `build_coldstart_data.py`
+and `launch_coldstart_job.sh` are the existing machinery. Re-running this scan on that
+checkpoint would cost the same ~1.5 h and would be answering the question that was asked;
+on a base checkpoint this scan is answering a noisier one.
+
+## If the arm is run anyway
 
 ```
-bash launch_grpo_omni_overlap_job.sh --overlap-layer <L> --overlap-heads <h,h>
+bash launch_grpo_omni_overlap_job.sh --overlap-layer 19 --overlap-heads 4,9
 ```
+
+That is a defensible improvement on `33 / 28,31` — selected rather than inherited, positive
+under both labels, and replacing a pair that ranks 148–176 of 192. Any number read off it
+still has to say that the head pair was chosen on a corpus whose correctness label is 52%
+disputed.
+
+## Reproducing the tables
+
+```
+python head_correlation_probe.py --stage report \
+    --out-dir  outputs/omni_head_select/setA/scan \
+    --cases-dir outputs/omni_head_select/setA/cases \
+    --max-union 0.5 --controls union,npatch,ntok,alen \
+    --incumbent-layer 33 --incumbent-heads 28,31 --regrade off    # and --regrade soft
+```
+
+The four logs are in `outputs/omni_head_select/setA/logs/report_maxunion0.5_*.log`
+(`{off,soft}` × `{raw,partial}`), and each writes its own `corr_*.npz`.

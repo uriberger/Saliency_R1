@@ -162,9 +162,29 @@ fi
 # ---------- 3. the report ----------
 step "report at the pre-registered --max-union $MAX_UNION"
 set +u; source "$CONDA_SH"; conda activate "$ENV_NAME"; set -u
-python "$REPO/head_correlation_probe.py" --stage report --out-dir "$SCAN_DIR" \
-    --max-union "$MAX_UNION" --incumbent-layer 33 --incumbent-heads 28,31 \
-    2>&1 | tee "$OUT_DIR/logs/report_maxunion${MAX_UNION}.log"
+# --cases-dir is what lets the report AUDIT the label before it ranks anything: the cases
+# carry the model's own answers, and the trainer's accuracy_reward marks a
+# verbose-but-correct one wrong. Without it the report silently skips the audit.
+# FOUR reports, because the pick has to hold across both of the axes this corpus is
+# uncertain on and neither is knowable in advance:
+#
+#   the LABEL     strict is what the reward optimises; soft is what a verbose-but-correct
+#                 answer can pass. On the Omni 52% of completions disagree.
+#   the CONTROLS  uncontrolled, the largest reproducible correlations in the scan are the
+#                 union-size confound -- r(auroc, union) reaches -0.41 -- and they do not
+#                 survive being residualised on it.
+#
+# A cell that survives the parity split in all four is a candidate. One that only survives
+# in some of them is telling you which artefact it is made of.
+for label in off soft; do
+    for ctrl in "" "union,npatch,ntok,alen"; do
+        name="${label}$([ -z "$ctrl" ] && echo _raw || echo _partial)"
+        python "$REPO/head_correlation_probe.py" --stage report --out-dir "$SCAN_DIR" \
+            --cases-dir "$CASES_DIR" --max-union "$MAX_UNION" --controls "$ctrl" \
+            --incumbent-layer 33 --incumbent-heads 28,31 --regrade "$label" \
+            2>&1 | tee "$OUT_DIR/logs/report_maxunion${MAX_UNION}_${name}.log"
+    done
+done
 
 step "DONE"
 echo "The pick is the head whose r(select) sign SURVIVES on r(HELD OUT), not the top of"

@@ -435,8 +435,50 @@ def scan(args, device):
 # ---------------------------------------------------------------------------
 # stage: report
 # ---------------------------------------------------------------------------
-def col_corr(X, y):
-    """Pearson r of every column of X [N, L, H] against y [N], NaN-aware. -> [L, H]."""
+def _resid(y, Z):
+    """`y` with the columns of `Z`, plus an intercept, projected out."""
+    M = np.column_stack([np.ones(len(y))] + [np.asarray(z, dtype=np.float64) for z in Z])
+    beta, *_ = np.linalg.lstsq(M, np.asarray(y, dtype=np.float64), rcond=None)
+    return np.asarray(y, dtype=np.float64) - M @ beta
+
+
+def col_corr(X, y, controls=None):
+    """Pearson r of every column of X [N, L, H] against y [N], NaN-aware. -> [L, H].
+
+    With `controls` -- a list of [N] covariates -- this is the PARTIAL correlation, both
+    sides residualised on them first.
+
+    WHY IT MATTERS HERE, measured on the Omni: uncontrolled, the largest and most
+    reproducible correlations in the whole 192-cell scan are NEGATIVE, and they are the
+    union-size confound this file's own docstring warns about. r(auroc, union) reaches
+    -0.41 at some heads, correctness is weakly positive in union, and the product is a
+    strong spurious negative that survives the parity split because the confound does.
+    Controlling union, patch count, step token count and answer length, those cells fall
+    to a held-out r of ~-0.004 and a different, POSITIVE family is what is left.
+
+    Answer length is in the list for the other half of the same problem: the trainer's
+    `accuracy_reward` falls back to an exact string match, so r(strict correctness, answer
+    length) = -0.251 -- "was it right" is substantially "was it terse". See `label_audit`.
+
+    The vectorised no-controls path is kept exactly as it was, so every published
+    Qwen3-VL number reproduces bit for bit.
+    """
+    if controls:
+        N = len(y)
+        Lc, Hc = X.shape[1], X.shape[2]
+        Xf = X.reshape(N, -1)
+        yv = np.asarray(y, dtype=np.float64)
+        out = np.full(Xf.shape[1], np.nan)
+        for j in range(Xf.shape[1]):
+            col = Xf[:, j]
+            ok = np.isfinite(col) & np.isfinite(yv)
+            if ok.sum() < 8:
+                continue
+            Z = [np.asarray(z, dtype=np.float64)[ok] for z in controls]
+            xr, yr = _resid(col[ok], Z), _resid(yv[ok], Z)
+            if xr.std() > 0 and yr.std() > 0:
+                out[j] = np.corrcoef(xr, yr)[0, 1]
+        return out.reshape(Lc, Hc)
     ok = np.isfinite(X) & np.isfinite(y)[:, None, None]
     n = ok.sum(0).astype(np.float64)
     Xs = np.where(ok, X, 0.0).astype(np.float64)
@@ -571,6 +613,43 @@ def label_audit(cases_dir, row, cor):
     return soft, note
 
 
+def answer_lengths(cases_dir, row):
+    """Characters in the model's own answer, per step. -> [N] float, NaN where unknown.
+
+    The covariate `--controls alen` needs, and the reason it is worth having: the trainer's
+    `accuracy_reward` falls back to an exact string match, so a SHORT answer is far more
+    likely to score. On the Omni r(strict correctness, answer length) = -0.251, which means
+    a quarter of "was it right" is "was it terse" -- and any head whose attention covaries
+    with how much the model went on to write would inherit that for free.
+    """
+    lens = {}
+    for f in sorted((Path(cases_dir) / "cases").glob("shard*.json")):
+        for c in json.loads(f.read_text())["cases"]:
+            if c.get("answer_text") is not None:
+                lens[int(c["row_index"])] = float(len(c["answer_text"]))
+    return np.array([lens.get(int(r), np.nan) for r in row], dtype=np.float64)
+
+
+def survivor_table(r_sel, r_out, r_all, layers, min_held, top):
+    """The cells whose SELECT-half sign is still there on the held-out half. -> lines.
+
+    This is the decision rule stated as output rather than left to the eye. The ranking
+    above it is not the answer -- with 192 cells the best of them looks impressive whether
+    or not any head has an effect, and the parity split is the whole reason this stage
+    exists. `min_held` keeps a cell whose held-out r rounds to nothing from being called a
+    survivor on the strength of its sign alone.
+    """
+    Hc = r_sel.shape[1]
+    flat = np.abs(np.nan_to_num(r_sel)).ravel()
+    out = []
+    for t in np.argsort(-flat)[:top]:
+        l, h = divmod(int(t), Hc)
+        s, o, a = r_sel[l, h], r_out[l, h], r_all[l, h]
+        if np.sign(s) == np.sign(o) and abs(o) >= min_held:
+            out.append((int(layers[l]), h, s, o, a))
+    return out
+
+
 def report(args):
     out = Path(args.out_dir)
     files = sorted((out / "scan").glob("shard*.npz"))
@@ -584,11 +663,21 @@ def report(args):
     uni = np.concatenate([x["union"] for x in d])
     layers = d[0]["layers"]
     N, Lc, Hc = v2.shape
+    # The covariates the partial correlation can be taken against. `alen` is the length of
+    # the model's own answer and comes from the cases, not the scan. The rest ride along in
+    # the shards -- but only in shards written after they were added, and the published
+    # Qwen3-VL scan predates `npatch`/`ntok`, so a covariate the archive does not carry is
+    # simply absent from the menu rather than a KeyError at load.
+    covs = {"union": uni}
+    for k in ("npatch", "ntok"):
+        if all(k in x.files for x in d):
+            covs[k] = np.concatenate([x[k] for x in d]).astype(np.float64)
 
     # Before anything is ranked: how much of "wrong" is the grader rather than the model.
     if args.cases_dir and Path(args.cases_dir, "cases").is_dir():
         soft, note = label_audit(args.cases_dir, row, cor)
         print(note)
+        covs["alen"] = answer_lengths(args.cases_dir, row)
         if args.regrade == "soft":
             if soft is None:
                 raise SystemExit("--regrade soft, but no case carries `answer_text`")
@@ -625,8 +714,14 @@ def report(args):
              f", and NO incumbent row -- layer {inc_layer} has no attention matrix on "
              f"this model, whose attention layers are {[int(x) for x in layers]}."))
 
+    cov_names = [c.strip() for c in str(args.controls).split(",") if c.strip()]
+    unknown = [c for c in cov_names if c not in covs]
+    if unknown:
+        raise SystemExit(f"--controls {unknown}: known covariates are {sorted(covs)} "
+                         "(`alen` additionally needs --cases-dir)")
     (v2, au, row, cor, uni), keep = apply_union_cap(args.max_union, uni,
                                                     (v2, au, row, cor, uni))
+    covs = {k: v[keep] for k, v in covs.items()}
     if not keep.all():
         print(f"\n--max-union {args.max_union}: {int(keep.sum())}/{N} steps and "
               f"{len(np.unique(row))} completions kept. Everything below is that "
@@ -649,18 +744,31 @@ def report(args):
         np.add.at(n, idx, np.isfinite(arr).astype(float))
         with np.errstate(invalid="ignore", divide="ignore"):
             cagg[name] = np.where(n > 0, s / n, np.nan)
+    # The covariates follow the observations: a completion's is the mean over its steps,
+    # which is the same reduction its overlap values get two lines up.
+    ccov = {}
+    for k, v in covs.items():
+        s = np.zeros(len(uniq))
+        n = np.zeros(len(uniq))
+        np.add.at(s, idx, np.nan_to_num(v, nan=0.0))
+        np.add.at(n, idx, np.isfinite(v).astype(float))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ccov[k] = np.where(n > 0, s / n, np.nan)
 
     sel_c = (uniq % 2 == 1)                # select on odd rows, confirm on even
     sel_s = (row % 2 == 1)
     for name, sarr, carr in (("mean_in_v2", v2, cagg["mean_in_v2"]),
                              ("auroc", au, cagg["auroc"])):
-        for setup, X, y, sel in (("step", sarr, cor, sel_s),
-                                 ("completion", carr, ccor, sel_c)):
-            r_all = col_corr(X, y)
-            r_sel = col_corr(X[sel], y[sel])
-            r_out = col_corr(X[~sel], y[~sel])
+        for setup, X, y, sel, cv in (("step", sarr, cor, sel_s, covs),
+                                     ("completion", carr, ccor, sel_c, ccov)):
+            Z = [cv[k] for k in cov_names]
+            r_all = col_corr(X, y, Z)
+            r_sel = col_corr(X[sel], y[sel], [z[sel] for z in Z])
+            r_out = col_corr(X[~sel], y[~sel], [z[~sel] for z in Z])
             print(f"\n=== {name} / {setup}-level "
-                  f"(n={len(y)}) ===")
+                  f"(n={len(y)}"
+                  + (f", partial on {'+'.join(cov_names)}" if cov_names else "")
+                  + ") ===")
             print("  per-LAYER (max |r| over its 32 heads, all data) -- pick layers here:")
             order = np.argsort(-np.nan_to_num(np.nanmax(np.abs(r_all), axis=1)))
             print(f"   {'rank':>4} {'layer':>5} {'max|r|':>8} {'head':>5} {'mean|r|':>8}")
@@ -677,6 +785,16 @@ def report(args):
                 l, h = divmod(int(t), Hc)
                 print(f"   {int(layers[l]):>5} {h:>5} {r_sel[l, h]:>+10.4f} "
                       f"{r_out[l, h]:>+12.4f} {r_all[l, h]:>+8.4f}")
+            surv = survivor_table(r_sel, r_out, r_all, layers, args.min_held,
+                                  args.top_heads)
+            print(f"  SURVIVORS -- of those {args.top_heads}, the ones whose sign is still "
+                  f"there on the held-out half with |r| >= {args.min_held}:")
+            if surv:
+                for l, h, s, o, a in surv:
+                    print(f"   L{l:>2}H{h:<3} {s:>+10.4f} {o:>+12.4f} {a:>+8.4f}")
+            else:
+                print("   none. Every selected head was selection noise at this setting, "
+                      "which is an answer and not a gap.")
             for hh in (inc_heads if has_inc else []):
                 if hh >= Hc:
                     continue
@@ -684,14 +802,18 @@ def report(args):
                             > abs(r_all[li_inc, hh])).sum()) + 1
                 print(f"   incumbent L{inc_layer}H{hh}: r(all) "
                       f"{r_all[li_inc, hh]:>+.4f}  rank {rank} of {Lc * Hc}")
-            # The label is part of the identity of these numbers, so a soft run writes
-            # beside the strict one rather than over it.
-            tag = "" if args.regrade == "off" else f"_{args.regrade}"
+            # The label AND the controls are part of the identity of these numbers, so
+            # each combination writes beside the others rather than over them. Leaving
+            # the controls out of the name silently overwrote the raw run with the
+            # partial one and made the two indistinguishable on disk.
+            tag = ("" if args.regrade == "off" else f"_{args.regrade}") + \
+                  ("" if not cov_names else "_partial")
             np.savez_compressed(out / f"corr_{name}_{setup}{tag}.npz",
                                 r_all=r_all, r_sel=r_sel, r_out=r_out, layers=layers,
                                 max_union=np.array(args.max_union),
-                                label=np.array(args.regrade))
-    print(f"\n-> {out}/corr_*{'' if args.regrade == 'off' else '_' + args.regrade}.npz")
+                                label=np.array(args.regrade),
+                                controls=np.array(",".join(cov_names)))
+    print(f"\n-> {out}/corr_*{tag}.npz")
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +842,17 @@ def main():
                         "default is the Qwen3-VL pair; on a model whose attention layers "
                         "do not include it the rows are omitted rather than relabelled")
     p.add_argument("--incumbent-heads", default="28,31")
+    p.add_argument("--controls", default="",
+                   help="report stage: comma list of covariates to take the correlations "
+                        "PARTIAL on -- union, npatch, ntok, alen (`alen` needs "
+                        "--cases-dir). Empty is the default and reproduces every "
+                        "published Qwen3-VL number. `union,npatch,ntok,alen` is what the "
+                        "Omni pick was made on: uncontrolled, the largest reproducible "
+                        "correlations in the scan are the union-size confound this file's "
+                        "docstring warns about, and they do not survive it")
+    p.add_argument("--min-held", type=float, default=0.03,
+                   help="a survivor's held-out |r| floor, so a cell is not called one on "
+                        "the strength of its sign alone")
     p.add_argument("--regrade", default="off", choices=["off", "soft"],
                    help="report stage: which correctness label to rank on. `off` is the "
                         "trainer's own accuracy_reward, what the scan stored and what the "
