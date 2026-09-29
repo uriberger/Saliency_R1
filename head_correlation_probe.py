@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -513,6 +514,63 @@ def apply_union_cap(max_union, uni, arrays):
     return tuple(None if a is None else a[keep] for a in arrays), keep
 
 
+def label_audit(cases_dir, row, cor):
+    """How much of "wrong" is the grader rather than the model. -> (soft label, note).
+
+    THE LABEL THIS PROBE RANKS ON is `accuracy_reward` on the model's own answer, and that
+    reward parses the gold with math_verify and falls back to an EXACT STRING MATCH when
+    math_verify yields nothing -- which it does for `C`, for `horses`, for `Yes`. So a
+    model answering `A` scores and the same model answering `(C) water supply`,
+    `\\boxed{A}` or `The cup stands on a shelf.` scores zero for being verbose.
+
+    On a cold-started Qwen3-VL that is nearly free: it was trained into the terse format.
+    On a base checkpoint it is not. The Nemotron-Omni reads 0.167 under the strict rule and
+    ~0.44 under `answer_grading` on the same completions, and it also echoes the SYSTEM
+    PROMPT's own illustration -- it writes the literal string "This is my answer." before
+    answering. Roughly half the CORRECT completions therefore carry a "wrong" label, which
+    attenuates every correlation the ranking is built from.
+
+    This never changes a number by itself. It prints the two accuracies and how many
+    completions disagree, so the size of the problem is on the record; `--regrade soft` is
+    what actually swaps the label, and the report says so when it does.
+    """
+    cases = {}
+    for f in sorted((Path(cases_dir) / "cases").glob("shard*.json")):
+        for c in json.loads(f.read_text())["cases"]:
+            if c.get("answer_text") is not None:
+                cases[int(c["row_index"])] = c
+    if not cases:
+        return None, (f"\n[label] no case under {cases_dir} carries `answer_text`, so the "
+                      "strict grade cannot be audited. Cases prepared before that field "
+                      "existed; re-run prepare to get the audit.")
+    AG = _load_module("_hc_answer_grading", "answer_grading.py")
+    soft = np.array(cor, dtype=np.float32)
+    n_missing = 0
+    per_row = {}
+    for i, r in enumerate(row):
+        c = cases.get(int(r))
+        if c is None:
+            n_missing += 1
+            continue
+        if int(r) not in per_row:
+            g = AG.grade_completion(c["answer_text"], c["gold"])
+            per_row[int(r)] = float(bool(g["soft"]))
+        soft[i] = per_row[int(r)]
+    uniq, first = np.unique(row, return_index=True)
+    strict_acc = float(np.asarray(cor)[first].mean())
+    soft_acc = float(soft[first].mean())
+    flipped = int((np.asarray(cor)[first] != soft[first]).sum())
+    note = (f"\n[label] {len(uniq)} completions   strict (the trainer's accuracy_reward) "
+            f"{strict_acc:.3f}   soft (answer_grading) {soft_acc:.3f}   "
+            f"{flipped} disagree"
+            + (f"   [{n_missing} steps had no case]" if n_missing else "")
+            + "\n        strict is what the REWARD optimises and stays the primary "
+              "number. soft is what a verbose-but-correct answer can pass; a large gap "
+              "means the ranking below is built on a label that is partly grading noise."
+              "\n        --regrade soft re-runs everything on the soft label.")
+    return soft, note
+
+
 def report(args):
     out = Path(args.out_dir)
     files = sorted((out / "scan").glob("shard*.npz"))
@@ -526,6 +584,19 @@ def report(args):
     uni = np.concatenate([x["union"] for x in d])
     layers = d[0]["layers"]
     N, Lc, Hc = v2.shape
+
+    # Before anything is ranked: how much of "wrong" is the grader rather than the model.
+    if args.cases_dir and Path(args.cases_dir, "cases").is_dir():
+        soft, note = label_audit(args.cases_dir, row, cor)
+        print(note)
+        if args.regrade == "soft":
+            if soft is None:
+                raise SystemExit("--regrade soft, but no case carries `answer_text`")
+            cor = soft
+            print("        *** EVERY NUMBER BELOW IS ON THE SOFT LABEL ***")
+    elif args.regrade == "soft":
+        raise SystemExit("--regrade soft needs --cases-dir pointing at the prepare "
+                         "out-dir whose cases carry the model's own answers")
 
     # THE INCUMBENT is whatever the run being compared against rewarded, and on a model
     # that is not Qwen3-VL-8B it may not exist: layer 22 is a Mamba layer on the Omni, so
@@ -613,10 +684,14 @@ def report(args):
                             > abs(r_all[li_inc, hh])).sum()) + 1
                 print(f"   incumbent L{inc_layer}H{hh}: r(all) "
                       f"{r_all[li_inc, hh]:>+.4f}  rank {rank} of {Lc * Hc}")
-            np.savez_compressed(out / f"corr_{name}_{setup}.npz",
+            # The label is part of the identity of these numbers, so a soft run writes
+            # beside the strict one rather than over it.
+            tag = "" if args.regrade == "off" else f"_{args.regrade}"
+            np.savez_compressed(out / f"corr_{name}_{setup}{tag}.npz",
                                 r_all=r_all, r_sel=r_sel, r_out=r_out, layers=layers,
-                                max_union=np.array(args.max_union))
-    print(f"\n-> {out}/corr_*.npz")
+                                max_union=np.array(args.max_union),
+                                label=np.array(args.regrade))
+    print(f"\n-> {out}/corr_*{'' if args.regrade == 'off' else '_' + args.regrade}.npz")
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +720,14 @@ def main():
                         "default is the Qwen3-VL pair; on a model whose attention layers "
                         "do not include it the rows are omitted rather than relabelled")
     p.add_argument("--incumbent-heads", default="28,31")
+    p.add_argument("--regrade", default="off", choices=["off", "soft"],
+                   help="report stage: which correctness label to rank on. `off` is the "
+                        "trainer's own accuracy_reward, what the scan stored and what the "
+                        "REWARD optimises -- the primary number. `soft` re-derives it "
+                        "from the cases' stored answers with answer_grading, which a "
+                        "verbose-but-correct answer can pass; it needs --cases-dir. The "
+                        "audit line prints both either way, because the gap between them "
+                        "is how much of the ranking is grading noise")
     p.add_argument("--max-union", type=float, default=0.0,
                    help="report stage: drop steps whose DINO union covers more than "
                         "this fraction of the patch grid (0 = off, the default and "

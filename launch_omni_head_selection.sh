@@ -67,7 +67,10 @@ if [ "$DIRECT" != true ]; then
     echo "Submitting omni-head-select/$RUN to $PARTITION for ${DURATION}h"
     exec submit_job --account nvr_israel_rlop --partition "$PARTITION" \
         --gpu 8 --nodes 1 --duration "$DURATION" --name "omni-head-select-$RUN" \
-        --command "STAGE=$STAGE N_SAMPLES=$N_SAMPLES RUN=$RUN bash $SCRIPT_PATH --direct"
+        --command "env STAGE=$STAGE N_SAMPLES=$N_SAMPLES RUN=$RUN MAX_UNION=$MAX_UNION bash $SCRIPT_PATH --direct"
+    # `env`, not a bare `STAGE=... bash ...`: the cluster wrapper puts this string after an
+    # `exec` in a generated script, and `exec VAR=val cmd` is not an assignment -- the shell
+    # looks for a command literally named `STAGE=all` and exits 127 in 90 seconds.
 fi
 
 # =========================================================================
