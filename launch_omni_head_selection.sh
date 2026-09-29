@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Select the Omni's saliency LAYER and HEAD PAIR, end to end, on one 8-GPU node.
 #
-# The reward the Omni GRPO run trains is `--overlap-layer 33 --overlap-heads 28,31`, and
-# NEITHER number was selected: 33 is the attention layer nearest Qwen3-VL's layer 22 in
+# This is what SELECTED the layer and the head pair the Omni GRPO run now trains,
+# `--overlap-layer 19 --overlap-heads 4,9`. Before 2026-09-29 it trained 33 / 28,31 and
+# NEITHER number was selected: 33 was the attention layer nearest Qwen3-VL's layer 22 in
 # relative depth, and 28,31 were chosen on Qwen3-VL-8B, where they name two different
-# heads of a different model. This is what replaces both.
+# heads of a different model. `docs/omni-head-selection.md` is the result.
+#
+# Re-run this and INCUMBENT_LAYER/INCUMBENT_HEADS should name whatever the launcher trains
+# at the time, so the report says where the thing being replaced actually ranks.
 #
 #   bash launch_omni_head_selection.sh                       # submit, 4 h, one node
 #   bash launch_omni_head_selection.sh --direct              # on a node already held
@@ -50,6 +54,11 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-768}
 DINO_PORT=${DINO_PORT:-8137}
 STAGE=${STAGE:-all}                 # all | prepare | scan | report
 RUN=${RUN:-setA}
+# What the training launcher currently rewards, so the report can say where it ranks. The
+# 2026-09-29 run was submitted with 33 / 28,31 -- the inherited pair -- and that is what
+# outputs/omni_head_select/setA/logs/ records.
+INCUMBENT_LAYER=${INCUMBENT_LAYER:-19}
+INCUMBENT_HEADS=${INCUMBENT_HEADS:-4,9}
 OUT_DIR=${OUT_DIR:-$REPO/outputs/omni_head_select/$RUN}
 CASES_DIR="$OUT_DIR/cases"
 SCAN_DIR="$OUT_DIR/scan"
@@ -181,7 +190,8 @@ for label in off soft; do
         name="${label}$([ -z "$ctrl" ] && echo _raw || echo _partial)"
         python "$REPO/head_correlation_probe.py" --stage report --out-dir "$SCAN_DIR" \
             --cases-dir "$CASES_DIR" --max-union "$MAX_UNION" --controls "$ctrl" \
-            --incumbent-layer 33 --incumbent-heads 28,31 --regrade "$label" \
+            --incumbent-layer "$INCUMBENT_LAYER" --incumbent-heads "$INCUMBENT_HEADS" \
+            --regrade "$label" \
             2>&1 | tee "$OUT_DIR/logs/report_maxunion${MAX_UNION}_${name}.log"
     done
 done

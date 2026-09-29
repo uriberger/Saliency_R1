@@ -133,7 +133,7 @@ PY
 # ---------- 3. the report ----------
 step "report: no incumbent row, because 22 is a Mamba layer here"
 python head_correlation_probe.py --stage report --out-dir "$SCAN_DIR" \
-    --incumbent-layer 33 --incumbent-heads 28,31 2>&1 | tee "$OUT_DIR/logs/report.log"
+    --incumbent-layer 19 --incumbent-heads 4,9 2>&1 | tee "$OUT_DIR/logs/report.log"
 
 step "SMOKE PASSED"
 echo "cases  $CASES_DIR"

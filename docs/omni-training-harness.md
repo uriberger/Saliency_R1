@@ -241,19 +241,35 @@ smallest norm dominates — the minimum norms are ~2e-04 against a median of ~3e
 global metric over the concatenated gradient was never computed and would very likely be
 far smaller. Probably benign for GRPO. Do not chase it unless something else points there.
 
-## The one number that could not be carried over
+## The one number that could not be carried over — now selected
 
 The Qwen3-VL runs read layer 22 of 36. **The Omni has an attention matrix at only 6 of its
 52 layers**, at `[5, 12, 19, 26, 33, 42]`. 22 is a Mamba layer here; pointing the reward at
 it attaches the capture hook to nothing, so the trainer refuses rather than training on a
 reward that is silently zero everywhere.
 
-The default is 33, because it is the nearest attention layer to the same relative depth
-(63% against Qwen3-VL's 61%), and that is the whole of the argument for it — there is no
-head-selection probe behind it. The head pair carries over even less: 28 and 31 were chosen
-on Qwen3-VL-8B by a probe, and on any other model the same two indices name two arbitrary
-heads. They are kept so the command line differs in as little as possible. **Any attention
-number read off this run has to say so.**
+Through 2026-09-28 the defaults were **33** — the nearest attention layer to the same
+relative depth, 63% against Qwen3-VL's 61%, and that was the whole of the argument — and
+heads **28,31**, which were chosen on Qwen3-VL-8B and on any other model name two arbitrary
+heads. The 30-step run in §11 trained those, so **any attention number read off it has to
+say so**.
+
+**They were replaced on 2026-09-29 by `--overlap-layer 19 --overlap-heads 4,9`**, selected
+on this model by `head_correlation_probe` over all 192 cells — 6 attention layers × 32
+heads, so the layer is selected too rather than argued from depth.
+`docs/omni-head-selection.md` is the scan. In short: L19 h4 and h9 are the only two cells
+positive on all four halves of the parity split under both correctness labels, their
+held-out r exceeds their select-half r, and the old pair ranks 148–176 of 192.
+
+Two things that doc says and this one must not lose:
+
+* **Layers 26 and 42 are poison.** All 32 heads of 26 and most of 42 correlate *negatively*
+  with correctness under both labels, and it is neither the union-size confound nor image
+  mass.
+* **The selection corpus has a 52%-disputed correctness label**, because the Omni is a base
+  checkpoint whose prose answers `accuracy_reward`'s exact-string fallback cannot read.
+  Cold-starting the Omni is the real fix; `19 / 4,9` is a defensible improvement on an
+  inherited pair, not a settled one.
 
 ## 9. What actually stopped it, in the order it stopped
 

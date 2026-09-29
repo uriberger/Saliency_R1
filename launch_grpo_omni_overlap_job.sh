@@ -93,20 +93,39 @@
 # attention layers [5, 12, 19, 26, 33, 42]. It refuses to start otherwise.
 #
 # ---------------------------------------------------------------------------
-# THE SALIENCY LAYER MOVED, and it is the one number that could not be carried over.
+# THE SALIENCY LAYER AND HEAD PAIR ARE SELECTED, on this model. Layer 19, heads 4 and 9.
 #
 # The Qwen3-VL runs read layer 22 of 36. **The Omni has an attention matrix at only 6 of
 # its 52 layers** -- `hybrid_override_pattern` is MEMEM*EMEM... and the `*` positions are
 # [5, 12, 19, 26, 33, 42]. 22 is a Mamba layer here; pointing the reward at it attaches
 # the capture hook to nothing, so the trainer refuses rather than training on a reward
-# that is silently zero. 33 is the default because it is the nearest attention layer to
-# the same RELATIVE DEPTH (63% against Qwen3-VL's 61%), and that is the whole of the
-# argument for it -- there is no head-selection probe behind it.
+# that is silently zero.
 #
-# The HEAD PAIR carries over even less. 28 and 31 were chosen on Qwen3-VL-8B by a probe;
-# on any other model the same two indices name two arbitrary heads. They are kept so the
-# command line differs in as little as possible, and any attention number read off this
-# run has to say so. `--overlap-heads` takes a list; passing all 32 is the alternative.
+# Until 2026-09-29 the defaults were 33 and 28,31, and NEITHER was selected: 33 was the
+# attention layer nearest Qwen3-VL's 22 in relative depth (63% against 61%), and 28,31
+# were chosen on Qwen3-VL-8B, where they name two different heads of a different model.
+# `docs/omni-head-selection.md` is the scan that replaced them -- 192 cells, every
+# attention layer, so the LAYER is selected here too rather than argued from depth.
+#
+# L19 h4 and h9 are the only two of the 192 that are positive on all four halves of the
+# parity split -- select and held out, under BOTH correctness labels -- with union size,
+# patch count, step tokens and answer length controlled. Their held-out r EXCEEDS their
+# select-half r (h4: +0.108 against +0.096; h9: +0.121 against +0.053), which is the
+# signature of an effect rather than of selection. The old 33/28,31 ranks 148-176 of 192
+# and survives 5 of 16 analysis variants, always NEGATIVE.
+#
+# READ §4 OF THAT DOC BEFORE TRUSTING A NUMBER OFF THIS RUN. The corpus the selection was
+# made on has a correctness label that is 52% disputed: the Omni is a BASE checkpoint, it
+# answers in prose, and `accuracy_reward`'s exact-string fallback cannot read what it
+# writes. Cold-starting the Omni is the honest fix and this is not it. `19 / 4,9` is a
+# defensible improvement on an inherited pair, not a settled pair.
+#
+# NEVER POINT THIS AT LAYER 26 OR 42. All 32 heads of layer 26 and most of 42 carry a
+# NEGATIVE correlation with correctness under both labels (mean partial r ~ -0.047), and
+# it is neither the union-size confound nor image mass. Rewarding overlap there would be
+# rewarding a statistic that predicts being wrong.
+#
+# `--overlap-heads` takes a list; passing all 32 is the alternative.
 #
 # ---------------------------------------------------------------------------
 # THE MEMORY CEILING, and the one hyper-parameter that could not be carried over.
@@ -216,8 +235,10 @@ EXTRA_ARGS=""
 # ---------- overlap-reward defaults ----------
 W_OVERLAP=0.2
 TOKEN_REDUCTION=mean
-OVERLAP_HEADS="28,31"
-OVERLAP_LAYER=33              # see THE SALIENCY LAYER MOVED
+# Selected on this model by head_correlation_probe -- see THE SALIENCY LAYER AND HEAD PAIR
+# ARE SELECTED, and docs/omni-head-selection.md. Was 33 / 28,31, which was inherited.
+OVERLAP_HEADS="4,9"
+OVERLAP_LAYER=19
 OVERLAP_METRIC=mean_in
 BOX_THRESHOLD=0.10
 MAX_BOX_AREA=0.5
@@ -316,6 +337,20 @@ if (( GEN_BATCH % NUM_GENERATIONS != 0 )); then
     echo "ERROR: gen_batch $GEN_BATCH is not a multiple of num_generations $NUM_GENERATIONS." >&2
     exit 1
 fi
+
+# Layers 26 and 42 are the ones the selection scan found ANTI-predictive: all 32 heads of
+# 26 and most of 42 correlate negatively with correctness under both labels, and it is
+# neither the union-size confound nor image mass. Rewarding overlap there is rewarding a
+# statistic that predicts being WRONG. A warning and not a refusal, because "train the
+# anti-predictive heads" is a legitimate control arm -- but never by accident.
+case ",$OVERLAP_LAYER," in
+    *,26,*|*,42,*)
+        echo "WARNING: --overlap-layer $OVERLAP_LAYER is one of the two layers"           >&2
+        echo "         docs/omni-head-selection.md measured as ANTI-predictive of"        >&2
+        echo "         correctness (mean partial r ~ -0.047, both labels, all 32 heads"   >&2
+        echo "         at 26). If that is the arm you meant, say so in the run notes."    >&2
+        ;;
+esac
 
 # The completion cap is in the name whenever it is not the Qwen3-VL runs' 1024, because
 # it is the ONE training hyper-parameter that could not be carried over and a run that

@@ -467,6 +467,34 @@ def test_label_audit():
           soft is None and "answer_text" in note)
 
 
+def test_selection_is_wired_into_the_launcher():
+    """The measured pick and the trained default must not drift apart.
+
+    `docs/omni-head-selection.md` selected layer 19, heads 4 and 9, on this model. If the
+    launcher quietly goes back to the inherited 33 / 28,31 -- a rebase, a revert, a copied
+    block from the Qwen3-VL launcher -- nothing else in the repo notices: the run starts,
+    the reward moves, and every attention number off it means something different.
+    """
+    print("\nThe selected pair is what the training launcher rewards")
+    src = (REPO / "launch_grpo_omni_overlap_job.sh").read_text()
+    layer = re.search(r"^OVERLAP_LAYER=(\d+)", src, re.M)
+    heads = re.search(r'^OVERLAP_HEADS="([\d,]+)"', src, re.M)
+    check("the Omni launcher rewards layer 19",
+          layer is not None and layer.group(1) == "19",
+          "got " + (layer.group(1) if layer else "no OVERLAP_LAYER="))
+    check("and heads 4,9", heads is not None and heads.group(1) == "4,9",
+          "got " + (heads.group(1) if heads else "no OVERLAP_HEADS="))
+    check("the inherited 33 / 28,31 is gone from the defaults",
+          not re.search(r"^OVERLAP_LAYER=33", src, re.M)
+          and not re.search(r'^OVERLAP_HEADS="28,31"', src, re.M))
+    # The two layers the scan measured as ANTI-predictive have to stay noisy to pick.
+    check("layers 26 and 42 still trip the warning",
+          'in ",$OVERLAP_LAYER," in' in src.replace("case ", "in ")
+          and "*,26,*|*,42,*" in src)
+    check("the run name carries the layer and the heads, so two arms cannot collide",
+          "_L${OVERLAP_LAYER}_h${OVERLAP_HEADS//,/-}" in src)
+
+
 def main():
     test_attention_modules()
     test_image_token()
@@ -478,6 +506,7 @@ def main():
     test_loader_dispatch()
     test_answer_grading()
     test_label_audit()
+    test_selection_is_wired_into_the_launcher()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         for n in FAIL:
