@@ -70,10 +70,19 @@ def mcq_letter(text: str):
     A bare `\\bA\\b` search is not it: prose contains the article "A", and on a
     five-option benchmark that alone would hand a wrong model a 1-in-5 credit. So the
     letter has to be in a position that means a choice -- the whole answer, a
-    "the answer is X", or a parenthesised "(X)".
+    "the answer is X", a `\\boxed{X}`, or a parenthesised "(X)".
+
+    `\\boxed` was added for the Nemotron-Omni, which writes it and which the earlier rules
+    all miss -- `{}` is neither a bracket nor a parenthesis, so `\\boxed{A}` against gold
+    `A` scored WRONG. It cannot move any number already published: across all 24,476
+    answer strings stored under outputs/fig1-multistep, exactly zero contain
+    `\\boxed{LETTER}`. Counted, not assumed.
     """
     t = (text or "").strip()
     m = re.fullmatch(r"\W*([A-Ea-e])\W*", t)                  # the answer IS the letter
+    if m:
+        return m.group(1).upper()
+    m = re.search(r"\\boxed\s*\{\s*([A-Ea-e])\s*\}", t)       # \boxed{A}
     if m:
         return m.group(1).upper()
     m = re.match(r"^\W*([A-E])\s*[.):,\-]", t)                # "C. In the upper left area"

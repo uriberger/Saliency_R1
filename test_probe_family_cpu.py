@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 REPO = Path(__file__).resolve().parent
@@ -373,6 +374,99 @@ def test_loader_dispatch():
     check("and refuses an --adapter rather than silently ignoring it", ok)
 
 
+def test_answer_grading():
+    """The label the head ranking is built on, and how much of it is the grader.
+
+    Every string here is one the Nemotron-Omni actually wrote in the smoke run, with the
+    gold it was scored against. The trainer's `accuracy_reward` gave five of these zero.
+    """
+    print("\nGrading a verbose answer against a short gold")
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_t_ag", REPO / "answer_grading.py")
+    AG = importlib.util.module_from_spec(spec)
+    sys.modules["_t_ag"] = AG
+    spec.loader.exec_module(AG)
+
+    #  (what the model wrote, gold, is it right)
+    real = [
+        ("(C) water supply", "C", True),
+        ("(C) working", "C", True),
+        ("\\boxed{A}", "A", True),
+        ("\\boxed{D}", "A", False),
+        ("This is my answer. \nD", "D", True),
+        ("This is my answer. singing", "singing", True),
+        ("A", "A", True),
+        ("Yes", "Yes", True),
+        ("This is my answer.", "horses", False),
+        ("Thus, the answer is (D).", "C", False),
+    ]
+    for text, gold, want in real:
+        got = bool(AG.grade_completion(text, gold)["soft"])
+        check(f"{text[:26]!r} vs {gold!r} -> {'right' if want else 'wrong'}",
+              got == want, f"got {got}")
+
+    # The trainer's own rule, restated, so the GAP is what this file asserts and not just
+    # the new grader's behaviour.
+    def trainer_rule(text, gold):
+        return text.strip().lower() == gold.strip().lower()
+
+    missed = [t for t, g, w in real if w and not trainer_rule(t, g)]
+    check("the trainer's exact-match rule misses 5 of the 7 correct ones",
+          len(missed) == 5, str(len(missed)))
+    check("and the article 'A' in prose is still not an answer",
+          AG.mcq_letter("A large bus is parked outside.") is None,
+          str(AG.mcq_letter("A large bus is parked outside.")))
+    check("a boxed letter that disagrees with the gold stays wrong",
+          AG.grade_completion("\\boxed{D}", "A")["soft"] is False)
+
+
+def test_label_audit():
+    """`report` must print the two accuracies without changing any of them."""
+    print("\nThe label audit")
+    import importlib.util
+    import json
+    import tempfile
+
+    spec = importlib.util.spec_from_file_location("_t_hc", REPO / "head_correlation_probe.py")
+    HC = importlib.util.module_from_spec(spec)
+    sys.modules["_t_hc"] = HC
+    spec.loader.exec_module(HC)
+
+    with tempfile.TemporaryDirectory() as td:
+        cases = Path(td) / "cases"
+        cases.mkdir()
+        (cases / "shard00.json").write_text(json.dumps({"config": {}, "dropped": {}, "cases": [
+            {"row_index": 4, "gold": "C", "answer_text": "(C) water supply"},
+            {"row_index": 7, "gold": "A", "answer_text": "A"},
+            {"row_index": 9, "gold": "C", "answer_text": "Thus, the answer is (D)."},
+        ]}))
+        # two steps per completion, the label constant within one -- the scan's shape
+        row = np.array([4, 4, 7, 7, 9, 9])
+        cor = np.array([0.0, 0.0, 1.0, 1.0, 0.0, 0.0])      # the trainer's grades
+        soft, note = HC.label_audit(td, row, cor)
+
+    check("row 4 flips: (C) water supply IS C",
+          soft is not None and list(soft[:2]) == [1.0, 1.0], str(None if soft is None else soft))
+    check("row 7 was already right and stays right", list(soft[2:4]) == [1.0, 1.0])
+    check("row 9 answered D against gold C and stays wrong", list(soft[4:]) == [0.0, 0.0])
+    check("both accuracies are printed", "0.333" in note and "0.667" in note, note.strip())
+    check("and the trainer's label is named as the primary",
+          "primary number" in note)
+    check("the audit returns a NEW array -- `cor` is not mutated",
+          list(cor) == [0.0, 0.0, 1.0, 1.0, 0.0, 0.0])
+
+    with tempfile.TemporaryDirectory() as td:
+        cases = Path(td) / "cases"
+        cases.mkdir()
+        (cases / "shard00.json").write_text(json.dumps({"config": {}, "dropped": {}, "cases": [
+            {"row_index": 4, "gold": "C"},           # prepared before answer_text existed
+        ]}))
+        soft, note = HC.label_audit(td, np.array([4]), np.array([0.0]))
+    check("cases with no stored answer say so rather than grading nothing",
+          soft is None and "answer_text" in note)
+
+
 def main():
     test_attention_modules()
     test_image_token()
@@ -382,6 +476,8 @@ def main():
     test_generate_inputs()
     test_prompt_opens_think()
     test_loader_dispatch()
+    test_answer_grading()
+    test_label_audit()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         for n in FAIL:
