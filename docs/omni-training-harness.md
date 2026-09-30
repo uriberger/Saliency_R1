@@ -567,11 +567,29 @@ backward. `SR1_EMPTY_CACHE_PER_MICROSTEP` does return it (free goes back to 15.1
 "before the forward"), but it runs at the *start of the next micro-step* — after the
 allreduce that needed the room.
 
-So §10's model is wrong in the way that matters. There is **no drift**: nothing climbs
-over 50 steps, and mean completion length FALLS (349 → 335), as it did over the previous
-run's 30 (375 → 340). The failure mode is not "a cap reached eventually", it is **a margin
-of zero that is crossed when something asks for memory at the wrong instant** — which is
-exactly what `ncclUnhandledCudaError` from DDP's allreduce is (§12.2).
+So §10's model is wrong in the way that matters. The drift test, over the 50 steps:
+
+| | r |
+|---|---|
+| reserved (worst rank) vs **step number** | **−0.073** |
+| free (worst rank) vs **step number** | **+0.123** |
+| `completions/mean_length` vs step number | +0.079 |
+| reserved vs `completions/mean_length` | +0.375 |
+| free vs `completions/mean_length` | −0.429 |
+
+**Nothing climbs.** Memory does track length across steps — the bottom two rows — but
+length itself is flat, and the relationship is loose because the batch MEAN is not the
+variable that fills a card: the longest rollout on the fullest rank is. (That is why the
+plot's middle panel measures the same physics against the micro-step's own token count,
+where it is a straight line, and the right-hand panel is the looser view the question was
+originally asked in.)
+
+Mean completion length FALLS over this run (349 → 335) as it did over the previous run's
+30 (375 → 340). The failure mode is not "a cap reached eventually", it is **a margin of
+zero that is crossed when something asks for memory at the wrong instant** — which is
+exactly what `ncclUnhandledCudaError` from DDP's allreduce is (§12.2). The honest answer to
+"was it about to fail?" is: it was exactly as close to failing at step 49 as at step 0, and
+that distance was zero on nine of the fifty.
 
 The working set is linear in the sequence, cleanly, and now on the axis that decides it:
 

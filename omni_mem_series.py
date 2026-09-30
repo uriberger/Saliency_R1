@@ -119,13 +119,13 @@ INK, MUTED, GRID, SURFACE = "#0b0b0b", "#898781", "#e1e0d9", "#fcfcfb"
 CRITICAL = "#d03b3b"
 
 
-def plot(steps, rows, total, png, title):
+def plot(steps, rows, total, png, title, lengths_for=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 4.6), facecolor=SURFACE)
-    for ax in (ax1, ax2):
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(17.5, 4.6), facecolor=SURFACE)
+    for ax in (ax1, ax2, ax3):
         ax.set_facecolor(SURFACE)
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
@@ -199,6 +199,33 @@ def plot(steps, rows, total, png, title):
     ax2.set_title("Working set against sequence length", color=INK,
                   fontsize=11, loc="left", pad=10)
 
+    # ---- panel C: the one the handoff asked for, and why it is the weaker view -------
+    # `completions/mean_length` is a mean over the whole 48-rollout generation batch, and
+    # what fills a card is the LONGEST rollout on the fullest rank. So this relationship
+    # is real but loose, and panel B is the same physics measured on the right variable.
+    lengths_for = lengths_for or {}
+    ml = [(lengths_for[s_ + 1][0], steps[s_][2]) for s_ in sorted(steps)
+          if s_ + 1 in lengths_for]
+    if ml:
+        mx, my = zip(*ml)
+        ax3.scatter(mx, my, s=34, color=C_FREE, alpha=0.75, linewidths=0, zorder=3)
+        if len(set(mx)) > 1:
+            import numpy as np
+            r = float(np.corrcoef(mx, my)[0, 1])
+            b, a = np.polyfit(mx, my, 1)
+            xr = np.array([min(mx), max(mx)])
+            ax3.plot(xr, a + b * xr, color=INK, linewidth=1.4, zorder=4)
+            ax3.text(0.03, 0.95, f"r = {r:+.3f}   (n = {len(ml)} steps)",
+                     transform=ax3.transAxes, color=INK, fontsize=9, va="top", ha="left")
+        ax3.axhline(0, color=CRITICAL, linewidth=1.2, linestyle=(0, (4, 3)), zorder=1)
+        ax3.annotate(" card full", (max(mx), 0), xytext=(2, 4), textcoords="offset points",
+                     color=CRITICAL, fontsize=8.5, va="bottom", ha="right",
+                     annotation_clip=False)
+    ax3.set_xlabel("completions/mean_length for the step", color=MUTED, fontsize=9.5)
+    ax3.set_ylabel("free at its worst, GB", color=MUTED, fontsize=9.5)
+    ax3.set_title("Headroom against the batch's mean length", color=INK,
+                  fontsize=11, loc="left", pad=10)
+
     fig.suptitle(title, color=INK, fontsize=12.5, x=0.005, ha="left", y=0.995)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(png, dpi=160, facecolor=SURFACE)
@@ -235,7 +262,7 @@ def main():
                 fh.write(f"{s},{p:.2f},{r:.2f},{f:.2f},{a:.2f},{ml:.1f},{xl:.0f}\n")
         print(f"wrote {args.csv}")
     if args.png:
-        plot(steps, rows, total, args.png, args.title)
+        plot(steps, rows, total, args.png, args.title, lengths)
 
 
 if __name__ == "__main__":
