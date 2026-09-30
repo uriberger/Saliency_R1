@@ -334,7 +334,9 @@ Two were tried and REMOVED because they made it fail earlier:
 `garbage_collection_threshold` (does not compose with expandable segments) and capped NCCL
 channels.
 
-**`--max-completion-length` is the one training hyper-parameter that did not carry over.**
+**`--max-completion-length` is the one training hyper-parameter that did not carry over**
+— and until 2026-09-30 the launcher dropped it on the way to the node, so the paragraph
+below describes an intention rather than any run that happened. See §12.1.
 At 1024 the run reaches step 12-15 and then dies on whichever micro-step is carrying a
 completion that reached the cap -- and it gets there later, not never, because this reward
 lengthens chains, so the peak grows with them. 768 is the value the runs use; the policy's
@@ -344,6 +346,11 @@ that differs in it can never be mistaken for one that does not, and any comparis
 Qwen3-VL run has to state it.
 
 ## 11. Where the run got to
+
+> **Read §12 before using any number in this section.** The run below trained at 1024, not
+> at the 768 its directory name claims; its resumes died in NCCL and not in the allocator;
+> and the "97-124 s on a bare `srun`" is a run with the overlap reward switched off.
+
 
 50 steps were asked for; **30 were done**, `checkpoint-30` is on disk, and every logged step
 carried a live reward:
@@ -374,3 +381,146 @@ rather than never. Three ways forward, none free:
   hyper-parameter change -- but it is the one that makes the cap hold instead of drifting.
 * a lower cap (512), which truncates completions that finish.
 * a card bigger than 80 GB, which changes nothing else.
+
+## 12. Three things §10 and §11 got wrong, and how each was found
+
+Everything below came out of evidence that already existed on 2026-09-28 — the job logs in
+`outputs/omni_grpo_plan_a/job_logs/` and the `.wandb` transaction logs under
+`trl_repo_nemotron/wandb/`. No GPU was used to establish any of it. `omni_step_budget.py`
+is the reader.
+
+### 12.1 No submitted run has ever trained at 768
+
+`launch_grpo_omni_overlap_job.sh` submits a job whose command re-executes the same script
+with `--direct`, rebuilding the argument list from an `ARGS` array. **That array did not
+include `--max-completion-length`.** A flag passed on the submit line and not repeated in
+`ARGS` is silently replaced by the default at the top of the file, and nothing warns: the
+banner prints the default, the run trains, and the only record of what happened is the
+wandb config.
+
+The 30-step run in §11 was launched with `--max-completion-length 768`. It trained at
+**1024**:
+
+| evidence | value |
+|---|---|
+| `wandb-metadata.json` argv, `--max_completion_length` | `1024` |
+| `completions/max_length`, over its 30 logged steps | `1024` on 29 of 30 |
+| wandb run id | `..._mean_in` — the `_c768` suffix is computed on the node, and was lost |
+
+The output *directory* says `_c768` because the parent computed it before submitting and
+passed it explicitly. So the one hyper-parameter §10 calls "the deviation, and the ONLY
+one" had never reached a node, and **"768 OOMs on resume as well as 1024" is a statement
+about 1024 both times.**
+
+No submitted run has ever used 768. The only run on record that did (`run-20260928_055534`)
+was a `--direct` one, started before `--dino_api_base` existed, and it reached step 7.
+
+Six other parsed flags were missing the same way — `--num-generations`,
+`--per-device-batch`, `--learning-rate`, `--token-reduction`, `--box-threshold`,
+`--max-box-area` and the `--` passthrough. All of them happened to be sitting at their
+defaults, so only the completion cap bit. All seven are forwarded now, the default is 768,
+and the cap is on the node's own banner so a job log answers the question by itself.
+
+### 12.2 The resumes died in NCCL, not in the allocator
+
+§11 reads "every resume past step 30 OOMs on its first backward" and attributes it to the
+§10 dynamic — a working set linear in tokens reaching a fixed cap. The traceback says
+otherwise, identically in all three resume logs:
+
+```
+torch.distributed.DistBackendError: NCCL error in: .../ProcessGroupNCCL.cpp:3699,
+unhandled cuda error, NCCL version 2.27.3
+ncclUnhandledCudaError: Call to CUDA function failed.
+Last error:
+Cuda failure 2 'out of memory'
+```
+
+raised from DDP's gradient allreduce inside `loss.backward()`. That is **not**
+`torch.OutOfMemoryError`, which is what a working set that does not fit produces and which
+names the size it wanted. And the last memory line before it reads `peak 68.0 of 79.2`.
+
+NCCL allocates its communicator and channel buffers with its own `cudaMalloc`, outside the
+caching allocator. The three columns `_mem_report` printed — allocated, reserved, peak —
+are all torch's view of torch's own pool, and none of them can see that memory or the
+margin it needs. A report saying "68.0 of 79.2" was describing a card that had nothing
+left to give NCCL.
+
+`_mem_report` now prints `cuda.mem_get_info()`'s **free** as a fourth column, on every
+rank rather than the main process, for every micro-step rather than the first six, with
+the micro-step's own forwarded token count. `omni_mem_series.py` plots it.
+
+What this does *not* yet establish is the mechanism — whether reserved growth crowds NCCL
+out, whether it is specific to the resume path, or whether a fresh start is equally
+exposed and got lucky. The instrumentation is there to answer it on the next failure
+instead of after it.
+
+### 12.3 There is no container-vs-`srun` gap
+
+§11's "215.7 s on the submitted (container) path and 97-124 s on a bare `srun`" compares
+two runs that were not doing the same work. The fast number comes from
+`run-20260928_024250`, whose profiling reads:
+
+```
+_compute_overlap_step_maps    0.0 s
+think_overlap_reward          0.0 s
+```
+
+and whose logged rewards are `think_format_reward/mean: 0` and
+`think_overlap_reward/mean: nan` on every step. It is the pre-fix run from §9's table —
+the one where the chat template already opens `<think>`, so every rollout scored as
+malformed and **no saliency map was built at all**. The saliency capture is the largest
+single item in the step, and that run skipped it.
+
+Median step time from the wandb timestamps, same code path, same cluster:
+
+| run | cap | overlap reward | step |
+|---|---|---|---|
+| `024250` | 1024 | **off** (format 0, overlap NaN) | **84.1 s** |
+| `055534`, direct | 768 | live | **184.2 s** |
+| `070121`, submitted | 1024 | live | **208.5 s** |
+
+The 184 → 208 difference is the completion cap, not the container: at 768
+`vLLM.generate` drops 37.4 → 27.9 s and the saliency capture 57.1 → 25.6 s. So the
+container costs nothing measurable, and the honest reading of "97-124 s" is *what a step
+costs with the reward under test turned off*.
+
+### 12.4 The step budget, as far as rank 0 can see it
+
+From `run-20260928_070121` (cap 1024, 29 profiled steps, medians; `_prepare_inputs` and
+`compute_loss` are summed over their 8 calls per optimizer step):
+
+| | s | |
+|---|---|---|
+| `_prepare_inputs` | **168.6** | envelope |
+| ├ `_compute_overlap_step_maps` | 57.1 | 8 teacher-forced forwards + T5 segmentation |
+| ├ `vLLM.generate` | 37.4 | |
+| ├ `_calculate_rewards` | 6.9 | of which judge 4.6, DINO-backed overlap 2.0 |
+| ├ `_move_model_to_vllm` | 0.2 | the 18-tensor sync is doing its job |
+| └ **unattributed** | **67.0** | inline code with no method to wrap |
+| `compute_loss` | 15.0 | forward only; `_get_per_token_logps_and_entropies` 9.2 of it |
+| **outside both** | **~24.9** | backward, optimizer, DDP allreduce, dataloader, logging |
+| observed step | **208.5** | |
+
+Two corrections to the handoff's estimates, both large and both in the same direction:
+generation is **37 s and not 7-9.8 s**, and the saliency capture is **57 s and not ~5 s**.
+The ~5 s was extrapolated from a head-selection scan at 0.65 s per case; the trainer's
+capture is an order of magnitude more per case, and the scan is not a measurement of it.
+
+The 67 s is the target of `SR1_LAP` (see the block above `_mem_report` in
+`grpo_trainer_qwen3.py`). It is inline code in the middle of
+`_generate_and_score_completions` — the processor on eight native-resolution pictures,
+`gather_object` on the images, the decode-and-pad, the logging gathers — none of it a
+method, so `profiling_context` never saw it. The leading hypothesis is **straggler time**:
+every number here is rank 0's, `_compute_overlap_step_maps` ranges 11-270 s across runs,
+and a step costs the slowest rank. `_lap_barrier` is placed immediately after the capture
+precisely to split "this rank's work" from "waiting for the worst one".
+
+### 12.5 What this changes about the three levers
+
+§11 lists `--length-guard` first. It bounds the **mean**, and the allocation that decides
+whether a micro-step fits is set by that micro-step's **own** completion — `per_device` is
+1 and `SR1_TRIM_COMPLETION_PADDING` trims to the sequence actually forwarded. A guard makes
+cap-length micro-steps rarer; it cannot make the worst one smaller. Only the cap can.
+
+And §11's evidence for drift does not survive its own table: mean length went **375 → 340**
+over the 30 steps. "This reward lengthens chains" is not what that run shows.
