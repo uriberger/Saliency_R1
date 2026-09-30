@@ -17,6 +17,7 @@ import inspect
 import os
 import re
 import textwrap
+import time
 import warnings
 
 import numpy as np
@@ -2418,6 +2419,7 @@ class GRPOTrainer(Trainer):
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
+        self._lap()  # start the step's stopwatch; see SR1_LAP above _mem_report
 
         prompts = [x["prompt"] for x in inputs]
 
@@ -2532,6 +2534,8 @@ class GRPOTrainer(Trainer):
         # anchored `$` is what keeps the system prompt's own `<think></think>` out of it.
         self._prompt_opens_think = bool(
             prompts_text and re.search(r"<think>\s*$", prompts_text[0]))
+
+        self._lap("prep_prompts")  # chat template + processor (images) + prompt truncation
 
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
@@ -2737,6 +2741,11 @@ class GRPOTrainer(Trainer):
         # branch it was already sliced to prompt_length, so this is consistent either way.
         prompt_length = prompt_ids.size(1)
 
+        # The whole generation block, MINUS the `vLLM.generate` call the profiler already
+        # times: the weight sync, the gather_object of prompts and PIL images across six
+        # ranks, and the scatter of the results back.
+        self._lap("generate_block")
+
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
@@ -2901,6 +2910,9 @@ class GRPOTrainer(Trainer):
         answer_end = [min(i, len(attentions) - 1) if j else 1 for i, j in zip(answer_end, invalid)]
         answer_start = [min(z, i) if j else 1 for i, j, z in zip(answer_start, invalid, answer_end)]
         '''
+        # Decode, EOS-mask, old/ref log-probs, and the think/answer span search.
+        self._lap("post_generate")
+
         attn_batch = []
 
         if self.reward_variant == "none":
@@ -3085,12 +3097,18 @@ class GRPOTrainer(Trainer):
 
         torch.cuda.empty_cache()
 
-
+        # THIS RANK's saliency capture, then the wait for the slowest one. The split
+        # matters: the capture is eight teacher-forced forwards over completions whose
+        # lengths differ by 10x between ranks, so the step costs the MAXIMUM and the
+        # profiler only ever saw the main process's own share.
+        self._lap("saliency_block")
+        self._lap_barrier("wait_ranks_after_saliency")
 
         # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
         # important because rewards will be normalized per group, and completions are distributed. We will later slice
         # rewards_per_func to extract each process's subset.
         rewards_per_func = self._calculate_rewards(inputs, original_prompts, completions, completion_ids_list, attn_batch, invalid)
+        self._lap("rewards_block")
 
         # Apply weights to each reward function's output and sum.
         #
@@ -3382,6 +3400,10 @@ class GRPOTrainer(Trainer):
         for key in (*self.family.mm_inputs, *self.family.geometry_inputs):
             if key in prompt_inputs:
                 output[key] = prompt_inputs[key]
+        # Advantage normalisation, the metric gathers, and -- under --log_completions --
+        # a `gather_object` of every prompt, completion and PIL image in the batch.
+        self._lap("epilogue")
+        self._lap_flush()
         return output
 
     def compute_liger_loss(self, unwrapped_model, inputs):
@@ -3434,8 +3456,72 @@ class GRPOTrainer(Trainer):
         else:
             return self._compute_loss(model, inputs)
 
-    def _mem_report(self, where):
-        """One line of CUDA accounting, for the first few micro-steps of a run.
+    # ---- SR1_LAP: the part of the step that no profiler covers -------------------------
+    #
+    # TRL's `profiling_context` wraps whole METHODS, so everything it can see is a method:
+    # `vLLM.generate`, `_compute_overlap_step_maps`, `_calculate_rewards`, `compute_loss`.
+    # On the Omni those add to ~102 s inside a `_prepare_inputs` that measures 169 s, and
+    # the missing 67 s is all inline code in the middle of `_generate_and_score_completions`
+    # -- the processor call on eight native-resolution pictures, `gather_object` on the
+    # images, the decode-and-pad, the logging gathers -- none of which is a method and none
+    # of which can be wrapped without re-indenting branches in a 970-line function.
+    #
+    # So this is a stopwatch and not a context manager: `_lap("name")` closes the span that
+    # began at the previous mark and names it. Single-line inserts cannot mis-indent an
+    # `if`, and adding one more probe is one more line rather than a diff that moves code.
+    #
+    # Everything here is off unless SR1_LAP=1. `_lap_barrier` is the exception worth
+    # stating: it calls `wait_for_everyone()`, which does not exist in the uninstrumented
+    # run. It does not ADD time -- the ranks already meet at the next collective -- it MOVES
+    # it, out of whatever span happens to follow and into a line that says "waiting for the
+    # slowest rank". That distinction is the whole question for the saliency capture, whose
+    # per-step cost on the main process ranges 11-270 s across runs.
+
+    def _lap(self, name=None):
+        """Mark the end of a span. `name=None` just starts the clock."""
+        if os.environ.get("SR1_LAP") != "1":
+            return
+        now = time.perf_counter()
+        prev = getattr(self, "_lap_t", None)
+        if prev is not None and name:
+            acc = getattr(self, "_lap_acc", None)
+            if acc is None:
+                acc = self._lap_acc = {}
+            acc[name] = acc.get(name, 0.0) + (now - prev)
+        self._lap_t = now
+
+    def _lap_barrier(self, name):
+        """Close a span at a rendezvous, so straggler time is attributed to itself."""
+        if os.environ.get("SR1_LAP") != "1":
+            return
+        self.accelerator.wait_for_everyone()
+        self._lap(name)
+
+    def _lap_flush(self):
+        """Log one step's spans and reset. wandb, and the log when SR1_LAP_STDOUT=1."""
+        if os.environ.get("SR1_LAP") != "1":
+            return
+        acc = getattr(self, "_lap_acc", None)
+        if not acc:
+            return
+        self._lap_acc = {}
+        self._lap_t = None
+        if self.accelerator.is_main_process:
+            if "wandb" in self.args.report_to:
+                try:
+                    import wandb
+
+                    if wandb.run is not None:
+                        wandb.log({f"lap/{k}": v for k, v in acc.items()})
+                except Exception:
+                    pass
+            if os.environ.get("SR1_LAP_STDOUT") == "1":
+                step = getattr(getattr(self, "state", None), "global_step", -1)
+                parts = "  ".join(f"{k} {v:.1f}" for k, v in sorted(acc.items(), key=lambda kv: -kv[1]))
+                print(f"[lap] step {step:>4}  {parts}", flush=True)
+
+    def _mem_report(self, where, tokens=None):
+        """One line of CUDA accounting per micro-step.
 
         SR1_MEM_REPORT=N prints it for the first N calls and then goes quiet. It exists
         because "73.84 GB in use and it wants 5.50 more" says nothing about WHICH 73.84:
@@ -3443,20 +3529,60 @@ class GRPOTrainer(Trainer):
         INCLUDING that request, and the gap between those two numbers is the whole
         question. `reserved - allocated` separates "the allocator is holding it" from
         "something owns it", which is what decides whether the fix is a knob or a design.
+
+        FREE IS THE COLUMN THAT WAS MISSING, and it is the only one of the four that can
+        explain the failure this was written for. The three torch counters describe torch's
+        own pool; `cuda.mem_get_info()` asks the DRIVER. Everything that allocates outside
+        the caching allocator -- the CUDA context, cuBLAS workspaces, and NCCL's
+        communicator and channel buffers -- is invisible to the first three and comes
+        straight off the fourth. The 2026-09-28 resumes died in
+        `ncclUnhandledCudaError: Cuda failure 2 'out of memory'` raised from DDP's
+        allreduce inside `loss.backward()`, NOT in `torch.OutOfMemoryError`, with torch's
+        own peak at 68.0 GB of 79.2. A report that prints only torch's numbers says "11 GB
+        spare" about a card that had none left to give NCCL.
+
+        Three env knobs, all off by default so a Qwen3-VL run is untouched:
+
+            SR1_MEM_REPORT=N          first N calls (unchanged)
+            SR1_MEM_REPORT_EVERY=K    and then every Kth call, for the whole run -- this is
+                                      what lets peak be plotted against step number
+            SR1_MEM_REPORT_RANKS=all  every rank, not just the main process. Peak is
+                                      per-DEVICE and the ranks do not carry equal work, so
+                                      the main process's number is a lower bound on the
+                                      one that decides whether the step fits.
+
+        `tokens` is the micro-step's actual forwarded sequence length, so the working set
+        can be regressed on it rather than on the batch's `completions/mean_length`.
         """
         n = int(os.environ.get("SR1_MEM_REPORT", "0"))
-        if not n or getattr(self, "_mem_reports", 0) >= n:
+        every = int(os.environ.get("SR1_MEM_REPORT_EVERY", "0"))
+        if not n and not every:
             return
-        if not self.accelerator.is_main_process:
+        calls = getattr(self, "_mem_reports", 0)
+        self._mem_reports = calls + 1
+        due = (calls < n) or (every and calls % every == 0)
+        if not due:
             return
-        self._mem_reports = getattr(self, "_mem_reports", 0) + 1
+        if os.environ.get("SR1_MEM_REPORT_RANKS", "") != "all" and not self.accelerator.is_main_process:
+            return
         g = 2 ** 30
-        print(f"[mem] {where:<22} allocated {torch.cuda.memory_allocated()/g:5.1f}  "
+        free, total = torch.cuda.mem_get_info()
+        rank = self.accelerator.process_index
+        step = getattr(getattr(self, "state", None), "global_step", -1)
+        print(f"[mem] r{rank} step {step:>4} {where:<22} "
+              f"allocated {torch.cuda.memory_allocated()/g:5.1f}  "
               f"reserved {torch.cuda.memory_reserved()/g:5.1f}  "
               f"peak {torch.cuda.max_memory_allocated()/g:5.1f}  "
-              f"(of 79.2 GB)", flush=True)
+              f"free {free/g:5.1f}  (of {total/g:.1f} GB)"
+              + ("" if tokens is None else f"  tokens {tokens}"), flush=True)
 
     def _compute_loss(self, model, inputs):
+        # BEFORE the empty_cache below, deliberately: this is the only point in the loop
+        # that sees what the PREVIOUS micro-step's backward left behind. `empty_cache()`
+        # returns the allocator's pool to the driver, so "before the forward" always reads
+        # tidy and can never show the post-backward reserved that NCCL had to allocate
+        # around.
+        self._mem_report("entering compute_loss")
         if os.environ.get("SR1_EMPTY_CACHE_PER_MICROSTEP") == "1":
             # RELEASE THE CACHE BEFORE THE BIGGEST ALLOCATION OF THE STEP, and the numbers
             # are why. On the Omni a training rank sits at
@@ -3475,7 +3601,8 @@ class GRPOTrainer(Trainer):
             # OFF by default: it is a sync per micro-step, and a run with room does not
             # need it.
             torch.cuda.empty_cache()
-        self._mem_report("before the forward")
+        # ("before the forward" is reported further down, once the padding trim has fixed
+        # the sequence length, so the line can carry the token count it is explaining.)
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -3507,6 +3634,12 @@ class GRPOTrainer(Trainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
+        # The sequence this micro-step actually forwards, AFTER the padding trim above --
+        # the working set is linear in it, and it is not `completions/mean_length`, which
+        # is a mean over the whole generation batch and misses the one rollout at the cap
+        # that decides whether the card holds.
+        self._mem_report("before the forward", tokens=input_ids.size(1))
+
         # Compute the per_token_logps and the entropy at each position in the completion
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
@@ -3517,7 +3650,7 @@ class GRPOTrainer(Trainer):
             mm_source=inputs,
         )
 
-        self._mem_report("after the forward")
+        self._mem_report("after the forward", tokens=input_ids.size(1))
 
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)

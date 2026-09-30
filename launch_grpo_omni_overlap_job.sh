@@ -212,13 +212,30 @@ EXCLUDE_HOSTS=${EXCLUDE_HOSTS:-}
 # batch_short (PriorityTier 40). Warm-up is longer here than there -- the preflight is ~4
 # min and vLLM loads 62 GB -- so a 1 h chunk is mostly warm-up on the FIRST allocation and
 # mostly training on every requeue after it.
-DURATION=${DURATION:-2}
+# 4 h, and the reason is the RESUME rather than the throughput. At ~180 s a step a 50-step
+# run is ~2.5 h of training on top of ~25 min of warm-up (a ~4 min preflight, then vLLM
+# loading 62 GB), so a 2 h chunk cannot hold it and every 2 h chunk ends in a requeue --
+# and the requeue is exactly where the 2026-09-28 run died, three times, in NCCL's
+# allreduce rather than in the allocator. Asking for one allocation that fits the whole
+# run takes that failure off the critical path instead of betting on it.
+#
+# The cost is giving up batch_short: sr1__drop_too_short removes it at anything over 2 h
+# (MaxTime=2h), so a 4 h job goes to batch_singlenode / batch_block1 and loses
+# PriorityTier 40. DURATION=2 buys it back for a run that is happy to requeue.
+DURATION=${DURATION:-4}
 
 # ---------- training defaults: identical to the Qwen3-VL runs ----------
 MODEL=${MODEL:-nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16}
 NUM_GPUS=8
 OUTPUT_DIR=""
-MAX_COMPLETION_LENGTH=1024
+# 768, NOT the Qwen3-VL runs' 1024. THE MEMORY CEILING is the argument; this is only the
+# note on why the default moved. It was 1024 with the recipe carried in prose ("768 is the
+# value the runs use"), and prose is not a default: every submitted run so far trained at
+# 1024 regardless of what was typed, because the submit path dropped the flag. Both halves
+# are fixed -- the flag is forwarded now, and the value a run gets when nobody passes one
+# is the value the harness doc says the runs use. The RUN_NAME rule below is unchanged and
+# still keys off 1024, so this default lands in the name as `_c768`.
+MAX_COMPLETION_LENGTH=768
 NUM_GENERATIONS=8
 GRAD_ACCUM=8
 PER_DEVICE_BATCH=1
@@ -363,14 +380,40 @@ RUN_NAME="grpo-omni30b-overlap__wov${W_OVERLAP}_L${OVERLAP_LAYER}_h${OVERLAP_HEA
 if [ "$DIRECT" != true ]; then
     PARTITION=${PARTITION:-$(SR1_JOB_HOURS=$DURATION sr1_pick_partition)}
     sr1_find_submit_job || { echo "ERROR: submit_job not found" >&2; exit 1; }
+    # EVERY PARSED TRAINING FLAG HAS TO BE ON THIS LIST, and the one that was missing cost
+    # a run. The submitted job re-executes this same script with `--direct` on the node,
+    # so a flag the user passed here and this array does not repeat is silently replaced
+    # by the DEFAULT at the top of the file. Nothing warns: the banner prints the default,
+    # the run trains, and only the wandb config says what actually happened.
+    #
+    # `--max-completion-length` was the missing one. The 2026-09-28 run was launched with
+    # `--max-completion-length 768`, wrote to `.../grpo-omni30b-overlap__..._c768/`, and
+    # trained at **1024** -- its wandb config says `max_completion_length: 1024`, its
+    # `completions/max_length` is 1024 on 29 of 30 logged steps, and its wandb run id lost
+    # the `_c768` suffix because RUN_NAME is recomputed on the node from the default. The
+    # one hyper-parameter THE MEMORY CEILING calls "the deviation, and the ONLY one" had
+    # never actually been applied to a submitted run, so "768 OOMs on resume too" was a
+    # statement about 1024 both times. See docs/omni-training-harness.md §12.
+    #
+    # The submit-only flags are deliberately absent: --partition, --duration and
+    # --exclude-hosts are consumed by submit_job here and mean nothing on the node.
     ARGS=("--direct" "--num-gpus" "$NUM_GPUS" "--model" "$MODEL" "--output-dir" "$OUTPUT_DIR"
           "--dataset" "$DATASET" "--max-steps" "$MAX_STEPS" "--w-overlap" "$W_OVERLAP"
           "--overlap-layer" "$OVERLAP_LAYER" "--overlap-heads" "$OVERLAP_HEADS"
           "--overlap-metric" "$OVERLAP_METRIC" "--lora-targets" "$LORA_TARGETS"
           "--grad-accum" "$GRAD_ACCUM" "--vllm-gpus" "$VLLM_GPUS_N"
-          "--vllm-gpu-mem" "$VLLM_GPU_MEM" "--beta" "$BETA")
+          "--vllm-gpu-mem" "$VLLM_GPU_MEM" "--beta" "$BETA"
+          "--max-completion-length" "$MAX_COMPLETION_LENGTH"
+          "--num-generations" "$NUM_GENERATIONS"
+          "--per-device-batch" "$PER_DEVICE_BATCH"
+          "--learning-rate" "$LEARNING_RATE"
+          "--token-reduction" "$TOKEN_REDUCTION"
+          "--box-threshold" "$BOX_THRESHOLD"
+          "--max-box-area" "$MAX_BOX_AREA")
     [ "$PREFLIGHT" = true ] || ARGS+=("--no-preflight")
     [ "$SYNC_LORA_ONLY" = true ] || ARGS+=("--sync-all-weights")
+    # `-- <passthrough>` has to stay LAST, because the node-side parser stops at `--`.
+    [ -n "$EXTRA_ARGS" ] && ARGS+=("--" $EXTRA_ARGS)
     echo "Submitting $RUN_NAME to $PARTITION for ${DURATION}h"
     exec submit_job --account "$ACCOUNT" --partition "$PARTITION" \
         --gpu 8 --nodes 1 --duration "$DURATION" --name "$RUN_NAME" \
@@ -407,6 +450,27 @@ mkdir -p "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR"
 # CUDA accounting for the first few micro-steps. Cheap, and the only thing that separates
 # "the allocator is holding it" from "something owns it" on a card this full.
 export SR1_MEM_REPORT=${SR1_MEM_REPORT:-6}
+# ...and then for EVERY micro-step, on EVERY rank, for the whole run. Six is enough to
+# answer "does it start", and the failure this run exists to close is not at the start:
+# the 2026-09-28 run died after thirty steps, and the six lines it printed were from step
+# 1. Peak has to be a series before "was it about to fail?" is a question with an answer.
+#
+# Three reports x eight micro-steps x six ranks x fifty steps is ~7,200 lines against a
+# 28 MB job log, and the cost is four `cudaMemGetInfo` calls a micro-step.
+#
+# ALL RANKS, not the main process: peak is per-device, the ranks hold completions of very
+# different lengths, and it is the fullest card that decides whether the step fits.
+export SR1_MEM_REPORT_EVERY=${SR1_MEM_REPORT_EVERY:-1}
+export SR1_MEM_REPORT_RANKS=${SR1_MEM_REPORT_RANKS:-all}
+# Per-span timing for the part of the step TRL's profiler cannot see -- ~67 s of a 169 s
+# `_prepare_inputs` is inline code in `_generate_and_score_completions`, which is not a
+# method and so was never wrapped. See the SR1_LAP block in grpo_trainer_qwen3.py.
+#
+# It adds two `wait_for_everyone()` calls per step. They move time rather than adding it
+# (the ranks already meet at the next collective), but they are a real change to the run,
+# which is why they are behind a flag and named in the banner.
+export SR1_LAP=${SR1_LAP:-1}
+export SR1_LAP_STDOUT=${SR1_LAP_STDOUT:-1}
 # Release the allocator's cache before each micro-step's forward. Measured on this model:
 # a rank sits at 62.4 GB allocated and 71.9 GB RESERVED, so 9.2 GB is held and owned by
 # nothing, and the backward's one ~5.5 GB block then fails with 5.3 GB free. The forward
@@ -447,6 +511,12 @@ echo "Envs:             train=$TRAIN_ENV  generate=$VLLM_ENV"
 echo "GPUs (total $NUM_GPUS):  DINO=cuda:$DINO_GPU  vLLM=cuda:[$VLLM_GPUS]  train=cuda:[$TRAIN_GPUS] ($TRAIN_N procs)"
 echo "Plan:             $([ "$VLLM_GPUS_N" = 2 ] && echo "A' (server on two cards, five trainers)" || echo 'A (one whole copy per training card)')"
 echo "Batch:            per_device=$PER_DEVICE_BATCH num_generations=$NUM_GENERATIONS grad_accum=$GRAD_ACCUM  (gen_batch=$GEN_BATCH)"
+# PRINTED BECAUSE IT WENT WRONG SILENTLY. This is the one hyper-parameter that differs
+# from the Qwen3-VL runs, it is what decides whether the card holds, and for one whole run
+# the value here was not the value on the command line -- see the ARGS array above. It is
+# now on the node's own banner, so `head` on a job log answers "what cap did this train
+# at?" without going to wandb.
+echo "Completion cap:   max_completion_length=$MAX_COMPLETION_LENGTH $([ "$MAX_COMPLETION_LENGTH" = 1024 ] && echo '(the Qwen3-VL value -- see THE MEMORY CEILING)' || echo "(in the run name as _c$MAX_COMPLETION_LENGTH)")"
 echo "Reward:           overlap $OVERLAP_METRIC w=$W_OVERLAP  layer=$OVERLAP_LAYER heads=$OVERLAP_HEADS tr=$TOKEN_REDUCTION"
 echo "LoRA:             r=16 alpha=32 targets=$LORA_TARGETS (scoped to the decoder by vlm_family)"
 echo "Steps:            max_steps=$MAX_STEPS save_steps=$SAVE_STEPS"
