@@ -322,6 +322,21 @@ def test_video_frames():
           cc.f_step.size == 16 and cc.f_step.size >= c2.f_step.size,
           f"{cc.f_step.size} vs {c2.f_step.size}")
 
+    # A heading is one unwrapped string, so a long model name beside a narrow column
+    # used to lose its last word off the edge with nothing to show for it. It is sized
+    # for now, and the gate is that no ink lands outside the panel it belongs to.
+    long_lbl = ["Self-Saliency (ours)  ·  step 1 of 2", "Vanilla  ·  answer"]
+    cl = V.Canvas(img, q, chains, cfg(), labels=long_lbl)
+    panel4 = img.resize((cl.img_w, cl.img_h))
+    f = cl.frame([(("ours", long_lbl[0]), panel4, 0, None),
+                  (("coldstart", long_lbl[1]), panel4, None, ("D", "B", False))])
+    a = np.asarray(f)
+    right_margin = a[:, cl.w - cl.pad + 2:, :]
+    check("a long heading does not run off the right edge",
+          int(right_margin.max()) <= 20, f"brightest margin pixel {int(right_margin.max())}")
+    check("and the heading gets more than one line when it needs one",
+          cl.lbl_lines >= 2 and cl.lbl_h > c.lbl_h, f"{cl.lbl_lines} lines, {cl.lbl_h}px")
+
     # Two verdicts side by side under chains of different lengths have to line up, or
     # the eye reads the shorter chain's model as having answered first.
     card = cc.frame([(("ours", "ours"), panel3, None, ("Two", "Two", True)),

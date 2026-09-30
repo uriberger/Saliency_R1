@@ -119,8 +119,14 @@ class Canvas:
     against the longest step text, and each frame only repaints it.
     """
 
-    def __init__(self, img, question, chains, args):
+    def __init__(self, img, question, chains, args, labels=()):
         """`chains` is [(model name, [step text, ...])], one panel of the frame each.
+
+        `labels` is every heading any frame can put above a chain -- "Vanilla · step 1 of
+        2", "Self-Saliency (ours) · answer". They are sized for here rather than drawn and
+        hoped for: a heading is one string, it is not wrapped by the caller, and a long
+        model name beside a narrow column silently loses its last word off the edge.
+        Pass them all, and the tallest wrap decides how much room the heading gets.
 
         `--layout rows` stacks the models, each with its chain beside its picture: a tall
         frame, and the one to use when the picture is wide. `--layout columns` puts them
@@ -155,7 +161,9 @@ class Canvas:
             self.f_step = font(size)
             self.f_lbl = font(size, bold=True)
             self.lh = int(self.f_step.size * 1.45)
-            self.lbl_h = int(self.f_lbl.size * 2.2)
+            self.lbl_lines = max([len(wrap(l, self.f_lbl, self.text_w - 2 * pad))
+                                  for l in labels] or [1])
+            self.lbl_h = int(self.f_lbl.size * 1.45) * self.lbl_lines + self.lh // 2
             self.blocks = {name: [wrap(f"{i + 1}. {s}", self.f_step, self.text_w - 2 * pad)
                                   for i, s in enumerate(steps)]
                            for name, steps in chains}
@@ -176,10 +184,16 @@ class Canvas:
         if self.h % 2:
             self.h += 1
 
+    def _label(self, d, x, y, label, colour):
+        """The heading, wrapped to the column -- never drawn wider than it was sized for."""
+        lh = int(self.f_lbl.size * 1.45)
+        for i, ln in enumerate(wrap(label, self.f_lbl, self.text_w - 2 * self.pad)):
+            d.text((x, y + i * lh), ln, fill=colour, font=self.f_lbl)
+
     def _chain(self, d, x, y, key, cur, footer, label=None):
         """The chain with `cur` lit and the answer line; `label` above it if given."""
         if label is not None:
-            d.text((x, y), label, fill=ACCENT if cur is not None else DIM, font=self.f_lbl)
+            self._label(d, x, y, label, ACCENT if cur is not None else DIM)
             y += self.lbl_h
         top = y
         for i, block in enumerate(self.blocks[key]):
@@ -228,8 +242,8 @@ class Canvas:
                             key, cur, footer, label=label)
             else:
                 left = pad + k * (self.img_w + pad)
-                d.text((left, self.head_h), label,
-                       fill=ACCENT if cur is not None else DIM, font=self.f_lbl)
+                self._label(d, left, self.head_h, label,
+                            ACCENT if cur is not None else DIM)
                 out.paste(picture, (left, self.head_h + self.lbl_h))
                 self._chain(d, left, self.head_h + self.lbl_h + self.img_h + pad,
                             key, cur, footer)
@@ -385,9 +399,21 @@ def main():
     img = Image.open(loaded[0]["sdir"] / "original.png").convert("RGB")
     meta0 = loaded[0]["meta"]
     shown_q = (args.question or str(meta0.get("question", ""))).strip()
-    canvas = Canvas(img, shown_q, [(m["model"], m["texts"]) for m in loaded], args)
-    plain = fit_image(img, canvas.img_w, canvas.img_h)
     multi = len(loaded) > 1
+    map_label = args.map if args.map_label is None else args.map_label
+
+    # every heading any frame can draw, built before the layout so it can be sized for
+    headings = []
+    for m in loaded:
+        tag = f"{m['label']}  ·  " if multi else ""
+        headings += [f"{tag}input", f"{tag}answer"]
+        headings += [f"{tag}step {k + 1} of {len(m['want'])}"
+                     + (f"  ·  {map_label}" if map_label else "")
+                     for k in range(len(m["want"]))]
+
+    canvas = Canvas(img, shown_q, [(m["model"], m["texts"]) for m in loaded], args,
+                    labels=headings)
+    plain = fit_image(img, canvas.img_w, canvas.img_h)
     gold = args.gold if args.gold is not None else str(meta0.get("gt_answer"))
 
     def norm(s):
@@ -413,8 +439,6 @@ def main():
         m["ok"] = (v == "ok") if v is not None else norm(m["said"]) == norm(gold)
         m["footer"] = (m["said"], gold, m["ok"])
 
-    map_label = args.map if args.map_label is None else args.map_label
-
     def panel(m, k):
         """Model `m` at position `k`; past the end of its chain it shows its answer."""
         tag = f"{m['label']}  ·  " if multi else ""
@@ -432,9 +456,8 @@ def main():
     for k in range(max(len(m["want"]) for m in loaded)):
         states.append((canvas.frame([panel(m, k) for m in loaded]), args.hold_step))
     if args.hold_answer > 0:
-        states.append((canvas.frame(
-            [((m["model"], f"{m['label']}  ·  answer" if multi else "answer"),
-              plain, None, m["footer"]) for m in loaded]), args.hold_answer))
+        states.append((canvas.frame([panel(m, len(m["want"])) for m in loaded]),
+                       args.hold_answer))
 
     timed = []
     for i, (im, secs) in enumerate(states):
