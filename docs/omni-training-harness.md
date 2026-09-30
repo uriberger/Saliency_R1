@@ -646,14 +646,27 @@ is linear in tokens.
    length and the capture is linear in length, so the upper bound on the recovery is most
    of that 48.3 s — a ~174 s step. Not yet implemented; it touches how the generation batch
    is split across ranks, which is a correctness-sensitive place.
-2. **Stop all-gathering the pictures.** `self._logs["image"].extend(gather_object(images))`
-   runs on every step, is guarded only by `has_images` and not by `--log_completions`, and
-   pickles eight native-resolution PIL images per rank — ~40 MB a step of images already on
-   disk in the dataset. It sits inside a span measured at **38.8 s, 17% of the step**, whose
-   only other contents are the advantage arithmetic and ~15 scalar all-gathers. That the
-   image gather dominates is the strong inference and not yet the measurement: the span is
-   now split three ways (`epilogue_metrics` / `epilogue_log_text` / `epilogue_log_images`)
-   and the next run attributes it for free.
+2. **The 38.8 s epilogue — measured, but NOT yet attributed, and the first guess at it was
+   wrong.** The span is real: 38.8 s, 17% of the step. The guess was that
+   `self._logs["image"].extend(gather_object(images))` dominated it. Two things say
+   otherwise, both checked after the fact:
+
+   * **The payload is small.** set_a's images are capped at 512 px on the long side and
+     pickle to a median of **0.50 MB**, so the whole step gathers **24 MB** across six
+     ranks. Over NVLink that is milliseconds, and pickling 48 PIL images is a memcpy.
+     Nothing there costs 38.8 s.
+   * **The span holds 24 `.item()` calls and 12 `gather()` calls**, against 3
+     `gather_object()`. Every `.item()` is a host-device synchronisation, and the first one
+     after a stretch of asynchronous GPU work waits for all of it to drain. That is the
+     better candidate, and it means the time may not belong to the epilogue at all — it may
+     be the saliency capture's queued work, finally being waited on.
+
+   So: no fix is named here yet. The span is now split three ways (`epilogue_metrics` /
+   `epilogue_log_text` / `epilogue_log_images`) and the next run says which it is, at no
+   cost. One small thing IS worth changing regardless: `if has_images:` should also test
+   `self.log_completions`, because `self._logs` is a `deque(maxlen=48)` that is read only
+   under that flag — a run without it does the gather for nothing. That is correctness, not
+   a speed-up; **this run had `--log_completions` on, so its images were used.**
 
 **`--length-guard` is still not wired, and neither run gives a reason to wire it.** §11
 reaches for it against "this reward lengthens chains"; mean length fell in both runs (375 →
@@ -665,6 +678,10 @@ makes cap-length micro-steps rarer; only the cap makes the worst one smaller.
 ### 13.4 Is 222.5 s a step fast enough?
 
 For this task, yes: it put 50 steps on the board inside one allocation with the margin
-measured. For anything longer it is not — a 4,000-step run at this rate is ten days. The
-two fixes above are 39% of the step between them and neither is model compute; the
-model-compute floor (`compute_loss` + backward + the capture's own work) is around 90 s.
+measured. For anything longer it is not — a 4,000-step run at this rate is ten days.
+
+Of the 222.5 s, **one item has a named fix with a number behind it**: the 48.3 s of
+straggler wait, 22%. The 38.8 s epilogue is 17% more that is measured but not yet
+attributed, so it is a lead and not a fix. The model-compute floor (`compute_loss` + the
+backward + the capture's own work) is around 90 s, so even taking both there is no version
+of this that runs at Qwen3-VL's 22.5 s a step.

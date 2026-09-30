@@ -3387,11 +3387,13 @@ class GRPOTrainer(Trainer):
 
         self._lap("epilogue_log_text")
 
-        if has_images:
-            # NOT guarded by --log_completions: `self._logs` is filled every step and read
-            # only when the flag is on, so a run that logs nothing still pickles eight
-            # native-resolution PIL images per rank and all-gathers them, every step. ~40 MB
-            # a step of pictures that are already on disk in the dataset.
+        # `self._logs` is a deque(maxlen=generation_batch_size) that is READ only under
+        # --log_completions, so without the flag this gather feeds a buffer nobody opens.
+        # Correctness, not a speed-up: set_a's pictures are capped at 512 px on the long
+        # side and pickle to a median 0.50 MB, so the whole step moves ~24 MB across six
+        # ranks -- milliseconds on NVLink. The 38.8 s this span was measured at is far more
+        # likely the 24 `.item()` calls above it, each of which is a host-device sync.
+        if has_images and self.log_completions:
             self._logs["image"].extend(gather_object(images))
 
         self._lap("epilogue_log_images")
