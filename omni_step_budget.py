@@ -70,6 +70,10 @@ def iter_history(path):
 
 
 PREFIX = "profiling/Time taken: "
+# The SR1_LAP spans. They are NOT a decomposition of the profiled methods and must not be
+# added to them: they cover the inline code BETWEEN those methods, plus (for
+# `saliency_block`) the method itself. Reported in their own section for that reason.
+LAP_PREFIX = "lap/"
 
 
 def collect(paths):
@@ -86,6 +90,8 @@ def collect(paths):
                 if k.startswith(PREFIX) and isinstance(v, (int, float)):
                     short = k[len(PREFIX):].split(".", 1)[-1]
                     per_step[gs][short].append(float(v))
+                elif k.startswith(LAP_PREFIX) and isinstance(v, (int, float)):
+                    per_step[gs]["lap: " + k[len(LAP_PREFIX):]].append(float(v))
                 elif k.startswith(("completions/", "train/")) and isinstance(v, (int, float)):
                     scalars[gs][k] = float(v)
     return per_step, scalars
@@ -141,24 +147,43 @@ def main():
         sys.exit("no profiled steps found")
 
     print(f"\nprofiled steps: {len(steps)}  (global_step {steps[0]}..{steps[-1]})\n")
-    print(f"{'phase':<44} {'calls/step':>10} {'median s':>9} {'mean s':>8} {'max s':>8}")
-    print("-" * 84)
     rows = sorted(totals.items(), key=lambda kv: -median(kv[1]))
-    for k, vals in rows:
-        c = counts[k]
-        print(f"{k:<44} {median(c):>10.0f} {median(vals):>9.1f} "
-              f"{sum(vals)/len(vals):>8.1f} {max(vals):>8.1f}")
+    prof = [(k, v) for k, v in rows if not k.startswith("lap: ")]
+    laps = [(k, v) for k, v in rows if k.startswith("lap: ")]
+
+    def table(title, entries):
+        if not entries:
+            return
+        print(f"\n{title}")
+        print(f"{'phase':<44} {'calls/step':>10} {'median s':>9} {'mean s':>8} {'max s':>8}")
+        print("-" * 84)
+        for k, vals in entries:
+            c = counts[k]
+            print(f"{k:<44} {median(c):>10.0f} {median(vals):>9.1f} "
+                  f"{sum(vals) / len(vals):>8.1f} {max(vals):>8.1f}")
+
+    table("TRL's profiler (methods):", prof)
 
     # `_prepare_inputs` is the whole generation+reward block, so it must not be added to
-    # its own children. Report it as the envelope and the children as its decomposition.
+    # its own children. Report it as the envelope and the children as its decomposition;
+    # what is left over is the inline code SR1_LAP exists to name.
     env = "_prepare_inputs"
-    kids = [k for k in totals if k != env]
     if env in totals:
+        # The direct children of `_prepare_inputs`. `_get_per_token_logps_and_entropies`
+        # is excluded because on this configuration it is called from `compute_loss`, and
+        # the individual reward funcs because `_calculate_rewards` already contains them.
+        children = ("_compute_overlap_step_maps", "_compute_grad_step_maps",
+                    "_compute_glimpse_step_maps", "vLLM.generate",
+                    "transformers.generate", "transformers.generate_batch",
+                    "_calculate_rewards", "_move_model_to_vllm")
         env_med = median(totals[env])
-        kid_med = sum(median(totals[k]) for k in kids if k not in ("_calculate_rewards",))
+        kid_med = sum(median(totals[k]) for k in children if k in totals)
         print("-" * 84)
         print(f"{'envelope (_prepare_inputs)':<44} {'':>10} {env_med:>9.1f}")
-        print(f"{'its children, summed medians':<44} {'':>10} {kid_med:>9.1f}")
+        print(f"{'its profiled children, summed medians':<44} {'':>10} {kid_med:>9.1f}")
+        print(f"{'UNATTRIBUTED inside the envelope':<44} {'':>10} {env_med - kid_med:>9.1f}")
+
+    table("SR1_LAP spans (inline code; NOT additive with the table above):", laps)
 
     if args.per_step or args.csv:
         keys = [k for k, _ in rows]
