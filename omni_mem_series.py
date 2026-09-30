@@ -50,8 +50,14 @@ def parse(path):
     rows, lengths, total = [], {}, None
     with open(path, errors="replace") as fh:
         for line in fh:
-            m = MEM_RE.search(line)
-            if m:
+            # finditer, NOT search: six ranks write `print(flush=True)` to one pipe, and
+            # two of them landing in the same write shows up as two reports concatenated
+            # on one line. `search` would keep the first and drop the second -- silently,
+            # and biased towards keeping whichever rank got there first, which is the
+            # opposite of the rank this file is trying to find.
+            found = False
+            for m in MEM_RE.finditer(line):
+                found = True
                 d = m.groupdict()
                 total = float(d["total"])
                 rows.append(dict(
@@ -60,6 +66,7 @@ def parse(path):
                     peak=float(d["peak"]), free=float(d["free"]),
                     tokens=int(d["tokens"]) if d["tokens"] else None,
                 ))
+            if found:
                 continue
             ml = MEAN_LEN_RE.search(line)
             if ml:
