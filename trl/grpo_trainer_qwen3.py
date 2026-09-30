@@ -3371,6 +3371,13 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["rewards/overall/std"].append(nanstd(rewards).item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
+        # The advantage normalisation and ~15 scalar `gather`s. Split from the object
+        # gathers below because the two are nothing alike: a scalar all-gather is a
+        # rendezvous and some bytes, and `gather_object` PICKLES. Job 7103770 measured the
+        # pair together at 38.8 s a step -- 17% of a 222.5 s step -- and which half that
+        # is decides whether the fix is free.
+        self._lap("epilogue_metrics")
+
         # Log prompt and completion texts
         self._logs["prompt"].extend(gather_object(prompts_text))
         self._logs["completion"].extend(gather_object(completions_text))
@@ -3378,8 +3385,16 @@ class GRPOTrainer(Trainer):
             self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
         self._logs["advantages"].extend(all_process_advantages.tolist())
 
+        self._lap("epilogue_log_text")
+
         if has_images:
+            # NOT guarded by --log_completions: `self._logs` is filled every step and read
+            # only when the flag is on, so a run that logs nothing still pickles eight
+            # native-resolution PIL images per rank and all-gathers them, every step. ~40 MB
+            # a step of pictures that are already on disk in the dataset.
             self._logs["image"].extend(gather_object(images))
+
+        self._lap("epilogue_log_images")
 
         output = {
             "prompt_ids": prompt_ids,

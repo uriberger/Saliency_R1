@@ -48,7 +48,13 @@ MAX_LEN_RE = re.compile(r"'completions/max_length': '([\d.e+]+)'")
 
 def parse(path):
     rows, lengths, total = [], {}, None
-    with open(path, errors="replace") as fh:
+    # newline="\n" MATTERS. tqdm redraws its bar with a carriage return, and Python's
+    # default universal-newline mode treats a bare \r as a line terminator -- which splits
+    # the progress bar away from the `{'loss': ...}` dict that follows it on the same
+    # physical line. The step number lives in the bar and the lengths live in the dict, so
+    # in universal mode they are never seen together and every length comes out NaN.
+    # `grep` splits on \n only, which is why the two look joined when you look by hand.
+    with open(path, errors="replace", newline="\n") as fh:
         for line in fh:
             # finditer, NOT search: six ranks write `print(flush=True)` to one pipe, and
             # two of them landing in the same write shows up as two reports concatenated
@@ -66,8 +72,11 @@ def parse(path):
                     peak=float(d["peak"]), free=float(d["free"]),
                     tokens=int(d["tokens"]) if d["tokens"] else None,
                 ))
-            if found:
-                continue
+            # NO `continue` HERE. The trainer's per-step log dict arrives on the same
+            # stream as 7,200 [mem] reports, so it regularly shares a line with one --
+            # skipping a line because it matched a memory report is how every
+            # `completions/mean_length` in a 446,000-line log came out NaN.
+            del found
             ml = MEAN_LEN_RE.search(line)
             if ml:
                 st = STEP_RE.search(line)
@@ -76,6 +85,13 @@ def parse(path):
                     lengths[int(st.group(1))] = (float(ml.group(1)),
                                                  float(xl.group(1)) if xl else float("nan"))
     return rows, lengths, total
+
+
+# `state.global_step` is incremented AFTER the optimizer step, so a [mem] line printed
+# during the first step says 0 while tqdm's bar says 1/50. Align on the tqdm numbering,
+# which is what the trainer's own logs and wandb use.
+def length_for(lengths, mem_step):
+    return lengths.get(mem_step + 1, (float("nan"), float("nan")))
 
 
 def per_step(rows):
@@ -120,9 +136,13 @@ def plot(steps, rows, total, png, title):
         ax.set_axisbelow(True)
 
     # ---- panel A: the series, over the run -----------------------------------------
+    # Only RESERVED and FREE are plotted as series, and that is a correctness point, not
+    # a layout one. `max_memory_allocated()` is a high-water mark since the process
+    # started, so a "peak per step" line built from it can only ever be flat or rising
+    # and says nothing about the step it is drawn at. It goes in as a horizontal
+    # reference instead, which is the only honest reading of it.
     xs = sorted(steps)
     series = [
-        ("peak allocated", [steps[s][0] for s in xs], C_PEAK),
         ("reserved", [steps[s][1] for s in xs], C_RESERVED),
         ("free (driver)", [steps[s][2] for s in xs], C_FREE),
     ]
@@ -133,6 +153,13 @@ def plot(steps, rows, total, png, title):
         ax1.annotate(f" card total {total:.1f} GB", (xs[-1], total), xytext=(2, 4),
                      textcoords="offset points", color=CRITICAL,
                      fontsize=8.5, va="bottom", ha="left", annotation_clip=False)
+    hwm = max(steps[s][0] for s in xs)
+    ax1.axhline(hwm, color=C_PEAK, linewidth=1.1, linestyle=(0, (2, 3)), zorder=1)
+    # LEFT end: the right margin is where the two series put their direct labels, and
+    # reserved sits within a few GB of the high-water mark all run.
+    ax1.annotate(f"peak allocated {hwm:.1f} (high-water mark) ", (xs[0], hwm), xytext=(0, -12),
+                 textcoords="offset points", color=C_PEAK, fontsize=8.5,
+                 va="top", ha="left", annotation_clip=False)
     for label, ys, color in series:
         ax1.plot(xs, ys, color=color, linewidth=2, zorder=3)
         ax1.annotate(f" {label}", (xs[-1], ys[-1]), color=color, fontsize=9,
@@ -144,7 +171,10 @@ def plot(steps, rows, total, png, title):
     ax1.set_xlim(xs[0], xs[-1] + 0.22 * (xs[-1] - xs[0] + 1))
 
     # ---- panel B: the working set against the sequence it is a function of ----------
-    pts = [(r["tokens"], r["peak"]) for r in rows
+    # RESERVED at "after the forward", not peak: reserved is instantaneous, so it varies
+    # with the micro-step actually being measured. Peak is cumulative and would draw a
+    # ceiling rather than a relationship.
+    pts = [(r["tokens"], r["reserved"]) for r in rows
            if r["tokens"] and r["where"] == "after the forward"]
     if pts:
         tx, ty = zip(*pts)
@@ -156,15 +186,16 @@ def plot(steps, rows, total, png, title):
             ax2.plot(xr, a + b * xr, color=INK, linewidth=1.4, zorder=4)
             # Above the LEFT end: the right end is where the cap-length micro-steps pile
             # up, and a label there sits on the densest part of the scatter.
-            ax2.annotate(f"{b * 1000:+.2f} GB per 1,000 tokens",
-                         (xr[0], a + b * xr[0]), xytext=(4, 14),
-                         textcoords="offset points", color=INK, fontsize=9,
-                         va="bottom", ha="left", annotation_clip=False)
+            # Axes coordinates, top-left: the fit runs corner to corner, so any label
+            # anchored ON it lands on the line or on the scatter.
+            ax2.text(0.03, 0.95, f"{b * 1000:+.2f} GB per 1,000 tokens",
+                     transform=ax2.transAxes, color=INK, fontsize=9,
+                     va="top", ha="left")
         if total:
             ax2.axhline(total, color=CRITICAL, linewidth=1.2, linestyle=(0, (4, 3)), zorder=1)
     ax2.set_xlabel("tokens forwarded by the micro-step (prompt + trimmed completion)",
                    color=MUTED, fontsize=9.5)
-    ax2.set_ylabel("peak allocated, GB", color=MUTED, fontsize=9.5)
+    ax2.set_ylabel("reserved after the forward, GB", color=MUTED, fontsize=9.5)
     ax2.set_title("Working set against sequence length", color=INK,
                   fontsize=11, loc="left", pad=10)
 
@@ -192,7 +223,7 @@ def main():
     print(f"\n{'step':>5} {'peak':>6} {'reserv':>7} {'free':>6} {'meanlen':>8} {'maxlen':>7}")
     for s in xs:
         p, r, f, _a, _n = steps[s]
-        ml, xl = lengths.get(s, (float("nan"), float("nan")))
+        ml, xl = length_for(lengths, s)
         print(f"{s:>5} {p:>6.1f} {r:>7.1f} {f:>6.1f} {ml:>8.0f} {xl:>7.0f}")
 
     if args.csv:
@@ -200,7 +231,7 @@ def main():
             fh.write("step,peak_max,reserved_max,free_min,alloc_max,mean_length,max_length\n")
             for s in xs:
                 p, r, f, a, _n = steps[s]
-                ml, xl = lengths.get(s, (float("nan"), float("nan")))
+                ml, xl = length_for(lengths, s)
                 fh.write(f"{s},{p:.2f},{r:.2f},{f:.2f},{a:.2f},{ml:.1f},{xl:.0f}\n")
         print(f"wrote {args.csv}")
     if args.png:
