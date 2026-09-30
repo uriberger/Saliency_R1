@@ -524,3 +524,129 @@ cap-length micro-steps rarer; it cannot make the worst one smaller. Only the cap
 
 And §11's evidence for drift does not survive its own table: mean length went **375 → 340**
 over the 30 steps. "This reward lengthens chains" is not what that run shows.
+
+## 13. The 50-step run: job 7103770, and what it cost
+
+`grpo-omni30b-overlap__wov0.2_L19_h4-9_mean_in_c768`, the selected heads, **a real 768**,
+one 4 h allocation on pool1-00186. **50/50 steps, no OOM, no requeue**, 3 h 05 m wall at
+**222.5 s a step**. `checkpoint-50` is on disk and `completions/max_length` is 768 on every
+step, so the cap was binding rather than decorative.
+
+```
+                    first 5    last 5      (50 logged steps, overlap never NaN)
+overlap reward       0.0478    0.0535
+within-group sd      0.0233    0.0259
+total reward         0.880     0.947
+format reward        0.542     0.583
+judge reward         0.317     0.337
+mean length            349       335
+clipped ratio        0.188     0.154
+```
+
+**Read no attention conclusion off this.** §9 of `docs/omni-head-selection.md` applies in
+full: `19 / 4,9` was selected on a corpus whose correctness label is 52% disputed, because
+the Omni is a base checkpoint. This run establishes that the arm RUNS, at a stated cap,
+with a live reward. It does not establish that the heads are the right ones.
+
+### 13.1 The memory question, answered: it is a knife edge, not a drift
+
+`outputs/omni_grpo_plan_a/.../mem_series.{csv,png}`, 7,200 reports, 6 ranks, 50 steps.
+Worst rank per step:
+
+| | step 0 | median over 50 | worst over 50 |
+|---|---|---|---|
+| allocated, entering compute_loss | 61.6 | 61.6 | 61.6 |
+| **reserved**, entering compute_loss | 77.4 | 75.9 | **77.4** |
+| **free (driver)** | 0.1 | 0.8 | **0.0** |
+
+**Free reaches 0.0 GB on 9 of the 50 steps, and never exceeds 6 GB on any of them.** The
+card is completely full at the driver level for part of every step, while torch's
+*allocated* sits at 61.6 GB — the weights and nothing else. The gap is the caching
+allocator: 15.8 GB reserved and owned by nothing, left behind by the previous micro-step's
+backward. `SR1_EMPTY_CACHE_PER_MICROSTEP` does return it (free goes back to 15.1 at
+"before the forward"), but it runs at the *start of the next micro-step* — after the
+allreduce that needed the room.
+
+So §10's model is wrong in the way that matters. There is **no drift**: nothing climbs
+over 50 steps, and mean completion length FALLS (349 → 335), as it did over the previous
+run's 30 (375 → 340). The failure mode is not "a cap reached eventually", it is **a margin
+of zero that is crossed when something asks for memory at the wrong instant** — which is
+exactly what `ncclUnhandledCudaError` from DDP's allreduce is (§12.2).
+
+The working set is linear in the sequence, cleanly, and now on the axis that decides it:
+
+```
+reserved after the forward  =  +7.90 GB per 1,000 tokens forwarded
+```
+
+which is what makes the cap the only lever that moves the peak. At 768 the longest
+micro-step is ~1,190 positions and reserved after the forward reaches 72.2; the backward
+adds ~5.2 more, to 77.4 of 79.2. At 1024 the same arithmetic gives ~1,446 positions,
+~74.2 after the forward and **~79.4 after the backward, against 79.18 available.** That is
+the 2026-09-28 failure, to within the rounding of these numbers.
+
+**Caveat on one column.** `peak` is `torch.cuda.max_memory_allocated()`, a high-water mark
+since the process started, so the flat 72.3 across all 50 steps means only "no micro-step
+ever exceeded what step 0 already reached". It is not a per-step series and is not plotted
+as one. A true per-step peak needs `reset_peak_memory_stats()` once per step; that is not
+wired, and `reserved` and `free` — both instantaneous — carry the argument without it.
+
+### 13.2 The step budget, closed
+
+The `SR1_LAP` spans partition `_generate_and_score_completions` end to end, and on the mean
+they sum to the envelope exactly:
+
+| span | mean s | of the step |
+|---|---|---|
+| `prep_prompts` | 0.1 | |
+| `generate_block` (incl. `vLLM.generate` 28.4) | 28.7 | 13% |
+| `post_generate` | 0.1 | |
+| `saliency_block` — this rank's 8 teacher-forced forwards | 48.8 | 22% |
+| **`wait_ranks_after_saliency`** — waiting for the slowest rank | **48.3** | **22%** |
+| `rewards_block` (judge 13.9, DINO-backed overlap 4.9) | 18.9 | 9% |
+| `epilogue` (advantages, ~15 scalar gathers, 3 `gather_object`) | 38.8 | 17% |
+| **`_prepare_inputs`** | **183.7** | |
+| `compute_loss`, 8 micro-steps, forward only | 15.7 | 7% |
+| outside both: backward, optimizer, DDP allreduce, dataloader | 23.1 | 10% |
+| **step** | **222.5** | |
+
+0.1 + 28.7 + 0.1 + 48.8 + 48.3 + 18.9 + 38.8 = 183.7, against `_prepare_inputs` at 183.7.
+Nothing is left over.
+
+**The single largest item is not compute.** The saliency capture costs this rank 48.8 s and
+then this rank waits 48.3 s for a slower one — so the slowest rank spends about 97 s where
+the main process spends 49, and the step pays the maximum. Every profiled number before
+this was the main process's own share, which is why the capture looked like half of what it
+costs. **Load imbalance is 22% of the step**, and it is imbalance rather than work: the six
+ranks hold eight completions each whose lengths differ by a factor of ten, and the capture
+is linear in tokens.
+
+### 13.3 Two named fixes, with the measurement behind each
+
+1. **Balance the saliency capture by token count, not by row count.** Measured cost of the
+   present imbalance: **48.3 s a step, 22%.** The rollouts are handed out without regard to
+   length and the capture is linear in length, so the upper bound on the recovery is most
+   of that 48.3 s — a ~174 s step. Not yet implemented; it touches how the generation batch
+   is split across ranks, which is a correctness-sensitive place.
+2. **Stop all-gathering the pictures.** `self._logs["image"].extend(gather_object(images))`
+   runs on every step, is guarded only by `has_images` and not by `--log_completions`, and
+   pickles eight native-resolution PIL images per rank — ~40 MB a step of images already on
+   disk in the dataset. It sits inside a span measured at **38.8 s, 17% of the step**, whose
+   only other contents are the advantage arithmetic and ~15 scalar all-gathers. That the
+   image gather dominates is the strong inference and not yet the measurement: the span is
+   now split three ways (`epilogue_metrics` / `epilogue_log_text` / `epilogue_log_images`)
+   and the next run attributes it for free.
+
+**`--length-guard` is still not wired, and neither run gives a reason to wire it.** §11
+reaches for it against "this reward lengthens chains"; mean length fell in both runs (375 →
+340 over 30 steps, 349 → 335 over 50) and `clipped_ratio` fell too (0.188 → 0.154). It
+would also not help the memory: `per_device` is 1 and the padding is trimmed, so the
+allocation that decides a micro-step is set by that micro-step's OWN completion. A guard
+makes cap-length micro-steps rarer; only the cap makes the worst one smaller.
+
+### 13.4 Is 222.5 s a step fast enough?
+
+For this task, yes: it put 50 steps on the board inside one allocation with the margin
+measured. For anything longer it is not — a 4,000-step run at this rate is ten days. The
+two fixes above are 39% of the step between them and neither is model compute; the
+model-compute floor (`compute_loss` + backward + the capture's own work) is around 90 s.
