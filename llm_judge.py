@@ -70,14 +70,18 @@ def judge_scores(items, workers: int = 8, cache_path=None, verbose: bool = True)
     if cache_path and Path(cache_path).exists():
         cache = json.loads(Path(cache_path).read_text())
 
-    # Everything that is already cached, or empty, needs no client at all -- so a report
-    # can be regenerated from a cache with no key in the environment.
-    todo = [i for i, it in enumerate(items)
-            if (it.get("answer") or "").strip()
-            and cache_key(it["question"], it["gt_answer"], it["answer"]) not in cache]
+    # Everything already cached, or empty, needs no client at all -- so a report can be
+    # regenerated from a cache with no key in the environment. And the batch is
+    # DEDUPLICATED on the cache key before anything is asked: four models on the same
+    # 1,800 pictures produce ~490 repeated (question, gold, answer) triples, and paying
+    # for each of them twice is money and rate limit for an identical answer.
+    todo = sorted({cache_key(it["question"], it["gt_answer"], (it.get("answer") or "").strip())
+                   for it in items
+                   if (it.get("answer") or "").strip()} - set(cache))
     if verbose:
-        print(f"[judge] {len(items)} items, {len(items) - len(todo)} already cached or "
-              f"empty, {len(todo)} to ask", flush=True)
+        n_empty = sum(1 for it in items if not (it.get("answer") or "").strip())
+        print(f"[judge] {len(items)} items, {n_empty} empty (scored 0 without a call), "
+              f"{len(todo)} distinct uncached triples to ask", flush=True)
 
     client = model = None
     if todo:
@@ -94,17 +98,12 @@ def judge_scores(items, workers: int = 8, cache_path=None, verbose: bool = True)
         if verbose:
             print(f"[judge] model={model}  workers={workers}", flush=True)
 
-    def ask(it):
-        ans = (it.get("answer") or "").strip()
-        if not ans:
-            return 0.0
-        ck = cache_key(it["question"], it["gt_answer"], ans)
-        if ck in cache:
-            return cache[ck]
+    def ask(ck):
+        question, gold, ans = json.loads(ck)
         content = (
             f"I will give you an image and the following text as inputs:\n\n"
-            f"1. **Question Related to the Image**: {it['question']}\n"
-            f"2. **Ground Truth Answer**: {it['gt_answer']}\n"
+            f"1. **Question Related to the Image**: {question}\n"
+            f"2. **Ground Truth Answer**: {gold}\n"
             f"3. **Model Predicted Answer**: {ans}\n\n"
             "Your task is to evaluate the model's predicted answer against the ground "
             "truth answer, based on the context provided by the image and the question. "
@@ -131,24 +130,27 @@ def judge_scores(items, workers: int = 8, cache_path=None, verbose: bool = True)
                     return None
                 time.sleep(0.2 * 2 ** attempt)
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        out = list(ex.map(ask, items))
+    fresh = {}
+    if todo:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for ck, s in zip(todo, ex.map(ask, todo)):
+                if s is not None:             # never cache a failure as an answer
+                    fresh[ck] = s
+        if cache_path:
+            cache.update(fresh)
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(cache_path).write_text(json.dumps(cache))
+            if verbose:
+                print(f"[judge] cache now {len(cache)} entries (+{len(fresh)}) at "
+                      f"{cache_path}", flush=True)
+        else:
+            cache.update(fresh)
 
-    if cache_path:
-        n_new = 0
-        for it, s in zip(items, out):
-            ans = (it.get("answer") or "").strip()
-            if not ans or s is None:          # never cache a failure as an answer
-                continue
-            ck = cache_key(it["question"], it["gt_answer"], ans)
-            if ck not in cache:
-                n_new += 1
-            cache[ck] = s
-        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(cache_path).write_text(json.dumps(cache))
-        if verbose:
-            print(f"[judge] cache now {len(cache)} entries (+{n_new}) at {cache_path}",
-                  flush=True)
+    out = []
+    for it in items:
+        ans = (it.get("answer") or "").strip()
+        out.append(0.0 if not ans
+                   else cache.get(cache_key(it["question"], it["gt_answer"], ans)))
     n_fail = sum(1 for s in out if s is None)
     if n_fail and verbose:
         print(f"[judge] {n_fail} items came back None and are excluded, not counted wrong",

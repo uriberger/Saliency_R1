@@ -394,6 +394,22 @@ def stage_judge(args):
     items = [{"question": r["question"], "gt_answer": r["gold"], "answer": r["answer"]}
              for r in todo]
     cache = args.judge_cache or str(out / "judge_cache.json")
+    # Judgements are keyed on content, so any cache this project has written is free
+    # money. They are merged INTO this run's cache rather than read alongside it, so one
+    # file is the record of what was judged.
+    if args.seed_from:
+        import glob as _glob
+        seeded = json.loads(Path(cache).read_text()) if Path(cache).exists() else {}
+        n0 = len(seeded)
+        for p in sorted(_glob.glob(args.seed_from)):
+            if Path(p).resolve() == Path(cache).resolve():
+                continue
+            seeded.update({k: v for k, v in json.loads(Path(p).read_text()).items()
+                           if v is not None})
+        Path(cache).parent.mkdir(parents=True, exist_ok=True)
+        Path(cache).write_text(json.dumps(seeded))
+        print(f"[judge] seeded cache {n0} -> {len(seeded)} entries from {args.seed_from}",
+              flush=True)
     scores = judge_scores(items, workers=args.judge_workers, cache_path=cache)
     for r, s in zip(todo, scores):
         r["judge"] = s
@@ -665,6 +681,9 @@ def main():
     ap.add_argument("--judge-cache", default="",
                     help="reuse a cache written by another probe; defaults to "
                          "OUT/judge_cache.json")
+    ap.add_argument("--seed-from", default="",
+                    help="glob of other *.judge_cache.json files to merge in first, e.g. "
+                         "'outputs/human_box_correct/*.judge_cache.json'")
     ap.add_argument("--correct-on", default="judge", choices=["judge", "soft", "strict"])
     args = ap.parse_args()
     os.chdir(REPO)
