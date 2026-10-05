@@ -475,7 +475,22 @@ export WANDB_RESUME=${WANDB_RESUME:-allow}
 export WANDB_DATA_DIR=${WANDB_DATA_DIR:-/home/uberger/scratch/cache/wandb_data}
 export WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-/home/uberger/scratch/cache/wandb_cache}
 mkdir -p "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR"
-[ -n "${WANDB_API_KEY:-}" ] || export WANDB_MODE=offline
+# ONLINE IF WE CAN AUTHENTICATE AT ALL, not only if WANDB_API_KEY is exported.
+# `~/.netrc` with a `machine api.wandb.ai` entry is a perfectly good wandb credential and
+# `wandb.Api()` uses it with no environment variable at all -- but this line used to force
+# offline whenever the variable was unset, so a launch from a shell that had the netrc and
+# not the export produced a run nobody could find. The failure is quiet in the worst way:
+# the trainer logs happily, the metrics are all captured locally, and only the absence of
+# the run from the project says anything.
+_WANDB_NETRC=${NETRC:-$HOME/.netrc}
+if [ -n "${WANDB_API_KEY:-}" ]; then
+    WANDB_AUTH="WANDB_API_KEY"
+elif [ -r "$_WANDB_NETRC" ] && grep -q "machine[[:space:]]\+api\.wandb\.ai" "$_WANDB_NETRC"; then
+    WANDB_AUTH="$_WANDB_NETRC"
+else
+    WANDB_AUTH=""
+    export WANDB_MODE=offline
+fi
 [ -n "${NVIDIA_API_KEY:-}" ] && export NVIDIA_API_KEY
 [ -n "${OPENAI_API_KEY:-}" ] && export OPENAI_API_KEY
 [ -n "${OPENAI_BASE_URL:-}" ] && export OPENAI_BASE_URL
@@ -598,6 +613,12 @@ echo "Batch:            per_device=$PER_DEVICE_BATCH num_generations=$NUM_GENERA
 # now on the node's own banner, so `head` on a job log answers "what cap did this train
 # at?" without going to wandb.
 echo "Mamba kernels:    $MAMBA_KERNELS $([ "$MAMBA_KERNELS" = fused ] && echo '(fused: 1.61x and -8.2 GB on the training side, job 7184255)' || echo '(naive torch fallback -- the pre-2026-10-04 path)')"
+if [ -n "$WANDB_AUTH" ]; then
+    echo "W&B:              ONLINE via $WANDB_AUTH  ->  https://wandb.ai/\${WANDB_ENTITY:-<your-entity>}/$WANDB_PROJECT/runs/$WANDB_RUN_ID"
+else
+    echo "W&B:              OFFLINE -- no WANDB_API_KEY and no 'machine api.wandb.ai' in $_WANDB_NETRC."
+    echo "                  Metrics still land in trl_repo_nemotron/wandb/offline-run-*; 'wandb sync' uploads them later."
+fi
 echo "Steps classifier: $STEPS_DEVICE   (OMP_NUM_THREADS=$OMP_NUM_THREADS of $_CORES cores across $TRAIN_N ranks)"
 echo "Completion cap:   max_completion_length=$MAX_COMPLETION_LENGTH $([ "$MAX_COMPLETION_LENGTH" = 1024 ] && echo '(the Qwen3-VL value -- see THE MEMORY CEILING)' || echo "(in the run name as _c$MAX_COMPLETION_LENGTH)")"
 echo "Reward:           overlap $OVERLAP_METRIC w=$W_OVERLAP  layer=$OVERLAP_LAYER heads=$OVERLAP_HEADS tr=$TOKEN_REDUCTION"
