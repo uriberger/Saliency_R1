@@ -215,8 +215,13 @@ def plot(steps, rows, total, png, title, lengths_for=None):
             b, a = np.polyfit(mx, my, 1)
             xr = np.array([min(mx), max(mx)])
             ax3.plot(xr, a + b * xr, color=INK, linewidth=1.4, zorder=4)
-            ax3.text(0.03, 0.95, f"r = {r:+.3f}   (n = {len(ml)} steps)",
-                     transform=ax3.transAxes, color=INK, fontsize=9, va="top", ha="left")
+            # Put the label in whichever half the points are NOT in. Free memory sits at
+            # the top of this panel on a healthy run and at the bottom on a starved one,
+            # so a fixed corner collides with the data on one of the two.
+            hi = (sum(my) / len(my) - min(my)) > 0.5 * (max(my) - min(my) or 1)
+            ax3.text(0.03, 0.05 if hi else 0.95, f"r = {r:+.3f}   (n = {len(ml)} steps)",
+                     transform=ax3.transAxes, color=INK, fontsize=9,
+                     va="bottom" if hi else "top", ha="left")
         ax3.axhline(0, color=CRITICAL, linewidth=1.2, linestyle=(0, (4, 3)), zorder=1)
         ax3.annotate(" card full", (max(mx), 0), xytext=(2, 4), textcoords="offset points",
                      color=CRITICAL, fontsize=8.5, va="bottom", ha="right",

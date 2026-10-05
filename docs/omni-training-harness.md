@@ -685,3 +685,98 @@ straggler wait, 22%. The 38.8 s epilogue is 17% more that is measured but not ye
 attributed, so it is a lead and not a fix. The model-compute floor (`compute_loss` + the
 backward + the capture's own work) is around 90 s, so even taking both there is no version
 of this that runs at Qwen3-VL's 22.5 s a step.
+
+## 14. The fused Mamba kernels, and what they moved the bottleneck to
+
+`grpo-omni30b-overlap__wov0.2_L19_h4-9_mean_in_c768_fused`, job 7185146: the same reward,
+the same cap, the same heads as §13, with `causal_conv1d` and `mamba_ssm` installed and the
+`vendor/mamba_ssm_min` stub no longer prepended to `PYTHONPATH`. **50/50 steps, no OOM, one
+allocation, 2 h 13 m.**
+
+### 14.1 What it bought
+
+| | §13, naive | §14, fused | |
+|---|---|---|---|
+| step time | 222.5 s | **160.3 s** | **−28%** |
+| wall for 50 steps | 3 h 05 m | **2 h 13 m** | |
+| reserved, worst rank | 71.5–77.4 GB | **63.3–63.8 GB** | a 0.4 GB band |
+| **free, worst rank** | **0.0–5.9 GB** | **13.1–14.0 GB** | |
+| steps with ~0 free | **9 of 50** | **0 of 50** | |
+| **memory per 1,000 tokens** | **+7.90 GB** | **+2.46 GB** | **3.2× flatter** |
+
+The last row is the one with the longest reach. The naive path's working set grew more than
+three times faster with sequence length, so the cap was not just low, it was low *because*
+of the kernels. At +2.46 GB/1,000 and 13.1 GB spare there is room for roughly **5,300 more
+tokens** — 1024 is comfortable, and the §10 memory argument that forced 768 no longer binds.
+
+The one-card A/B that justified the switch (`bench_mamba_kernels_ab.sh`, job 7184255) said
+31.21 → 19.39 s and 71.2 → 63.0 GB peak. The full run beat the memory prediction (13.1 GB
+free against 8.2 GB predicted) and under-delivered on speed (−28% against −1.61×), and
+§14.2 is why.
+
+Rewards stayed healthy: total 0.9245 → 1.0246, format 0.5625 → 0.6208, judge 0.3428 →
+0.3732, mean length 328 → 303 (falling again, for the third run running), entropy flat.
+Do not compare the overlap reward against §13 in detail — different kernels give different
+numbers, and 50 steps is not a trend.
+
+### 14.2 The capture was never mostly model compute
+
+`OVERLAP_PROFILE=1` has been in `grpo_trainer_qwen3.py` since it was written and had never
+been switched on. Over 260 scored cases in 47 profiled steps:
+
+| | total | per case | share |
+|---|---|---|---|
+| model forwards (one layer, no_grad) | 135.5 s | **0.52 s** | 8% |
+| FLAN-T5 observe-step segmentation, on CPU | **1,611.6 s** | **6.20 s** | **92%** |
+
+A 110M-parameter encoder on CPU costs twelve times a 30B model's forward pass. That is why
+the fused kernels moved the step 28% and not 61%: they made the 8% cheaper.
+
+And it is not steady work, it is contention. Per-case T5 ranges **0.53 s to 45.36 s**, a
+85× spread with a median of 3.94 — six ranks on one node, each torch process sizing its
+thread pool for all 96 cores. `OMP_NUM_THREADS` is not set anywhere in the launcher.
+
+### 14.3 The budget, closed again
+
+Lap means, which sum to `_prepare_inputs` exactly (54.2 + 28.5 + 35.7 + 8.5 + 4.0 + 0.1 +
+0.1 = 131.1 against 131.1):
+
+| span | naive | fused | |
+|---|---|---|---|
+| `wait_ranks_after_saliency` | 48.3 | **54.2** | **up** — see below |
+| `saliency_block` | 48.8 | 35.7 | 92% of it is CPU T5 |
+| `generate_block` | 28.7 | 28.5 | unchanged; vLLM has its own kernels |
+| `compute_loss` | 15.7 | 11.0 | |
+| `rewards_block` | 18.9 | 8.5 | |
+| `epilogue*` | 38.8 | **4.0** | |
+| outside both | 23.1 | ~18 | backward, optimizer, dataloader |
+| **step** | **222.5** | **160.3** | |
+
+Two rows deserve comment.
+
+**The epilogue fell 38.8 → 4.0 s, and nothing was done to it.** §12.5 guessed the image
+all-gather dominated it; that was withdrawn when the payload turned out to be 24 MB, and
+the replacement hypothesis was that the span's 24 `.item()` calls were host-device syncs
+draining GPU work queued earlier. This run settles it: `epilogue_log_images` and
+`epilogue_log_text` both measure **0.0 s**, and the whole span collapsed once the GPU work
+in front of it got faster. It was never the pictures.
+
+**The straggler wait went UP, 48.3 → 54.2 s, and is now the largest single item at 34% of
+the step.** That follows: the capture's GPU half got 1.6× faster while its CPU half did
+not, so the imbalance is a larger share of a smaller step. The `[lap]` lines show how
+extreme it is — rank 0 scored **zero** cases at step 1 and still waited 49.2 s — because
+only format-valid completions are scored, so a rank's workload swings from 0 to 8 cases.
+
+### 14.4 Where the time is now
+
+T5 and the wait it causes are **54.2 + 0.92 × 35.7 ≈ 87 s of a 160 s step**. The two
+changes that address it are both cheap and neither touches the objective:
+
+1. **`OVERLAP_STEPS_DEVICE=cuda`.** The launcher pins the classifier to CPU and says why:
+   "the training card is at 65-73 GB of 79 ... a 110M-parameter encoder is not worth one of
+   the ~6 GB that are left". There are now **13 GB** left, and the premise is gone.
+2. **`OMP_NUM_THREADS`.** Six ranks each sizing a thread pool for 96 cores is the obvious
+   reading of an 85× per-case spread, and capping it costs nothing.
+
+If T5 stops being the capture, the capture becomes 0.52 s/case — about 3 s a step — and
+most of the 54.2 s wait goes with it, because the imbalance being waited on is T5's.
