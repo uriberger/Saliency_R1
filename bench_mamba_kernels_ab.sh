@@ -96,11 +96,19 @@ export SR1_REPO="$REPO"
 
 echo "=============================================================="
 echo "node $(hostname)   steps=$STEPS   completion=$COMPLETION"
-nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
+# `|| true` for the same reason the Omni launcher has it: a banner must never
+# be the thing that ends a job, and on a login node this command does not exist.
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 echo "=============================================================="
 
 run_arm() {
-    local arm="$1" pp="$2" log="$OUT_DIR/$arm.log"
+    # Three statements, not one. `local a="$1" b=".../$a.log"` expands every argument
+    # BEFORE it assigns any of them, so `$a` is still unset in the second -- which under
+    # `set -u` is "arm: unbound variable" and a dead job (7184154).
+    local arm="$1"
+    local pp="$2"
+    local log="$OUT_DIR/$arm.log"
+    local rc=0
     echo
     echo "########## arm $arm  (PYTHONPATH='${pp:-<unset>}') ##########"
     (
@@ -130,12 +138,26 @@ PY
             --bits 16 --grad-ckpt 1 --reforward 1 \
             --completion "$COMPLETION" --steps "$STEPS" \
             --out "$OUT_DIR/$arm.json"
-    ) 2>&1 | tee "$log"
-    # The model's own verdict, which is the one that cannot be argued with.
+    # `set -e` + pipefail would abort the whole job on one arm's failure, and a fused arm
+    # that crashes would then also cost us the baseline it was to be compared against.
+    # Record the status, keep going, and let the summary say which arm has no JSON.
+    ) 2>&1 | tee "$log" || rc=$?
+    [ "$rc" -eq 0 ] || echo "  >>> arm $arm EXITED ${rc} -- see $log"
+    # The verdict comes from the PROBE line, not from the absence of the fallback warning.
+    # An arm that died before loading the model prints no warning either, and reading that
+    # as "fused" is how a crash gets filed as a result.
+    local probe
+    probe=$(grep -m1 "IS_FAST_PATH_AVAILABLE" "$log" | awk '{print $NF}')
+    case "$probe" in
+        True)  echo "  >>> arm $arm resolved the FUSED Mamba path" ;;
+        False) echo "  >>> arm $arm resolved the NAIVE Mamba path" ;;
+        *)     echo "  >>> arm $arm: probe did not run -- path unknown" ;;
+    esac
+    # Cross-check against what the model itself said while loading.
     if grep -q "fast path is not available" "$log"; then
-        echo "  >>> arm $arm ran the NAIVE Mamba path"
-    else
-        echo "  >>> arm $arm ran the FUSED Mamba path (no fallback warning)"
+        echo "      (model logged the fallback warning: naive, confirmed)"
+    elif [ "$rc" -eq 0 ]; then
+        echo "      (model logged no fallback warning: fused, confirmed)"
     fi
 }
 
