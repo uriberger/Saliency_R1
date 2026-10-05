@@ -56,9 +56,22 @@ STEPS=${STEPS:-10}
 COMPLETION=${COMPLETION:-768}
 DURATION=${DURATION:-1}
 DIRECT=false
-[ "${1:-}" = "--direct" ] && DIRECT=true
-
 OUT_DIR=${OUT_DIR:-$REPO/outputs/omni_grpo_plan_a/mamba_kernel_ab}
+
+# FLAGS, NOT AN ENV PREFIX, and this is not style. `submit_job` **execs** the string it is
+# given rather than running it through a shell, so `STEPS=10 bash script` dies with
+# `exec: STEPS=10: not found` and exit 127 before anything loads (job 7184083). Every
+# launcher in this repo passes settings as flags for that reason.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --direct)     DIRECT=true;      shift ;;
+        --steps)      STEPS="$2";       shift 2 ;;
+        --completion) COMPLETION="$2";  shift 2 ;;
+        --out-dir)    OUT_DIR="$2";     shift 2 ;;
+        --duration)   DURATION="$2";    shift 2 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
 
 if [ "$DIRECT" != true ]; then
     source "$REPO/cluster_env.sh"
@@ -67,7 +80,7 @@ if [ "$DIRECT" != true ]; then
     echo "Submitting mamba-kernel A/B to $PARTITION for ${DURATION}h (steps=$STEPS, completion=$COMPLETION)"
     exec submit_job --account nvr_israel_rlop --partition "$PARTITION" \
         --gpu 1 --nodes 1 --duration "$DURATION" --name "omni-mamba-kernel-ab" \
-        --command "STEPS=$STEPS COMPLETION=$COMPLETION OUT_DIR=$OUT_DIR bash $SCRIPT_PATH --direct"
+        --command "bash $SCRIPT_PATH --direct --steps $STEPS --completion $COMPLETION --out-dir $OUT_DIR"
 fi
 
 # ---------------------------------------------------------------- on the node
