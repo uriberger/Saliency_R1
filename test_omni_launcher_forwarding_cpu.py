@@ -148,14 +148,28 @@ check("the selected layer reaches the node", after(argv, "--overlap-layer") == "
       str(after(argv, "--overlap-layer")))
 check("the selected heads reach the node", after(argv, "--overlap-heads") == "4,9",
       str(after(argv, "--overlap-heads")))
-check("a 768 run is named _c768", name.endswith("_c768"), name)
+# CONTAINS rather than ends-with: the cap is one of several name-bearing knobs now
+# (--mamba-kernels appends after it), and a suffix test would fail every time a new one
+# is added -- which is noise, not a finding. What must hold is that the cap is IN there.
+check("a 768 run is named _c768", "_c768" in name, name)
 
 # A non-default cap that is NOT the historical one, to prove the value is carried rather
 # than a string that happens to read 768 somewhere in the script.
 argv512, name512 = submit("--max-completion-length", "512")
 check("an arbitrary cap is carried verbatim",
       after(argv512, "--max-completion-length") == "512", str(after(argv512, "--max-completion-length")))
-check("and lands in the run name", name512.endswith("_c512"), name512)
+check("and lands in the run name", "_c512" in name512, name512)
+
+# The Mamba kernels are name-bearing too: they change the arithmetic of 23 of the 52
+# layers, so a fused run must not land in a directory holding a naive run's checkpoints.
+check("the kernel choice reaches the node", after(argv, "--mamba-kernels") == "fused",
+      str(after(argv, "--mamba-kernels")))
+check("a fused run says so in its name", name.endswith("_fused"), name)
+argv_n, name_n = submit("--mamba-kernels", "naive")
+check("naive is forwarded too", after(argv_n, "--mamba-kernels") == "naive",
+      str(after(argv_n, "--mamba-kernels")))
+check("naive carries no kernel suffix (it is the historical path)",
+      not name_n.endswith("_fused") and not name_n.endswith("_naive"), name_n)
 
 # 1024 is the Qwen3-VL value, and the naming rule keys off it: at 1024 there is no suffix,
 # because a run that matches the reference runs must not be advertised as deviating.
