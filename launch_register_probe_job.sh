@@ -15,22 +15,38 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO"
 
-NAME="register-probe"
+NAME=""
 OUT_DIR=""
+STAGE="extract"
 DURATION=1
+GPUS=""
 DRY_RUN=0
 EXTRA=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --dry-run)  DRY_RUN=1;      shift   ;;
-        --name)     NAME="$2";      shift 2 ;;
-        --out-dir)  OUT_DIR="$2";   shift 2 ;;
-        --duration) DURATION="$2";  shift 2 ;;
-        --)         shift; EXTRA+=("$@"); break ;;
-        *)          EXTRA+=("$1"); shift ;;
+        --dry-run)   DRY_RUN=1;       shift   ;;
+        --name)      NAME="$2";       shift 2 ;;
+        --out-dir)   OUT_DIR="$2";    shift 2 ;;
+        --stage)     STAGE="$2";      shift 2 ;;
+        --duration)  DURATION="$2";   shift 2 ;;
+        --gpus)      GPUS="$2";       shift 2 ;;
+        --partition) PARTITION="$2";  shift 2 ;;
+        --)          shift; EXTRA+=("$@"); break ;;
+        *)           EXTRA+=("$1"); shift ;;
     esac
 done
+
+case "$STAGE" in
+    extract) GPUS=${GPUS:-1} ;;
+    # `probe` is pure CPU and takes about an hour: 16 classes x 11 arm-runs x 5 folds of a
+    # regularisation search. That is too much for a contended login node, and this account
+    # has 50 GPU-free nodes in cpu_short it can have immediately.
+    probe)   GPUS=${GPUS:-0}; PARTITION=${PARTITION:-cpu_short} ;;
+    *)       echo "ERROR: --stage must be extract or probe (labels and report are" \
+                  "seconds on the login node)." >&2; exit 2 ;;
+esac
+NAME=${NAME:-register-probe-$STAGE}
 
 [[ -n "$OUT_DIR" ]] || { echo "ERROR: --out-dir is required." >&2; exit 2; }
 [[ -f "$OUT_DIR/labels.jsonl" ]] || {
@@ -58,14 +74,14 @@ RUNNER="$LOG_ROOT/$NAME.runner.sh"
     echo "conda activate $CONDA_ENV"
     echo "export HF_HOME=${HF_HOME:-/home/uberger/scratch/cache/hf_cache}"
     echo "export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}"
-    printf 'python %q/register_probe.py extract --out-dir %q' "$REPO" "$OUT_DIR"
+    printf 'python %q/register_probe.py %q --out-dir %q' "$REPO" "$STAGE" "$OUT_DIR"
     for a in ${EXTRA[@]+"${EXTRA[@]}"}; do printf ' %q' "$a"; done
     printf '\n'
 } > "$RUNNER"
 chmod +x "$RUNNER"
 
 echo "=========================================================================="
-echo "Job     : $NAME   ($ACCOUNT, $PARTITION, ${DURATION}h, 1 GPU)"
+echo "Job     : $NAME   ($ACCOUNT, $PARTITION, ${DURATION}h, stage=$STAGE, ${GPUS} GPU)"
 echo "Out dir : $OUT_DIR"
 echo "Extra   : ${EXTRA[*]:-(none)}"
 echo "=========================================================================="
@@ -78,7 +94,7 @@ submit_job \
     --account "$ACCOUNT" \
     --partition "$PARTITION" \
     --name "$NAME" \
-    --gpu 1 \
+    --gpu "$GPUS" \
     --duration "$DURATION" \
     --outfile "$LOG_ROOT/$NAME.%j.out" \
     --logroot "$LOG_ROOT" \

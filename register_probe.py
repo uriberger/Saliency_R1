@@ -309,31 +309,60 @@ def stage_probe(args):
             X[k] = v / nrm if nrm > 0 else v          # SCALE CONTROL: direction only
         feats[arm] = X
 
+    def score(X, y, folds):
+        """Balanced accuracy per fold. liblinear's DUAL solver because there are far more
+        numbers than pictures (4,096 against a few hundred), which is the case it is for:
+        identical predictions to lbfgs in a check at this exact shape, 3-4x faster."""
+        sc = []
+        for tr, te in folds:
+            clf = LogisticRegressionCV(
+                Cs=np.logspace(-4, 4, 9), cv=args.inner_folds, scoring="balanced_accuracy",
+                class_weight="balanced", solver="liblinear", dual=True,
+                max_iter=5000, n_jobs=args.jobs)
+            clf.fit(X[tr], y[tr])
+            sc.append(balanced_accuracy_score(y[te], clf.predict(X[te])))
+        return sc
+
+    def make_folds(y, seed):
+        skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=seed)
+        return list(skf.split(np.zeros(len(y)), y))
+
     results = collections.defaultdict(dict)
     for ci, obj in enumerate(classes):
         ks = sorted(k for k in arrs if obj in labels.get(k, {}))
         y = np.array([labels[k][obj] for k in ks])
-        skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
-        folds = list(skf.split(np.zeros(len(ks)), y))     # SAME folds for every arm
+        folds = make_folds(y, args.seed)                  # SAME folds for every arm
         for arm in ARMS:
             X = np.stack([feats[arm][k] for k in ks])
-            scores = []
-            for tr, te in folds:
-                clf = LogisticRegressionCV(
-                    Cs=np.logspace(-4, 4, 9), cv=args.inner_folds, scoring="balanced_accuracy",
-                    class_weight="balanced", max_iter=2000, n_jobs=args.jobs)
-                clf.fit(X[tr], y[tr])
-                scores.append(balanced_accuracy_score(y[te], clf.predict(X[te])))
-            results[obj][arm] = {"mean": float(np.mean(scores)),
-                                 "sd": float(np.std(scores, ddof=1)),
-                                 "folds": [float(s) for s in scores]}
+            sc = score(X, y, folds)
+            results[obj][arm] = {"mean": float(np.mean(sc)),
+                                 "sd": float(np.std(sc, ddof=1)),
+                                 "folds": [float(s) for s in sc]}
         results[obj]["n"] = {"yes": int(y.sum()), "no": int((1 - y).sum())}
+
+        # THE FLOOR, measured rather than assumed. With 60-500 pictures a single arm can
+        # read well above 0.50 on a label it cannot possibly know -- a synthetic check at
+        # n=240 put an uninformative arm at 0.589. So the same pipeline is run on SHUFFLED
+        # labels, which is what chance actually looks like at this sample size, for the
+        # two arms the conclusion rests on.
+        if args.null_shuffles:
+            nrng = np.random.default_rng(args.seed + 991 + ci)
+            nulls = collections.defaultdict(list)
+            for s in range(args.null_shuffles):
+                ysh = nrng.permutation(y)
+                fsh = make_folds(ysh, args.seed + s)
+                for arm in ("tl", "mid"):
+                    X = np.stack([feats[arm][k] for k in ks])
+                    nulls[arm].append(float(np.mean(score(X, ysh, fsh))))
+            results[obj]["null"] = {a: v for a, v in nulls.items()}
         print(f"[probe] {ci + 1}/{len(classes)} {obj:<16} "
-              + "  ".join(f"{a}={results[obj][a]['mean']:.3f}" for a in ARMS), flush=True)
+              + "  ".join(f"{a}={results[obj][a]['mean']:.3f}" for a in ARMS)
+              + (f"   null tl={np.mean(results[obj]['null']['tl']):.3f}"
+                 if args.null_shuffles else ""), flush=True)
 
     (out / "probe.json").write_text(json.dumps(
         {"classes": classes, "arms": list(ARMS), "folds": args.folds,
-         "results": results}, indent=1))
+         "null_shuffles": args.null_shuffles, "results": results}, indent=1))
     print(f"[probe] -> {out / 'probe.json'}")
     return 0
 
@@ -358,14 +387,27 @@ def stage_report(args):
     o("the commoner way. One square's 4,096 numbers, scaled to unit length, one simple")
     o(f"weighted-sum classifier, {d['folds']} folds, the same folds for every arm.")
     o("")
-    o(f"   {'object':<16} {'yes':>5} {'no':>5} " + "".join(f"{a:>9}" for a in arms))
+    has_null = bool(d.get("null_shuffles"))
+    o(f"   {'object':<16} {'yes':>5} {'no':>5} " + "".join(f"{a:>9}" for a in arms)
+      + (f"{'tl|null':>9}" if has_null else ""))
     for obj in classes:
         r = res[obj]
         o(f"   {obj:<16} {r['n']['yes']:>5} {r['n']['no']:>5} "
-          + "".join(f"{r[a]['mean']:>9.3f}" for a in arms))
-    o("   " + "-" * (16 + 12 + 9 * len(arms)))
+          + "".join(f"{r[a]['mean']:>9.3f}" for a in arms)
+          + (f"{np.mean(r['null']['tl']):>9.3f}" if has_null else ""))
+    o("   " + "-" * (16 + 12 + 9 * (len(arms) + int(has_null))))
     means = {a: float(np.mean([res[o_][a]["mean"] for o_ in classes])) for a in arms}
-    o(f"   {'MEAN':<16} {'':>5} {'':>5} " + "".join(f"{means[a]:>9.3f}" for a in arms))
+    o(f"   {'MEAN':<16} {'':>5} {'':>5} " + "".join(f"{means[a]:>9.3f}" for a in arms)
+      + (f"{np.mean([np.mean(res[o_]['null']['tl']) for o_ in classes]):>9.3f}"
+         if has_null else ""))
+    if has_null:
+        nt = [v for o_ in classes for v in res[o_]["null"]["tl"]]
+        o("")
+        o(f"   THE FLOOR, measured: with labels SHUFFLED, the tl arm reads "
+          f"{np.mean(nt):.3f} on average,")
+        o(f"   spread {np.std(nt, ddof=1):.3f}, highest single class {max(nt):.3f} "
+          f"({d['null_shuffles']} shuffles x {len(classes)} classes).")
+        o("   Read every number above against THAT, not against 0.500.")
 
     o("")
     o("THE COMPARISON THAT MATTERS: top-left against the FIXED MIDDLE square.")
@@ -385,6 +427,12 @@ def stage_report(args):
       f"classes")
     lo, hi = ST.wilson(wins, len(diffs))
     o(f"   win rate 95% interval [{lo:.2f}, {hi:.2f}]  (0.5 is a coin flip)")
+    if has_null:
+        nd = [res[o_]["null"]["tl"][i] - res[o_]["null"]["mid"][i]
+              for o_ in classes for i in range(len(res[o_]["null"]["tl"]))]
+        o(f"   with labels shuffled the same difference is {np.mean(nd):+.3f} "
+          f"(spread {np.std(nd, ddof=1):.3f}), so the bar for the row above is roughly "
+          f"{2 * np.std(nd, ddof=1) / np.sqrt(len(classes)):.3f}.")
 
     o("")
     o("READING IT")
@@ -424,6 +472,9 @@ def main():
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--inner-folds", type=int, default=3)
     ap.add_argument("--jobs", type=int, default=8)
+    ap.add_argument("--null-shuffles", type=int, default=3,
+                    help="label shuffles per class, on the tl and mid arms, to measure "
+                         "what chance looks like at this sample size. 0 disables.")
     ap.add_argument("--seed", type=int, default=20261005)
     args = ap.parse_args()
     os.chdir(REPO)
