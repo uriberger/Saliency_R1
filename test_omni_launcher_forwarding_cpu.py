@@ -171,6 +171,19 @@ check("naive is forwarded too", after(argv_n, "--mamba-kernels") == "naive",
 check("naive carries no kernel suffix (it is the historical path)",
       not name_n.endswith("_fused") and not name_n.endswith("_naive"), name_n)
 
+# The classifier device and the free-text tag. --tag exists so a performance experiment
+# gets its own directory without the naming rule growing a suffix per knob, so the one
+# thing it must do is reach the node: RUN_NAME is recomputed there for WANDB_RUN_ID, and a
+# tag that only the submitting side knows about means two runs sharing one wandb run.
+argv_t, name_t = submit("--steps-device", "cuda", "--tag", "t5gpu")
+check("the classifier device reaches the node", after(argv_t, "--steps-device") == "cuda",
+      str(after(argv_t, "--steps-device")))
+check("the tag reaches the node", after(argv_t, "--tag") == "t5gpu", str(after(argv_t, "--tag")))
+check("the tag lands LAST in the run name", name_t.endswith("_t5gpu"), name_t)
+argv_u, name_u = submit()
+check("no tag emits no --tag at all", "--tag" not in argv_u, " ".join(argv_u[-4:]))
+check("and leaves the name unsuffixed", not name_u.endswith("_"), name_u)
+
 # 1024 is the Qwen3-VL value, and the naming rule keys off it: at 1024 there is no suffix,
 # because a run that matches the reference runs must not be advertised as deviating.
 argv1024, name1024 = submit("--max-completion-length", "1024")

@@ -246,6 +246,12 @@ BETA=0
 # Resolved HERE rather than there because RUN_NAME is built before the submit, and the
 # fused path changes the numbers enough that two runs must not share a directory.
 MAMBA_KERNELS=${SR1_MAMBA_KERNELS:-fused}
+# A free-text marker appended to the run name. It exists so a PERFORMANCE experiment can
+# have its own directory and its own wandb run without every tuning knob earning a place in
+# the naming rule -- the rule is for things that change the science, and accreting one
+# suffix per knob is how it stops being readable. Two runs that differ in nothing the rule
+# names MUST still differ here, or the launcher resumes the first one's checkpoint.
+RUN_TAG=${RUN_TAG:-}
 MAX_STEPS=${MAX_STEPS:-50}
 SAVE_STEPS=${SAVE_STEPS:-10}
 CKPT_KEEP_EVERY=${CKPT_KEEP_EVERY:-50}
@@ -281,12 +287,23 @@ VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-True}
 # has ~914. vLLM's default max_num_seqs is 1024, so it refuses before anything runs. One
 # GRPO step asks for gen_batch sequences at most (48 here); 64 leaves margin.
 VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-64}
-# The FLAN-T5 observe-step classifier. The Qwen3-VL launcher puts it on the training GPU
-# because CPU was the dominant per-step cost there; here the training card is at 65-73 GB
-# of 79 and the first attempt died in NCCL's allreduce with "Cuda failure 2 'out of
-# memory'". A 110M-parameter encoder is not worth one of the ~6 GB that are left. It costs
-# step time, and the node has 96 cores for six ranks to spend.
-OVERLAP_STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cpu}
+# The FLAN-T5 observe-step classifier, and this was the largest cost in the step.
+#
+# It lived on CPU here, against the trainer's own default of `cuda`, for a memory reason
+# that was true when it was written and is not any more: "the training card is at 65-73 GB
+# of 79 ... a 110M-parameter encoder is not worth one of the ~6 GB that are left". With the
+# fused Mamba kernels the worst rank has **13.1 GB** free (§14.1), so it is.
+#
+# What it was costing, measured by OVERLAP_PROFILE over 260 scored cases in job 7185146:
+#
+#     model forwards, one layer, no_grad    0.52 s a case     8% of the capture
+#     FLAN-T5 segmentation, on CPU          6.20 s a case    92% of the capture
+#
+# A 110M encoder on CPU cost twelve times a 30B model's forward pass, and the per-case
+# figure ranged 0.53-45.36 s -- an 85x spread, which is contention rather than work. The
+# trainer's comment beside its own default said this all along: "on CPU it was hundreds of
+# serial encoder forwards per step (the dominant overlap-reward cost)".
+STEPS_DEVICE=${OVERLAP_STEPS_DEVICE:-cuda}
 OVERLAP_STEPS_CKPT=${OVERLAP_STEPS_CKPT:-$REPO/checkpoint/steps_classifier/best}
 PREFLIGHT=${PREFLIGHT:-true}
 SYNC_LORA_ONLY=true
@@ -319,6 +336,8 @@ while [[ $# -gt 0 ]]; do
         --max-box-area)           MAX_BOX_AREA="$2";            shift 2 ;;
         --beta)                   BETA="$2";                    shift 2 ;;
         --mamba-kernels)          MAMBA_KERNELS="$2";           shift 2 ;;
+        --steps-device)           STEPS_DEVICE="$2";            shift 2 ;;
+        --tag)                    RUN_TAG="$2";                 shift 2 ;;
         --vllm-gpus)              VLLM_GPUS_N="$2";             shift 2 ;;
         --vllm-gpu-mem)           VLLM_GPU_MEM="$2";            shift 2 ;;
         --preflight)              PREFLIGHT=true;               shift 1 ;;
@@ -384,6 +403,7 @@ RUN_NAME="grpo-omni30b-overlap__wov${W_OVERLAP}_L${OVERLAP_LAYER}_h${OVERLAP_HEA
 # on the naive path, and a run that differs in them must not land in a directory that
 # already holds the other one's checkpoints.
 [ "$MAMBA_KERNELS" = naive ] || RUN_NAME="${RUN_NAME}_${MAMBA_KERNELS}"
+[ -z "$RUN_TAG" ] || RUN_NAME="${RUN_NAME}_${RUN_TAG}"
 [ -n "$OUTPUT_DIR" ] || OUTPUT_DIR="$REPO/outputs/omni_grpo_plan_a/$RUN_NAME"
 
 # ---------- submit, or run here ----------
@@ -420,7 +440,9 @@ if [ "$DIRECT" != true ]; then
           "--token-reduction" "$TOKEN_REDUCTION"
           "--box-threshold" "$BOX_THRESHOLD"
           "--max-box-area" "$MAX_BOX_AREA"
-          "--mamba-kernels" "$MAMBA_KERNELS")
+          "--mamba-kernels" "$MAMBA_KERNELS"
+          "--steps-device" "$STEPS_DEVICE")
+    [ -n "$RUN_TAG" ] && ARGS+=("--tag" "$RUN_TAG")
     [ "$PREFLIGHT" = true ] || ARGS+=("--no-preflight")
     [ "$SYNC_LORA_ONLY" = true ] || ARGS+=("--sync-all-weights")
     # `-- <passthrough>` has to stay LAST, because the node-side parser stops at `--`.
@@ -444,7 +466,8 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE=1
 export VLLM_NO_USAGE_STATS=1
 export DO_NOT_TRACK=1
-export OVERLAP_STEPS_DEVICE OVERLAP_STEPS_CKPT
+export OVERLAP_STEPS_DEVICE="$STEPS_DEVICE"
+export OVERLAP_STEPS_CKPT
 export WANDB_PROJECT=${WANDB_PROJECT:-saliency_r1}
 export WANDB_RUN_ID=${WANDB_RUN_ID:-$RUN_NAME}
 export WANDB_NAME=${WANDB_NAME:-$RUN_NAME}
@@ -480,6 +503,16 @@ export SR1_MEM_REPORT_RANKS=${SR1_MEM_REPORT_RANKS:-all}
 # It adds two `wait_for_everyone()` calls per step. They move time rather than adding it
 # (the ranks already meet at the next collective), but they are a real change to the run,
 # which is why they are behind a flag and named in the banner.
+# EACH RANK'S FAIR SHARE OF THE CORES, not all of them. torch sizes its CPU thread pool
+# from the machine's core count, so six training ranks on one node each opened a pool for
+# every core and then fought over them. The visible symptom was the T5 segmentation above
+# ranging 0.53-45.36 s a case for the same work -- an 85x spread that is not work, it is
+# oversubscription. Set from nproc rather than hardcoded, because the two clusters this
+# repo runs on do not have the same core count.
+_CORES=$(nproc 2>/dev/null || echo 32)
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$(( _CORES / TRAIN_N > 0 ? _CORES / TRAIN_N : 1 ))}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-$OMP_NUM_THREADS}
+
 export SR1_LAP=${SR1_LAP:-1}
 # Splits the saliency capture into model forwards vs the FLAN-T5 segmentation that runs on
 # CPU beside them -- the single biggest item in the step (48.8 s) and never attributed,
@@ -565,6 +598,7 @@ echo "Batch:            per_device=$PER_DEVICE_BATCH num_generations=$NUM_GENERA
 # now on the node's own banner, so `head` on a job log answers "what cap did this train
 # at?" without going to wandb.
 echo "Mamba kernels:    $MAMBA_KERNELS $([ "$MAMBA_KERNELS" = fused ] && echo '(fused: 1.61x and -8.2 GB on the training side, job 7184255)' || echo '(naive torch fallback -- the pre-2026-10-04 path)')"
+echo "Steps classifier: $STEPS_DEVICE   (OMP_NUM_THREADS=$OMP_NUM_THREADS of $_CORES cores across $TRAIN_N ranks)"
 echo "Completion cap:   max_completion_length=$MAX_COMPLETION_LENGTH $([ "$MAX_COMPLETION_LENGTH" = 1024 ] && echo '(the Qwen3-VL value -- see THE MEMORY CEILING)' || echo "(in the run name as _c$MAX_COMPLETION_LENGTH)")"
 echo "Reward:           overlap $OVERLAP_METRIC w=$W_OVERLAP  layer=$OVERLAP_LAYER heads=$OVERLAP_HEADS tr=$TOKEN_REDUCTION"
 echo "LoRA:             r=16 alpha=32 targets=$LORA_TARGETS (scoped to the decoder by vlm_family)"
