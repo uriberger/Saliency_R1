@@ -780,3 +780,84 @@ changes that address it are both cheap and neither touches the objective:
 
 If T5 stops being the capture, the capture becomes 0.52 s/case — about 3 s a step — and
 most of the 54.2 s wait goes with it, because the imbalance being waited on is T5's.
+
+## 15. The classifier back on the GPU: 222.5 → 73.7 s
+
+`..._c768_fused_t5gpu`, job 7193337. Two one-line changes on top of §14 —
+`OVERLAP_STEPS_DEVICE=cuda` and `OMP_NUM_THREADS=nproc/TRAIN_N` — and nothing else.
+**50/50 steps, no OOM, one allocation, 1 h 01 m.**
+
+### 15.1 The three runs
+
+| | §13 naive | §14 fused | §15 + T5 on GPU |
+|---|---|---|---|
+| **step** | **222.5 s** | **160.3 s** | **73.7 s** |
+| wall, 50 steps | 3 h 05 m | 2 h 13 m | **1 h 01 m** |
+| free, worst rank | 0.0–5.9 GB | 13.1–14.0 | 12.7–13.9 |
+| steps at ~0 free | 9 of 50 | 0 | 0 |
+
+**−67% on two configuration changes.** No algorithm was rewritten, no batch size moved, no
+reward touched.
+
+The reward trajectory is the healthiest of the three: total 0.970 → 1.089, format 0.592 →
+0.663, judge 0.359 → 0.401, mean length 340 → 305 (falling, as in all three runs), entropy
+flat at 0.41.
+
+### 15.2 What the T5 move did
+
+| per scored case | §14, CPU | §15, GPU | |
+|---|---|---|---|
+| model forward (1 layer, no_grad) | 0.52 s | 0.50 s | unchanged, as expected |
+| **FLAN-T5 segmentation** | **6.20 s** | **0.027 s** | **230×** |
+| T5 share of the capture | 92% | **5%** | |
+| per-case spread | 0.53–45.36 s | 0.000–0.300 s | |
+
+259 cases over the run. The 85× spread that made the old numbers so noisy is gone, which is
+what `OMP_NUM_THREADS` was for — though with T5 off the CPU entirely it is hard to separate
+the two, and the honest statement is that together they did this.
+
+**And the straggler wait went with it: 54.2 s → 1.1 s.** That confirms what §14.3 could
+only assert — the imbalance the ranks were waiting on *was* the classifier's. Nothing was
+done to load balancing; making the work cheap made the imbalance irrelevant.
+
+### 15.3 The budget, closed a third time
+
+Lap means, summing to `_prepare_inputs` exactly (28.3 + 9.4 + 4.3 + 2.8 + 1.1 + 0.1 + 0.1 =
+46.1 against 46.1):
+
+| span | naive | fused | +T5 GPU | share of 73.7 |
+|---|---|---|---|---|
+| **`generate_block`** | 28.7 | 28.5 | **28.3** | **38%** |
+| outside both (backward, optimizer, loader) | 23.1 | ~18 | 16.7 | 23% |
+| `compute_loss` | 15.7 | 11.0 | 10.9 | 15% |
+| `rewards_block` (judge 4.3, DINO overlap 5.1) | 18.9 | 8.5 | 9.4 | 13% |
+| `epilogue_metrics` | 38.8 | 4.0 | 4.3 | 6% |
+| `saliency_block` | 48.8 | 35.7 | **2.8** | 4% |
+| `wait_ranks_after_saliency` | 48.3 | 54.2 | **1.1** | 1% |
+
+The saliency capture — the thing this whole harness exists to compute, and the item §11
+named as the one to attack — is now **4% of the step**.
+
+### 15.4 Generation is the bottleneck now, and it never moved
+
+`generate_block` is 28.7 → 28.5 → 28.3 across the three runs. It has been untouched by
+everything done so far, because vLLM has its own kernels and its own process. At 38% of the
+step it is now the largest single item.
+
+`VLLM_ENFORCE_EAGER` defaults to `True` here, for a reason the header states plainly:
+torch.compile and CUDA-graph capture on a 52-layer MoE is minutes of startup that a short
+allocation pays on every requeue. At 1 h of training per 50 steps that trade has flipped —
+minutes of startup against a double-digit percentage of every step. It is the obvious next
+measurement, and `VLLM_ENFORCE_EAGER=False` is the whole of it.
+
+After that the remaining items are ordinary: 16.7 s outside the profiled spans (backward,
+optimizer, dataloader), 10.9 s of forward, and a 9.4 s reward block that is two network
+services. There is no longer a single dominant cost.
+
+### 15.5 What the headroom is now worth
+
+Free memory sits at 12.7–13.9 GB with the working set growing at +2.46 GB per 1,000 tokens.
+**The 768 cap is no longer forced by anything.** Raising it to 1024 costs ~2 GB of the ~13
+available and would make every Omni run directly comparable to the Qwen3-VL ones, which is
+the reason the deviation was regretted in the first place (§10). That is a science decision
+rather than a performance one, so it is not taken here.
