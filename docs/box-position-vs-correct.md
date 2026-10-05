@@ -99,42 +99,82 @@ word elsewhere in the span). And 327 of the 1,800 rows are flickr30k, whose gold
 sentence — they are real VQA with real questions, the judge grades them fine, and a string
 rule scores them at **0.003** and would have forced dropping 18% of the corpus.
 
-## The result — pending the judge
+## The result — 2026-10-05
 
-`judge` has not been run: it needs `NVIDIA_API_KEY`, which is supplied at run time and is
-not in this environment. Everything else is built and verified, and the report below is
-the **soft string grade**, which is the noisy label — it is here to show the shape of the
-answer and the size of the confound, and every number in it should be re-read off the
-judge before it is quoted.
+Judge run: 7,152 of 7,200 rows scored, 48 gateway failures excluded rather than counted
+wrong. `outputs/box_position/arm0/{table.jsonl,judge_cache.json,report.txt}`.
 
-Centre vs the eight other 3×3 bins, same 1,800 pictures, four models:
+**The judge was worth buying.** It agrees with the soft string grade on 76.2% of rows, and
+the disagreement is one-sided: 18.4% of rows are judge-right/soft-wrong against 5.4% the
+other way. Accuracy by model, judge vs soft vs strict:
+
+| model | judge | soft | strict | hit the 1024 cap | produced no answer |
+|---|---|---|---|---|---|
+| GLM-4.1V-9B | **0.585** | 0.387 | 0.267 | 82 | 82 |
+| InternVL3.5-8B | **0.554** | 0.429 | 0.048 | 0 | 0 |
+| Nemotron-Omni-30B | **0.493** | 0.331 | 0.226 | 456 | 453 |
+| Qwen3-VL-8B | **0.461** | 0.422 | 0.006 | 14 | 0 |
+
+A string rule would have under-read every model by 6 to 20 points, and would have reversed
+the ordering of Qwen3-VL and the Nemotron.
+
+### Centre vs periphery
+
+Centre bin against the eight other 3×3 bins, same 1,800 pictures. MH holds picture
+difficulty (how many of the *other* three models answered that picture correctly, 0–3)
+crossed with the box's area quartile.
 
 | model | centre | periphery | diff | Fisher p | MH OR | MH p |
 |---|---|---|---|---|---|---|
-| Qwen3-VL-8B | 0.448 | 0.407 | +0.041 | 0.092 | 0.96 | 0.82 |
-| InternVL3.5-8B | 0.468 | 0.406 | +0.062 | 0.012 | 1.14 | 0.39 |
-| GLM-4.1V-9B | 0.421 | 0.368 | +0.054 | 0.027 | 1.11 | 0.54 |
-| Nemotron-Omni-30B | 0.355 | 0.318 | +0.037 | 0.119 | 0.99 | 0.99 |
+| InternVL3.5-8B | 0.597 | 0.530 | +0.067 | 0.007 | 1.14 | 0.33 |
+| GLM-4.1V-9B | 0.623 | 0.563 | +0.060 | 0.014 | 1.17 | 0.26 |
+| Qwen3-VL-8B | 0.498 | 0.440 | +0.059 | 0.018 | 1.07 | 0.62 |
+| Nemotron-Omni-30B | 0.511 | 0.482 | +0.028 | 0.260 | 0.84 | 0.16 |
 
-MH holds picture difficulty (how many of the *other* three models answered that picture
-correctly, 0–3) crossed with the box's area quartile.
+The raw gap is +2.8 to +6.7 points and significant in three of four. Every stratified odds
+ratio lands between 0.84 and 1.28 with p ≥ 0.16 — and the Nemotron's points the other way.
+Dropping its 453 unfinished chains does not rescue it (+0.021, p = 0.48).
 
-Read the last two columns against the first two. **The raw centre advantage is +3.7 to
-+6.2 points in all four models and it dissolves once difficulty and box size are held
-fixed** — every common odds ratio lands between 0.96 and 1.14 with p ≥ 0.39. The
-threshold-free version agrees: Spearman ρ between the centroid's radial depth and
-correctness is 0.012–0.056, and the AUC separating right from wrong answers by depth is
-0.507–0.532.
+### Threshold-free, and then the number that settles it
 
-And the confound is visible and large: **ρ(radial depth, box area) = +0.375**. Central
-boxes are *bigger* boxes, bigger boxes are answered better (Q4 accuracy is the highest
-quartile in all four models), and that alone reproduces the raw gap.
+Unlike the soft label, the continuous version is significant everywhere: Spearman ρ between
+the box centroid's radial depth (0 = on the border, 1 = dead centre) and the judge's own
+0–1 score is positive in all four models, p ≤ 0.036.
 
-So the provisional reading — to be confirmed on the judge label — is that **the raw centre
-advantage in this corpus is mostly the size of the region, not its position.** That is a
-useful negative: it is exactly the confound the interventional arms are built to remove,
-and Arm 2's slide ladder removes it by construction, since the content is shrunk once and
-only the offset varies.
+But radial depth and box **area** are correlated at **+0.375** on this corpus — central
+boxes are bigger boxes — and area predicts correctness on its own at ρ = +0.069 to +0.138,
+*larger* than the depth correlation in three of the four. So the question reduces to a
+partial correlation, on the whole rank ordering rather than in four bins:
+
+| model | ρ(depth, score) | p | **ρ(depth, score \| area)** | p | survives |
+|---|---|---|---|---|---|
+| Qwen3-VL-8B | 0.1013 | <0.0001 | **0.0431** | 0.077 | 43% |
+| InternVL3.5-8B | 0.0647 | 0.008 | **0.0083** | 0.734 | 13% |
+| GLM-4.1V-9B | 0.0624 | 0.011 | **0.0446** | 0.069 | 71% |
+| Nemotron-Omni-30B | 0.0510 | 0.036 | **0.0139** | 0.567 | 27% |
+
+**Hold box size fixed and the position effect does not reach significance in any of the
+four models**, and how much of it survives — 13% to 71% — is not consistent across them.
+Accuracy by area quartile is monotone or near-monotone in all four (Qwen3-VL runs
+0.364 → 0.434 → 0.527 → 0.520).
+
+### What Arm 0 concludes
+
+**On this corpus, at this granularity, the centre advantage is the size of the answer
+region and not its position.** The upper bound on a position effect is about ρ = 0.045,
+which is an AUC of roughly 0.52 — nothing you would design a system around.
+
+Three things that does and does not license:
+
+1. It does **not** say the geometric bias is harmless. The corpus cannot put an answer in
+   cell (0,0), where the register sits and where the effect would be largest if it exists,
+   and a 3×3 bin is a very blunt instrument for a one-patch phenomenon.
+2. It **does** say the confound is real and dominant, and that any arm which varies
+   position must hold the target's size fixed. Arm 2's slide ladder does this by
+   construction — the content is shrunk once and only the offset varies — which is now a
+   requirement rather than a preference.
+3. It **does** say the effect, if present, is small. Arms 1–3 should be sized for a few
+   points, not for a dramatic one.
 
 ## Power — what Arm 2 has to be sized for
 
@@ -143,10 +183,10 @@ Taking each model's own raw centre-vs-periphery gap as the effect to detect, two
 
 | model | centre | periphery | gap | n per group |
 |---|---|---|---|---|
-| InternVL3.5-8B | 0.468 | 0.406 | +0.062 | 1,003 |
-| GLM-4.1V-9B | 0.421 | 0.368 | +0.054 | 1,301 |
-| Qwen3-VL-8B | 0.448 | 0.407 | +0.041 | 2,234 |
-| Nemotron-Omni-30B | 0.355 | 0.318 | +0.037 | 2,557 |
+| InternVL3.5-8B | 0.597 | 0.530 | +0.067 | 868 |
+| GLM-4.1V-9B | 0.623 | 0.563 | +0.060 | 1,042 |
+| Qwen3-VL-8B | 0.498 | 0.440 | +0.059 | 1,129 |
+| Nemotron-Omni-30B | 0.511 | 0.482 | +0.028 | 4,929 |
 
 Arm 2 is **paired within picture**, so its real requirement is lower than this by roughly
 the within-picture correlation — but the order of magnitude is the point: a few hundred

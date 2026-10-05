@@ -622,6 +622,23 @@ def stage_report(args):
                              [float(_correct(r, label)) for r in rs])
         o(f"   {m:<28} rho(box area, correct) = {rho:+.4f}  p = {p:.3g}")
     o("")
+    o("   THE PARTIAL. rho(depth, score) with box AREA held fixed on the whole rank")
+    o("   ordering, not in four bins. This is the number the question reduces to: if the")
+    o("   raw association in section 5 survives here it is position; if it collapses it")
+    o("   was size.")
+    o(f"   {'model':<28} {'raw rho':>9} {'partial rho':>12} {'p':>9} {'kept':>7}")
+    for m in models:
+        rs = [r for r in by_model[m] if _correct(r, label) is not None]
+        dv = [r["judge"] if label == "judge" and r["judge"] is not None
+              else float(_correct(r, label)) for r in rs]
+        dep = [r["depth_norm"] for r in rs]
+        ar = [r["area_frac"] for r in rs]
+        raw, _ = ST.spearman(dep, dv)
+        par, pp = ST.partial_spearman(dep, dv, ar)
+        o(f"   {m:<28} {raw:>9.4f} {par:>12.4f} "
+          f"{pp if pp is not None else float('nan'):>9.4f} "
+          f"{(par / raw if raw else float('nan')):>6.0%}")
+    o("")
     o("   accuracy by box-area quartile (Q1 = smallest):")
     o(f"   {'model':<28} {'Q1':>12} {'Q2':>12} {'Q3':>12} {'Q4':>12}")
     for m in models:

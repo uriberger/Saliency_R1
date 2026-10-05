@@ -127,6 +127,34 @@ def spearman(x, y):
     return rho, float(math.erfc(abs(z) / math.sqrt(2.0)))
 
 
+def partial_spearman(x, y, z):
+    """(rho_xy.z, two-sided p): the rank correlation of x and y with z held fixed.
+
+    This is the statistic the box-position question actually needs. Radial depth and box
+    AREA are correlated at +0.375 on this corpus -- central boxes are bigger boxes -- and
+    area predicts correctness on its own, so a raw rho(depth, correct) is partly a size
+    effect wearing a position effect's clothes. Stratifying on area quartiles answers the
+    same question with four bins and throws away everything inside them; this uses the
+    whole rank ordering.
+
+    First-order partial on Spearman rhos, with the usual normal approximation on Fisher's
+    z at n - 4. Exactly as valid as the rank correlations it is built from, which is to
+    say: it removes a MONOTONE confound, not an arbitrary one.
+    """
+    rxy, _ = spearman(x, y)
+    rxz, _ = spearman(x, z)
+    ryz, _ = spearman(y, z)
+    if rxy is None or rxz is None or ryz is None:
+        return None, None
+    den = math.sqrt(max(1e-12, (1 - rxz ** 2) * (1 - ryz ** 2)))
+    rho = (rxy - rxz * ryz) / den
+    n = int(np.sum(np.isfinite(np.asarray(x, dtype=np.float64))))
+    if n < 6 or abs(rho) >= 1.0:
+        return float(rho), None
+    z_ = math.atanh(rho) * math.sqrt((n - 4) / 1.06)
+    return float(rho), float(math.erfc(abs(z_) / math.sqrt(2.0)))
+
+
 def n_per_group_for(p1, p2, power=0.80, alpha=0.05):
     """Two-proportion, two-sided: n per group to detect p1 vs p2. -> int, or None.
 
