@@ -434,6 +434,24 @@ def stage_report(args):
           f"(spread {np.std(nd, ddof=1):.3f}), so the bar for the row above is roughly "
           f"{2 * np.std(nd, ddof=1) / np.sqrt(len(classes)):.3f}.")
 
+    # The classes carry 60 to 500 pictures, so an unweighted mean lets the noisiest
+    # estimates vote as loudly as the most reliable one. Both are printed, and the
+    # interval is clustered on CLASS rather than on fold, because the five folds of one
+    # class are five readings of the same pictures and not five independent facts.
+    nn = np.array([res[o_]["n"]["yes"] + res[o_]["n"]["no"] for o_ in classes], float)
+    dd = np.array(diffs)
+    fd = np.array([res[o_]["tl"]["folds"][i] - res[o_]["mid"]["folds"][i]
+                   for o_ in classes for i in range(len(res[o_]["tl"]["folds"]))])
+    se = fd.std(ddof=1) / np.sqrt(len(classes))
+    o("")
+    o(f"   unweighted over classes {dd.mean():+.3f}     "
+      f"weighted by pictures {np.average(dd, weights=nn):+.3f}")
+    o(f"   95% interval, clustered on class: "
+      f"[{fd.mean() - 1.96 * se:+.3f}, {fd.mean() + 1.96 * se:+.3f}]")
+    big = nn >= 130
+    o(f"   the {int(big.sum())} classes with >=130 pictures: {dd[big].mean():+.3f}   "
+      f"the {int((~big).sum())} smaller ones: {dd[~big].mean():+.3f}")
+
     o("")
     o("READING IT")
     o("  tl >> mid, by the 20-30 points prior work reports for this comparison")
