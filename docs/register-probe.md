@@ -1,6 +1,7 @@
 # H1 — does the top-left visual token carry the whole picture? No.
 
-**Answered on Qwen3-VL-8B, 2026-10-05.** `register_probe.py`, data under
+**Answered on Qwen3-VL-8B, 2026-10-05, twice: by a linear probe on the encoder's output
+and by a causal intervention through the whole model. They agree.** `register_probe.py`, data under
 `outputs/register_probe/pope/`.
 
 ## The question, and why it needed asking
@@ -121,6 +122,70 @@ first visual token carries the summary, so the rest might be redundant. The rest
 redundant — they carry the same kind of information, and the average of them beats the
 corner by 14 points.
 
+## The objection, and the causal test that answers it
+
+A probe only sees what a *linear* classifier can read off a vector **in isolation**. The
+encoder and the language model were trained together, so the model might extract
+whole-picture information from that cell by a route no probe would see. That objection is
+right, and it needs an intervention rather than a classifier.
+
+**The test.** Move ONE cell a fixed distance toward a donor picture's cell at the same
+index — in the rows the language model consumes **and** in all three DeepStack injections,
+since Qwen3-VL feeds those into the decoder's early layers under the same indexing, and
+moving the pooled row alone would leave three quarters of the token's content in place.
+The distance is common to all three cells and is the **smallest** of that picture's three
+literal-swap distances (mean 19.16), so no arm is hit harder than another. Then ask the
+model POPE's own question in words and read the first answer token.
+
+**5,096 questions over 497 pictures, every arm.** The mass on {yes, no} is 1.0000, so the
+model answers the question asked and nothing is being renormalised away.
+
+| arm | accuracy | P(correct) | Δ accuracy vs clean | Δ P(correct) vs clean |
+|---|---|---|---|---|
+| clean | 0.9129 | 0.9092 | — | — |
+| **tl** | 0.9150 | 0.9104 | **+0.0022** [−0.0001, +0.0044] | **+0.0012** [+0.0003, +0.0021] |
+| mid | 0.9121 | 0.9083 | −0.0008 [−0.0022, +0.0007] | −0.0009 [−0.0017, −0.0001] |
+| rand | 0.9111 | 0.9079 | −0.0018 [−0.0034, −0.0001] | −0.0013 [−0.0023, −0.0003] |
+| tl_raw (literal swap) | 0.9141 | 0.9098 | +0.0012 [−0.0016, +0.0039] | +0.0007 [−0.0005, +0.0019] |
+
+Intervals are clustered on picture, because the ~10 questions about one picture share its
+cell.
+
+**Corrupting the top-left cell costs nothing.** If anything it helps by a hair:
+tl − mid on P(correct) is **+0.0021** [+0.0010, +0.0033], tl − rand **+0.0025**
+[+0.0013, +0.0038]. Both in the model's favour.
+
+**And the instrument is not blind** — this is what makes the null worth something.
+Corrupting a *random* cell measurably hurts (−0.0018 accuracy, −0.0013 P(correct), both
+intervals excluding zero). A random cell sometimes holds the object; the corner never
+holds anything the answer needs. So the probe and the intervention agree, by two methods
+that could easily have disagreed.
+
+### The cells themselves
+
+| cell | mean row norm | × the mean cell |
+|---|---|---|
+| top-left | 36.04 | **1.71** |
+| middle | 24.72 | 1.18 |
+| random | 20.46 | 0.97 |
+
+The top-left cell is a norm outlier at 1.71× here (this project has 2.3× on record from a
+different corpus), **and it is never the largest**: the largest-norm cell of each picture
+is 3.19× the mean, sits at cell (0,0) on **0.0%** of pictures, and moves around with the
+content — 174 distinct cells take it, 89.6% of them in the interior. Those are two
+different phenomena and only one of them is in a fixed place. The second has not been
+looked at here at all.
+
+### One tension to state rather than bury
+
+`token_mediation_probe` found that swapping this same cell costs **1.56×** what swapping a
+random cell costs, measured as log-KL along a teacher-forced chain. Here it costs *less*
+than a random cell. Both are right and they measure different things: log-KL over a long
+free-form chain moves on any shift in the output distribution, including generic ones,
+while a yes/no answer about object presence is a task-specific readout. The corner shifts
+what the model says without carrying what the answer needs — which is the norm-sink
+picture, stated twice.
+
 ## What would overturn it
 
 **Sample size, and only sample size.** With 500 pictures the interval on tl − mid is about
@@ -157,3 +222,8 @@ python register_probe.py report  --out-dir outputs/register_probe/pope
 - **A linear probe is a lower bound on what is present.** Information the classifier
   cannot read linearly is still information; this measures what is linearly available,
   which is what the comparison between arms needs and not the same as what is there.
+  The intervention is what closes that gap, and it agrees.
+- **The intervention's task is easy** — object presence, answered at 91%. A harder or
+  finer-grained question might be more sensitive to the same perturbation. What the
+  random-cell arm establishes is that the instrument can see *something* at this
+  difficulty, not that it could see everything.
