@@ -392,7 +392,7 @@ def stage_intervene(args):
         return py, pn
 
     rng = __import__("random").Random(args.seed)
-    recs, skipped = [], 0
+    recs, diags, skipped = [], [], 0
     for n, r in enumerate(rows):
         key = r["key"]
         if key not in grids:
@@ -410,6 +410,17 @@ def stage_intervene(args):
         cells = {"tl": 0, "mid": (gh // 2) * gw + (gw // 2),
                  "rand": rng.randrange(gh * gw)}
         mags, diag = TMP.matched_magnitudes(t_rows, t_deep, d_rows, d_deep, cells)
+        # Kept per picture rather than printed once: whether the top-left cell is a norm
+        # outlier AT ALL is a claim this project has on record from a different corpus
+        # (2.3x there), and the arms being norm-matched is only meaningful next to it.
+        tn = t_rows.float().norm(dim=-1)
+        diags.append({"key": key, "donor": donor, "grid": [gh, gw],
+                      "mags": [float(m) for m in mags],
+                      "row_norm": {k: float(tn[int(v)]) for k, v in cells.items()},
+                      "row_norm_mean": float(tn.mean()),
+                      "row_norm_max": float(tn.max()),
+                      "argmax_cell": int(tn.argmax()),
+                      "delta": {k: v[0] for k, v in diag["delta"].items()}})
         objs = sorted(r["objects"].items())
         for arm in INTERVENE_ARMS:
             sw = None
@@ -442,6 +453,9 @@ def stage_intervene(args):
 
     with open(out / "intervene.jsonl", "w") as fh:
         for x in recs:
+            fh.write(json.dumps(x) + "\n")
+    with open(out / "intervene_diag.jsonl", "w") as fh:
+        for x in diags:
             fh.write(json.dumps(x) + "\n")
     print(f"[intervene] {len(recs)} rows, {skipped} pictures skipped "
           f"-> {out / 'intervene.jsonl'}", flush=True)
@@ -745,6 +759,28 @@ def stage_ireport(args):
           f"{np.mean([x['correct'] for x in n_]):>14.4f} "
           f"{np.mean([x['p_yes'] for x in v]):>12.4f}")
 
+    dpath = out / "intervene_diag.jsonl"
+    if dpath.exists():
+        dg = [json.loads(l) for l in dpath.read_text().splitlines() if l]
+        o("")
+        o("THE CELLS THEMSELVES -- is the top-left one a norm outlier here at all, and")
+        o("were the arms really moved the same distance?")
+        o("")
+        o(f"   {'cell':<8} {'mean row norm':>14} {'x the mean cell':>16} "
+          f"{'mean move distance':>19}")
+        mn = float(np.mean([x["row_norm_mean"] for x in dg]))
+        for c in ("tl", "mid", "rand"):
+            v = float(np.mean([x["row_norm"][c] for x in dg]))
+            dv = float(np.mean([x["delta"][c] for x in dg]))
+            o(f"   {c:<8} {v:>14.2f} {v / mn:>16.2f} {dv:>19.2f}")
+        o(f"   {'any cell':<8} {mn:>14.2f} {1.0:>16.2f}")
+        mx = float(np.mean([x["row_norm_max"] / x["row_norm_mean"] for x in dg]))
+        at0 = float(np.mean([x["argmax_cell"] == 0 for x in dg]))
+        o(f"   the LARGEST-norm cell of each picture is {mx:.2f}x the mean and is cell "
+          f"(0,0) on {at0:.1%} of them")
+        o("   (the move distance is one number per picture by construction -- the")
+        o("    smallest of the three cells' own ||donor - target|| -- so the three")
+        o("    columns above differ only by rounding)")
     o("")
     o("READING IT")
     o("  tl costs clearly more than mid -> the language model IS reading something out")
