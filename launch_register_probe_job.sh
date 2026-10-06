@@ -38,13 +38,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$STAGE" in
-    extract) GPUS=${GPUS:-1} ;;
+    extract|intervene) GPUS=${GPUS:-1} ;;
     # `probe` is pure CPU and takes about an hour: 16 classes x 11 arm-runs x 5 folds of a
     # regularisation search. That is too much for a contended login node, and this account
     # has 50 GPU-free nodes in cpu_short it can have immediately.
     probe)   GPUS=${GPUS:-0}; PARTITION=${PARTITION:-cpu_short} ;;
-    *)       echo "ERROR: --stage must be extract or probe (labels and report are" \
-                  "seconds on the login node)." >&2; exit 2 ;;
+    *)       echo "ERROR: --stage must be extract, intervene or probe (labels and" \
+                  "the report stages are seconds on the login node)." >&2; exit 2 ;;
 esac
 NAME=${NAME:-register-probe-$STAGE}
 

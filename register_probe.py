@@ -271,6 +271,184 @@ ARMS = ("tl", "mid", "rand", "mean", "br")
 
 
 # ---------------------------------------------------------------------------
+# intervene -- the causal version of the same question
+# ---------------------------------------------------------------------------
+#: The question, asked of the model in words. POPE's own wording, so the clean arm is
+#: comparable to the published benchmark.
+INTERVENE_Q = "Is there a {obj} in the image? Answer yes or no."
+
+#: Spellings counted as each answer. Summed rather than picking one, because which casing
+#: the model prefers is a property of its chat template and not of the picture.
+YES_WORDS = ("Yes", "yes", "YES")
+NO_WORDS = ("No", "no", "NO")
+
+#: clean plus one swapped cell each. Every swap is NORM-MATCHED -- the row is moved a fixed
+#: distance toward the donor's row rather than replaced by it -- so the arms differ in
+#: what the cell SAYS and not in how loud it is. `tl_raw` is the literal replacement, kept
+#: as a reference because it is what "swap the token" normally means and it is nearly free.
+INTERVENE_ARMS = ("clean", "tl", "mid", "rand", "tl_raw")
+
+
+def answer_token_ids(tokenizer):
+    """-> ({'yes': [ids], 'no': [ids]}). Only spellings that are ONE token are usable.
+
+    Reading the first answer position only works if the whole word is that position. A
+    spelling that tokenises to two pieces would have its probability read off its first
+    piece, which is shared with other words, so it is dropped and said so.
+    """
+    out, dropped = {"yes": [], "no": []}, []
+    for key, words in (("yes", YES_WORDS), ("no", NO_WORDS)):
+        for w in words:
+            ids = tokenizer.encode(w, add_special_tokens=False)
+            (out[key].append(ids[0]) if len(ids) == 1 else dropped.append(w))
+    if not out["yes"] or not out["no"]:
+        raise SystemExit(f"no single-token spelling of yes/no for this tokenizer "
+                         f"(dropped {dropped})")
+    return out, dropped
+
+
+def stage_intervene(args):
+    """Change what one cell SAYS without changing how loud it is, then ask the model.
+
+    The probe stage asked whether the corner's vector carries whole-picture information in
+    a form a linear classifier can read. This asks the question the probe cannot: whether
+    the LANGUAGE MODEL gets that information out of it, by whatever route, including ones
+    no linear probe would see. The two can disagree, and the causal answer is the one that
+    matters -- the encoder and the language model were trained together.
+
+    Each arm moves ONE cell a fixed distance toward a donor picture's cell at the same
+    index, in the rows the language model consumes AND in all three DeepStack injections,
+    which Qwen3-VL feeds into the decoder's early layers under the same indexing. Moving
+    the pooled row alone would leave three quarters of the token's content in place and
+    read as "replacing it did nothing".
+
+    The distance is common to every cell and is the SMALLEST of their own
+    ||donor - target||, so no arm is pushed further than a literal swap would push it and
+    the arms cannot differ by how hard they were hit.
+
+    Two numbers per question, because they can come apart: whether the answer flipped, and
+    how much probability mass stayed on the right word. A perturbation can cost a lot of
+    confidence while leaving the argmax alone, and reporting only accuracy would call that
+    "no effect".
+    """
+    import torch
+
+    import sink_location as SL
+    import sink_location_probe as SLP
+    import token_mediation_probe as TMP
+    from PIL import Image
+
+    out = Path(args.out_dir)
+    rows = [json.loads(l) for l in (out / "labels.jsonl").read_text().splitlines() if l]
+    if args.limit:
+        rows = rows[: args.limit]
+    device = args.device
+    processor, model = SLP.load_model(args.model, args.adapter, device, "sdpa")
+    fam = SLP.load_family(model, processor, args.system_prompt)
+    ids, dropped = answer_token_ids(processor.tokenizer)
+    print(f"[intervene] yes ids {ids['yes']}, no ids {ids['no']}"
+          + (f", dropped multi-token {dropped}" if dropped else ""), flush=True)
+
+    def prep(r):
+        im = TMP.snap_to_grid(Image.open(out / r["image"]).convert("RGB"))
+        return im
+
+    # Group by the grid the processor actually produces: a cell index only means the same
+    # slot in two pictures that share a grid.
+    grids, imgs = {}, {}
+    for r in rows:
+        im = prep(r)
+        inputs = SLP.build_inputs(fam, processor, [im], "x", device)
+        _runs, gr = SL.locate_image_runs(inputs["input_ids"], inputs, fam)
+        if len(gr) != 1:
+            continue
+        _t, gh, gw = gr[0]
+        grids[r["key"]] = (int(gh), int(gw))
+        imgs[r["key"]] = im
+    by_grid = collections.defaultdict(list)
+    for k, g in grids.items():
+        by_grid[g].append(k)
+    print(f"[intervene] {len(grids)} pictures over {len(by_grid)} grid shapes; "
+          f"largest {max(len(v) for v in by_grid.values())}", flush=True)
+
+    def capture(im):
+        cap = TMP.RowCapture(model, family=fam).install()
+        try:
+            inputs = SLP.build_inputs(fam, processor, [im], "x", device)
+            with torch.no_grad():
+                model(**inputs, use_cache=False)
+        finally:
+            cap.uninstall()
+        return cap.rows, cap.deepstack
+
+    def ask(im, obj, swap):
+        inputs = SLP.build_inputs(fam, processor, [im],
+                                  INTERVENE_Q.format(obj=obj), device)
+        with torch.no_grad():
+            lg = model(**inputs, use_cache=False).logits[0, -1].float()
+        p = torch.softmax(lg, dim=-1)
+        py = float(p[ids["yes"]].sum())
+        pn = float(p[ids["no"]].sum())
+        return py, pn
+
+    rng = __import__("random").Random(args.seed)
+    recs, skipped = [], 0
+    for n, r in enumerate(rows):
+        key = r["key"]
+        if key not in grids:
+            skipped += 1
+            continue
+        gh, gw = grids[key]
+        pool = [k for k in by_grid[(gh, gw)] if k != key]
+        if not pool:
+            skipped += 1
+            continue
+        donor = pool[rng.randrange(len(pool))]
+        im = imgs[key]
+        t_rows, t_deep = capture(im)
+        d_rows, d_deep = capture(imgs[donor])
+        cells = {"tl": 0, "mid": (gh // 2) * gw + (gw // 2),
+                 "rand": rng.randrange(gh * gw)}
+        mags, diag = TMP.matched_magnitudes(t_rows, t_deep, d_rows, d_deep, cells)
+        objs = sorted(r["objects"].items())
+        for arm in INTERVENE_ARMS:
+            sw = None
+            if arm != "clean":
+                cell = cells["tl" if arm == "tl_raw" else arm]
+                sw = TMP.RowSwap(model, [cell], d_rows, d_deep, family=fam,
+                                 magnitudes=None if arm == "tl_raw" else mags).install()
+            try:
+                for obj, gold in objs:
+                    py, pn = ask(im, obj, arm)
+                    tot = py + pn
+                    pyes = py / tot if tot > 0 else 0.5
+                    recs.append({"key": key, "donor": donor, "arm": arm, "object": obj,
+                                 "gold": int(gold), "p_yes": pyes, "mass": tot,
+                                 "p_correct": pyes if gold else 1.0 - pyes,
+                                 "correct": int((pyes > 0.5) == bool(gold))})
+            finally:
+                if sw is not None:
+                    if sw.applied == 0:
+                        raise RuntimeError("the swap hook never fired -- the tower did "
+                                           "not re-run, so this arm measured the clean "
+                                           "picture")
+                    sw.uninstall()
+        if n == 0:
+            print(f"[intervene] cell indices {cells}, matched distances "
+                  f"{[round(m, 2) for m in mags]}, row norms "
+                  f"{ {k: round(v[0], 1) for k, v in diag['row'].items()} }", flush=True)
+        if (n + 1) % 25 == 0:
+            print(f"[intervene] {n + 1}/{len(rows)}  ({len(recs)} rows)", flush=True)
+
+    with open(out / "intervene.jsonl", "w") as fh:
+        for x in recs:
+            fh.write(json.dumps(x) + "\n")
+    print(f"[intervene] {len(recs)} rows, {skipped} pictures skipped "
+          f"-> {out / 'intervene.jsonl'}", flush=True)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # probe
 # ---------------------------------------------------------------------------
 def stage_probe(args):
@@ -475,10 +653,117 @@ def stage_report(args):
     return 0
 
 
+def stage_ireport(args):
+    out = Path(args.out_dir)
+    recs = [json.loads(l) for l in
+            (out / "intervene.jsonl").read_text().splitlines() if l]
+    lines = []
+
+    def o(s=""):
+        print(s, flush=True)
+        lines.append(s)
+
+    by_arm = collections.defaultdict(list)
+    for r in recs:
+        by_arm[r["arm"]].append(r)
+    arms = [a for a in INTERVENE_ARMS if a in by_arm]
+    # index by (picture, object) so every arm is compared on the same question
+    idx = collections.defaultdict(dict)
+    for r in recs:
+        idx[(r["key"], r["object"])][r["arm"]] = r
+    paired = [v for v in idx.values() if len(v) == len(arms)]
+
+    o("=" * 76)
+    o("Does the LANGUAGE MODEL get whole-picture information out of one cell?")
+    o("=" * 76)
+    o("One cell is moved a fixed distance toward a donor picture's cell at the same")
+    o("index -- in the rows the LLM consumes and in all three DeepStack injections -- so")
+    o("the arms differ in what the cell SAYS, not in how loud it is. Then the model is")
+    o("asked POPE's own question in words and the first answer token is read.")
+    o("")
+    o(f"{len(paired)} (picture, object) questions answered under every arm, "
+      f"{len({k for k, _ in idx}) } pictures.")
+    o("")
+    o(f"   {'arm':<8} {'accuracy':>9} {'P(correct)':>11} {'mass on yes/no':>15}")
+    for a in arms:
+        v = [p[a] for p in paired]
+        o(f"   {a:<8} {np.mean([x['correct'] for x in v]):>9.4f} "
+          f"{np.mean([x['p_correct'] for x in v]):>11.4f} "
+          f"{np.mean([x['mass'] for x in v]):>15.4f}")
+
+    o("")
+    o("PAIRED AGAINST CLEAN, on the same questions. Intervals are clustered on PICTURE,")
+    o("because the ~10 questions about one picture share its cell and are not ten")
+    o("independent facts.")
+    o("")
+    o(f"   {'arm':<8} {'d accuracy':>12} {'95% CI':>20} {'d P(correct)':>14} {'95% CI':>20}")
+    keys = sorted({k for k, _ in idx})
+    kpos = {k: i for i, k in enumerate(keys)}
+    for a in arms:
+        if a == "clean":
+            continue
+        da = np.array([p[a]["correct"] - p["clean"]["correct"] for p in paired])
+        dp = np.array([p[a]["p_correct"] - p["clean"]["p_correct"] for p in paired])
+        g = np.array([kpos[p[a]["key"]] for p in paired])
+
+        def ci(x):
+            # cluster on picture: average within picture, then the spread of those means
+            m = np.array([x[g == i].mean() for i in np.unique(g)])
+            se = m.std(ddof=1) / np.sqrt(m.size)
+            return x.mean(), x.mean() - 1.96 * se, x.mean() + 1.96 * se
+
+        ma, la, ha = ci(da)
+        mp, lp, hp = ci(dp)
+        o(f"   {a:<8} {ma:>+12.4f} {f'[{la:+.4f}, {ha:+.4f}]':>20} "
+          f"{mp:>+14.4f} {f'[{lp:+.4f}, {hp:+.4f}]':>20}")
+
+    o("")
+    o("THE COMPARISON THAT MATTERS: does moving the TOP-LEFT cell cost more than moving")
+    o("a fixed middle cell, on the same questions?")
+    o("")
+    for other in ("mid", "rand"):
+        if other not in by_arm or "tl" not in by_arm:
+            continue
+        d = np.array([(p["tl"]["p_correct"] - p["clean"]["p_correct"])
+                      - (p[other]["p_correct"] - p["clean"]["p_correct"]) for p in paired])
+        g = np.array([kpos[p["tl"]["key"]] for p in paired])
+        m = np.array([d[g == i].mean() for i in np.unique(g)])
+        se = m.std(ddof=1) / np.sqrt(m.size)
+        o(f"   tl minus {other:<5} on P(correct): {d.mean():+.4f}  "
+          f"95% CI [{d.mean() - 1.96 * se:+.4f}, {d.mean() + 1.96 * se:+.4f}]")
+
+    o("")
+    o("BY GOLD ANSWER -- a perturbation that just pushes the model toward 'yes' would")
+    o("look like damage on the no questions and like help on the yes ones.")
+    o("")
+    o(f"   {'arm':<8} {'acc | gold=yes':>15} {'acc | gold=no':>14} {'mean P(yes)':>12}")
+    for a in arms:
+        v = [p[a] for p in paired]
+        y = [x for x in v if x["gold"] == 1]
+        n_ = [x for x in v if x["gold"] == 0]
+        o(f"   {a:<8} {np.mean([x['correct'] for x in y]):>15.4f} "
+          f"{np.mean([x['correct'] for x in n_]):>14.4f} "
+          f"{np.mean([x['p_yes'] for x in v]):>12.4f}")
+
+    o("")
+    o("READING IT")
+    o("  tl costs clearly more than mid -> the language model IS reading something out")
+    o("     of that cell that it cannot read elsewhere, and the linear probe missed it.")
+    o("  tl costs the same as mid -> the cell is not privileged for the model either,")
+    o("     and the probe and the intervention agree.")
+    o("  nothing costs anything -> one cell out of ~200 is too small a perturbation to")
+    o("     move a yes/no answer; look at P(correct) before concluding that, and at the")
+    o("     tl_raw arm, which is the largest perturbation here.")
+    (out / "intervene_report.txt").write_text("\n".join(lines) + "\n")
+    print(f"\n-> {out / 'intervene_report.txt'}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stage", choices=["labels", "extract", "probe", "report"])
+    ap.add_argument("stage", choices=["labels", "extract", "probe", "report",
+                                      "intervene", "ireport"])
     ap.add_argument("--out-dir", default="outputs/register_probe/pope")
     ap.add_argument("--pope-repo", default="lmms-lab/POPE")
     ap.add_argument("--pope-config", default="Full")
@@ -497,7 +782,8 @@ def main():
     args = ap.parse_args()
     os.chdir(REPO)
     return {"labels": stage_labels, "extract": stage_extract,
-            "probe": stage_probe, "report": stage_report}[args.stage](args)
+            "probe": stage_probe, "report": stage_report,
+            "intervene": stage_intervene, "ireport": stage_ireport}[args.stage](args)
 
 
 if __name__ == "__main__":
