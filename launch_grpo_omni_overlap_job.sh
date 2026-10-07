@@ -246,6 +246,15 @@ BETA=0
 # Resolved HERE rather than there because RUN_NAME is built before the submit, and the
 # fused path changes the numbers enough that two runs must not share a directory.
 MAMBA_KERNELS=${SR1_MAMBA_KERNELS:-fused}
+# ours | none. `none` is the NO-SALIENCY arm: GRPO on format + accuracy + judge, with no
+# attention capture and no Grounding-DINO call at all. The trainer has supported it since
+# it was written (`reward_funcs = [think_format_reward, accuracy_reward, openai_reward]`)
+# and no launcher in this repo had ever wired it, so it could only be reached by passing
+# `-- --reward_variant none --reward_weights 1.0 1.0 1.0` and hoping argparse's last-wins
+# beat the hardcoded flags -- which it does, and which leaves the run NAME advertising an
+# overlap weight the run never applied. That is the failure mode this repo already paid
+# for once with `_c768`, so the arm gets a flag and a name of its own instead.
+REWARD_VARIANT=ours
 # A free-text marker appended to the run name. It exists so a PERFORMANCE experiment can
 # have its own directory and its own wandb run without every tuning knob earning a place in
 # the naming rule -- the rule is for things that change the science, and accreting one
@@ -337,6 +346,8 @@ while [[ $# -gt 0 ]]; do
         --beta)                   BETA="$2";                    shift 2 ;;
         --mamba-kernels)          MAMBA_KERNELS="$2";           shift 2 ;;
         --steps-device)           STEPS_DEVICE="$2";            shift 2 ;;
+        --no-saliency)            REWARD_VARIANT=none;          shift 1 ;;
+        --reward-variant)         REWARD_VARIANT="$2";          shift 2 ;;
         --tag)                    RUN_TAG="$2";                 shift 2 ;;
         --vllm-gpus)              VLLM_GPUS_N="$2";             shift 2 ;;
         --vllm-gpu-mem)           VLLM_GPU_MEM="$2";            shift 2 ;;
@@ -379,6 +390,27 @@ if (( GEN_BATCH % NUM_GENERATIONS != 0 )); then
     exit 1
 fi
 
+case "$REWARD_VARIANT" in
+    ours) SALIENCY_FLAGS=(--reward_variant ours
+                          --overlap_metric "$OVERLAP_METRIC"
+                          --overlap_layer "$OVERLAP_LAYER"
+                          --overlap_heads "$OVERLAP_HEADS"
+                          --token_reduction "$TOKEN_REDUCTION"
+                          --dino_api_base "http://127.0.0.1:$DINO_PORT"
+                          --box_threshold "$BOX_THRESHOLD"
+                          --max_box_area "$MAX_BOX_AREA")
+          REWARD_WEIGHTS=(1.0 "$W_OVERLAP" 1.0 1.0) ;;
+    none) # THREE weights, not four. `--reward_variant none` builds reward_funcs as
+          # [format, accuracy, judge]; leaving the overlap weight in would silently shift
+          # the judge's weight onto accuracy and drop the judge.
+          SALIENCY_FLAGS=(--reward_variant none)
+          REWARD_WEIGHTS=(1.0 1.0 1.0) ;;
+    *) echo "ERROR: --reward-variant must be 'ours' or 'none' (got '$REWARD_VARIANT')." >&2
+       echo "       grad and glimpse are refused on this model: they have no object at" >&2
+       echo "       46 of its 52 layers. See docs/omni-training-harness.md §3." >&2
+       exit 1 ;;
+esac
+
 # Layers 26 and 42 are the ones the selection scan found ANTI-predictive: all 32 heads of
 # 26 and most of 42 correlate negatively with correctness under both labels, and it is
 # neither the union-size confound nor image mass. Rewarding overlap there is rewarding a
@@ -396,7 +428,13 @@ esac
 # The completion cap is in the name whenever it is not the Qwen3-VL runs' 1024, because
 # it is the ONE training hyper-parameter that could not be carried over and a run that
 # differs in it must never be mistaken for one that does not. See THE MEMORY CEILING.
-RUN_NAME="grpo-omni30b-overlap__wov${W_OVERLAP}_L${OVERLAP_LAYER}_h${OVERLAP_HEADS//,/-}_${OVERLAP_METRIC}"
+if [ "$REWARD_VARIANT" = none ]; then
+    # No overlap weight, no layer, no heads, no metric -- none of them apply, and a name
+    # carrying them would describe a reward this run does not compute.
+    RUN_NAME="grpo-omni30b-nosal"
+else
+    RUN_NAME="grpo-omni30b-overlap__wov${W_OVERLAP}_L${OVERLAP_LAYER}_h${OVERLAP_HEADS//,/-}_${OVERLAP_METRIC}"
+fi
 [ "$MAX_COMPLETION_LENGTH" = 1024 ] || RUN_NAME="${RUN_NAME}_c${MAX_COMPLETION_LENGTH}"
 # The fused Mamba kernels are in the name for the same reason the completion cap is: they
 # change the arithmetic of 23 of 52 layers, every measurement before 2026-10-04 was taken
@@ -441,7 +479,8 @@ if [ "$DIRECT" != true ]; then
           "--box-threshold" "$BOX_THRESHOLD"
           "--max-box-area" "$MAX_BOX_AREA"
           "--mamba-kernels" "$MAMBA_KERNELS"
-          "--steps-device" "$STEPS_DEVICE")
+          "--steps-device" "$STEPS_DEVICE"
+          "--reward-variant" "$REWARD_VARIANT")
     [ -n "$RUN_TAG" ] && ARGS+=("--tag" "$RUN_TAG")
     [ "$PREFLIGHT" = true ] || ARGS+=("--no-preflight")
     [ "$SYNC_LORA_ONLY" = true ] || ARGS+=("--sync-all-weights")
@@ -621,7 +660,12 @@ else
 fi
 echo "Steps classifier: $STEPS_DEVICE   (OMP_NUM_THREADS=$OMP_NUM_THREADS of $_CORES cores across $TRAIN_N ranks)"
 echo "Completion cap:   max_completion_length=$MAX_COMPLETION_LENGTH $([ "$MAX_COMPLETION_LENGTH" = 1024 ] && echo '(the Qwen3-VL value -- see THE MEMORY CEILING)' || echo "(in the run name as _c$MAX_COMPLETION_LENGTH)")"
-echo "Reward:           overlap $OVERLAP_METRIC w=$W_OVERLAP  layer=$OVERLAP_LAYER heads=$OVERLAP_HEADS tr=$TOKEN_REDUCTION"
+if [ "$REWARD_VARIANT" = none ]; then
+    echo "Reward:           NO SALIENCY -- format + accuracy + judge only (weights ${REWARD_WEIGHTS[*]})"
+    echo "                  no attention capture, no Grounding-DINO call, no overlap term"
+else
+    echo "Reward:           overlap $OVERLAP_METRIC w=$W_OVERLAP  layer=$OVERLAP_LAYER heads=$OVERLAP_HEADS tr=$TOKEN_REDUCTION"
+fi
 echo "LoRA:             r=16 alpha=32 targets=$LORA_TARGETS (scoped to the decoder by vlm_family)"
 echo "Steps:            max_steps=$MAX_STEPS save_steps=$SAVE_STEPS"
 echo "Output:           $OUTPUT_DIR"
@@ -848,16 +892,9 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS accelerate launch \
     --gradient_checkpointing \
     --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
     --reforward_saliency True \
-    --reward_variant ours \
-    --overlap_metric "$OVERLAP_METRIC" \
-    --overlap_layer "$OVERLAP_LAYER" \
-    --overlap_heads "$OVERLAP_HEADS" \
-    --token_reduction "$TOKEN_REDUCTION" \
-    --dino_api_base "http://127.0.0.1:$DINO_PORT" \
-    --box_threshold "$BOX_THRESHOLD" \
-    --max_box_area "$MAX_BOX_AREA" \
+    "${SALIENCY_FLAGS[@]}" \
     $BETA_FLAG \
-    --reward_weights 1.0 "$W_OVERLAP" 1.0 1.0 \
+    --reward_weights "${REWARD_WEIGHTS[@]}" \
     --use_vllm \
     --vllm_mode server \
     --vllm_server_host 127.0.0.1 \

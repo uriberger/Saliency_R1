@@ -64,6 +64,9 @@ SUBMIT_ONLY = {
     "--openai-api-key": "crosses in the environment, not the command line",
     "--wandb-api-key": "crosses in the environment, not the command line",
     "--hf-token": "crosses in the environment, not the command line",
+    "--no-saliency": "shorthand that resolves into --reward-variant none; the canonical "
+                     "flag carries the value across the hop, so forwarding both would be a "
+                     "duplicate. Same shape as --grad/--glimpse in the Qwen3-VL launcher.",
     "--": "the passthrough separator, appended last",
 }
 
@@ -183,6 +186,21 @@ check("the tag lands LAST in the run name", name_t.endswith("_t5gpu"), name_t)
 argv_u, name_u = submit()
 check("no tag emits no --tag at all", "--tag" not in argv_u, " ".join(argv_u[-4:]))
 check("and leaves the name unsuffixed", not name_u.endswith("_"), name_u)
+
+# The no-saliency arm. Its weights list is THREE long, not four, because
+# --reward_variant none builds reward_funcs as [format, accuracy, judge]; a four-value list
+# would silently shift the judge's weight onto accuracy and drop the judge. And its name
+# must not carry an overlap weight, a layer, heads or a metric -- none of them apply.
+argv_n, name_n = submit("--no-saliency", "--max-steps", "3990")
+check("--no-saliency resolves to --reward-variant none",
+      after(argv_n, "--reward-variant") == "none", str(after(argv_n, "--reward-variant")))
+check("the no-sal run is named for what it is", name_n.startswith("grpo-omni30b-nosal"), name_n)
+check("and carries no overlap weight in its name", "wov" not in name_n, name_n)
+check("the shorthand itself is not forwarded twice", "--no-saliency" not in argv_n)
+argv_o, name_o = submit()
+check("the default arm is still 'ours'", after(argv_o, "--reward-variant") == "ours",
+      str(after(argv_o, "--reward-variant")))
+check("and still names its overlap weight", "wov" in name_o, name_o)
 
 # 1024 is the Qwen3-VL value, and the naming rule keys off it: at 1024 there is no suffix,
 # because a run that matches the reference runs must not be advertised as deviating.
