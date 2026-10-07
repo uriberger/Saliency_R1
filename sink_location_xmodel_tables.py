@@ -104,6 +104,16 @@ INK, MUTED, SURFACE = "#0b0b0b", "#52514e", "#fcfcfb"
 #: labelled with its own number, so a clipped cell never silently reads as "the maximum".
 CLIP = 2.0
 
+#: Past the ramp's end, colour stops carrying the number. A corner at 51x and a corner at
+#: 12x are both "saturated red", so the picture says they are the same and only the direct
+#: label says otherwise -- which is exactly the comparison a before/after pair is for.
+#: Anything two octaves beyond the ramp (4x -> 16x) gets its own colour and its own key
+#: entry, so "off the chart" is a state the reader can SEE. The colour is off the
+#: blue<->red axis on purpose: the ramp never passes through violet, so an extreme cell
+#: cannot be misread as an interpolated one.
+EXTREME = 4.0 * 4.0
+EXTREME_COLOUR = "#4a3aa7"
+
 
 # ---------------------------------------------------------------------------
 def _slug(label):
@@ -291,6 +301,14 @@ def draw(mat, title, subtitle, path, note=""):
     ax.set_facecolor(SURFACE)
     im = ax.imshow(np.clip(z, -CLIP, CLIP), cmap=cmap, vmin=-CLIP, vmax=CLIP,
                    interpolation="nearest")
+    # Cells two octaves past the ramp, painted over it in their own colour (see EXTREME).
+    # Drawn after `im` and before the labels, so it covers the fill and not the number.
+    from matplotlib.colors import ListedColormap
+    over = np.where(np.isfinite(mat) & (mat > EXTREME), 1.0, np.nan)
+    has_over = bool(np.isfinite(over).any())
+    if has_over:
+        ax.imshow(np.ma.masked_invalid(over), cmap=ListedColormap([EXTREME_COLOUR]),
+                  vmin=0, vmax=1, interpolation="nearest")
     # a thin surface gap between cells, so adjacent fills never bleed into one another
     ax.set_xticks(np.arange(-0.5, GW, 1), minor=True)
     ax.set_yticks(np.arange(-0.5, GH, 1), minor=True)
@@ -332,6 +350,15 @@ def draw(mat, title, subtitle, path, note=""):
                           color=MUTED)
     cb.outline.set_visible(False)
     cb.ax.tick_params(length=0)
+    # The key for the over-range colour, under the bar it is not part of. Only drawn when
+    # a cell actually reached it, so a figure with nothing off the chart says nothing.
+    if has_over:
+        from matplotlib.patches import Patch
+        cb.ax.legend(handles=[Patch(facecolor=EXTREME_COLOUR, edgecolor="none",
+                                    label=f"> {EXTREME:g}x")],
+                     loc="upper left", bbox_to_anchor=(-0.1, -0.03), frameon=False,
+                     fontsize=7, labelcolor=MUTED, handlelength=1.0, handleheight=1.0,
+                     borderpad=0.0, handletextpad=0.4)
     if note:
         fig.text(0.01, 0.015, note, fontsize=6.5, color=MUTED, va="bottom")
     fig.tight_layout(rect=(0, 0.03 if note else 0, 1, 1))
