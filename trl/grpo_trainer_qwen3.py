@@ -2448,9 +2448,28 @@ class GRPOTrainer(Trainer):
                         role = message.get("role")
                         if isinstance(content, str):
                             if role == "user":
+                                # The USER turn has to become structured: that is the only
+                                # way to say "a picture goes here" to a chat template.
                                 message["content"] = [{"type": "image"}, {"type": "text", "text": content}]
-                            elif role == "system":
-                                message["content"] = [{"type": "text", "text": content}]
+                            # THE SYSTEM TURN IS LEFT A PLAIN STRING, and that is a fix.
+                            #
+                            # It used to be wrapped the same way. Qwen3-VL's template
+                            # understands that shape for the system role; the Omni's does
+                            # NOT, and Jinja stringifies the list, so every Omni run ever
+                            # launched sent its model this as the system prompt:
+                            #
+                            #   <|im_start|>system
+                            #   [{'type': 'text', 'text': 'A conversation between user ...'}]
+                            #
+                            # Read off the live wov0.4 run's own logged completions table,
+                            # 2026-10-08. The instructions were still in there, wrapped in a
+                            # Python repr, which is not what any Qwen3-VL run ever sent --
+                            # so the two arms differed in their prompts as well as in their
+                            # cold start.
+                            #
+                            # A plain string is the universal form and renders BYTE-IDENTICAL
+                            # on Qwen3-VL, so this is a no-op there and a repair here.
+                            # test_system_prompt_render_cpu.py pins both.
 
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
 
