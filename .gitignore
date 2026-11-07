@@ -49,3 +49,6 @@ wandb/
 laser_repo
 laser_fork
 ease_repo
+
+# The DeepEyes arm's own verl clone (see docs/deepeyes-build-prompts.md Prompt 0).
+deepeyes_fork

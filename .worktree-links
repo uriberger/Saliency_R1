@@ -55,3 +55,11 @@ laser_repo
 # executes, patched by patch_laser_qwen3.sh. Shared like trl_repo, which means
 # re-patching it from a worktree re-patches it for every session.
 laser_fork
+
+# The SECOND verl clone -- the one the DeepEyes arm executes. Cloned from laser_fork
+# at qwen3-vl/bfd3b30, so it starts byte-identical, and installed editable into the
+# `deepeyes` conda env (laser_fork stays wired to `laser`). It exists so that giving
+# DeepEyes its own zoom tool, reward and config block never rewrites the verl that
+# the LASER arm and any in-flight LASER job are importing. Shared exactly like
+# laser_fork: editing it from a worktree edits it for every session.
+deepeyes_fork
