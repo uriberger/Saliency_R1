@@ -373,6 +373,15 @@ cp "$REPO/trl/rewards/overlap_rewards.py" "$REPO/trl_repo/trl/rewards/overlap_re
 cp "$REPO/trl/scripts/utils.py"           "$REPO/trl_repo/trl/scripts/utils.py"
 cp "$REPO/trl/grpo_vlm_qwen3.py"          "$REPO/trl_repo/examples/scripts/grpo_vlm_qwen3.py"
 cp "$REPO/trl/grpo_trainer_qwen3.py"      "$REPO/trl_repo/trl/trainer/grpo_trainer_qwen3.py"
+# The geometry seam, which the line above imports at MODULE scope
+# (`from .vlm_family import family_for`). It lives at the repo root rather than under
+# trl/, which is how it came to be missing from this list: the trainer was being synced
+# and the module it cannot import without was not. A backbone added to vlm_family.py and
+# not copied here is a trainer that still believes every model is Qwen3-VL.
+cp "$REPO/vlm_family.py"                  "$REPO/trl_repo/trl/trainer/vlm_family.py"
+# Imported lazily, and only for a trust_remote_code checkpoint -- but it is the same
+# one-copy-per-clone rule, and patch_trl_qwen3.sh carries both.
+cp "$REPO/nemotron_loader.py"             "$REPO/trl_repo/trl/trainer/nemotron_loader.py"
 echo "Synced overlap-reward sources into trl_repo/"
 
 cd "$REPO/trl_repo"

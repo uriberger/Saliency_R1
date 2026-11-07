@@ -173,6 +173,18 @@ bash launch_grpo_qwen3_overlap_job.sh \
     --overlap-layer <L> --overlap-heads <a,b> --overlap-metric mean_in_v2
 ```
 
+**One thing to check before the first launch, and it is not specific to these backbones.**
+The shared `trl_repo/` currently has **no `trl/trainer/vlm_family.py` at all**, and its
+`grpo_trainer_qwen3.py` is the pre-seam 3,427-line version. The launcher copies the
+seamed trainer in at launch time, and that file imports `.vlm_family` at module scope — so
+without the module beside it the run dies on import, on Qwen3-VL as much as on anything
+new. This branch adds `vlm_family.py` and `nemotron_loader.py` to the launcher's own copy
+list, which closes it for the non-colocated launcher. The colocated one syncs nothing and
+still relies on `patch_trl_qwen3.sh` having been run.
+
+`patch_trl_qwen3.sh` re-patches the clone **every session and every running job** shares,
+so run it deliberately rather than as part of a launch, and not while a job is mid-step.
+
 The first scored step prints
 
 ```
