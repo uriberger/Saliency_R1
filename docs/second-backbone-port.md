@@ -177,6 +177,55 @@ On a fail: re-run the cold start at `max_steps=4000` (+1.8 h) and gate again. Do
 to §5 — a weak cold start does not announce itself in GRPO, it looks like a reward that
 does not work.
 
+## 3.6. The two config defects the first runs actually hit
+
+Both were found on 2026-11-07, the first time either arm ran on a GPU. Both are now fixed
+in the tracked configs, so this section is why those configs look the way they do — not a
+list of things to do.
+
+**GLM: `stage3_param_persistence_threshold: 0`.** Stock ZeRO-3 kills GLM on the first
+optimizer step with `TypeError: output tensor must have the same type as input tensor`.
+In `partition_parameters.py::_allgather_params_coalesced`, every output buffer is
+allocated `dtype=param_list[0].ds_tensor.dtype` and then each param's own `ds_tensor` is
+all-gathered into it; LF keeps trainable params fp32 under ZeRO-3 against a bf16 base, so
+a persistent-parameter list holding both dtypes throws on the first element that differs
+from the zeroth. GLM's list does, InternVL's and Qwen3-VL's happen not to. Threshold 0
+empties the list and `_post_step` guards with `if len(self.persistent_parameters) > 0`,
+so the path is never entered. **No math changes**, so the arms stay comparable — only
+which small params stay unpartitioned between steps. `train/cold_start/ds_z3_no_persist.json`
+is a repo-local copy because LLaMA-Factory's checkout is external and shared.
+
+**InternVL: the output head must be explicitly untied, and this is the nastier one.**
+`OpenGVLab/InternVL3_5-8B-HF` omits `tie_word_embeddings` from its config, so it defaults
+`True`, while shipping a `lm_head` that genuinely differs from `embed_tokens`
+(max|diff| = 0.9448). `from_pretrained` detects the conflict and declines to tie;
+**ZeRO-3's init cannot**, ties them, and the run trains against a wrong output head.
+
+| | loss |
+|---|---|
+| untied (as `from_pretrained` loads it) | 4.65 |
+| tied (`lm_head := embed_tokens`) | **13.25** |
+| `ln(vocab)` — a uniform guess | 11.93 |
+| what the broken run logged at step 10 | **13.898** (GLM: 1.578) |
+
+**A step-10 loss above `ln(vocab)` is the tell**, and it is visible a minute into the run.
+Everything after that looks healthy — loss converged to 0.873 by step 2,000, because the
+LoRA learns to compensate — and then the merged model scored `format_ok` **0.0%** at §3.5's
+gate, emitting token salad. A low *final* loss proves nothing here.
+
+Localising it: generate from (a) base alone, (b) base + adapter via `PeftModel`, (c) the
+merged checkpoint. Base coherent while (b) == (c) gibberish means the merge is faithful
+and the adapter is the problem; weights were finite throughout, so NaN hunting is a dead
+end. It is not a transformers-version or tiling issue — both were ruled out by measurement.
+
+`make_untied_internvl_base.py` builds the fix: symlinks to the HF cache plus one patched
+`config.json`, so no 16 GB copy and nothing to go stale. The yaml points at its output, so
+a missing directory fails loudly instead of silently.
+
+**This is also the argument for §3.5 existing.** Nothing between the data loader and the
+gate said a word; the gate is what caught it, one GPU-hour after the cold start rather
+than a week into GRPO.
+
 ## 4. The two traps, and where each is now stopped
 
 **InternVL's processor tiles unless told not to, and the attribute is a lie.**
@@ -304,7 +353,36 @@ cold-start row; the vocab arithmetic; LF's resolved cold-start LoRA targets; vLL
 registry entries and InternVL's patch count; and 63 CPU checks in
 `test_vlm_geometry_cpu.py`.
 
-**Not verified, because it needs GPUs:** a cold-start step, a GRPO step, the
-`[overlap]` shape line on either backbone, and anything about reward quality. The next
-action is §3 on both, then §5, then §6 — in that order, because §5 needs the merged
-cold-start checkpoint as its base model.
+**Run on GPUs 2026-11-07 (cs-oci-ord), both cold starts:**
+
+| | steps | wall | loss | gate |
+|---|---|---|---|---|
+| GLM-4.1V-9B | 2,000 / 2,000 | 3h33 | 1.578 → 0.558 | **PASS** |
+| InternVL3.5-8B (tied head, §3.6) | 2,000 / 2,000 | 3h03 | 13.898 → 0.873 | **FAIL, format 0.0%** |
+| InternVL3.5-8B (refit, untied) | 2,000 / 2,000 | — | 1.611 → — | — |
+
+Both fit one 4-hour allocation, so autoresume never fired. §3's claims were re-checked on
+the real adapters rather than inherited: **480 LoRA tensors for GLM and 504 for InternVL,
+0 in either vision tower** — 240 and 252 resolved modules, the counts §3 predicts. The §4
+tiling trap is avoided in the cold start because LF writes `self_attn.q_proj`/`k_proj`/
+`v_proj` rather than bare names, and InternViT's attention is `attn.*`.
+
+The gate, 100 held-out prompts at temperature 1.0, with the Qwen3-VL cold start measured
+alongside as the bar:
+
+| criterion | GLM | Qwen3-VL ref | threshold |
+|---|---|---|---|
+| `format_ok` | 95.0% | 97.0% | ≥ 95% |
+| `<answer>` tags | 0.0% | 0.0% | ≤ 2% |
+| median observe steps | 4 | 3 | ≥ 2 |
+| chains with zero steps | 0/95 | 0/97 | — |
+| exact-match accuracy | 26.0% | 29.0% | context only |
+
+**The `<answer>` risk §3.5 singles out did not materialise on GLM** — 0.0%, despite it
+being that checkpoint's native format. GLM's five format failures are all *truncations* at
+`max_new_tokens=512`, the same failure mode as the reference's three, so the 95-vs-97 gap
+is chain length rather than unlearned format.
+
+**Still not verified, because it needs GPUs:** a GRPO step, the `[overlap]` shape line on
+either backbone, and anything about reward quality. Next is §5 on each merged checkpoint,
+then §6.
