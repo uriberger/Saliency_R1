@@ -9,6 +9,25 @@
 #   WANDB_API_KEY=... NVIDIA_API_KEY=... bash launch_grpo_qwen3_overlap_job.sh [OPTIONS]
 #   bash launch_grpo_qwen3_overlap_job.sh --direct --num-gpus 8 --w-overlap 0.3
 #
+# A SECOND BACKBONE IS `--model` PLUS ITS OWN LAYER AND HEADS -- nothing else in this
+# launcher is Qwen3-VL-specific, and the LoRA scoping, the processor keywords and the
+# grid all come from `vlm_family` inside the trainer:
+#
+#   bash launch_grpo_qwen3_overlap_job.sh \
+#       --model $REPO/checkpoint/coldstart_glm4v_9b_thinking_sft_epoch2_lr5e5_merged \
+#       --overlap-layer <L> --overlap-heads <a,b>
+#
+# THE LAYER AND THE HEADS ARE NOT OPTIONAL and must not be left at 22 / 28,31. Those were
+# selected on Qwen3-VL-8B by head_correlation_probe.py; on GLM-4.1V (40 layers x 32 heads)
+# and InternVL3.5 (36 x 32) the same two indices name two arbitrary heads, and the layer
+# and heads ARE the reward's definition. Run launch_head_correlation.sh first --
+# docs/omni-head-selection.md is the precedent and docs/second-backbone-port.md §5 the
+# recipe. A run launched on the defaults is a smoke test, not a baseline.
+#
+# The first scored step prints `[overlap] first scored case: ... map N patches against
+# grid GxH`. On a new backbone that line is the thing to read: a MISMATCH there means
+# every map is being dropped and the reward will be nan.
+#
 # THE HACK-RESISTANT REWARD -- one flag, nothing else to set:
 #
 #   bash launch_grpo_qwen3_overlap_job.sh --overlap-metric auroc
