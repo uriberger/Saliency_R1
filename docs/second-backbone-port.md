@@ -49,6 +49,8 @@ This branch adds:
 * `trl/grpo_trainer_qwen3.py` — `family.proc_defaults` at the processor call, and three
   `== 151655` literals that now ask the family;
 * `train/cold_start/{glm4v_9b_thinking_sft,internvl3_5_8b_sft}/train.yaml`;
+* `coldstart_gate.py` + `test_coldstart_gate_cpu.py` — the acceptance gate for a
+  shortened cold start, and 22 CPU checks on its judgement;
 * `test_vlm_geometry_cpu.py` — 25 more checks, no GPU and no weights.
 
 ## 3. Cold start
@@ -96,14 +98,84 @@ targets, **0 in the vision tower**.
 image processor honours its own `crop_to_patches: False`. Measured: `pixel_values`
 `(1, 3, 448, 448)`, 256 image tokens. The trap is one level up — see §4.
 
+### The budget is 2,000 steps, not 2 epochs
+
+Both configs carry `max_steps: 2000`. **This is the one place the two new arms
+deliberately depart from the Qwen3-VL recipe**, and the reason is that the Qwen3-VL arm
+exists to be compared against Saliency-R1's published numbers while these two do not —
+they only have to learn the format and a reasoning style the overlap reward can score.
+
+What the full recipe bought, off the Qwen3-VL run's own `trainer_log.jsonl` (share of the
+total loss drop, 1.7276 → 0.4728):
+
+| step | epoch | share | | step | epoch | share |
+|---|---|---|---|---|---|---|
+| 100 | 0.02 | **79.9%** | | 3,000 | 0.70 | 96.7% |
+| 300 | 0.07 | 89.7% | | 4,258 | 1.00 | 97.5% |
+| 1,000 | 0.23 | 92.5% | | 8,516 | 2.00 | 100% |
+| 2,000 | 0.47 | 94.3% | | | | |
+
+The entire second epoch is 3.8 hours for the last 2.5%. At ~1,124 steps/h, 2,000 steps is
+**~1.8 h — one 4-hour allocation, so the autoresume cycle never starts**, which on a
+contended cluster is worth more than the 4× compute saving. `save_steps` drops to 250 to
+match.
+
+`max_steps` rather than a fraction of an epoch, and the difference matters: the cosine
+schedule and warmup are computed against it, so the LR anneals to zero over exactly these
+2,000 steps. Stopping an 8,516-step run at 2,000 would leave the adapter mid-schedule at a
+high LR. `num_train_epochs: 2` stays in the yaml and is ignored, so deleting one line
+restores the full recipe.
+
+The cut is a bet, and §3.5 is how it gets settled.
+
 Then merge, exactly as for Qwen3-VL (the script reads the base out of
 `adapter_config.json`, so it is already model-agnostic):
 
 ```fish
 bash merge_lora_grpo_qwen3.sh \
-    $REPO/checkpoint/coldstart_glm4v_9b_thinking_sft_epoch2_lr5e5 \
-    $REPO/checkpoint/coldstart_glm4v_9b_thinking_sft_epoch2_lr5e5_merged
+    $REPO/checkpoint/coldstart_glm4v_9b_thinking_sft_2ksteps_lr5e5 \
+    $REPO/checkpoint/coldstart_glm4v_9b_thinking_sft_2ksteps_lr5e5_merged
 ```
+
+## 3.5. The gate — settle the 2,000-step bet before spending a GPU-day on it
+
+```fish
+python coldstart_gate.py --model <merged> \
+    --reference checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged
+```
+
+~15 minutes on one GPU, 100 held-out prompts from `cold_data/grpo_sets/val_natural`,
+**sampled at temperature 1.0** because that is what GRPO generates at and greedy decoding
+overstates format compliance. Exits non-zero on a fail. `--reference` scores the Qwen3-VL
+cold start alongside, which is the only one of the three with a known-good GRPO run behind
+it, so its numbers are what "good enough" means in practice rather than in principle.
+
+Three criteria, each a mechanism the reward depends on, and each one silent when it fails:
+
+| criterion | threshold | what it being wrong looks like later |
+|---|---|---|
+| `format_ok` | ≥ 95% | every reward masked; `format` flat near 0 |
+| median observe steps | ≥ 2 | `think_overlap_reward = nan`, nothing in the log says why |
+| `<answer>` tags in the answer | ≤ 2% | `accuracy_reward` exactly 0.0 forever, no error |
+
+**That third row is the one worth knowing about.** The trainer's format regex is
+`^<think>…</think>…$`, with no `<answer>` in it — but it does not *reject* those tags
+either, it swallows them into the answer capture group. `accuracy_reward` then takes
+everything after `</think>` and, for the non-LaTeX gold that is most of this corpus,
+string-compares it against the solution. `"<answer> flower </answer>"` is never
+`"flower"`. And `<think>…</think><answer>…</answer>` is **GLM-4.1V-Thinking's native
+format** — it was trained upstream to write it — so a *shortened* cold start is precisely
+the condition under which it creeps back. The gate therefore counts the tags itself rather
+than trusting the format regex to catch them.
+
+`test_coldstart_gate_cpu.py` pins all of this with 22 checks and no GPU, including that
+the tagged completion really does pass the format regex, and a drift guard that makes the
+gate refuse to run if the trainer's pattern or system prompt ever moves away from the one
+it scores.
+
+On a fail: re-run the cold start at `max_steps=4000` (+1.8 h) and gate again. Do not go on
+to §5 — a weak cold start does not announce itself in GRPO, it looks like a reward that
+does not work.
 
 ## 4. The two traps, and where each is now stopped
 
@@ -154,7 +226,7 @@ The probe is already family-driven and takes the model and the environment as ar
 
 ```fish
 bash launch_head_correlation.sh --gpus 8 --out-dir DIR --cases-dir PROBE_DIR \
-    --base-model $REPO/checkpoint/coldstart_glm4v_9b_thinking_sft_epoch2_lr5e5_merged
+    --base-model $REPO/checkpoint/coldstart_glm4v_9b_thinking_sft_2ksteps_lr5e5_merged
 python head_correlation_probe.py --stage report --out-dir DIR --max-union 0.5
 ```
 
@@ -169,7 +241,7 @@ trainer:
 
 ```fish
 bash launch_grpo_qwen3_overlap_job.sh \
-    --model $REPO/checkpoint/coldstart_glm4v_9b_thinking_sft_epoch2_lr5e5_merged \
+    --model $REPO/checkpoint/coldstart_glm4v_9b_thinking_sft_2ksteps_lr5e5_merged \
     --overlap-layer <L> --overlap-heads <a,b> --overlap-metric mean_in_v2
 ```
 

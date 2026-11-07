@@ -14,7 +14,7 @@
 # grid all come from `vlm_family` inside the trainer:
 #
 #   bash launch_grpo_qwen3_overlap_job.sh \
-#       --model $REPO/checkpoint/coldstart_glm4v_9b_thinking_sft_epoch2_lr5e5_merged \
+#       --model $REPO/checkpoint/coldstart_glm4v_9b_thinking_sft_2ksteps_lr5e5_merged \
 #       --overlap-layer <L> --overlap-heads <a,b>
 #
 # THE LAYER AND THE HEADS ARE NOT OPTIONAL and must not be left at 22 / 28,31. Those were

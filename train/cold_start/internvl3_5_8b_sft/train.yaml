@@ -42,9 +42,9 @@ overwrite_cache: true
 preprocessing_num_workers: 128
 
 ### output
-output_dir: /home/uberger/scratch/research/saliency_r1/checkpoint/coldstart_internvl3_5_8b_sft_epoch2_lr5e5
+output_dir: /home/uberger/scratch/research/saliency_r1/checkpoint/coldstart_internvl3_5_8b_sft_2ksteps_lr5e5
 logging_steps: 10
-save_steps: 500
+save_steps: 250            # 2,000 steps total, so a relaunch loses <=13 min, not <=27
 save_total_limit: 3
 # Resumability (submit_job autoresume across the wall limit): keep full trainer state
 # (optimizer/scheduler/RNG) so a relaunch resumes mid-run, and DON'T wipe the output dir.
@@ -53,7 +53,7 @@ save_strategy: 'steps'
 plot_loss: true
 overwrite_output_dir: false
 report_to: wandb
-run_name: coldstart_internvl3_5_8b_sft_epoch2_lr5e5
+run_name: coldstart_internvl3_5_8b_sft_2ksteps_lr5e5
 
 ### train
 # A 448px tile is 256 image tokens against Qwen3-VL's ~1,280 at the same picture, so this
@@ -62,6 +62,15 @@ run_name: coldstart_internvl3_5_8b_sft_epoch2_lr5e5
 per_device_train_batch_size: 8
 gradient_accumulation_steps: 1
 learning_rate: 5.0e-5
+# 2,000 steps, not 2 epochs -- the same budget and the same reasoning as the GLM config,
+# where the measured loss-drop table is written out in full. In short: the second epoch of
+# the Qwen3-VL run cost 3.8 hours for the last 2.5% of the loss drop, this arm has no
+# published baseline to match, and 2,000 steps fits one 4-hour allocation so the
+# autoresume cycle never starts. `max_steps` rather than fewer epochs so the cosine
+# schedule anneals to zero over exactly this budget.
+#
+# Gate it with `coldstart_gate.py` before merging on to head selection.
+max_steps: 2000
 num_train_epochs: 2
 lr_scheduler_type: cosine
 warmup_ratio: 0.05

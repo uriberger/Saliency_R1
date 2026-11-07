@@ -71,10 +71,21 @@ Pass `WANDB_API_KEY=...` to get online logging; without it the run goes to
 Qwen3-VL cold start did exactly that in 3 segments with no intervention. Do not babysit it
 with resubmissions.
 
-Expected, from the Qwen3-VL run's own `trainer_log.jsonl`: **8,516 steps at ~1,124
-steps/h ≈ 7.6 h of compute, about 3 chunks.** All three backbones sit at 250–320 image
-tokens per picture so per-step cost should be comparable; GLM is 9B against 8B, so expect
-it a little slower. `save_steps: 500` means a relaunch loses up to ~27 minutes.
+**Both configs are capped at `max_steps: 2000`, which is deliberate and is not 2 epochs.**
+The Qwen3-VL arm runs the full 8,516 steps because it reproduces Saliency-R1's published
+recipe and is compared against their numbers; these two have no published baseline to
+match, so they only have to learn the format and a reasoning style the overlap reward can
+score. Measured on the Qwen3-VL run's own `trainer_log.jsonl`, step 2,000 is **94.3% of
+the total loss drop** and the whole second epoch is 3.8 hours for the last 2.5%. The full
+table is in the GLM yaml.
+
+Expected per model: **2,000 steps at ~1,124 steps/h ≈ 1.8 h — one allocation, no
+autoresume at all.** All three backbones sit at 250–320 image tokens per picture so
+per-step cost should be comparable; GLM is 9B against 8B, so expect it a little slower.
+`save_steps: 250`, so even if it does get cut off a relaunch loses ≤13 minutes.
+
+Do not shorten further, and do not lengthen without a reason — step 2.5 is what decides
+whether 2,000 was enough.
 
 If a job OOMs, halve `per_device_train_batch_size` and double
 `gradient_accumulation_steps` — the effective batch must stay matched to the Qwen3-VL arm,
@@ -88,7 +99,7 @@ Watch, and report to me rather than fixing silently:
 
 * `squeue --me` state, and `outputs/logs/coldstart_<name>.<jobid>.out`;
 * `checkpoint/<run>/trainer_log.jsonl` — `current_steps`/`total_steps` and the loss;
-* that each run is on its **own** WandB id (`a0f941a6` for GLM, `85e85ffe` for InternVL,
+* that each run is on its **own** WandB id (`eb7486d5` for GLM, `7b14440a` for InternVL,
   `cceaecd9` is Qwen3-VL's and must not be touched). That bug was fixed in 34d96a2; if two
   runs ever share a curve again, something reverted.
 
@@ -99,6 +110,23 @@ The order is forced by a dependency, not a preference:
 1. merge each adapter —
    `bash merge_lora_grpo_qwen3.sh <checkpoint dir> <checkpoint dir>_merged`
    (it reads the base model out of `adapter_config.json`, so it is model-agnostic);
+
+1.5. **gate it — do not skip this.** The cold start was cut to 2,000 steps, and a cold
+   start that did not take does not announce itself in GRPO; it looks like a reward that
+   does not work, a week later.
+
+   ```bash
+   python coldstart_gate.py --model <merged> \
+       --reference checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged
+   ```
+
+   ~15 min on one GPU, 100 held-out prompts from `cold_data/grpo_sets/val_natural`,
+   sampled at temperature 1.0 because that is what GRPO generates at. It exits non-zero
+   on a fail and says which of the three criteria missed. `--reference` measures the
+   Qwen3-VL cold start alongside as the bar — that is the one with a known-good GRPO run
+   behind it. **Report the numbers to me before going on, pass or fail.**
+
+   If it fails, re-run the cold start at `max_steps=4000` (+1.8 h) and gate again;
 2. **head and layer selection** — `launch_head_correlation.sh --base-model <merged>`.
    This needs the merged checkpoint, so it cannot overlap step 1. `--overlap-layer 22
    --overlap-heads 28,31` are Qwen3-VL-8B numbers; on GLM (40x32) and InternVL (36x32)
@@ -117,6 +145,16 @@ The order is forced by a dependency, not a preference:
 * **InternVL's vision tower uses bare `q_proj`/`k_proj`/`v_proj`** — 48 of its 120 suffix
   matches are in the InternViT. `vlm_family.InternVL.lora_target_modules` scopes it; GLM
   and Qwen3-VL need no scoping (fused `qkv` towers).
+* **`<answer>` tags are format-legal and accuracy-fatal, and GLM is the one at risk.**
+  The trainer's format gate is `^<think>…</think>…$` with no `<answer>` in it — but the
+  regex does not *reject* those tags either, it just swallows them into the answer group.
+  `accuracy_reward` then takes everything after `</think>` and, for the non-LaTeX gold
+  that is most of this corpus, string-compares it: `"<answer> flower </answer>"` is never
+  `"flower"`, so accuracy is 0.0 on every row with no error anywhere.
+  `<think>…</think><answer>…</answer>` is **GLM-4.1V-Thinking's native format**, so a
+  shortened cold start is exactly the condition under which it creeps back.
+  `coldstart_gate.py` counts it as its own criterion; `test_coldstart_gate_cpu.py` pins
+  the behaviour.
 * **`trl_repo/` may lack `trl/trainer/vlm_family.py`** — it did on the origin cluster, and
   the trainer imports it at module scope. The non-colocated GRPO launcher now copies it in
   at launch; the colocated one still needs `patch_trl_qwen3.sh`, which re-patches a clone

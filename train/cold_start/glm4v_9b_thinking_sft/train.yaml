@@ -52,9 +52,9 @@ preprocessing_num_workers: 128
 # embedding has 151552 rows. Resizing would rebuild an embedding that does not need it.
 
 ### output
-output_dir: /home/uberger/scratch/research/saliency_r1/checkpoint/coldstart_glm4v_9b_thinking_sft_epoch2_lr5e5
+output_dir: /home/uberger/scratch/research/saliency_r1/checkpoint/coldstart_glm4v_9b_thinking_sft_2ksteps_lr5e5
 logging_steps: 10
-save_steps: 500
+save_steps: 250            # 2,000 steps total, so a relaunch loses <=13 min, not <=27
 save_total_limit: 3
 # Resumability (submit_job autoresume across the wall limit): keep full trainer state
 # (optimizer/scheduler/RNG) so a relaunch resumes mid-run, and DON'T wipe the output dir.
@@ -63,7 +63,7 @@ save_strategy: 'steps'
 plot_loss: true
 overwrite_output_dir: false
 report_to: wandb
-run_name: coldstart_glm4v_9b_thinking_sft_epoch2_lr5e5
+run_name: coldstart_glm4v_9b_thinking_sft_2ksteps_lr5e5
 
 ### train
 # 9B against the Qwen arm's 8B, on the same 8 cards. If this OOMs, halve the batch and
@@ -72,6 +72,36 @@ run_name: coldstart_glm4v_9b_thinking_sft_epoch2_lr5e5
 per_device_train_batch_size: 8
 gradient_accumulation_steps: 1
 learning_rate: 5.0e-5
+# THE BUDGET IS 2,000 STEPS, NOT 2 EPOCHS, AND THIS ARM DOES NOT NEED TO BE 2 EPOCHS.
+# The Qwen3-VL cold start reproduces Saliency-R1's own recipe because that arm is compared
+# against their published numbers. This one is not: it only has to teach the format and a
+# reasoning style good enough for the overlap reward to have observe steps to score.
+#
+# What 2 epochs bought, measured on the Qwen3-VL run's own trainer_log.jsonl (percentages
+# are the share of the total loss drop, 1.7276 -> 0.4728):
+#
+#     step   100  (0.02 ep)  79.9%        step 3,000  (0.70 ep)  96.7%
+#     step   300  (0.07 ep)  89.7%        step 4,258  (1.00 ep)  97.5%
+#     step 1,000  (0.23 ep)  92.5%        step 8,516  (2.00 ep)   100%
+#     step 2,000  (0.47 ep)  94.3%
+#
+# The whole second epoch is 3.8 hours for the last 2.5%. 2,000 steps is ~1.8 h at the
+# measured 1,124 steps/h, which fits ONE 4-hour allocation with headroom even if this 9B
+# runs slower -- so the autoresume cycle, and the up-to-27-minute checkpoint-granularity
+# loss on each relaunch, do not happen at all.
+#
+# `max_steps` RATHER THAN A SMALLER num_train_epochs, and the difference is not cosmetic:
+# the cosine schedule and the warmup are computed against max_steps, so the LR actually
+# anneals to zero over exactly these 2,000 steps. Stopping an 8,516-step run at 2,000
+# would leave the adapter mid-schedule at a high LR.
+#
+# num_train_epochs is kept at 2 and IGNORED (HF: "Overrides `num_train_epochs`"). It stays
+# so that deleting one line restores the full recipe.
+#
+# Do not shorten this further without re-running the gate: `coldstart_gate.py` is what
+# says whether 2,000 steps actually taught the format and left chains with observe steps
+# in them. See docs/second-backbone-port.md section 3.
+max_steps: 2000
 num_train_epochs: 2
 lr_scheduler_type: cosine
 warmup_ratio: 0.05
