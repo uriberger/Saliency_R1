@@ -25,6 +25,38 @@ Both `requirements_qwen3*.txt` files carry an `-e git+...#egg=trl` line for refe
 **strip it on install** (`grep -v '#egg=trl'`), because trl comes from the local `trl_repo/`
 clone, not from git. Same for `#egg=llamafactory` in `requirements_coldstart.txt`.
 
+### Replaying these freezes: `--no-deps`, and the pytorch index
+
+These files are `pip freeze` output, i.e. complete closures, and **a plain
+`pip install -r` cannot install `requirements_coldstart.txt` at all**:
+
+```
+ERROR: Cannot install datasets==4.0.0 and fsspec==2026.4.0 because these package
+versions have conflicting dependencies.  (datasets 4.0.0 depends on fsspec<=2025.3.0)
+```
+
+A freeze records what *is* installed, and pip only resolves within one command, so an env
+built up over several installs can hold a combination pip would refuse to construct in one
+go. It fails during resolution, so nothing is installed and it fails safe. Replay it the
+way a closure is meant to be replayed:
+
+```fish
+pip install --no-deps -r (grep -v '#egg=llamafactory' requirements_coldstart.txt | psub) \
+    --extra-index-url https://download.pytorch.org/whl/cu124
+```
+
+`--extra-index-url` is required for the `+cu124` local-version pins (`torch`,
+`torchvision`, `torchaudio`), which are not on PyPI. The fsspec/datasets pair was verified
+to work at runtime on a GPU node (datasets map + round-trip) despite the declared bound.
+
+**`torchaudio` must match `torch`'s CUDA build, and the freeze used to get this wrong** —
+it pinned `torchaudio==2.11.0` (built against `libcudart.so.13`) next to
+`torch==2.6.0+cu124`. LLaMA-Factory imports torchaudio at module scope, so every run died
+~2 minutes in with `OSError: libcudart.so.13: cannot open shared object file` before
+touching the data. Corrected to `torchaudio==2.6.0+cu124`. A smoke test that imports
+torch/transformers/deepspeed individually will NOT catch this; gate on LF's own entry
+point, `from llamafactory.train.tuner import run_exp`.
+
 ### `saliency_r1` — Qwen2.5-VL GRPO (the paper's baseline)
 
 `requirements_clean.txt` = their `requirements.txt` minus the 92 `@ file://` conda-local

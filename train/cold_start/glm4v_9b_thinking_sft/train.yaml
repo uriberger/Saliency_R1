@@ -13,7 +13,30 @@ do_train: true
 finetuning_type: lora
 lora_rank: 128
 lora_target: all
-deepspeed: /home/uberger/scratch/research/LLaMA-Factory/examples/deepspeed/ds_z3_config.json
+# NOT LLaMA-Factory's stock examples/deepspeed/ds_z3_config.json, which the Qwen3-VL and
+# InternVL arms use. This copy differs in exactly one field,
+# `stage3_param_persistence_threshold: 0`, and without it GLM DIES ON THE FIRST OPTIMIZER
+# STEP with:
+#
+#     TypeError: output tensor must have the same type as input tensor
+#
+# Measured cause, in the installed deepspeed (runtime/zero/partition_parameters.py, in
+# `_allgather_params_coalesced`):
+#
+#     flat_tensor = torch.empty(tensor_size, dtype=param_list[0].ds_tensor.dtype, ...)
+#
+# every output buffer is allocated with the dtype of param_list[0], and then each param's
+# own `ds_tensor` is all-gathered into its buffer. LF keeps trainable params in float32
+# under ZeRO-3 ("DeepSpeed ZeRO3 detected, remaining trainable params in float32") against
+# a bf16 base, so any PERSISTENT-parameter list holding both dtypes throws on the first
+# element whose dtype differs from the zeroth. GLM's list does; InternVL's and Qwen3-VL's
+# happen not to, which is why only this arm fell over.
+#
+# Setting the threshold to 0 empties `persistent_parameters`, and `stage3.py::_post_step`
+# guards the call with `if len(self.persistent_parameters) > 0:`, so the broken path is
+# never entered rather than being entered with better luck. It changes NO MATH -- only
+# which small params stay unpartitioned between steps -- so the arms remain comparable.
+deepspeed: /home/uberger/scratch/research/saliency_r1/train/cold_start/ds_z3_no_persist.json
 
 repetition_penalty: 1.05
 # Same system prompt as the Qwen3-VL cold start, and it has to be: the GRPO stage sends

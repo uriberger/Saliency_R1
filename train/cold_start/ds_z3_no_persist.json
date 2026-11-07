@@ -1,0 +1,31 @@
+{
+  "_comment": "LLaMA-Factory's examples/deepspeed/ds_z3_config.json, with ONE field changed: stage3_param_persistence_threshold is 0 rather than 'auto'. See train/cold_start/glm4v_9b_thinking_sft/train.yaml for why, and docs/second-backbone-port.md section 3.6. It is a repo-local copy because the LLaMA-Factory checkout is external and shared -- editing its examples/ would change the Qwen3-VL recipe and any job running at the time.",
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  "gradient_clipping": "auto",
+  "zero_allow_untested_optimizer": true,
+  "fp16": {
+    "enabled": "auto",
+    "loss_scale": 0,
+    "loss_scale_window": 1000,
+    "initial_scale_power": 16,
+    "hysteresis": 2,
+    "min_loss_scale": 1
+  },
+  "bf16": {
+    "enabled": "auto"
+  },
+  "zero_optimization": {
+    "stage": 3,
+    "overlap_comm": false,
+    "contiguous_gradients": true,
+    "sub_group_size": 1e9,
+    "reduce_bucket_size": "auto",
+    "stage3_prefetch_bucket_size": "auto",
+    "stage3_param_persistence_threshold": 0,
+    "stage3_max_live_parameters": 1e9,
+    "stage3_max_reuse_distance": 1e9,
+    "stage3_gather_16bit_weights_on_model_save": true
+  }
+}

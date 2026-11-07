@@ -4,7 +4,28 @@
 # `internvl`, which is the key `vlm_family.InternVL`, LLaMA-Factory's `intern_vl` plugin
 # and vLLM's `InternVLForConditionalGeneration` all dispatch on. The original repo is
 # `InternVLChatModel` behind trust_remote_code and shares none of that plumbing.
-model_name_or_path: OpenGVLab/InternVL3_5-8B-HF
+# NOT the bare `OpenGVLab/InternVL3_5-8B-HF`, and the difference is the whole run.
+#
+# That checkpoint's config.json OMITS `tie_word_embeddings`, so transformers defaults it
+# to True -- while the checkpoint ships BOTH `language_model.lm_head.weight` and
+# `language_model.model.embed_tokens.weight`, differing by max|diff| = 0.9448. A plain
+# `from_pretrained` spots the conflict and refuses to tie (which is why the base model
+# generates perfectly well, and why this hides). ZeRO-3's init never holds both full
+# tensors on one rank, cannot compare them, TIES THEM, and the cold start then trains
+# against a wrong output head -- silently.
+#
+# Measured on the 2026-11-07 run that hit it: step-10 loss 13.898 against GLM's 1.578 on
+# the same corpus, with ln(151936) = 11.93, i.e. it started worse than uniform. Loss still
+# converged to 0.873 because the LoRA learns to compensate, so the FINAL loss says
+# nothing; the merged model then scored format_ok 0.0% at the gate, emitting token salad.
+# Base alone coherent + base+adapter == merged gibberish is how it was localised to the
+# adapter rather than the merge.
+#
+# The directory below is symlinks to the HF cache plus one patched config.json. Build it
+# with `python make_untied_internvl_base.py` (idempotent; `--check` verifies). If it is
+# absent LLaMA-Factory fails loudly on a missing path, which is the intended failure mode
+# -- far better than the silent one above. See docs/second-backbone-port.md section 3.6.
+model_name_or_path: /home/uberger/scratch/research/saliency_r1/checkpoint/base_models/InternVL3_5-8B-HF-untied
 
 ### method
 # Identical to qwen3_vl_8b_instruct_sft/train.yaml in every hyperparameter -- see the note
