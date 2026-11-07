@@ -225,7 +225,15 @@ sinfo -h -N -o "%G" | grep -ci gpu      # 0 means there is no GPU hardware to wa
 rather than queueing into a partition with no nodes.
 
 Run it from `cs-oci-ord-login-01` ([[second-a100-cluster]]), which checks the repo
-out at the same absolute paths:
+out at the same absolute paths. The two clusters do **not** share a filesystem —
+`$HOME/scratch` is a per-cluster symlink into that cluster's own lustre mount — so
+the branch has to travel through `origin` first. From the central tree here:
+
+```fish
+git push origin probe/ergo-gate-lowres
+```
+
+then there:
 
 ```fish
 cd /home/uberger/scratch/research/saliency_r1
@@ -233,6 +241,11 @@ git fetch origin; and git checkout probe/ergo-gate-lowres
 bash launch_ergo_gate_lowres_job.sh --name ergo-gate-lowres \
     --out-dir outputs/ergo_gate_lowres --gpus 8 --duration 4
 ```
+
+Check before launching that the cold start and the three datasets are in that
+cluster's HF cache; if not, the first unit fails on a `ConnectionError` rather than
+downloading, because the eval nodes have no network and `HF_HUB_OFFLINE=1` is
+pinned on purpose.
 
 Then, once it is done:
 
