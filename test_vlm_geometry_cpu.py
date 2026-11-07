@@ -15,9 +15,19 @@
      from `imgs_sizes` over a 32px token, a different size per picture; and `image_flags`
      has to be synthesised because the forward requires a key the processor never emits.
 
+  3. **GLM-4.1V and InternVL3.5 split the two shapes between them**, which is the reason
+     they are cheap to add and the reason the seam exists. GLM is Qwen3-VL's shape to the
+     row -- the grids a real pair of pictures gets, and the packed `pixel_values` their
+     products add up to, are the numbers checked here. InternVL is the Omni's shape, one
+     448px tile per picture on a fixed 16x16 grid, plus one failure neither of the others
+     has: its processor tiles unless told not to, and a tiled batch is refused rather
+     than scored.
+
 Plus the trap that cost a run: the LoRA target scope. peft matches bare names by SUFFIX
 anywhere in the model, and the Omni carries a 24-layer AUDIO tower using exactly
-`q_proj`, `k_proj`, `v_proj`.
+`q_proj`, `k_proj`, `v_proj`. InternVL has the same collision in a tower that RUNS -- 48
+of its 120 suffix matches are in the InternViT -- so the same scoping is checked for it,
+including the detail that the Omni's own pattern would match nothing on this layout.
 
 CPU only, no model, no weights: every one of these is a pure function of a batch dict.
 
@@ -245,8 +255,133 @@ def test_v2_does_not_inherit_the_omni_grid():
     check("it carries no geometry key", fam.geometry_inputs == ())
 
 
+def test_glm_really_is_qwen_shaped():
+    print("\nGLM-4.1V: inherits Qwen3-VL's geometry, and that is a measured claim")
+    fam = VF._REGISTRY["glm4v"]()
+    # The two grids a 512x384 and a 300x700 picture actually get from this processor,
+    # whose pixel_values came back [2108, 1176] -- 1008 + 1100 rows.
+    grids = [(1, 28, 36), (1, 50, 22)]
+    batch = qwen_batch(grids)
+    thw = batch["image_grid_thw"]
+
+    check("pixel_values is packed behind the grid, like Qwen3-VL's",
+          fam.packed_inputs == ("pixel_values",))
+    check("mm_lengths == the grid products (1008, 1100)",
+          fam.mm_lengths(batch) == [1008, 1100])
+    mm = fam.mm_slice(batch, 1, 2)
+    check("mm_slice cuts the second picture's rows out of the stack",
+          torch.equal(mm["pixel_values"], batch["pixel_values"][1008:2108]))
+    # 28*36/4 = 252 and 50*22/4 = 275, which is what the processor emitted.
+    check("token_grid == (h//2, w//2) -> 252 and 275 tokens",
+          [fam.token_grid(batch, i) for i in range(2)] == [(14, 18), (25, 11)])
+    check("a token is 28 picture-pixels, not Qwen3-VL's 32", fam.patch_px(None) == 28)
+    check("the image token is GLM's 151343, not Qwen3-VL's 151655",
+          fam.image_token_id == 151343)
+
+    # Counted on the real checkpoint: 80 modules end in q_proj/v_proj and all 80 are in
+    # the language model, because Glm4vVisionAttention uses a fused `qkv`. So unlike
+    # InternVL this family wants the launcher's bare names passed straight through.
+    check("the LoRA targets stay bare -- the tower has no q_proj to catch",
+          fam.lora_target_modules(["q_proj", "v_proj"]) == ["q_proj", "v_proj"])
+    check("nothing has to be pinned on the processor", fam.proc_defaults == {})
+    check("the Saliency-R1 readout is defined on a dense GLM-4 decoder",
+          fam.supports_saliency_r1())
+
+
+def internvl_batch(n, tiles_each=1, seq=40):
+    """An InternVL prompt batch. `tiles_each` > 1 is the batch the processor TILED."""
+    return {
+        "input_ids": torch.zeros(n, seq, dtype=torch.long),
+        "pixel_values": torch.arange(n * tiles_each * 3 * 4 * 4, dtype=torch.float32)
+                             .reshape(n * tiles_each, 3, 4, 4),
+    }
+
+
+def test_internvl_is_one_row_per_picture():
+    print("\nInternVL3.5: a 448px tile, a fixed 16x16 grid, an ordinary slice")
+    fam = VF._REGISTRY["internvl"]()
+    batch = internvl_batch(3)
+
+    check("nothing is packed behind a grid", fam.packed_inputs == ())
+    check("mm_lengths has nothing to say", fam.mm_lengths(batch) is None)
+    mm = fam.mm_slice(batch, 1, 3)
+    check("mm_slice is a plain row slice",
+          torch.equal(mm["pixel_values"], batch["pixel_values"][1:3])
+          and set(mm) == {"pixel_values"})
+    check("token_grid is the fixed 16x16, every picture",
+          [fam.token_grid(batch, i) for i in range(3)] == [(16, 16)] * 3)
+    check("no geometry key has to be carried", fam.geometry_inputs == ())
+    check("an untiled batch passes through untouched",
+          fam.after_processor(batch) is batch)
+    # The chat template emits a bare <IMG_CONTEXT> with no <img>/</img> around it, so the
+    # parent's collapse is the right one -- unlike the Omni, whose processor adds them.
+    check("collapse_image_run folds the run, nothing else",
+          fam.collapse_image_run("a" + "<IMG_CONTEXT>" * 256 + "b", "<IMG_CONTEXT>")
+          == "a<IMG_CONTEXT>b")
+
+
+def test_internvl_refuses_a_batch_that_was_tiled():
+    print("\nThe silent one: crop_to_patches defaults ON inside the processor")
+    fam = VF._REGISTRY["internvl"]()
+
+    check("proc_defaults pins it off", fam.proc_defaults == {"crop_to_patches": False})
+    # 13 tiles is what a 512x384 picture really becomes: 12 aspect-matched tiles plus the
+    # whole-picture thumbnail. 3,328 image tokens against the 256 this family assumes.
+    tiled = internvl_batch(2, tiles_each=13)
+    try:
+        fam.after_processor(tiled)
+        raised = ""
+    except RuntimeError as exc:
+        raised = str(exc)
+    check("a tiled batch raises instead of being scored", bool(raised))
+    check("and the message says how to fix it",
+          "crop_to_patches" in raised and "26 image rows for 2 prompts" in raised,
+          raised[:60])
+    # A text-only batch has no pictures to count, and must not be mistaken for a tiled one.
+    check("a batch with no pixels passes",
+          fam.after_processor({"input_ids": torch.zeros(2, 8, dtype=torch.long)})
+          is not None)
+
+    check("the grad/glimpse/saliency_r1 readouts are refused, not mis-run",
+          not fam.supports_saliency_r1())
+
+
+def test_lora_scope_keeps_the_internvit_out():
+    print("\nThe same trap as the Omni's audio tower, on a tower that DOES run")
+    import re
+
+    fam = VF._REGISTRY["internvl"]()
+    pat = fam.lora_target_modules(["q_proj", "v_proj"])
+    check("a single string, so peft reads it as a regex", isinstance(pat, str), pat)
+
+    # The real module paths, off the checkpoint: 120 modules end in q_proj/v_proj and 48
+    # of them are in the InternViT. Left bare, 40% of the adapter trains the encoder --
+    # and unlike the Omni's audio tower this one runs on every batch, so it would train
+    # rather than sit at zero gradient, and the arm would quietly stop being comparable
+    # to the Qwen3-VL one.
+    wanted = ["model.language_model.layers.0.self_attn.q_proj",
+              "model.language_model.layers.35.self_attn.v_proj"]
+    unwanted = ["model.vision_tower.encoder.layer.0.attention.q_proj",
+                "model.vision_tower.encoder.layer.23.attention.v_proj",
+                "model.multi_modal_projector.1.weight",
+                "model.language_model.layers.0.self_attn.k_proj"]  # not a target name
+    check("every decoder projection matches",
+          all(re.fullmatch(pat, n) for n in wanted))
+    check("no InternViT module matches",
+          not any(re.fullmatch(pat, n) for n in unwanted),
+          str([n for n in unwanted if re.fullmatch(pat, n)]))
+    # The leading `.*` is what makes this work: peft fullmatches the WHOLE path, and the
+    # path here is `model.language_model....`, not `language_model....` as on the Omni.
+    check("the Omni's anchor-less pattern would have matched nothing here",
+          re.fullmatch(r"language_model\..*\.(q_proj|v_proj)", wanted[0]) is None)
+
+
 def main():
     test_qwen_is_unchanged()
+    test_glm_really_is_qwen_shaped()
+    test_internvl_is_one_row_per_picture()
+    test_internvl_refuses_a_batch_that_was_tiled()
+    test_lora_scope_keeps_the_internvit_out()
     test_omni_geometry()
     test_omni_prompt_goes_over_as_the_template_wrote_it()
     test_lora_scope_keeps_the_audio_tower_out()

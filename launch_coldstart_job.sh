@@ -11,6 +11,16 @@
 #   WANDB_API_KEY=... bash launch_coldstart_job.sh        # online WandB (else offline)
 #   bash launch_coldstart_job.sh --config /path/other.yaml
 #
+# THE SECOND AND THIRD BACKBONES. Same launcher, a different yaml; the job name follows
+# the config's directory, so their logs do not land on top of the Qwen3-VL run's:
+#
+#   bash launch_coldstart_job.sh --config train/cold_start/glm4v_9b_thinking_sft/train.yaml
+#   bash launch_coldstart_job.sh --config train/cold_start/internvl3_5_8b_sft/train.yaml
+#
+# Every hyperparameter in those two matches this one's -- only the backbone and its chat
+# template differ, which is what makes the arms comparable. docs/second-backbone-port.md
+# is the end-to-end recipe, including what to do with the merged checkpoint afterwards.
+#
 # Any `key=value` after the flags is forwarded verbatim as a LLaMA-Factory (OmegaConf)
 # override, e.g.:  bash launch_coldstart_job.sh per_device_train_batch_size=4
 #
@@ -57,7 +67,12 @@ if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR=$(grep -E '^output_dir:' "$CONFIG" | head -1 | sed 's/^output_dir:[[:space:]]*//')
 fi
 
-JOB_NAME="coldstart_qwen3_vl_8b_instruct_sft"
+# The config's own directory name, so a second backbone's job does not land in the
+# Qwen3-VL job's log file. `--name` and `--outfile` both use it, and the outfile is the
+# only record of a run that dies before WandB connects -- two backbones sharing one name
+# meant two runs appending to `coldstart_qwen3_vl_8b_instruct_sft.%j.out`.
+# Overridable, because a sweep may want its own label for the same config.
+JOB_NAME=${JOB_NAME:-coldstart_$(basename "$(dirname "$CONFIG")")}
 LOG_ROOT="$REPO/outputs/logs"
 mkdir -p "$LOG_ROOT" "$OUTPUT_DIR"
 

@@ -1,0 +1,75 @@
+### model
+# InternVL3.5-8B, the TRANSFORMERS-NATIVE repackaging (`-HF`) and not `OpenGVLab/
+# InternVL3_5-8B`. The difference is not cosmetic: the `-HF` checkpoint's `model_type` is
+# `internvl`, which is the key `vlm_family.InternVL`, LLaMA-Factory's `intern_vl` plugin
+# and vLLM's `InternVLForConditionalGeneration` all dispatch on. The original repo is
+# `InternVLChatModel` behind trust_remote_code and shares none of that plumbing.
+model_name_or_path: OpenGVLab/InternVL3_5-8B-HF
+
+### method
+# Identical to qwen3_vl_8b_instruct_sft/train.yaml in every hyperparameter -- see the note
+# in the GLM config; the arms have to differ only in the backbone.
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 128
+lora_target: all
+deepspeed: /home/uberger/scratch/research/LLaMA-Factory/examples/deepspeed/ds_z3_config.json
+
+repetition_penalty: 1.05
+# The same system prompt the GRPO stage sends. See the GLM config.
+default_system: "A conversation between user and assistant. The user asks a question, and the assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think></think> tags, i.e., <think>\nThis is my reasoning.\n</think>\nThis is my answer."
+
+### dataset
+dataset: saliency_r1_llava_cot_full, saliency_r1_mulberry_sft_full
+dataset_dir: /home/uberger/scratch/research/saliency_r1/cold_data/Saliency-R1-cold
+# `intern_vl` carries a Chinese `default_system` of its own, which the explicit
+# `default_system` above overrides. It is a plain Template rather than a ReasoningTemplate,
+# so the targets' literal <think> tags pass through untouched -- the same situation as the
+# Qwen3-VL arm's `qwen3_vl_nothink`.
+#
+# TILING: this is the one place the two stages could silently disagree, and they do not.
+# LF's `InternVLPlugin` calls the IMAGE processor directly with
+# `getattr(processor, "crop_to_patches", False)` -- absent, so False -- and the image
+# processor honours its own `crop_to_patches: False`. Measured: pixel_values comes back
+# (1, 3, 448, 448), one tile, 256 image tokens. That is the same geometry
+# `vlm_family.InternVL` assumes and the same one the GRPO trainer pins through
+# `proc_defaults`. The trap is in `InternVLProcessor.__call__` (the FULL processor), which
+# carries its own default and tiles to 13 tiles / 3,328 tokens; LF does not go through it.
+template: intern_vl
+cutoff_len: 16384
+overwrite_cache: true
+preprocessing_num_workers: 128
+
+### output
+output_dir: /home/uberger/scratch/research/saliency_r1/checkpoint/coldstart_internvl3_5_8b_sft_epoch2_lr5e5
+logging_steps: 10
+save_steps: 500
+save_total_limit: 3
+# Resumability (submit_job autoresume across the wall limit): keep full trainer state
+# (optimizer/scheduler/RNG) so a relaunch resumes mid-run, and DON'T wipe the output dir.
+save_only_model: false
+save_strategy: 'steps'
+plot_loss: true
+overwrite_output_dir: false
+report_to: wandb
+run_name: coldstart_internvl3_5_8b_sft_epoch2_lr5e5
+
+### train
+# A 448px tile is 256 image tokens against Qwen3-VL's ~1,280 at the same picture, so this
+# arm's sequences are the shortest of the three and this batch size is the least likely of
+# them to need lowering.
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 1
+learning_rate: 5.0e-5
+num_train_epochs: 2
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+bf16: true
+ddp_timeout: 540000000
+
+### eval
+val_size: 0
+per_device_eval_batch_size: 8
+eval_strategy: 'no'
+eval_steps: 10000000

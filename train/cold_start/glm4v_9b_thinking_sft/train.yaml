@@ -1,0 +1,85 @@
+### model
+# GLM-4.1V-9B-Thinking -- the second backbone. There is no Instruct variant of this
+# checkpoint; the Thinking one is the release, and it is already a reasoning model, which
+# is why `template: glm4v` below is the REASONING template and not a `_nothink` variant.
+model_name_or_path: zai-org/GLM-4.1V-9B-Thinking
+
+### method
+# Identical to qwen3_vl_8b_instruct_sft/train.yaml in every hyperparameter. The point of a
+# second backbone is the comparison between the two arms, and a recipe that drifted would
+# confound the backbone with the recipe.
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 128
+lora_target: all
+deepspeed: /home/uberger/scratch/research/LLaMA-Factory/examples/deepspeed/ds_z3_config.json
+
+repetition_penalty: 1.05
+# Same system prompt as the Qwen3-VL cold start, and it has to be: the GRPO stage sends
+# this exact string, and a cold start taught on a different one is off-distribution for
+# the thing it exists to prepare.
+default_system: "A conversation between user and assistant. The user asks a question, and the assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think></think> tags, i.e., <think>\nThis is my reasoning.\n</think>\nThis is my answer."
+
+### dataset
+dataset: saliency_r1_llava_cot_full, saliency_r1_mulberry_sft_full
+dataset_dir: /home/uberger/scratch/research/saliency_r1/cold_data/Saliency-R1-cold
+# `glm4v` is a ReasoningTemplate, UNLIKE the Qwen3-VL arm's `qwen3_vl_nothink`, and that
+# difference is correct rather than an oversight -- LF's own warning asks for the
+# `_nothink` suffix only when the base model has a separate Instruct variant, and this one
+# does not. What a ReasoningTemplate would do to these targets was checked rather than
+# assumed, because the failure is silent (the model simply never learns the tags):
+#
+#   * `enable_thinking` defaults True, so the `is False` branch that STRIPS <think>...
+#     </think> out of the target does not fire;
+#   * `preserve_thinking` defaults False, which strips thoughts from HISTORY turns --
+#     `range(1, len(messages) - 2, 2)`, empty on this single-turn corpus;
+#   * the "add an empty cot" branch is skipped because these targets already contain
+#     `<think>`, which is what it tests for.
+#
+#   Measured on the first row of saliency_r1_llava_cot_full: prompt 457 tokens, response
+#   170, exactly one <think> and one </think>. See docs/second-backbone-port.md §3.
+template: glm4v
+cutoff_len: 16384
+overwrite_cache: true
+preprocessing_num_workers: 128
+
+# NO `resize_vocab`, and that was checked too. LF logs "Add <|user|>,<|observation|>,
+# </answer> to stop words" followed by "New tokens have been added, make sure
+# `resize_vocab` is True" -- a warning it prints whenever it touches stop words. On this
+# tokenizer nothing was in fact added: <think>, </think>, <answer> and </answer> are
+# ALREADY single tokens (151345-151348), len(tokenizer) is unchanged at 151352, and the
+# embedding has 151552 rows. Resizing would rebuild an embedding that does not need it.
+
+### output
+output_dir: /home/uberger/scratch/research/saliency_r1/checkpoint/coldstart_glm4v_9b_thinking_sft_epoch2_lr5e5
+logging_steps: 10
+save_steps: 500
+save_total_limit: 3
+# Resumability (submit_job autoresume across the wall limit): keep full trainer state
+# (optimizer/scheduler/RNG) so a relaunch resumes mid-run, and DON'T wipe the output dir.
+save_only_model: false
+save_strategy: 'steps'
+plot_loss: true
+overwrite_output_dir: false
+report_to: wandb
+run_name: coldstart_glm4v_9b_thinking_sft_epoch2_lr5e5
+
+### train
+# 9B against the Qwen arm's 8B, on the same 8 cards. If this OOMs, halve the batch and
+# double gradient_accumulation_steps rather than changing anything above -- the effective
+# batch is what has to match the other arm.
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 1
+learning_rate: 5.0e-5
+num_train_epochs: 2
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+bf16: true
+ddp_timeout: 540000000
+
+### eval
+val_size: 0
+per_device_eval_batch_size: 8
+eval_strategy: 'no'
+eval_steps: 10000000
