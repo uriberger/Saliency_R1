@@ -32,6 +32,17 @@
 # image. vLLM stays at 0.11.0: vllm-project/vllm#29595 reports corrupted Qwen3-VL grounding
 # output above it, and <zoom> boxes are grounding output.
 #
+# Both were made by cloning, so the pins came along rather than being re-resolved. To
+# rebuild them (e.g. on cs-oci-ord-login-01, which runs this repo at the same paths):
+#
+#   conda create -y -n ergo      --clone saliency_r1_qwen3
+#   conda create -y -n ergo_vllm --clone saliency_r1_qwen3_vllm
+#   conda activate ergo;      and pip install -e <repo>/trl_repo_ergo --no-deps
+#   conda activate ergo_vllm; and pip install -e <repo>/trl_repo_ergo --no-deps
+#
+# `--no-deps` is not optional: without it pip re-resolves TRL's requirements and walks
+# torch 2.7.1 / transformers 5.13.0.dev0 / peft 0.19.1 off their pins.
+#
 # WHAT IT COPIES. Our tracked sources into trl_repo_ergo/ and nothing else -- the same list
 # patch_trl_nemotron.sh uses, so the three clones hold the same files and one copy list can
 # be diffed against another. Steps 1 and 3 are not copies and cannot be: they are in-place
