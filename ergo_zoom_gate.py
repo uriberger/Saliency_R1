@@ -518,6 +518,24 @@ def run_one(model_path, rows, args, device):
 
     max_pixels = args.vision_tokens * IMAGE_FACTOR * IMAGE_FACTOR
     min_pixels = MIN_VISION_TOKENS * IMAGE_FACTOR * IMAGE_FACTOR
+    # The processor has a floor and a ceiling of its own and will silently resize anything
+    # outside them, at which point our recorded geometry is not the model's. Read them
+    # rather than assuming: `size.shortest_edge` / `longest_edge` are this processor's
+    # min_pixels / max_pixels. Measured on a `--vision-tokens 64` smoke, where the budget
+    # EQUALS the floor and smart_resize's rounding lands just under it -- 1 of 2 images
+    # was upscaled under us, which the assertion caught.
+    sz = getattr(getattr(processor, "image_processor", None), "size", None)
+    lo = (sz or {}).get("shortest_edge") if hasattr(sz, "get") else getattr(sz, "shortest_edge", None)
+    hi = (sz or {}).get("longest_edge") if hasattr(sz, "get") else getattr(sz, "longest_edge", None)
+    if lo and max_pixels <= lo * 1.05:
+        print(f"WARNING: --vision-tokens {args.vision_tokens} is {max_pixels} px, at or "
+              f"below this processor's own floor of {lo} px ({lo // 1024} tokens). It "
+              "will upscale images back and the 'resized' frame will not be the frame "
+              "the model saw. Use a larger budget.", file=sys.stderr)
+    if hi and max_pixels > hi:
+        print(f"WARNING: --vision-tokens {args.vision_tokens} is {max_pixels} px, above "
+              f"this processor's ceiling of {hi} px ({hi // 1024} tokens); it will "
+              "downscale and the budget is not the budget.", file=sys.stderr)
     hint = COORD_HINTS[args.coord_hint]
     print(f"vision tokens {args.vision_tokens} -> max_pixels {max_pixels} "
           f"({args.vision_tokens}x{IMAGE_FACTOR}x{IMAGE_FACTOR}; ERGO writes this 28x28)",
