@@ -508,8 +508,12 @@ def run_one(model_path, rows, args, device):
 
     print(f"\n{'=' * 78}\n{model_path}\n{'=' * 78}", flush=True)
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    # float32 on CPU: torch's CPU bf16 path is emulated on most of these nodes and the
+    # end-to-end smoke that the CPU device exists for would take hours instead of minutes.
+    # The GPU measurement is bf16, which is what the trainer runs at.
+    dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
     model = AutoModelForImageTextToText.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
+        model_path, torch_dtype=dtype, trust_remote_code=True,
         attn_implementation="sdpa").to(device).eval()
 
     max_pixels = args.vision_tokens * IMAGE_FACTOR * IMAGE_FACTOR
