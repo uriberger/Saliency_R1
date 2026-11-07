@@ -61,6 +61,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# The job body runs `cd $LF_DIR` before `llamafactory-cli train $CONFIG`, so a RELATIVE
+# config path would be resolved against LLaMA-Factory's directory and not found. The
+# default is absolute ($REPO/train/...), which is why this never came up; a
+# `--config train/cold_start/.../train.yaml` typed from the repo root is the case it
+# breaks on. Absolutised here, while still in the invocation cwd.
+if [[ -e "$CONFIG" ]]; then
+    CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+else
+    echo "ERROR: no config at '$CONFIG'" >&2; exit 1
+fi
+
 # Default output dir = the value baked into the yaml (keep launcher + yaml in sync so
 # checkpoint detection below points at the right place).
 if [[ -z "$OUTPUT_DIR" ]]; then
@@ -73,6 +84,25 @@ fi
 # meant two runs appending to `coldstart_qwen3_vl_8b_instruct_sft.%j.out`.
 # Overridable, because a sweep may want its own label for the same config.
 JOB_NAME=${JOB_NAME:-coldstart_$(basename "$(dirname "$CONFIG")")}
+
+# The WandB run id, derived from the OUTPUT DIR rather than spelled out. It used to be
+# the literal string "coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5", which was
+# harmless while that was the only cold start and is not now: WandB keys a run on its ID,
+# and the `WANDB_RESUME=allow` in the job body means a second backbone carrying the same
+# ID APPENDS to the first one's run. Three cold starts would have shared one loss curve
+# with the display name set by whichever wrote last -- and the resume semantics make that
+# look like a successful resume rather than a collision.
+#
+# The output dir is the right source: it is already per-run (read out of the yaml above)
+# and it is what `resume_from_checkpoint` keys on, so a genuine auto-resume relaunch lands
+# on the same WandB run by construction. For the Qwen3-VL config its basename IS the old
+# literal, so that run's id is unchanged and an in-flight resume is not orphaned.
+#
+# Resolved HERE and interpolated as a value, not computed inside the job body: the body is
+# a single-quoted string inside a double-quoted one, and a nested $() does not survive
+# two rounds of quoting.
+WANDB_RUN_ID=${WANDB_RUN_ID:-$(echo -n "$(basename "$OUTPUT_DIR")" | md5sum | cut -c1-8)}
+
 LOG_ROOT="$REPO/outputs/logs"
 mkdir -p "$LOG_ROOT" "$OUTPUT_DIR"
 
@@ -110,7 +140,7 @@ submit_job \
         [ -z \"\$WANDB_API_KEY\" ] && export WANDB_MODE=offline;
         export WANDB_PROJECT=vlm_reasoning;
         export WANDB_ENTITY=nvr-israel;
-        export WANDB_RUN_ID=\$(echo -n "coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5" | md5sum | cut -c1-8);
+        export WANDB_RUN_ID=$WANDB_RUN_ID;
         export WANDB_RESUME=allow;
         # DeepSpeed under LLaMA-Factory must be launched via torchrun; use all N GPUs.
         export FORCE_TORCHRUN=1;
