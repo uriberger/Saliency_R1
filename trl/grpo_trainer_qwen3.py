@@ -2439,6 +2439,17 @@ class GRPOTrainer(Trainer):
             # sample; the Omni's walks a flat list, replacing each `<image>` in the text
             # rows in order, and a nested list is not iterable the way it expects.
             kwargs = {"images": self.family.batch_image_arg(images)}
+            # Processor keyword arguments THIS family has to pin. Empty for Qwen3-VL and
+            # the Omni, so this is a no-op on every run trained so far.
+            #
+            # InternVL is why it exists: `InternVLProcessor.__call__` carries its own
+            # `crop_to_patches` default and overrides the attribute, which is already
+            # False on the checkpoint. Not passing it gives 13 tiles and 3,328 image
+            # tokens where the family's geometry says one tile and 256 -- and the only
+            # symptom is every overlap map failing its length check and the reward going
+            # nan. `InternVL.after_processor` turns that into an exception a few lines
+            # below; this is what stops it happening.
+            kwargs.update(self.family.proc_defaults)
             for prompt in prompts:
                 if isinstance(prompt, list):
                     for message in prompt:
@@ -3017,7 +3028,12 @@ class GRPOTrainer(Trainer):
 
                     _fwd = _unwrapped(**_case_inputs, output_attentions=True, output_hidden_states=False)
 
-                    _image_mask = prompt_ids[case_id] == 151655
+                    # `self.image_token_id` comes from the family (Qwen3-VL's own 151655,
+                    # GLM-4.1V's 151343). It used to be the literal, which on any other
+                    # family selects a token that is not the picture -- an empty or
+                    # near-empty column mask, and a saliency map of nothing, with no error.
+                    # The overlap path has always asked the family; this one had not.
+                    _image_mask = prompt_ids[case_id] == self.image_token_id
                     _think_per_layer, _token_per_layer = [], []
                     for _l in range(self.NUM_LAYER):
                         _attn = _fwd.attentions[_l]  # [1, heads, full_len, full_len]
@@ -3087,14 +3103,16 @@ class GRPOTrainer(Trainer):
                         value_states = outputs.past_key_values.layers[layers].values.clone().detach()[[case_id]]
                         value_states = repeat_v(value_states, self.NUM_GROUP)
                         value_states = value_states[:, :, :prompt_length, :]
-                        value_states = value_states[:, :, prompt_ids[case_id] == 151655, :]
+                        # The family's image token, not the literal -- see the note on the
+                        # re-forward path's `_image_mask` above.
+                        value_states = value_states[:, :, prompt_ids[case_id] == self.image_token_id, :]
                         think_attn = torch.cat([attentions[answer_token][layers]
                                                     [[case_id], :, -1:,
                                                 prompt_length + think_start[case_id]:prompt_length + think_end[case_id] + 1]
                                                 for answer_token in range(answer_start[case_id], answer_end[case_id] + 1)],
                                                dim=0)
                         token_attn = torch.cat([attentions[i][layers][[case_id]][:, :, -1:,
-                                                prompt_completion_ids[case_id, :i + prompt_length] == 151655]
+                                                prompt_completion_ids[case_id, :i + prompt_length] == self.image_token_id]
                                                 for i in range(think_start[case_id], think_end[case_id] + 1)], dim=2)
                         token_attn = token_attn[:, :, :think_attn.shape[-1], :]
                         agg_attn = (think_attn @ token_attn).transpose(2, 3)

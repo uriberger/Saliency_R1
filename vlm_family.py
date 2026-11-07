@@ -600,6 +600,19 @@ class Glm4V(Qwen3VL):
     The decoder is GLM-4, 40 layers by 32 heads: neither Qwen nor Llama, which is the
     point. It is also a reasoning model, so its `generated` query set is a long chain
     rather than the handful of tokens the instruct models write.
+
+    THE TRAINER INHERITS EVERYTHING, and that is a measured claim rather than an
+    assumption carried over from the measuring side. On a two-picture batch of different
+    sizes this processor emits `pixel_values` [2108, 1176] -- one flat stack, exactly
+    Qwen3-VL's shape -- against grids [[1,28,36],[1,50,22]], whose products 1008 and 1100
+    sum to those 2108 rows. So `packed_inputs`, `mm_lengths` and `mm_slice` are right
+    unchanged, and the token counts 252 and 275 are (h//2)*(w//2), so `token_grid` is too.
+
+    AND THE LoRA TARGETS ARE SAFE BARE. `Glm4vVisionAttention` uses a fused `qkv`, like
+    Qwen3-VL's tower and unlike InternVL's: of the 80 modules whose name ends in `q_proj`
+    or `v_proj`, all 80 are in the language model. So no `lora_target_modules` override
+    here, and the reason is written down because the alternative is re-deriving it --
+    see `InternVL.lora_target_modules` for what it looks like when the answer is no.
     """
 
     name = "glm4v"
@@ -617,6 +630,19 @@ class Glm4V(Qwen3VL):
         # rounded multiple of the token size, so deriving it would round differently on
         # some sizes and quietly change what the padding arms pad by.
         return 28
+
+    def supports_saliency_r1(self):
+        """True -- stated here rather than inherited, because the inheritance is an
+        accident of where this class hangs and the answer is a separate question.
+
+        `Family.supports_saliency_r1`'s criterion is a dense transformer decoder with a
+        `self_attn.o_proj` at every layer, and GLM-4 is one: 40 attention layers, no
+        hybrid positions. The readout also wants `image_grid_thw`, which this processor
+        emits. What it does NOT give is a validated number -- nothing in this project has
+        ever run `--reward_variant saliency_r1` on GLM. This says the readout is defined,
+        not that it has been checked.
+        """
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +678,100 @@ class InternVL(Family):
     end_tokens = ("</img>",)
     fixed_grid = (16, 16)                          # 448/14 = 32, pixel-shuffled by 0.5
     proc_defaults = {"crop_to_patches": False}
+    # -- the TRAINER's view. The opposite of Qwen3-VL's and simpler: with tiling off this
+    # processor emits ONE 448x448 row of `pixel_values` per picture (measured: a batch of
+    # two differently-sized pictures comes back [2, 3, 448, 448]), so a micro-batch is an
+    # ordinary slice and nothing has to be cut by a grid. The whole of that sentence
+    # depends on the tiling being off, which is what `after_processor` checks.
+    mm_inputs = ("pixel_values",)
+    packed_inputs = ()
+
+    def token_grid(self, inputs, i):
+        """The fixed 16x16, every picture. See `after_processor` for what guarantees it."""
+        return tuple(self.fixed_grid)
+
+    def after_processor(self, inputs):
+        """Refuse a batch this processor TILED. -> inputs, unchanged.
+
+        THE FAILURE THIS CATCHES IS SILENT AND TOTAL, and it has already cost this
+        project a run on the measuring side. `InternVLProcessor.__call__` carries its own
+        `crop_to_patches` default and OVERRIDES the `image_processor.crop_to_patches`
+        attribute, which is False on this checkpoint. So a caller that does not pass the
+        keyword gets 13 tiles for one 512x384 picture -- 3,328 image tokens against the
+        256 the geometry here assumes.
+
+        Nothing downstream would say so. `mm_slice` takes `pixel_values[lo:hi]` and would
+        hand the forward one tile of some other sample's picture; `token_grid` would keep
+        answering 16x16; and the per-step map would come out 3,328 long against a 256-cell
+        grid, be dropped by `_compute_overlap_step_maps`'s length check, and surface days
+        later as `think_overlap_reward = nan` on every row.
+
+        One tile per sample is therefore an invariant and not a preference, and this is
+        where it is enforced -- the trainer calls this on every batch, immediately after
+        the processor. `proc_defaults` is what makes it true; this is what makes a failure
+        to apply it loud.
+        """
+        pv = inputs.get("pixel_values")
+        ids = inputs.get("input_ids")
+        if pv is None or ids is None:
+            return inputs
+        n_img, n_rows = int(pv.shape[0]), int(ids.shape[0])
+        if n_img != n_rows:
+            raise RuntimeError(
+                f"internvl: {n_img} image rows for {n_rows} prompts -- this processor "
+                f"TILED ({n_img / max(1, n_rows):.0f} tiles a picture). Every geometry "
+                "statement in this family assumes one 448px tile and a 16x16 grid. The "
+                "caller must pass `crop_to_patches=False` (the attribute is already "
+                "False and the processor ignores it); `InternVL.proc_defaults` carries "
+                "it, and the trainer applies it at the processor call.")
+        return inputs
+
+    def lora_target_modules(self, targets):
+        """Scope the bare names to the DECODER. -> a regex string for peft.
+
+        THE SAME TRAP THE OMNI HIT, on a model that looks nothing like it. peft matches a
+        list of bare names by SUFFIX anywhere in the tree, and `InternVLVisionAttention`
+        uses exactly `q_proj`, `k_proj`, `v_proj` -- where Qwen3-VL's and GLM-4.1V's
+        towers both use a fused `qkv` and are therefore missed by construction. Counted
+        on the real checkpoint: 120 modules end in `q_proj`/`v_proj`, and **48 of them are
+        in the InternViT**. Left bare, 40% of the adapter trains the vision encoder.
+
+        It would not fail loudly the way the Omni's did -- the audio tower never ran, so
+        those tensors got no gradient, whereas this tower runs on every batch and the
+        LoRA would train. It would just quietly be a different experiment from the
+        Qwen3-VL arm, which LoRAs the language model only, and the comparison between
+        the two arms is the entire point of training a second backbone.
+
+        A single string is a REGEX to peft (`re.fullmatch` against the whole module path)
+        and a list is suffix matching, so this returns a string. The leading `.*` is
+        load-bearing: the path is `model.language_model.layers.N.self_attn.q_proj` here,
+        and `fullmatch` on a pattern starting `language_model\\.` would match nothing at
+        all -- an adapter with zero target modules, which peft reports as an error only
+        some of the time.
+        """
+        if isinstance(targets, str):
+            targets = [targets]
+        names = sorted({str(t).split(".")[-1] for t in targets if str(t).strip()})
+        if not names:
+            raise SystemExit("internvl: no LoRA target names to scope")
+        return r".*language_model\..*\.(" + "|".join(names) + r")"
+
+    def supports_saliency_r1(self):
+        """False, and the reason is geometry rather than the decoder.
+
+        The text tower is a dense Qwen3, so the value-propagation maths is defined -- the
+        criterion that rules out the Omni does not rule this out. What rules it out is
+        that `_compute_grad_step_maps`, `_compute_glimpse_step_maps` and the
+        `reforward_saliency` readout all index `prompt_inputs["image_grid_thw"]`, which
+        this processor does not emit, and fold pixel gradients back with Qwen3-VL's
+        `patch_size x temporal_patch_size` packing, which a 448px tile does not use.
+
+        Returning False is what turns that into `_refuse_qwen3_only`'s one-line message
+        instead of a KeyError thirty frames down. The overlap reward -- `--reward_variant
+        ours`, which is what the arms in this project actually train -- does not go
+        through any of it: it asks `token_grid` and `image_token_id` and nothing else.
+        """
+        return False
 
     def bind(self, model=None, processor=None, config=None):
         super().bind(model=model, processor=processor, config=config)
