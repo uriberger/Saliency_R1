@@ -17,6 +17,16 @@ trl_repo
 # it for every session that uses it.
 trl_repo_nemotron
 
+# The THIRD TRL clone -- the one the ERGO baseline executes. Same fork, same branch,
+# patched from the same tracked sources by patch_trl_ergo.sh. ERGO puts TWO images on a
+# row (the downsampled original and the crop), which changes grpo_trainer_qwen3.py and
+# trl/scripts/vllm_serve.py; making those changes in trl_repo would hand them to every
+# in-flight Qwen3-VL rank mid-step, so they land here instead. Envs `ergo` and
+# `ergo_vllm` are the only things that resolve `trl` to it.
+# Shared exactly like trl_repo, with the same caution: patching it from a worktree
+# patches it for every session that uses it.
+trl_repo_ergo
+
 # The EASE (EasyR1/verl fork) clone that actually executes, shared the same way.
 # Upstream is github.com/Nrich-sunny/Attend-to-Evidence; ease/ holds our source
 # copy of anything we change on top of it.
