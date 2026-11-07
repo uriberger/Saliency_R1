@@ -575,13 +575,24 @@ def run(out_dir, num_gpus, only=None, dry_run=False, deadline=None):
     out_dir = Path(out_dir)
     (out_dir / "units").mkdir(parents=True, exist_ok=True)
     units = [u for u in plan() if not only or u["id"] in only]
-    done = 0
+    done, consecutive_failures = 0, 0
     for unit in units:
         if deadline and time.time() > deadline:
             print(f"[stop] out of time before {unit['id']}; rerun to resume", file=sys.stderr)
             break
         if run_unit(unit, out_dir, num_gpus, dry_run=dry_run) is not None:
             done += 1
+            consecutive_failures = 0
+            continue
+        consecutive_failures += 1
+        # Every unit runs the same command with two substitutions, so two in a
+        # row failing is a configuration fault, not a bad checkpoint or a flaky
+        # node. Marching through the remaining twelve would turn one readable
+        # error into fourteen and spend the allocation discovering it again.
+        if consecutive_failures >= 2:
+            print("[abort] two units failed in a row; this is a config fault, not a flake",
+                  file=sys.stderr)
+            break
     print(f"\n{done}/{len(units)} units complete", file=sys.stderr)
     return done == len(units)
 
