@@ -9,6 +9,7 @@ first real smoke run replaces the numbers.
 |---|---|---|
 | [DeepEyes](#deepeyes-on-qwen3-vl--port-and-training-estimate) — zoom tool, 80 steps, no cold start | ~3–5 weeks, ~1,000–2,500 A100-h | 2 days: serve `ChenShawn/DeepEyes-7B`, score it on our suite |
 | [Mini-o3](#mini-o3-on-qwen3-vl--port-and-training-estimate) — crop tool, deep multi-turn, over-turn masking | ~3–4 weeks, ~2,000–3,000 A100-h | 3–5 days: build the agentic eval wrapper, score their released `Mini-o3-7B-v1` |
+| [ERGO](#ergo-on-qwen3-vl--port-and-training-estimate) — two fixed turns, efficiency-oriented, crop verified by a VLM | ~2.5–3.5 weeks, ~400–1,000 A100-h | **1 day**: does Qwen3-VL even have a low-resolution penalty to recover? |
 
 ### What every one of these has in common
 
@@ -18,15 +19,24 @@ at "six months":
 1. **Every released fork is frozen pre-Qwen3-VL.** DeepEyes pins verl 0.2.0.dev0 /
    transformers 4.51.3 / vLLM 0.8.2; Mini-o3 pins verl 0.2.0.dev / transformers 4.52.0 /
    vLLM 0.9.2. Neither stack can *load* Qwen3-VL — it needs transformers ≥ 4.57 and
-   vLLM ≥ 0.11. Forward-porting the fork is always the expensive path.
+   vLLM ≥ 0.11. Forward-porting the fork is always the expensive path. ERGO is the
+   exception in the other direction: it released no training code at all, so there is
+   no fork to port and the rollout loop is ours to write from the paper.
 2. **Qwen3-VL is token-compatible with Qwen2.5-VL.** Identical ChatML scheme and
    identical vision token IDs (`vision_start 151652`, `vision_end 151653`,
    `image_token 151655`, `im_end 151645`) — verified against the local
    Qwen3-VL-8B-Instruct snapshot. Every hardcoded splice, token-count heuristic and
    `<image>` rewrite in these repos transfers verbatim. What does *not* transfer is
-   geometry: Qwen3-VL is patch-16 / merge-2, so one visual token covers 1,024 px²
-   against Qwen2.5-VL's 784. Any `max_pixels`-shaped hyperparameter is off by ~23% in
-   token terms and has to be re-tuned.
+   geometry: Qwen3-VL is patch-16 / merge-2 (`preprocessor_config.json`: `patch_size
+   16`, `merge_size 2`), so one visual token covers 1,024 px² against Qwen2.5-VL's 784.
+   Any `max_pixels`-shaped hyperparameter is off by ~23% in token terms and has to be
+   re-tuned. This lands hardest on ERGO, whose every configuration and every table
+   column is written as a token budget `N×28×28`.
+   **And one more that does not transfer: grounding coordinates.** Qwen2.5-VL emits
+   absolute pixels in the post-`smart_resize` frame; Qwen3-VL emits a 0–1000 relative
+   grid against the original image. Any repo that rescales box output by
+   `original/resized` — ERGO's `map_box` does exactly this — crops the wrong place on
+   Qwen3-VL while continuing to look healthy. Mini-o3 is already relative and is safe.
 3. **The target has already had this treatment.** Qwen3-VL's own tech report describes
    cold-start SFT on distilled multi-turn agentic traces plus tool-integrated RL — i.e.
    the vendor ran this class of recipe at larger scale before shipping the backbone. Each
@@ -524,3 +534,361 @@ budget-match deliberately or say so.
 * [mini-o3.github.io](https://mini-o3.github.io/) — project page
 * [Mini-o3 models](https://huggingface.co/Mini-o3/models) / [datasets](https://huggingface.co/Mini-o3/datasets)
 * [verl-project/verl](https://github.com/verl-project/verl) and [verl-recipe](https://github.com/verl-project/verl-recipe) — the framework, and where `recipe/deepeyes` went
+
+
+---
+
+# ERGO on Qwen3-VL — port and training estimate
+
+Assessment written 2026-11-07. The question: what would it cost to implement ERGO
+(Lee, Shin et al., ICLR 2026, [arXiv:2509.21991](https://arxiv.org/abs/2509.21991))
+on Qwen3-VL-8B so the result is a comparable row next to our model?
+
+**Verdict: ~14–18 person-days and ~400–1,000 A100-hours — the cheapest of the three —
+but run the 1-day gate in §8 FIRST, because ERGO's entire headroom is the
+low-resolution penalty, and Qwen3-VL may not have one.**
+
+Two differences from the sections above set this one apart. First, **they released no
+training code**, so there is no fork to port and no stack to forward-port — the method
+is reimplemented from the paper either way. Second, **ERGO's rollout is two fixed
+turns, not an agent loop**, which means it is the one baseline here that fits our
+existing TRL stack without the correctness risk that sends the others to verl.
+
+Repos cloned for this assessment (scratch, not under version control):
+
+    /tmp/ERGO                 # nota-github/ERGO @ main -- 627 lines, inference and eval only
+    /tmp/ergo_paper/ergo.txt  # arXiv:2509.21991v2, HTML -> text
+
+
+## 1. What the method is, mechanically
+
+Qwen2.5-VL-7B-Instruct, GRPO, **250 steps**, global batch 128, 8 rollouts per example
+(the appendix prose says 16 — see §10), lr 1e-6, AdamW, 4×H100, **~150 GPU-hours**.
+No cold start: the authors picked Qwen2.5-VL explicitly because its referring-detection
+ability makes grounding work without one.
+
+A rollout is **two fixed turns**:
+
+1. The image is downsampled to a token budget (`N×28×28`, `N ∈ {640, 1280, 16384}`) and
+   the policy emits `<think>…</think><zoom>[x1, y1, x2, y2]</zoom>`.
+2. That box is cropped from the **original, full-resolution** image, `smart_resize`d
+   back under the same budget, and appended as a fresh user turn. The policy answers
+   from `[downsampled image, turn-1 output, crop, question]` as
+   `<think>…</think><answer>…</answer>`.
+
+The prompts are released verbatim in `src/ergo/const.py` and the crop math in
+`src/ergo/utils.py` (`crop_with_zoom`, `map_box`, `parse_zoom_bbox_from_text`).
+
+The reward is four binary terms:
+
+    R = r_TCE + r_acc + r_format
+    r_TCE    = 1.0·r_region + 0.5·r_box
+
+    r_region = 1 iff a FROZEN reward model, shown ONLY the crop and the question,
+               answers correctly.                        <- the contribution
+    r_box    = 1 iff Area(crop) / Area(original) <= 0.6
+    r_acc    = 1 iff the policy's own turn-2 answer is correct
+    r_format = 1 iff BOTH turns match their tag structure
+
+Everything scores 0 if turn 1 produces no parseable box.
+
+The one real idea is `r_region`'s **withholding of the original image from the reward
+model**. DeepEyes and PixelReasoner show the RM both the full image and the crop, so the
+RM can answer from the full image and the crop is never forced to be self-contained.
+ERGO shows it the crop alone, so the policy is pushed to crop regions that *carry the
+answer* — which under downsampling means cropping context it can only infer (the straw
+near the coffee cup), not just the target it can see. That is also why the method is
+framed as "reasoning-driven perception" rather than better grounding.
+
+`r_box`'s γ = 0.6 comes from the GT-box area distribution in TreeVGR / VisCoT / V* / VGR
+(their Fig. 3). We can re-derive it on our own training set in an hour —
+`build_grpo_sets.py` already carries `_boxes_abs` per row and calls `union_bbox` on them.
+
+
+## 2. What they released, and what they did not
+
+`nota-github/ERGO` is **627 lines of Python, inference and evaluation only**:
+
+    src/ergo/const.py     10    the three prompts
+    src/ergo/infer.py    169    single-image HF demo of the two-stage loop
+    src/ergo/eval.py     283    async OpenAI-API client against a vLLM server
+    src/ergo/utils.py    165    smart_resize, box parse, crop, box -> original mapping
+
+**No training code, no reward implementation, no data pipeline, no config.** The repo
+credits [VLM-R1](https://github.com/om-ai-lab/VLM-R1) as the RL codebase, but VLM-R1 is
+92 files of single-turn open-r1-multimodal GRPO (rec / gui / ovd tasks) with no
+multi-turn path at all — so ERGO's two-turn rollout was custom and is unpublished. The
+repo has one issue, closed, about `uv`. There is nothing to lift and nobody else has
+reimplemented it.
+
+What *is* released and genuinely useful: the exact prompts, the exact crop/resize math,
+the exact eval protocol, every hyperparameter in their Table 7, and the public
+**`nota-ai/ERGO-7B`** checkpoint — so the method can be *measured* in half a day even
+though it cannot be trained from their code.
+
+
+## 3. What is broken
+
+Nothing dependency-shaped, for once — there is no pinned stack. Three things break
+anyway, and **all three are silent**:
+
+* **Coordinates changed scheme.** Per the shared section above, Qwen3-VL emits 0–1000
+  relative coordinates against the original image. `utils.py` carries
+  `width_scale = width / resize_w` and a `map_box()` built for Qwen2.5-VL's
+  absolute-in-resized-frame convention. Replace it with `x * w / 1000` and say so in
+  `QUESTION_TEMPLATE1`. Get it wrong and every crop lands in the wrong place, the
+  region reward collapses into the box-area reward, and training looks fine.
+* **The `28` is a `32`.** Qwen3-VL is patch-16 / merge-2, so `IMAGE_FACTOR = 28` in
+  `infer.py` / `eval.py` / `utils.py` must become 32, and every `N×28×28` budget must be
+  restated as `N×32×32` to mean the same *token* count. Copy their numbers literally and
+  `1280×28×28` buys 980 visual tokens, not 1,280 — a 23% different operating point on
+  every row of an efficiency table.
+* **Format is not free.** ERGO needs `<think>` in both turns, and
+  `build_coldstart_data.py:53` records Qwen3-VL-8B-Instruct at **format 0.000 under every
+  prompt variant tried** — which is why our cold start exists. If turn 1 is never
+  well-formed, every reward in the group is 0, the advantage is 0, and GRPO has no
+  gradient at all. Start from
+  `checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged`, which already
+  emits `<think>…</think><answer>…</answer>` and is the right starting point for
+  comparability anyway. Whether it will also emit `<zoom>` is Gate B in §8.
+
+Two further facts about our side, not theirs:
+
+* **Our training images are capped at 512 px.** `build_grpo_sets.py:109` and
+  `trl/grpo_vlm_qwen3.py:122` both set `MAX_IMAGE_SIDE = 512`. Training ERGO on 512 px
+  images trains a no-op — there is no high-resolution detail for the crop to recover.
+  The set must be rebuilt at native resolution and the trainer cap raised, which is what
+  drives the step cost in §9.
+* **Stay on vLLM 0.11.0.** vllm-project/vllm#29595 reports corrupted Qwen3-VL grounding
+  output above 0.11.0, and `saliency_r1_qwen3_vllm` is on exactly 0.11.0.
+
+
+## 4. Two routes, and ERGO is the one that can stay in TRL
+
+### Route A — our TRL trainer (recommended if ERGO is built alone)
+
+The key observation: **ERGO's two turns can be two independent training rows with the
+same advantage.**
+
+    row 1:  prompt = [sys, user(low-res image, Q1)]                     completion = o_region
+    row 2:  prompt = [sys, user(low-res image, Q1),
+                      assistant(o_region), user(crop, Q2)]              completion = o_acc
+
+Both carry `Â_g`, computed once per rollout from the four rewards. The gradient is
+identical to the concatenated-trajectory form, because turn 1's text is a *prompt* for
+turn 2 and carries no gradient there. So there is **no observation splicing, no
+observation-token loss mask, and no hand-rolled position ids** — each row is a normal
+two-image conversation that the Qwen3-VL processor builds itself and the model MRoPEs
+itself. That is precisely the bug class behind DeepEyes §3's `parallel_env.py:282`, and
+here it cannot arise. It is the reason this baseline, unlike the other two, does not
+need a second training framework.
+
+What does need building in `trl/grpo_trainer_qwen3.py`:
+
+* **Two images per row.** The trainer is single-image throughout
+  (`_signature_columns = ["prompt", "image"]`, line 1179) and `split_pixel_values_by_grid`
+  assumes one `image_grid_thw` row per sample. Generalising to a per-row image count is
+  contained, but it touches the ZeRO-3 path.
+* **Multi-image in the vLLM server.** `trl/scripts/vllm_serve.py:572-578` takes one
+  base64 image per prompt and builds `multi_modal_data={"image": img}`. We own that
+  file; it needs `list[list[str]]`.
+* **A two-phase rollout** in `_generate_and_score_completions`: generate turn 1 for all
+  rollouts, crop in PIL on the main process, build turn-2 prompts, generate again at
+  `n=1`, emit 2× rows.
+* **Advantage broadcast**: rewards per rollout, each advantage repeated twice. One
+  wrinkle to state in the launcher — a sequence-mean `loss_type` weights the two turns
+  equally rather than by length.
+* **Length caps.** `--max_prompt_length 2048` cannot hold turn 2 at `N=1280`
+  (1280 + 1280 visual tokens + text + turn-1 output ≈ 3,300). Both caps go up, with the
+  memory consequence in §9.
+
+### Route B — verl, i.e. `laser_repo` (recommended if DeepEyes or Mini-o3 is also built)
+
+If either section above is executed, ERGO is **incremental, not a second project**: same
+framework, same data, same backbone, and ERGO's zoom is `image_zoom_in_tool` pinned to
+`max_turns=2`. Per the shared section, `laser_repo` already carries that tool and the
+multimodal `tool_agent_loop.py`. The delta is the four reward functions, the vision
+reward-model client, and a two-turn cap — **4–7 days on top**.
+
+Standing up verl *only* for ERGO is not worth it: §5's 14–18 days would become ~20–25,
+to buy insurance against a bug class Route A does not have.
+
+**Decision rule: if DeepEyes or Mini-o3 is on the roadmap, do verl once and get all
+three. If ERGO is the only baseline, keep it in TRL.**
+
+
+## 5. Work breakdown (Route A)
+
+| | Days |
+|---|---|
+| **Gate A** — the low-resolution penalty on Qwen3-VL-8B (§8). Stops here if it is small | 1 |
+| **Gate B** — `<zoom>` emission and the 0–1000 coordinate check, on Qwen3-VL-8B-Instruct and on our cold start, mirroring `coldstart_gate.py` | 1 |
+| Benchmarks: add `vstar_bench`, `hrbench_4k`, `hrbench_8k` (+ `spatialtreebench`) to `eval_mini/benchmarks.py`; baseline our existing arms on them | 1–2 |
+| High-resolution training data: raise `MAX_IMAGE_SIDE`, rebuild the V*/visdrone rows; or convert DeepEyes' V* + ArxivQA parquets (§6) | 1–2 |
+| Trainer: two images per row (processor, `split_pixel_values_by_grid`) + multi-image `vllm_serve.py` | 2 |
+| Trainer: two-phase rollout, PIL crop, 2× rows, advantage broadcast, W&B logging of zoom-parse rate and crop area | 2–3 |
+| `trl/rewards/ergo_rewards.py`: region / box / accuracy / format, the vision-RM client, and a `test_ergo_reward_cpu.py` gate | 2 |
+| lmms-eval `ergo_qwen3_vl` two-stage chat wrapper (§7) | 1–2 |
+| Launcher + **debugging the first real rollouts**: format rate, zoom-parse rate, OOM at 2×1280 visual tokens, prompt truncation | 3–4 |
+| **Total** | **~14–18 days** |
+
+**If Gate B fails** — the cold start will not emit `<zoom>` — add **3–5 days** for a
+two-turn cold start: ~2–5k SFT rows in ERGO's format, turn-1 boxes taken from the GT
+annotations already in `cold_data/grpo_sets`. We have the whole cold-start pipeline, so
+that is data work, not new machinery. Note that Mini-o3 §1 pays this cost unconditionally
+(−19.0 without it); for ERGO it is contingent, which is part of why this section is
+cheaper.
+
+
+## 6. Data
+
+Two options, answering different questions.
+
+**Paper-faithful**: `ChenShawn/DeepEyes-Datasets-47k`, which DeepEyes §6 already
+describes — ERGO reuses it deliberately, "to isolate the contribution of our method from
+dataset curation effects". ERGO takes the V* and ArxivQA halves
+(`data_0.1.2_visual_toolbox_v2.parquet`, `data_v0.8_visual_toolbox_v2.parquet`) and not
+the ThinkLite math half. Reachable from the login node (checked).
+
+**Comparability-faithful**: our own GRPO sets, rebuilt at native resolution. Same rows
+our model trained on, so the ERGO arm and our arm differ only in method — the better
+choice for a table in our paper. The cost is one rebuild of `build_grpo_sets.py` with
+`MAX_IMAGE_SIDE` raised, plus the disk (V*/visdrone at native resolution, tens of GB;
+`cold_data` already holds 201 GB).
+
+Note what ERGO's training does **not** need: GT boxes. `r_region` is supervised by the
+reward model's answer, not by an annotation. Boxes are needed only to re-derive γ.
+
+
+## 7. Eval
+
+The task files are already here. In
+`/home/uberger/scratch/research/lmms-eval/lmms_eval/tasks`: `vstar_bench`, `hrbench`,
+`mme_realworld`, `spatialtreebench` all exist. VisualProbe (Mini-o3's) does not —
+optional, and Mini-o3 §6 covers where it lives.
+
+Three things need doing:
+
+* **Put them in the table.** None of V*, HR-Bench or TreeBench is in
+  `eval_mini/benchmarks.py` — only `mmerealworld`. Worth a day regardless of ERGO: our
+  effect lives in the visual-search half ([[benchmark-table-splits-search-vs-symbolic]])
+  and these are the canonical visual-search benchmarks.
+* **An `ergo_qwen3_vl` wrapper** running the two-stage loop at inference. Their
+  `eval.py` is the reference but is a standalone async OpenAI client, not an lmms-eval
+  model. Cheaper than Mini-o3 §7's wrapper, because the loop is fixed at two turns with
+  no tool-call parsing; `thyme.py` in our clone is the closest precedent, and
+  `qwen3_vl_vga.py` / `qwen3_vl_sinkshift.py` are the house style.
+* **A pixel-constraint sweep**, which is configuration rather than code:
+  `launch_lmms_eval_job.sh --max-pixels` exists and already suffixes the output
+  directory when set explicitly, exactly so sweeps do not collide. Two cautions. The
+  default in `_chat_base.py:40` is `IMAGE_KWARGS = {"max_pixels": 512*512}` — **256
+  visual tokens at factor 32**, far below even ERGO's smallest setting, so nothing here
+  is at ERGO's operating point today. And *our* model must be re-scored at the same caps
+  or the comparison is not matched (§10).
+
+
+## 8. Run this gate first — 1 day, and it is likelier than the other two to end the job
+
+ERGO's headroom *is* the gap its Table 1 reports for Qwen2.5-VL-7B on V*:
+
+| Pixel const. | Qwen2.5-VL-7B on V* |
+|---|---|
+| 16384×28×28 | 77.0 |
+| 1280×28×28 | 64.9 |
+| 640×28×28 | 56.5 |
+| 640×28×28 **+ GT crop appended** | **77.0** |
+
+The method recovers the 12–20 points that downsampling destroys — and the last row is
+the ceiling it is chasing. **If Qwen3-VL-8B does not lose those points, there is nothing
+to recover and the arm is pointless.** There is specific reason to doubt it does:
+DeepStack fuses multi-level ViT features precisely to hold detail at fewer tokens, and
+per DeepEyes §8 the backbone already had tool-integrated RL with an `image_zoom_in_tool`
+in its own post-training.
+
+**The gate**: `vstar_bench` + `hrbench_4k` + `hrbench_8k` on Qwen3-VL-8B-Instruct and on
+our cold start, at `--max-pixels` ∈ {640, 1280, 16384}×32×32 (note the 32, per §3), plus
+a fourth arm with the GT crop appended — a ~40-line task variant, since V* and HR-Bench
+both ship boxes. One day, ~10–20 A100-hours, and it reproduces their Table 1 on our
+backbone.
+
+Read it as:
+
+* **gap ≥ 10 points** — the method has room; proceed.
+* **gap 3–10 points** — proceed only if the claim being made is the efficiency axis
+  (tokens, latency), not accuracy.
+* **gap < 3 points** — stop. "ERGO's premise does not hold on this backbone" is a
+  publishable sentence and costs one day rather than a month.
+
+**A second, cheaper reference while the gate runs.** `nota-ai/ERGO-7B` is public: serve
+it and run their `src/ergo/eval.py` against our benchmark set. The backbone is wrong
+(Qwen2.5-VL-7B) so it does not settle the comparable-row question, but it sizes the
+target for zero training cost and it exercises the two-stage loop before any of ours
+exists. Half a day. Same logic as Mini-o3 §8, at a tenth the price.
+
+
+## 9. GPU budget
+
+Two independent anchors, which agree:
+
+* **The paper**: ~150 H100-hours for one 250-step run ⇒ **~300 A100-hours** at the same
+  2× used in DeepEyes §9.
+* **Token-volume scaling from our own runs**: a rollout is ~1,950 tokens for turn 1 and
+  ~3,320 for turn 2 at `N=1280`, so ~5,300 per rollout against our ~1,360, and 128
+  rollouts per step against our 48 — **~10× our token volume per step**. From ~22.5 s/step
+  on 8 H100s ([[grpo-step-time-is-mostly-fixed-cost]]) that is roughly 140–450 s/step on
+  8 A100s, i.e. **80–250 A100-hours** for 250 steps.
+
+Take **~200–350 A100-hours per run**; budget 2–3 runs (smoke, real, fix) ⇒
+**~400–1,000 A100-hours**, plus **~100–200** for the eval sweeps, which are not cheap
+here: two forward passes per document × 4 benchmarks × 3 pixel caps × the arms compared.
+
+That is **half the DeepEyes bill and a fifth of Mini-o3's**, and the reason is rollout
+shape: DeepEyes pushes `max_response_length=20480` over up to 5 generate rounds and
+Mini-o3 six turns with twelve images; ERGO is two rounds of ≤512 tokens.
+
+**The reward model is the one open cost.** The paper uses frozen Qwen2.5-VL-72B-Instruct
+— ~145 GB in bf16, so 2 A100-80GBs at best and realistically 4, as a sidecar for the
+whole run (3 runs × 4 GPUs × ~8 h ≈ 100 A100-hours). Three options:
+
+1. **Gateway** — `trl/rewards/openai_rewards.py` already calls the NVIDIA gateway and
+   its default `azure/openai/gpt-4o-mini` is vision-capable. Zero GPUs, and ~128 image
+   calls per step sits well inside the existing `ThreadPoolExecutor` judge path.
+   **Unverified**: that the gateway accepts image parts, and that a ~1 MP crop fits its
+   payload limit. Ten minutes to check, and it is the first thing to check.
+2. **Local Qwen2.5-VL-72B** — paper-faithful, 4 A100s, mirrors `serve_grounding_dino.sh`.
+3. **Local Qwen3-VL-32B** — the same-family analogue, 1–2 A100s. Cheapest local option
+   and arguably the better control, since the RM then shares the policy's visual
+   front-end.
+
+The cluster blocker in DeepEyes §9 applies unchanged: `sinfo` still reports zero GPU
+nodes on `oci-nrt-cs-001` ([[gpu-partitions-can-be-empty-of-hardware]]), so this runs on
+the A100 cluster — which is where the 2× above comes from. Unlike Mini-o3, nothing here
+wants multi-node Ray; 8 GPUs on one node is the whole job.
+
+
+## 10. Fidelity notes, and the comparability trap
+
+* **Rollouts per sample: 8 or 16?** Table 7 says 8; Appendix B's prose says "Sixteen
+  rollouts were sampled per training example". Pick one and say which.
+* **"Half of each mini-batch was allocated to longer rollouts to avoid VRAM
+  bottlenecks"** (Appendix B) is not reproducible from the paper. Ignore it and say so.
+* **γ = 0.6** was derived from *their* data's GT-box areas. Re-derive on ours — an hour
+  with `union_bbox` over `cold_data/grpo_sets` — and report both.
+* **"No cold start" is a claim about Qwen2.5-VL**, not a property of the method. If Gate
+  B forces one on Qwen3-VL, that is a finding worth a sentence, not a failure — and it is
+  the same observation DeepEyes §8 makes about *its* "emerges without SFT" framing.
+* **The comparability trap**, the ERGO-shaped version of Mini-o3 §9's. ERGO is an
+  *efficiency* method: its claim is accuracy at a reduced token budget, and its headline
+  is "+4.7 on V* at 23% of the vision tokens". Our model has never been evaluated under a
+  pixel cap at all — the default is 512×512, 256 tokens. An honest table reports accuracy
+  **at a matched pixel budget** for both arms, plus vision-token counts and latency, or
+  it is comparing a method tuned for a budget against one that never saw it.
+
+
+## Sources
+
+* [arXiv:2509.21991](https://arxiv.org/abs/2509.21991) — the paper (ICLR 2026)
+* [nota-github/ERGO](https://github.com/nota-github/ERGO) — inference and eval only, Apache 2.0
+* [nota-ai/ERGO-7B](https://huggingface.co/nota-ai/ERGO-7B) — the public checkpoint
+* [om-ai-lab/VLM-R1](https://github.com/om-ai-lab/VLM-R1) — the credited RL codebase; single-turn only
+* [Qwen3-VL blog](https://qwen.ai/blog?id=qwen3-vl) and `cookbooks/2d_grounding.ipynb` — the 0–1000 coordinate change
