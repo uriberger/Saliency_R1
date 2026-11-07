@@ -1,15 +1,20 @@
-# Porting external visual-agent baselines onto Qwen3-VL — estimates
+# Porting external baselines onto Qwen3-VL — estimates
 
 One section per external paper we have costed as a comparable row next to our model:
 same backbone (Qwen3-VL-8B-Instruct), same eval protocol, their method. Each section
 is a decision document, not a plan of record — the numbers in them are models, and the
 first real smoke run replaces the numbers.
 
+The first three are tool-using visual agents and share a shape. Monet is the odd one:
+it has no tool, it edits the forward pass instead, and it is the only one here whose
+cost is dominated by SFT rather than by rollouts.
+
 | baseline | verdict | gate before committing |
 |---|---|---|
 | [DeepEyes](#deepeyes-on-qwen3-vl--port-and-training-estimate) — zoom tool, 80 steps, no cold start | ~3–5 weeks, ~1,000–2,500 A100-h | 2 days: serve `ChenShawn/DeepEyes-7B`, score it on our suite |
 | [Mini-o3](#mini-o3-on-qwen3-vl--port-and-training-estimate) — crop tool, deep multi-turn, over-turn masking | ~3–4 weeks, ~2,000–3,000 A100-h | 3–5 days: build the agentic eval wrapper, score their released `Mini-o3-7B-v1` |
 | [ERGO](#ergo-on-qwen3-vl--port-and-training-estimate) — two fixed turns, efficiency-oriented, crop verified by a VLM | ~2.5–3.5 weeks, ~400–1,000 A100-h | **1 day**: does Qwen3-VL even have a low-resolution penalty to recover? |
+| [Monet](#monet-on-qwen3-vl--port-and-training-estimate) — no tool, latent visual embeddings, 3-stage SFT + VLPO | **~6–9 weeks, ~1,500–3,000 A100-h** — the most expensive | 2–3 days: serve `NOVAglow646/Monet-7B` on their own vLLM pin, score it on our suite |
 
 ### What every one of these has in common
 
@@ -18,10 +23,11 @@ at "six months":
 
 1. **Every released fork is frozen pre-Qwen3-VL.** DeepEyes pins verl 0.2.0.dev0 /
    transformers 4.51.3 / vLLM 0.8.2; Mini-o3 pins verl 0.2.0.dev / transformers 4.52.0 /
-   vLLM 0.9.2. Neither stack can *load* Qwen3-VL — it needs transformers ≥ 4.57 and
-   vLLM ≥ 0.11. Forward-porting the fork is always the expensive path. ERGO is the
-   exception in the other direction: it released no training code at all, so there is
-   no fork to port and the rollout loop is ours to write from the paper.
+   vLLM 0.9.2; Monet pins two stacks, transformers 4.54.0 / vLLM 0.10.0 for SFT and
+   transformers 4.51.3 / vLLM 0.8.5 for RL. None of them can *load* Qwen3-VL — it needs
+   transformers ≥ 4.57 and vLLM ≥ 0.11. Forward-porting the fork is always the expensive
+   path. ERGO is the exception in the other direction: it released no training code at
+   all, so there is no fork to port and the rollout loop is ours to write from the paper.
 2. **Qwen3-VL is token-compatible with Qwen2.5-VL.** Identical ChatML scheme and
    identical vision token IDs (`vision_start 151652`, `vision_end 151653`,
    `image_token 151655`, `im_end 151645`) — verified against the local
@@ -892,3 +898,411 @@ wants multi-node Ray; 8 GPUs on one node is the whole job.
 * [nota-ai/ERGO-7B](https://huggingface.co/nota-ai/ERGO-7B) — the public checkpoint
 * [om-ai-lab/VLM-R1](https://github.com/om-ai-lab/VLM-R1) — the credited RL codebase; single-turn only
 * [Qwen3-VL blog](https://qwen.ai/blog?id=qwen3-vl) and `cookbooks/2d_grounding.ipynb` — the 0–1000 coordinate change
+
+---
+
+# Monet on Qwen3-VL — port and training estimate
+
+Assessment written 2026-11-07. The question: what would it cost to implement Monet
+(Wang, Shi et al., CVPR 2026, [arXiv:2511.21395](https://arxiv.org/abs/2511.21395)) on
+Qwen3-VL-8B so the result is a comparable row next to our model?
+
+**Verdict: ~31–44 person-days (~6–9 weeks) and ~1,500–3,000 A100-hours — the most
+expensive of the four — and the published numbers already say Qwen3-VL has closed most
+of the gap Monet opens. Run the 2–3 day gate in §8 first.**
+
+Three things set this section apart from the three above. **There is no tool**, so none
+of the agent-loop machinery applies and `laser_repo` buys nothing — the RL half is
+EasyR1, not verl. **The method edits the forward pass**, a ~950-line delta inside
+`Qwen2_5_VLModel.forward`, which is the one thing none of the other three require. And
+**the SFT is not optional**: three stages plus two full precompute passes over 125K
+samples produce the checkpoint RL consumes, so unlike DeepEyes you cannot start at the
+interesting part.
+
+Repos cloned for this assessment (scratch, not under version control):
+
+    /home/uberger/scratch/ref/Monet    # NOVAglow646/Monet @ 08939998 (2026-03-19)
+    /home/uberger/scratch/ref/EasyR1   # hiyouga/EasyR1 @ 602a128, for the RL rebase
+    /home/uberger/scratch/ref/_ref/    # the exact upstream files their forks diverge from
+
+
+## 1. What the method is, mechanically
+
+Qwen2.5-VL-7B, **vision tower frozen** (`src/main.py:127`), LLM fully fine-tuned,
+8 GPUs, batch 1 × grad-accum 16, DeepSpeed ZeRO-2, lr 1e-5. Three SFT stages, then RL:
+
+1. **Warm-up (stage 1)** — ordinary interleaved image-text CoT SFT on Monet-SFT-125K.
+   3,885 steps; the paper calls this 3 epochs, `script_examples/sft_stage1.sh` passes
+   `--epochs 4` (§10).
+2. **Target latents (stage 2)** — a student emits `latent_size` ∈ {8, 10, 12} continuous
+   embeddings after each auxiliary image, behind a custom 4D mask so *only the latents*
+   can see that image. Loss = NTP + 2.0 · an all-layer alignment between the observation
+   tokens' hidden states with and without the auxiliary image, back-propagated **only
+   through the latent vectors** (`torch.autograd.grad` on them, `src/trainer.py:11`).
+3. **Latent generation (stage 3)** — reinitialise from stage 1 and train the model to
+   produce those same latents with no auxiliary image present. Loss = NTP + 2.0 ·
+   all-layer alignment to the stage-2 latents.
+4. **VLPO** — GRPO where latents get a surrogate log-prob `−‖z − μ‖² / 2σ²` (σ = 10)
+   spliced into `log_probs` at latent positions, so the existing ratio machinery
+   optimises them. 3.2K Thyme-RL prompts, 1 epoch, batch 64 × 8 rollouts, temperature
+   0.5, KL 0.01, max response 4,096, online difficulty sampling (keep only examples
+   whose rollout accuracy falls in (0, 0.6)), Gemini-2.5-Pro as judge.
+
+The latent mechanism itself is two lines of idea: **the last decoder layer's hidden
+state is fed back as the next input embedding**, for N steps, triggered by the model
+emitting `<abs_vis_token>`. Everything else is the supervision needed to make that
+hidden state mean something.
+
+Stages 2 and 3 each require a **full forward pass over all 125K samples first** to dump
+their alignment targets to disk (`src/precompute_teacher_reps.py`,
+`src/precompute_teacher_latents.py`). That is five GPU jobs, not two.
+
+Reward at RL time is `accuracy + 0.1 · format` with a length penalty and an API-based
+repetition penalty. Deliberately **no reward on using latents** — "to prevent
+indiscriminate invocation".
+
+
+## 2. What they released, and how big the delta actually is
+
+Everything: SFT code, RL code, both vLLM patches, the data, and three checkpoints
+(stage 1 / stage 3 / final). 26,367 lines of Python. But almost all of it is vendored
+copies of upstream files, and the *actual* Monet delta is small. Measured by diffing
+against the exact upstream versions they pin:
+
+| file | lines | delta vs upstream | portability |
+|---|---|---|---|
+| `monet_qwen_model/modeling_qwen2_5_vl_monet.py` | 2,583 | **+954 / −105** vs HF 4.54.0 | **the hard part** |
+| `RL/monet_models/transformers/monet_modeling_qwen2_5_vl.py` | 2,070 | +48 / −13 vs HF 4.51.3 — of which **three lines are real**: `inputs_embeds[0, latent_poss] = latents` at `:1858` | trivial |
+| `RL/monet_models/vllm/monet_gpu_model_runner.py` | 2,001 | **+234 / −9** vs vLLM 0.8.5 | model-agnostic |
+| `inference/vllm/monet_gpu_model_runner.py` | 2,929 | **+87 / −12** vs vLLM 0.10.0 | model-agnostic |
+| `src/` — their SFT harness, subclassing `trl.SFTTrainer` | ~2,400 | their own | mostly agnostic |
+| `RL/verl` — an EasyR1 fork | ~10,000 | ~100 lines mention monet/latent across 11 files, **plus** ~1,000 lines of `SampleHashServer`, online difficulty sampling, API judge and repetition penalty that upstream EasyR1 does not have | medium |
+
+**The latent machinery is backbone-agnostic.** Both vLLM runners key off two token IDs
+read from environment variables and never mention Qwen anywhere. VLPO is ~30 lines in
+`RL/verl/workers/actor/dp_actor.py` (`compute_latent_log_probs` at `:135`, the splice at
+`:302`) plus `compute_grpo_latent_advantage` at `core_algos.py:258`. The ~260 lines of
+alignment-loss helpers (`compute_affine_projectors`, `affine_subspace_alignment_loss`,
+`_svd_select_U`) are pure tensor math over hidden states.
+
+What is *not* agnostic is the SFT forward. `Qwen2_5_VLModel.forward` is rewritten from
+`:1689` onward into a Python loop that drives `self.language_model(...)` segment by
+segment with a KV cache, one extra call per latent token, at batch size 1 — their own
+comment at `:1745` reads "we only use batch_size=1 in our training. Larger batch_size
+has not been tested."
+
+One piece is dead on arrival and should be deleted rather than ported: the modified
+`Qwen2_5_VLAttention.forward` exists solely to serve `collect_emphasize_attn`
+(`:948`), an auxiliary attention loss that nothing in the repo ever enables — one of the
+paper's own "early unsuccessful attempts". Dropping it means **the attention module is
+never touched**, which is what keeps interleaved MRoPE out of the blast radius.
+
+
+## 3. What ports for free
+
+Checked against the local `checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged`
+and against the installed vLLM, not assumed:
+
+* **Token compatibility**, per the shared section above. Monet's text manipulation is
+  built on `<|vision_start|><|image_pad|><|vision_end|>` splicing and an
+  `<|im_start|>assistant` answer-start pattern, all identical on Qwen3-VL. So
+  `replace_latent_placeholder_with_img_pad`, `add_latent_pad_after_auxiliary_img` and
+  the two 4D mask builders in `src/utils.py` (`build_4d_attn` at `:487`,
+  `build_4d_attn_wo_helper_images` at `:764`) transfer as written.
+* **No grounding coordinates anywhere.** The auxiliary images in the SFT data are
+  pre-cropped files on disk (`ReFocus/images/1_1.jpg` and friends), not boxes the model
+  emits. The 0–1000 coordinate change that breaks ERGO cannot touch this one.
+* **The 4D mask passthrough survives transformers 5.x.** `_preprocess_mask_arguments`
+  in `masking_utils.py` documents that an already-4D mask "is returned as-is". Their
+  dict form `{'full_attention': …}` becomes a bare tensor; that is the whole change.
+* **Both vLLM hook sites exist at 0.11.0**, in our own `saliency_r1_qwen3_vllm` env:
+  `self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(…)` at `gpu_model_runner.py:1984`
+  (where the pending hidden state is written over the next token's embedding) and
+  `sample_hidden_states = hidden_states[logits_indices]` at `:2330` (where it is
+  captured). vLLM 0.11 even ships a native `prompt_embeds` path writing into the same
+  buffer at `:2014`.
+* **Current EasyR1 already supports Qwen3-VL** — `verl/models/transformers/qwen3_vl.py`,
+  `monkey_patch.py` dispatching on `qwen3_vl` / `qwen3_vl_moe`, and
+  `examples/qwen3_vl_4b_geo3k_grpo.sh`. Commit `a354cdc`, "[deps] Allow transformers
+  <5.0.0 for Qwen3-VL". Same finding as DeepEyes §4: the Qwen3-VL work is upstream, the
+  fork is what is old.
+* **The data is self-contained**, see §6.
+* **The checkpoint is public and ordinary** — `NOVAglow646/Monet-7B` declares
+  `architectures: ["Qwen2_5_VLForConditionalGeneration"]`, `vocab_size: 151670`, no
+  `auto_map`, no custom code. That is what makes §8's gate cost days rather than weeks.
+
+
+## 4. What is broken, and the one silent trap
+
+**Pin both environments at transformers 4.57.6, not 5.x.** Their SFT code targets
+4.54.0 and current EasyR1 requires `>=4.54.0,<5.0.0`; Qwen3-VL landed in 4.57.0
+(verified: the `qwen3_vl` modeling file is present at tag `v4.57.0`). 4.57.6 is the only
+point that satisfies all three. Our working envs are at `transformers 5.13.0.dev0`, so
+this is a third pinned env, not a reuse — but porting a hand-modified 2,583-line
+modeling file across the 4.x → 5.x boundary is work that buys nothing.
+
+Qwen3-VL-specific breaks in the segmented SFT forward, in descending order of how
+expensive they are to find late:
+
+* **DeepStack, and it is silent.** `Qwen3VLTextModel.forward` (installed transformers,
+  `modeling_qwen3_vl.py:823`) injects ViT features into the first *k* decoder layers at
+  the rows flagged by `visual_pos_masks`, via `_deepstack_process` at `:849`. Monet calls
+  the language model **once per segment**, so each call needs `visual_pos_masks` sliced
+  to `[s, e)` *and* the matching rows of every `deepstack_visual_embeds[l]` selected
+  cumulatively across segments. Get the offsets wrong and the injection lands on the
+  wrong tokens; training runs, loss falls, and the model is wrong. This is the Qwen3-VL
+  analogue of DeepEyes §3's `parallel_env.py:282`.
+* **`position_ids` has four rows, not three** (text, t, h, w). Monet's
+  `position_ids[:, b:b+1]` slicing is dimension-agnostic and survives, but
+  `get_rope_index` / `compute_3d_position_ids` / `rope_deltas` have different signatures
+  and `Qwen3VLTextModel` splits off `text_position_ids = position_ids[0]` itself.
+* **`get_image_features` returns a tuple** on Qwen3-VL — `(image_embeds,
+  deepstack_image_embeds)`. Monet does `torch.cat(self.get_image_features(...), dim=0)`
+  at `:1603`, which will silently concatenate the wrong thing.
+* **The `28` is a `32`**, exactly as in ERGO §3, and it is wired deeper here.
+  `src/utils.py:299` hardcodes `divisor=28` and every budget in the codebase is written
+  `N*28*28` — `2000*28*28` for stages 1 and 3, `1500*28*28` global and `1280*28*28`
+  per image for stage 2, `1000*28*28` / `500*28*28` in the latent precompute. Two
+  consequences, not one: copying the numbers literally buys ~23% fewer visual tokens
+  than they trained on, *and* `divisor=28` emits image dimensions that are not multiples
+  of 32, so Qwen3-VL's `smart_resize` re-rounds them and the `new_sizes` the collate
+  re-applies at `src/main.py:264` go stale.
+* **vLLM async scheduling must be off.** The latent state machine reads
+  `valid_sampled_token_ids` synchronously inside `execute_model`; at 0.11 that is behind
+  `if not self.use_async_scheduling:` (`gpu_model_runner.py:2139`), with an
+  `AsyncGPUModelRunnerOutput` path that returns token ids later. Assert it rather than
+  assume it.
+* **Stay on vLLM 0.11.0** for the same reason ERGO §3 gives.
+
+**The silent trap.** `README.md:212-213` hardcodes `LATENT_START_ID=151666` and
+`LATENT_END_ID=151667`. On Qwen3-VL those IDs are **`</tool_response>`** and
+**`<think>`**. Their training code is clean — it derives the IDs from
+`tokenizer.add_tokens(...)`, which on Qwen3-VL lands the three new tokens at
+151669/151670/151671 (free, below `vocab_size: 151936`, so no embedding resize is
+needed). But the eval recipe is a copy-pasted `sitecustomize.py` carrying those two
+literals, and anyone who follows the README gets a model that flips into latent decoding
+whenever the policy emits `</tool_response>`. **Set both from the tokenizer, never from
+the README.**
+
+
+## 5. Work breakdown
+
+| | Days |
+|---|---|
+| **The gate** (§8) — serve `Monet-7B` on their own vLLM 0.10.0 pin, score it against Qwen3-VL-8B-Instruct and our cold start. Stops here if the headroom is gone | 2–3 |
+| Two conda envs pinned at transformers 4.57.6: SFT (trl, deepspeed ZeRO-2) and RL (EasyR1 + vLLM 0.11). flash-attn on A100 is the usual risk ([[laser-env-gotchas]]) | 3–4 |
+| Port the ~950-line SFT modeling delta onto Qwen3-VL: DeepStack slicing, 4-row position ids, the `get_image_features` tuple, the 28→32 restatement; delete the dead attention path | 5–8 |
+| **Equivalence tests**, which are the only defence against §4's silent breaks: `latent_mode=False` must reproduce stock Qwen3-VL logits, and the segmented forward must equal one full forward on the same input | 2 |
+| Data/template layer: `src/utils.py` mask builders, the new special tokens, a `test_monet_masks_cpu.py` in this repo's shape | 2–3 |
+| Precompute passes + **sharded** storage (§6) | 2 |
+| RL: graft EasyR1's `models/transformers/qwen3_vl.py` + `monkey_patch.py` into their fork, bump vLLM 0.8.5 → 0.11 and re-apply the 234-line runner patch at the two anchors, swap the Gemini judge for ours | 5–8 |
+| Launchers in this repo's shape — SLURM, 4 h chunks, autoresume — for **five** jobs, not one | 3 |
+| Eval: either VLMEvalKit + their `sitecustomize`, or port the 87-line inference patch to our vLLM 0.11 and write a `monet_qwen3_vl` lmms-eval wrapper (§7) | 3–4 |
+| **Debugging the first real runs** — where the time actually goes | 6–10 |
+| **Total** | **~31–44 days** |
+
+**The cost to flag hardest** is not any single line above: it is that this adds *two*
+frameworks. Their SFT harness subclasses `trl.SFTTrainer`, so it is at least the same
+family as ours, but it is a separate trainer from
+`trl_repo/trl/trainer/grpo_trainer_qwen3.py` with its own collate, its own loss and its
+own DeepSpeed config. The RL half is EasyR1 — a different framework from the verl that
+DeepEyes, Mini-o3 and ERGO Route B all share. **Monet is the one baseline here that
+reuses nothing from the other three.** If the roadmap is "build several baselines", it
+should be built last or not at all.
+
+**The cheap partial.** Stage 1 alone is an ordinary interleaved-CoT SFT on 125K rows:
+no modeling fork, no latents, no precompute, runs on the cold-start pipeline we already
+have. ~3–5 days and ~150–350 A100-hours, and it reproduces the paper's "+ vanilla SFT"
+row — which already carries two thirds of their V* gain (§8). That isolates how much of
+Monet is the dataset and how much is the latent space, for a twentieth of the price, and
+it is worth doing even if the full arm is cancelled.
+
+
+## 6. Data and disk
+
+**The data is the easiest of the four.** `NOVAglow646/Monet-SFT-125K` is **13.5 GB with
+images bundled** — Visual-CoT 8.10 GB, Zebra-CoT-count 4.46 GB, Zebra-CoT-visual-search
+0.70 GB, CogCoM 0.04 GB, ReFocus 0.02 GB, plus five `train.json` files totalling 0.17 GB.
+One `images.zip` per subset, no scavenging across source repos, reachable from the login
+node. RL uses `Kwai-Keye/Thyme-RL`, of which they take a 3.2K subset.
+
+The format is a plain conversation list with `<abs_vis_token></abs_vis_token>` marking
+where a latent segment goes and `<observation>…</observation>` marking the alignment
+targets. Checked on ReFocus: **2.00 auxiliary images and 2.00 latent segments per
+sample**, and the observation spans are tiny — mean **1.7 words per sample**, median 1.
+
+**The disk cost is the precompute, and their layout is wrong for lustre.** Both
+precompute scripts write one `.pt` per sample (`rep_*.pt`, `latent_*.pt`) holding
+all-layer hidden states at the aligned positions. On Qwen3-VL-8B that is 37 layers ×
+4,096 × 2 B = **303 KB per aligned token**:
+
+| | tokens/sample | per sample | × 125K |
+|---|---|---|---|
+| stage-2 targets (observation tokens) | ~5–20 | 1.5–6 MB | **190–760 GB** |
+| stage-3 targets (latents: 2 segments × 8–10) | ~16–30 | 5–9 MB | **600 GB–1.1 TB** |
+
+So **~0.8–1.9 TB in ~250,000 files**. Lustre has 17 TB free, so the bytes are fine; a
+quarter-million files in two directories is not. Shard them (one file per 256 samples,
+indexed) before this runs — it is an hour's work beforehand and a day's recovery after.
+The scripts already carry `--resume` and a `_scan_existing_reps` glob, which is itself a
+hint about how long these passes take.
+
+
+## 7. Eval
+
+Three of the paper's five benchmarks are **already in the HF cache**:
+`craigwu___vstar_bench`, `DreamMr___hr-bench`, `yifanzhang114___mme-real_world-lmms-eval`.
+VisualPuzzles is not and would need downloading; it is small.
+
+The gap is the harness. They evaluate through **VLMEvalKit** with a `sitecustomize.py`
+that swaps `vllm.v1.worker.gpu_model_runner` for theirs, plus an API judge replacing
+exact matching. Two routes:
+
+* **Their way** — a throwaway VLMEvalKit + vLLM 0.10.0 env. Zero porting, correct for
+  the gate in §8, wrong as a permanent arm because none of our benchmark table lives
+  there.
+* **Our way** — port the 87-line inference patch to vLLM 0.11 (§3 confirms the anchors)
+  and write a `monet_qwen3_vl` lmms-eval model, in the house style of
+  `qwen3_vl_vga.py` / `qwen3_vl_sinkshift.py`. The wrapper is genuinely simple, because
+  unlike Mini-o3 §7 and ERGO §7 there is **no loop to drive**: latent decoding happens
+  inside vLLM, so the wrapper is a normal single-turn chat model that happens to need a
+  patched runner and two env vars.
+
+Their system prompt is load-bearing and is published: *"You are a helpful multimodal
+assistant. You are required to answer the question based on the image provided. Put your
+final answer in \\boxed{}."* Use it verbatim or the numbers are not theirs.
+
+One output-handling detail: latent tokens are not decodable text, so any logging path
+has to detect `<abs_vis_token>` and substitute a `<latent>` placeholder before the
+string reaches a judge or a W&B table.
+
+
+## 8. Run this gate first — 2–3 days, and it is likely to end the job
+
+`NOVAglow646/Monet-7B` is public and, per §3, is a stock Qwen2.5-VL checkpoint. Serve it
+in a throwaway vLLM **0.10.0** env with their `monet_gpu_model_runner.py` and
+`LATENT_START_ID=151666` — their exact recipe, zero porting — and score V*, HR-Bench and
+MME-RealWorld against Qwen3-VL-8B-Instruct, our cold start, and our `eval_mini` natural
+set.
+
+The reason to gate, from their Table 3 and Table 5 against the Qwen3-VL figures DeepEyes
+§8 already collected:
+
+| | V* | HRBench-4K | HRBench-8K | VisualPuzzles |
+|---|---|---|---|---|
+| Qwen2.5-VL-7B (their baseline) | 76.44 | 68.00 | 55.75 | 32.71 |
+| + vanilla SFT on their 125K | 81.68 | 68.38 | 58.50 | 33.99 |
+| + vanilla SFT + GRPO | 78.53 | 70.00 | 56.75 | 30.99 |
+| Monet-SFT (latents, no VLPO) | 82.20 | 68.50 | 66.00 | 30.48 |
+| **Monet-7B** | **83.25** | **71.00** | **68.00** | **35.02** |
+| Qwen3-VL-8B-Thinking, **nothing added** | 77.5 | 72.4 | 68.1 | — |
+
+**Qwen3-VL-8B already beats Monet-7B on HRBench-4K and ties it on HRBench-8K.** The only
+clear headroom is V* (~+5.75) and the out-of-distribution VisualPuzzles column. Those
+Qwen3-VL numbers are not ours — they come from DeepEyes §8 and a community benchmark
+table, which is precisely what the gate converts into a measurement.
+
+Read it as:
+
+* **Monet-7B clearly above Qwen3-VL on ≥ 3 of 4** — proceed to §5.
+* **Monet-7B above on V* only** — do the stage-1 partial from §5 and report it as a data
+  result, not a method result.
+* **Qwen3-VL at or above on ≥ 3 of 4** — stop. Same sentence DeepEyes §8 earns, one week
+  instead of two months.
+
+**Read the ablation column while the gate runs**, because it reframes what is being
+bought. On V*, the entire latent apparatus is worth **+0.52** over a plain SFT on the
+same data (81.68 → 82.20), and VLPO a further +1.05. Where latents genuinely pay is
+HRBench-8K: 58.50 → 66.00 → 68.00, i.e. **+9.5 from the latent machinery**. That single
+column is the whole case for this arm — and it is also the column Qwen3-VL already
+matches at 68.1 with nothing added.
+
+
+## 9. GPU budget
+
+No hardware or hour count appears anywhere in the paper; the only resource statement is
+"to avoid OOM, we use a batch size of 1". So this is modelled rather than scaled from
+theirs, from two anchors: a FLOP count at ~110 TFLOP/s effective on an A100 with
+gradient checkpointing, and our own step times for the rollout half
+([[grpo-step-time-is-mostly-fixed-cost]]).
+
+A sample is ~1,000 tokens: the global budget caps all images in a sample at 2,000
+patches, i.e. ~500 visual tokens after the 2×2 merge, plus text.
+
+| stage | volume | A100-h |
+|---|---|---|
+| 1 — warm-up | 500K sample-passes, full FT of the 8B LLM | 150–350 |
+| precompute A — teacher reps | 125K forward-only | 20–40 |
+| 2 — target latents | 1,000 steps × 128, plus the per-latent-token forward *and backward* | 100–250 |
+| precompute B — target latents | 125K through the segmented latent forward | 60–120 |
+| 3 — latent generation | 1,000 steps × 128, same loop | 100–250 |
+| **one clean SFT pass** | | **~450–1,000** |
+| VLPO, per run | ~50 optimizer steps | 35–100 |
+
+**Where the unusual cost is.** Stages 2 and 3 run ~16–30 extra single-token
+`language_model()` calls per sample, each carrying its own autograd graph, at batch size
+1. Those are launch-latency bound rather than FLOP bound — roughly +0.3–0.9 s per
+sample, which is ~20–40% of the stage cost and is pure overhead that no amount of GPU
+buys back. It is also why batch size 1 is in the paper at all.
+
+**RL is comparatively cheap.** 3.2K prompts over 1 epoch at `rollout_batch_size=64` is
+~50 optimizer steps. But `online_accum_size=256` means 256 prompts are rolled out to
+keep 64, so each step generates ~2,048 completions of up to 4,096 tokens — ~8M tokens
+against our ~0.7M per step, and latent decoding serialises on top. Call it 5–15 min/step
+on 8 A100s, 4–12 h per run.
+
+Budget **two SFT passes** (the first will be wrong) and **three RL runs** (smoke, real,
+fix): **~1,100–2,400 A100-hours**, plus eval, so **~1,500–3,000** all in. That is the
+largest of the four sections, and the reason is that it is the only one paying for SFT.
+
+Per [[fewer-gpus-keeps-batch-and-total-steps]], the 8-GPU shape is not a requirement —
+trading ranks for grad-accum preserves batch and step count. The cluster blocker in
+DeepEyes §9 applies unchanged: `oci-nrt-cs-001` still has no GPU hardware
+([[gpu-partitions-can-be-empty-of-hardware]]), so all of this runs on
+`cs-oci-ord-login-01`. Nothing here wants multi-node Ray.
+
+
+## 10. Fidelity notes, and the comparability trap
+
+* **Stage 1 is 3 epochs or 4.** Table 7 says 3 epochs / 3,885 steps;
+  `script_examples/sft_stage1.sh` passes `--epochs 4`. 125K / 128 × 4 = 3,908, so the
+  step count matches the script and the epoch count does not. Pick the step count and
+  say which.
+* **Stages 2 and 3 are 1 epoch or 2**, same disagreement: Table 7 says ~1,000 steps
+  ("~1 epoch"), the scripts pass `--epochs 2`.
+* **`latent_size` is {8, 10, 12} in the SFT table, 8 in the scripts, 10 at RL and 10 at
+  inference.** It is a genuine free parameter and the paper never settles it; state the
+  value used.
+* **Their two tables disagree about their own model.** Monet-7B's MME-RealWorld is 58.34
+  in Table 3 and 55.50 in Table 5. The ablation column is therefore not strictly
+  comparable to the main one, which matters because §8's argument leans on the ablation.
+* **The judge is Gemini-2.5-Pro over an external API**, both for accuracy during RL and
+  as a "supplementary judge" at eval. Ours is self-hosted. Swapping it is correct and
+  cheap, but it is a deviation that belongs in the caption, not a footnote — their
+  VisualPuzzles and MME-RealWorld numbers were produced by a different grader than ours
+  would be.
+* **"No cold start" is not claimed here, and that is a comparability gift.** Monet's
+  stage 1 *is* a cold start in their own format, so the Qwen3-VL format problem recorded
+  at `build_coldstart_data.py:53` is solved by the method rather than around it. The flip
+  side is that a Monet arm and our arm would then have **different cold starts** — theirs
+  on Monet-SFT-125K, ours on LLaVA-CoT + Mulberry. An honest table says so, or adds a
+  "+vanilla SFT on Monet-SFT-125K" control, which is the §5 partial and another reason to
+  do it.
+* **The comparability trap, in the Monet-shaped version.** Their claim is not accuracy
+  at a budget (ERGO) or depth of search (Mini-o3) — it is that *continuous embeddings
+  can carry visual thought*. The benchmark table is weak evidence for that and §8 shows
+  it has largely evaporated on this backbone. If this arm is built, the interesting
+  comparison is not V*: it is whether our attention-based story and their
+  latent-embedding story are measuring the same thing, which is an analysis, not a row.
+  Worth deciding **before** six weeks are spent, not after.
+
+
+## Sources
+
+* [arXiv:2511.21395](https://arxiv.org/abs/2511.21395) — the paper (CVPR 2026)
+* [NOVAglow646/Monet](https://github.com/NOVAglow646/Monet) — SFT, RL, both vLLM patches
+* [NOVAglow646/Monet-7B](https://huggingface.co/NOVAglow646/Monet-7B) — the public checkpoint; stage 1 and stage 3 are also released
+* [NOVAglow646/Monet-SFT-125K](https://huggingface.co/datasets/NOVAglow646/Monet-SFT-125K) — 13.5 GB, images included
+* [Kwai-Keye/Thyme-RL](https://huggingface.co/datasets/Kwai-Keye/Thyme-RL) — the RL data
+* [hiyouga/EasyR1](https://github.com/hiyouga/EasyR1) — the RL framework; already Qwen3-VL-aware upstream
+* [UMass-Embodied-AGI/Mirage](https://github.com/UMass-Embodied-AGI/Mirage) — the latent-reasoning predecessor they credit
