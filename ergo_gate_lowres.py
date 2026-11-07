@@ -654,6 +654,71 @@ def token_census(out_dir, n=24):
     return rows
 
 
+def target_census(out_dir):
+    """How big V*'s answer-bearing region is, in visual tokens, at each cap.
+
+    The accuracy table says whether the penalty exists. This says whether it CAN,
+    and it is the half the gate can produce without a GPU.
+
+    A visual token is 32x32 pixels of the RESIZED image, so the question "is the
+    object still there at 640 tokens" has an arithmetic answer: scale the box by
+    the same factor the image was scaled by and count. A target that lands under
+    one token cannot be read at any temperature, and one that is still several
+    tokens wide at 640 was never going to be the thing a crop recovers.
+
+    Run over all 191 documents and all three caps, from the committed boxes.
+    """
+    from qwen_vl_utils.vision_process import smart_resize
+
+    import datasets
+
+    boxes = json.loads((REPO / "assets" / "vstar_bench_boxes.json").read_text())
+    data = datasets.load_dataset("lmms-lab-encoder/vstar-bench", split="test")
+
+    rows = []
+    for cap in list(CAPS) + ["crop"]:
+        tokens, sub_token = [], 0
+        for i in range(len(data)):
+            doc = data[i]
+            width, height = doc["image"].size
+            entry = boxes[str(doc["question_id"])]
+            x1 = min(b[0] for b in entry["bbox"])
+            y1 = min(b[1] for b in entry["bbox"])
+            x2 = max(b[0] + b[2] for b in entry["bbox"])
+            y2 = max(b[1] + b[3] for b in entry["bbox"])
+            box_w, box_h = max(1, x2 - x1), max(1, y2 - y1)
+
+            if cap == "crop":
+                # The oracle arm: the crop IS the region, so it is re-encoded on
+                # its own and min_pixels is what decides its size.
+                rh, rw = smart_resize(box_h, box_w, factor=32,
+                                      min_pixels=MIN_PIXELS, max_pixels=CROP_CAP * VISUAL_TOKEN_PX)
+                target_tokens = rh * rw / VISUAL_TOKEN_PX
+            else:
+                rh, rw = smart_resize(height, width, factor=32, min_pixels=MIN_PIXELS,
+                                      max_pixels=cap * VISUAL_TOKEN_PX)
+                scale_x, scale_y = rw / width, rh / height
+                target_tokens = (box_w * scale_x) * (box_h * scale_y) / VISUAL_TOKEN_PX
+            tokens.append(target_tokens)
+            sub_token += target_tokens < 1.0
+        tokens.sort()
+        row = dict(cap=cap, n=len(tokens),
+                   median_target_tokens=round(tokens[len(tokens) // 2], 2),
+                   p10=round(tokens[len(tokens) // 10], 2),
+                   p90=round(tokens[9 * len(tokens) // 10], 2),
+                   share_under_one_token=round(sub_token / len(tokens), 3))
+        rows.append(row)
+        print(f"V* target at cap {str(cap):>5}: median {row['median_target_tokens']:>8.2f} tokens "
+              f"(p10 {row['p10']}, p90 {row['p90']}); "
+              f"{100*row['share_under_one_token']:.1f}% under one token")
+
+    path = Path(out_dir) / "target_census.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows, indent=1))
+    print(f"\nwrote {path}", file=sys.stderr)
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
@@ -785,6 +850,8 @@ def main():
             print("    " + " ".join(shlex.quote(c) for c in cmd))
     if args.token_census:
         token_census(args.out_dir)
+        print()
+        target_census(args.out_dir)
     if args.run:
         if not (Path(args.out_dir) / "tasks" / "vstar_bench_gtcrop.yaml").is_file():
             make_tasks(args.out_dir, args.hrbench_n, args.seed)

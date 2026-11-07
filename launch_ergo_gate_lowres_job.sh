@@ -62,14 +62,57 @@ PY="${GATE_PYTHON:-/home/uberger/scratch/miniconda3/envs/lmms_eval/bin/python}"
 "$PY" "$REPO/ergo_gate_lowres.py" --make-tasks --out-dir "$OUT_DIR" \
     ${HRBENCH_N:+--hrbench-n "$HRBENCH_N"}
 
+# Does this cluster have GPUs AT ALL? oci-nrt-cs-001 lost every GPU node around
+# 2026-10-27: each GPU partition still reports State=UP, so it accepts the job and
+# parks it at Reason=PartitionConfig -- which reads exactly like ordinary queueing
+# and is normally something to poll rather than resubmit. It is not queueing. The
+# partitions have TotalNodes=0 and nothing anywhere advertises a gpu GRES, so a 4h
+# allocation submitted here never starts and nobody finds out for a day.
+if [[ $DRY_RUN -eq 0 ]] && command -v sinfo >/dev/null 2>&1; then
+    if [[ "$(sinfo -h -N -o '%G' | grep -ci gpu)" -eq 0 ]]; then
+        echo "ERROR: no node on $(hostname) advertises a gpu GRES." >&2
+        echo "       Every GPU partition here reports TotalNodes=0, so this job would be" >&2
+        echo "       accepted, parked at (PartitionConfig), and never scheduled." >&2
+        echo "       Run it from cs-oci-ord-login-01 instead -- same repo, same paths." >&2
+        echo "       Override with GATE_SKIP_GPU_CHECK=1 if the partitions have come back." >&2
+        [[ -n "${GATE_SKIP_GPU_CHECK:-}" ]] || exit 1
+    fi
+fi
+
 # shellcheck source=/dev/null
 source "$REPO/cluster_env.sh"
 PARTITION=${PARTITION_OVERRIDE:-${PARTITION:-$(SR1_JOB_HOURS=$DURATION sr1_pick_partition)}}
 ACCOUNT=${ACCOUNT:-nvr_israel_rlop}
 CONDA_ENV=${CONDA_ENV:-lmms_eval}
 
-sr1_find_submit_job || [[ $DRY_RUN -eq 1 ]] || {
-    echo "ERROR: submit_job not found under the cluster-interface paths." >&2; exit 1; }
+# `submit_job` on PATH proves nothing: it sources detect_system.sh, whose host
+# case list does not cover every login node, and on a host it does not know it
+# exits with "Unable to determine target cluster system from host name". Probe it
+# and fall back to raw sbatch, the way watch_bench_evals.sh does. Capture the
+# output rather than piping into `grep -q`: under pipefail grep's early exit
+# SIGPIPEs detect_system.sh, the pipeline reports 141, and the negation would read
+# a detected failure as success -- choosing submit_job on exactly the hosts where
+# it cannot work.
+BACKEND=""
+if sr1_find_submit_job; then
+    CI_DIR="$(dirname "$(command -v submit_job)")"
+    if [[ -f "$CI_DIR/detect_system.sh" ]]; then
+        PROBE="$(bash "$CI_DIR/detect_system.sh" 2>&1 || true)"
+        [[ "$PROBE" != *"Unable to determine target cluster"* ]] && BACKEND=submit_job
+    fi
+fi
+if [[ -z "$BACKEND" ]] && command -v sbatch >/dev/null 2>&1; then
+    BACKEND=sbatch
+fi
+[[ -n "$BACKEND" || $DRY_RUN -eq 1 ]] || {
+    echo "ERROR: neither submit_job nor sbatch can submit from $(hostname)." >&2; exit 1; }
+
+# Only the sbatch backend needs these; submit_job sizes the allocation itself.
+# 229 GiB per GPU is the ceiling, not a preference: slurm rejects outright any
+# request whose memory-to-GPU ratio would strand GPUs on the node, so an over-ask
+# means nothing is submitted at all.
+CPUS_PER_GPU=${CPUS_PER_GPU:-28}
+MEM_PER_GPU_GB=${MEM_PER_GPU_GB:-229}
 
 LOG_ROOT="$REPO/outputs/logs"
 mkdir -p "$LOG_ROOT" "$OUT_DIR"
@@ -114,6 +157,7 @@ echo "==========================================================================
 echo "Job       : $NAME   ($ACCOUNT, $PARTITION, ${DURATION}h, ${GPUS} GPU)"
 echo "Out dir   : $OUT_DIR"
 echo "Units     : $("$PY" "$REPO/ergo_gate_lowres.py" --plan --out-dir "$OUT_DIR" | grep -c '^[a-z]')"
+echo "Backend   : ${BACKEND:-(none)}   (from $(hostname))"
 echo "Runner    : $RUNNER"
 echo "=========================================================================="
 cat "$RUNNER"
@@ -121,12 +165,33 @@ echo "==========================================================================
 
 [[ $DRY_RUN -eq 1 ]] && { echo "[dry-run] not submitting."; exit 0; }
 
-submit_job \
-    --account "$ACCOUNT" \
-    --partition "$PARTITION" \
-    --name "$NAME" \
-    --gpu "$GPUS" \
-    --duration "$DURATION" \
-    --outfile "$LOG_ROOT/$NAME.%j.out" \
-    --logroot "$LOG_ROOT" \
-    -c "bash $RUNNER"
+if [[ "$BACKEND" == "submit_job" ]]; then
+    submit_job \
+        --account "$ACCOUNT" \
+        --partition "$PARTITION" \
+        --name "$NAME" \
+        --gpu "$GPUS" \
+        --duration "$DURATION" \
+        --outfile "$LOG_ROOT/$NAME.%j.out" \
+        --logroot "$LOG_ROOT" \
+        -c "bash $RUNNER"
+else
+    SBATCH="$LOG_ROOT/$NAME.sbatch"
+    cat > "$SBATCH" <<SBATCH_EOF
+#!/bin/bash
+#SBATCH --account=$ACCOUNT
+#SBATCH --partition=$PARTITION
+#SBATCH --job-name=$NAME
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:$GPUS
+#SBATCH --cpus-per-task=$((CPUS_PER_GPU * GPUS))
+#SBATCH --mem=$((MEM_PER_GPU_GB * GPUS))G
+#SBATCH --time=${DURATION}:00:00
+#SBATCH --export=ALL
+#SBATCH --output=$LOG_ROOT/$NAME.%j.out
+
+bash $RUNNER
+SBATCH_EOF
+    sbatch "$SBATCH"
+fi
