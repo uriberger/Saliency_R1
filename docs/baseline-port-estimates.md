@@ -16,6 +16,11 @@ cost is dominated by SFT rather than by rollouts.
 | [ERGO](#ergo-on-qwen3-vl--port-and-training-estimate) — two fixed turns, efficiency-oriented, crop verified by a VLM | ~2.5–3.5 weeks, ~400–1,000 A100-h | **1 day**: does Qwen3-VL even have a low-resolution penalty to recover? |
 | [Monet](#monet-on-qwen3-vl--port-and-training-estimate) — no tool, latent visual embeddings, 3-stage SFT + VLPO | **~6–9 weeks, ~1,500–3,000 A100-h** — the most expensive | 2–3 days: serve `NOVAglow646/Monet-7B` on their own vLLM pin, score it on our suite |
 
+**Execution briefs.** Two of the four have been broken into agent-sized prompts:
+[ergo-build-prompts.md](ergo-build-prompts.md) and
+[deepeyes-build-prompts.md](deepeyes-build-prompts.md). Those are the plans of record
+for building these arms; this document stays the decision.
+
 ### What every one of these has in common
 
 Three findings recur, and they are why these estimates land where they do rather than
