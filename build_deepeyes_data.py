@@ -70,34 +70,50 @@ Two resolution facts the launcher needs, and `stats.json` reports both:
     analytically on the patch-16 / merge-2 grid (32 px per token). That second number
     is what `data.max_prompt_length` has to hold, not the first.
 
-WHERE THE ORIGINAL IMAGE GOES, AND WHY IT IS A FILE
----------------------------------------------------
-`ImageZoomInTool.create()` (deepeyes_fork, :332) requires `create_kwargs["image"]` and
-raises `ValueError` without it; `tool_agent_loop.py:444` passes exactly
-`tools_kwargs[tool_name]["create_kwargs"]`. So every tool row must carry an image a
-second time, because the one in the `images` column has by then been through
-`process_image` -> `fetch_image` and is smart-resized.
+WHERE THE ORIGINAL IMAGE GOES, AND THE THREE FIELDS THE TOOL DEMANDS
+---------------------------------------------------------------------
+`tool_agent_loop.py:444` hands `tools_kwargs[tool_name]["create_kwargs"]` straight to
+`ImageZoomInTool.create()`, so every tool row must carry its image a second time: the
+copy in the `images` column has by then been through `process_image` and is
+smart-resized, and a crop of that recovers nothing.
 
-Default `--image-mode file` writes those originals to `<out>/images/<source>/` and
-points `create_kwargs.image` at a `file://` URI. The alternative, `--image-mode
-datauri`, inlines a base64 copy and is what P2's smoke data did; it costs ~+4.3 GB of
-parquet and makes every row carry its image twice through ray. The file mode keeps the
-parquet at the published size and -- the actual reason -- leaves the pre-resize
-original as an inspectable artifact on disk, which is what P3 has to assert it crops.
+Since P3, `create_kwargs` needs THREE fields, not one:
 
-A WARNING FOR P3 THAT IS NOT FIXABLE FROM THE DATA SIDE
---------------------------------------------------------
-`ImageZoomInTool.create()` does `img = fetch_image({"image": image})`, and
-`qwen_vl_utils.fetch_image` ALWAYS calls `smart_resize` -- for a PIL object, a
-`file://` path and a data URI alike. So the tool stores a resized image whatever we
-hand it, and P3's requirement "crop the original, pre-processor-resize image" cannot be
-met by choosing a different `create_kwargs` encoding. It needs a change inside
-`create()`. The `file://` path at least makes the true original reachable.
+    image          what to load
+    original_size  [W, H] read from the RAW bytes
+    view_size      [w, h] of what the dataloader will show the model
 
-Related, and also P3/P7's: `fetch_image`'s grid is `image_patch_size * 2`, and verl's
-`data.image_patch_size` defaults to **14**. Qwen3-VL is patch-16, so the default
-resizes onto a 28 px grid and caps at 12,845,056 px instead of 16,777,216.
-`data.image_patch_size=16` belongs in the launcher.
+The last two are not decoration. "Is this the original?" cannot be answered from the
+pixels -- an already-resized image looks exactly like an original that needed no
+resize -- so the data declares the size and the tool compares. Under
+`crop_source_check: strict` a missing `original_size`, a mismatch against the loaded
+image, or a `view_size` that disagrees with the tool's own smart_resize **kills the
+run on purpose**.
+
+They are therefore produced by `deepeyes/zoom_tool_config.py::build_create_kwargs`
+(P3's), never by this file. That helper derives them from the raw image by two
+different computations; a conversion that assigns both from one already-processed
+variable passes its own assertions and silently makes the zoom a no-op, which is the
+exact mistake the helper exists to make impossible. `load_zoom_tool_config()` below
+imports it, with a temporary path for the unmerged branch.
+
+Default `--image-mode file` writes the originals to `<out>/images/<corpus>/` and points
+`create_kwargs.image` at a `file://` URI. The one thing this file does on top of the
+helper is substitute that URI for the PIL object the helper returns, because a PIL
+object does not survive parquet -- same image, byte for byte, and P3's `create()`
+loads a `file://` without resizing. `--image-mode datauri` inlines a base64 copy
+instead, which is what P2's smoke data did; it also RE-ENCODES to PNG, so a corpus of
+JPEGs grows several-fold. The file mode keeps the parquet at the published size and
+leaves the pre-resize original as an artifact anyone can open.
+
+`data.image_patch_size` IS NOT OPTIONAL, AND IT NOW FAILS LOUDLY
+-----------------------------------------------------------------
+verl defaults `data.image_patch_size` to **14** (`rl_dataset.py:108`,
+`legacy_data.yaml:71`) and derives it from nothing. Qwen3-VL is patch-16 / merge-2, so
+the default smart-resizes the prompt image onto a 28 px grid. The `view_size` written
+here is computed on the correct 32 px grid, so a launcher that leaves the default in
+place will have the tool's crop-source check reject every call -- which is the good
+failure, but it is still a dead job. `data.image_patch_size=16`.
 
 TWO MORE THINGS THE LAUNCHER MUST SET, BOTH FOUND HERE
 -------------------------------------------------------
@@ -199,6 +215,63 @@ TOOL_NAME = "image_zoom_in_tool"
 TOOL_AGENT = "tool_agent"
 PLAIN_AGENT = "single_turn_agent"
 
+#: `deepeyes.zoom_tool_config`, resolved once in main(). Module-level because
+#: convert_source is called per corpus and the lookup prints a note.
+zoom_cfg = None
+
+
+# ---------------------------------------------------------------------------
+# P3's create_kwargs builder
+# ---------------------------------------------------------------------------
+def load_zoom_tool_config():
+    """`deepeyes.zoom_tool_config`, wherever it currently lives.
+
+    P3 made `original_size` and `view_size` MANDATORY in `create_kwargs`: the tool
+    cannot tell an original from an already-smart-resized copy by looking at it, so the
+    data states the original's size and the tool kills the run on a mismatch rather
+    than cropping a downsampled image and leaving the loss curve looking healthy.
+
+    Both fields come from `build_create_kwargs`, never from here, and that is the
+    point: it derives them by two deliberately different computations from the raw
+    image, so a conversion that assigns both from one already-processed variable cannot
+    pass. Hand-rolling the dict is the specific mistake it exists to make impossible.
+
+    THE FALLBACK IS TEMPORARY. `deepeyes/zoom_tool_config.py` is on branch
+    `feat/deepeyes-zoom-tool`, which is not merged yet, so this also looks in that
+    worktree. Once P3 lands on `main` the plain import succeeds and the second branch
+    can be deleted -- if it ever starts being the one that fires in a real run, that is
+    a sign the branches were merged in the wrong order, not something to work around.
+    """
+    try:
+        from deepeyes.zoom_tool_config import build_create_kwargs, smart_resize_wh  # noqa: F401
+
+        return sys.modules["deepeyes.zoom_tool_config"]
+    except ImportError:
+        pass
+
+    import importlib.util
+
+    for cand in (
+        REPO / "deepeyes" / "zoom_tool_config.py",
+        REPO.parent.parent / ".worktrees" / "feat-deepeyes-zoom-tool" / "deepeyes" / "zoom_tool_config.py",
+        REPO / ".worktrees" / "feat-deepeyes-zoom-tool" / "deepeyes" / "zoom_tool_config.py",
+    ):
+        if cand.exists():
+            if cand != REPO / "deepeyes" / "zoom_tool_config.py":
+                print(f"NOTE: deepeyes.zoom_tool_config taken from the unmerged P3 worktree\n"
+                      f"      {cand}\n"
+                      f"      This path disappears when feat/deepeyes-zoom-tool lands on main.",
+                      flush=True)
+            spec = importlib.util.spec_from_file_location("deepeyes_zoom_tool_config", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    raise SystemExit(
+        "cannot find deepeyes/zoom_tool_config.py. It is P3's "
+        "(branch feat/deepeyes-zoom-tool) and owns build_create_kwargs, which is the "
+        "only supported way to produce create_kwargs.original_size / view_size."
+    )
+
 #: Qwen3-VL geometry: patch 16, spatial merge 2 -> one visual token per 32x32 px.
 #: These are the numbers `qwen_vl_utils.fetch_image` uses once `data.image_patch_size`
 #: is 16, and they are what the image-token estimate below is computed against.
@@ -263,6 +336,17 @@ def image_token_count(width: int, height: int) -> int:
     return (h_bar // PATCH_FACTOR) * (w_bar // PATCH_FACTOR)
 
 
+def smart_resize_wh_local(width: int, height: int) -> tuple[int, int]:
+    """(width, height) after smart_resize, from THIS file's own transcription.
+
+    Deliberately NOT `zoom_tool_config.smart_resize_wh`, which is what the build used
+    and which prefers the installed `qwen_vl_utils`. A verification that calls the same
+    function the build called can only ever agree with it.
+    """
+    h_bar, w_bar = smart_resize_hw(height, width)
+    return w_bar, h_bar
+
+
 def percentile(sorted_vals, q: float):
     if not sorted_vals:
         return None
@@ -306,7 +390,17 @@ def output_schema():
     """
     import pyarrow as pa
 
-    create_kwargs = pa.struct([("image", pa.string())])
+    # `original_size` and `view_size` are REQUIRED by ImageZoomInTool since P3: without
+    # original_size the tool refuses to run under crop_source_check=strict, and a
+    # view_size that disagrees with its own smart_resize kills the run. Both are
+    # [width, height], ints, produced by zoom_tool_config.build_create_kwargs.
+    create_kwargs = pa.struct(
+        [
+            ("image", pa.string()),
+            ("original_size", pa.list_(pa.int64())),
+            ("view_size", pa.list_(pa.int64())),
+        ]
+    )
     tools_kwargs = pa.struct([(TOOL_NAME, pa.struct([("create_kwargs", create_kwargs)]))])
     return pa.schema(
         [
@@ -383,6 +477,7 @@ def convert_source(
         "height": [],
         "image_tokens_per_row": [],
         "image_bytes": [],
+        "view_px": [],
         "prompt_roles": {},
         "prompt_chars": [],
         "rows_without_image_tag": 0,
@@ -427,7 +522,7 @@ def convert_source(
                 continue
 
             tokens = 0
-            first_uri = None
+            create_kwargs = None
             for k, im in enumerate(images):
                 b = im["bytes"]
                 with Image.open(io.BytesIO(b)) as pim:  # header only; no decode
@@ -439,27 +534,34 @@ def convert_source(
                 stats["pixels"].append(w * h)
                 stats["image_bytes"].append(len(b))
                 tokens += image_token_count(w, h)
-                if k == 0 and want_tool and not stats_only:
+                if k == 0 and want_tool and not stats_only and image_mode != "none":
+                    # original_size / view_size come from P3's builder, derived from the
+                    # RAW bytes. Never from `w`/`h` above: reusing a variable that has
+                    # been anywhere near process_image is the exact failure the tool's
+                    # crop-source check exists to catch, and it would pass.
+                    create_kwargs = zoom_cfg.build_create_kwargs(
+                        b, as_data_uri=(image_mode == "datauri")
+                    )
                     if image_mode == "file":
                         ext = IMAGE_EXT.get(fmt, "img")
                         p = image_dir / f"{i:06d}.{ext}"
                         if not p.exists():
                             p.write_bytes(b)  # verbatim: no decode, no re-encode
-                        first_uri = "file://" + str(p)
-                    elif image_mode == "datauri":
-                        mime = {"JPEG": "jpeg", "PNG": "png", "WEBP": "webp"}.get(fmt, "png")
-                        first_uri = f"data:image/{mime};base64," + base64.b64encode(b).decode()
-                    elif image_mode == "none":
-                        first_uri = None
-                    else:
-                        raise SystemExit(f"unknown --image-mode {image_mode}")
+                        # build_create_kwargs hands back a PIL object when it is not
+                        # making a data URI, and a PIL object does not survive parquet.
+                        # Swap in the file the raw bytes just went into -- same image,
+                        # byte for byte, and the tool loads it without resizing.
+                        create_kwargs["image"] = "file://" + str(p)
+                    stats["view_px"].append(
+                        create_kwargs["view_size"][0] * create_kwargs["view_size"][1]
+                    )
             stats["image_tokens_per_row"].append(tokens)
 
             if not stats_only:
                 xi = row["extra_info"] or {}
                 tk = None
-                if want_tool and first_uri is not None:
-                    tk = {TOOL_NAME: {"create_kwargs": {"image": first_uri}}}
+                if want_tool and create_kwargs is not None:
+                    tk = {TOOL_NAME: {"create_kwargs": create_kwargs}}
                 out_rows.append(
                     {
                         "data_source": ds,
@@ -502,6 +604,10 @@ def finalize_stats(stats: dict) -> dict:
     out["image_tokens_per_row"] = summarize(stats["image_tokens_per_row"], "image_tokens_per_row")
     out["image_bytes"] = summarize(stats["image_bytes"], "image_bytes")
     out["prompt_chars"] = summarize(stats["prompt_chars"], "prompt_chars")
+    # What the model is shown, as declared in create_kwargs.view_size. The ratio of
+    # this to `pixels` is the headroom a zoom actually has; where it is 1.0 the tool is
+    # decoration (which is what ImageZoomInTool.min_expected_downscale guards).
+    out["view_px"] = summarize(stats["view_px"], "view_px") if stats["view_px"] else None
     out["n_images"] = {str(k): v for k, v in sorted(stats["n_images"].items())}
     return out
 
@@ -592,8 +698,10 @@ def verify(out_dir: Path, hf_dir: Path, model: str, n_rows: int, strict_template
     # One pass on purpose: every `for r in ds` materializes 47k rows of image bytes out
     # of arrow, so three loops cost three times what one does.
     bad_math, bad_tool, missing_img, missing_files = 0, 0, 0, 0
+    missing_sizes, bad_sizes, bad_views, size_checked = 0, 0, 0, 0
     by_src, out_hashes, idx, orig = {}, {}, [], []
     checked_files = 0
+    from PIL import Image as _PILImage
     for r in ds:
         src = r["data_source"]
         by_src[src] = by_src.get(src, 0) + 1
@@ -607,13 +715,29 @@ def verify(out_dir: Path, hf_dir: Path, model: str, n_rows: int, strict_template
         else:
             if r["agent_name"] != TOOL_AGENT:
                 bad_tool += 1
-            img = ((tk or {}).get(TOOL_NAME) or {}).get("create_kwargs", {}).get("image") or ""
+            ck = ((tk or {}).get(TOOL_NAME) or {}).get("create_kwargs", {}) or {}
+            img = ck.get("image") or ""
             if not img:
                 missing_img += 1
+            # ImageZoomInTool refuses to run under crop_source_check=strict without
+            # original_size, and dies on a view_size that disagrees with its own
+            # smart_resize. Both are checked against the row's own image, not against
+            # whatever the builder happened to have in a variable.
+            if not ck.get("original_size") or not ck.get("view_size"):
+                missing_sizes += 1
             elif img.startswith("file://") and checked_files < n_rows:
                 checked_files += 1
-                if not Path(img[7:]).exists():
+                p = Path(img[7:])
+                if not p.exists():
                     missing_files += 1
+                else:
+                    size_checked += 1
+                    with _PILImage.open(p) as pim:
+                        w, h = pim.size
+                    if [int(v) for v in ck["original_size"]] != [w, h]:
+                        bad_sizes += 1
+                    if [int(v) for v in ck["view_size"]] != list(smart_resize_wh_local(w, h)):
+                        bad_views += 1
         out_hashes[xi.get("index")] = [
             hashlib.sha256(im["bytes"]).hexdigest() for im in (r["images"] or [])
         ]
@@ -622,6 +746,12 @@ def verify(out_dir: Path, hf_dir: Path, model: str, n_rows: int, strict_template
     check("toolbox rows carry create_kwargs.image", missing_img == 0, f"{missing_img} missing")
     check("create_kwargs file:// targets exist", missing_files == 0,
           f"{missing_files} missing of {checked_files} sampled")
+    check("every tool row declares original_size and view_size", missing_sizes == 0,
+          f"{missing_sizes} rows missing one")
+    check("original_size equals the raw image's own size", bad_sizes == 0 and size_checked > 0,
+          f"{size_checked} sampled, {bad_sizes} wrong")
+    check("view_size matches an independent smart_resize on the 32 px grid",
+          bad_views == 0 and size_checked > 0, f"{size_checked} sampled, {bad_views} wrong")
     res["rows_by_data_source"] = by_src
 
     # ---- 3: byte identity against the published parquet --------------------------
@@ -752,10 +882,16 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=20261107)
     args = ap.parse_args()
 
+    global zoom_cfg
+    zoom_cfg = load_zoom_tool_config()
+
     hf_dir = resolve_snapshot(args.hf_dir)
     out_dir = Path(args.out_dir).resolve()
     print(f"HF snapshot : {hf_dir}")
-    print(f"out dir     : {out_dir}\n", flush=True)
+    print(f"out dir     : {out_dir}")
+    print(f"zoom config : {getattr(zoom_cfg, '__file__', zoom_cfg)}  "
+          f"(patch {zoom_cfg.IMAGE_PATCH_SIZE}, merge {zoom_cfg.MERGE_SIZE}, "
+          f"{zoom_cfg.PATCH_FACTOR}px/token)\n", flush=True)
 
     if args.verify_only:
         r = verify(out_dir, hf_dir, args.model, args.verify_rows, args.strict_template)
@@ -769,7 +905,7 @@ def main() -> int:
 
     all_stats, all_rows = {}, {}
     combined = {"pixels": [], "width": [], "height": [], "image_tokens_per_row": [],
-                "image_bytes": [], "prompt_chars": []}
+                "image_bytes": [], "prompt_chars": [], "view_px": []}
     for name, spec in SOURCES.items():
         src = hf_dir / spec["file"]
         if not src.exists():
@@ -889,16 +1025,29 @@ def main() -> int:
             "cap is NOT applied and must never be. env_name is preserved in extra_info "
             "for provenance only -- modern verl routes on agent_name."
         ),
+        "tool_contract": {
+            "create_kwargs_fields": ["image", "original_size", "view_size"],
+            "built_by": "deepeyes/zoom_tool_config.py::build_create_kwargs (P3)",
+            "zoom_tool_config": str(getattr(zoom_cfg, "__file__", "")),
+            "view_grid_px": zoom_cfg.PATCH_FACTOR,
+            "bbox_frame": (
+                "NOT set here. ImageZoomInTool has no default for it and raises at "
+                "construction; P4 measures which of rel1000 / abs_original / "
+                "abs_smartresize Qwen3-VL emits, and the launcher names it."
+            ),
+        },
         "launcher_must_set": {
             "data.image_patch_size": 16,
             "data.tool_config_path": None,
             "actor_rollout_ref.rollout.multi_turn.tool_config_path": "<the zoom tool yaml>",
             "actor_rollout_ref.rollout.agent.default_agent_loop": PLAIN_AGENT,
             "why": (
-                "image_patch_size defaults to 14, which is Qwen2.5-VL's grid. "
-                "data.tool_config_path inherits the rollout one by oc.select and then "
-                "RLHFDataset renders the tool schema into the prompt a second time and "
-                "constructs a ray actor during dataset build."
+                "image_patch_size defaults to 14, which is Qwen2.5-VL's grid; on 14 the "
+                "dataloader's view disagrees with the view_size written here and the "
+                "tool's crop-source check fails every call. data.tool_config_path "
+                "inherits the rollout one by oc.select and then RLHFDataset renders the "
+                "tool schema into the prompt a second time and constructs a ray actor "
+                "during dataset build."
             ),
         },
         "known_deviation": (

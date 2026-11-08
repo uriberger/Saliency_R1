@@ -93,6 +93,20 @@ fi
     echo "  hf download ChenShawn/DeepEyes-Datasets-47k --repo-type dataset" >&2
     exit 1; }
 
+# P3's corpus verifier, which the build is not allowed to grade itself with: it decodes
+# create_kwargs.image through the TOOL's own decoder and compares against the raw
+# `images` column as an independent witness, then reports the downscale distribution --
+# the one number that says whether a zoom on this corpus recovers anything at all.
+# The second path is the unmerged feat/deepeyes-zoom-tool worktree and disappears when
+# P3 lands on main.
+ZOOM_CFG=""
+for c in "$REPO/deepeyes/zoom_tool_config.py" \
+         "$REPO/../../.worktrees/feat-deepeyes-zoom-tool/deepeyes/zoom_tool_config.py" \
+         "$REPO/.worktrees/feat-deepeyes-zoom-tool/deepeyes/zoom_tool_config.py"; do
+    [[ -f "$c" ]] && { ZOOM_CFG=$(resolve "$c"); break; }
+done
+[[ -n "$ZOOM_CFG" ]] || { echo "MISSING deepeyes/zoom_tool_config.py (P3's)" >&2; exit 1; }
+
 LOG_ROOT="$(resolve "$REPO/outputs")/logs"
 mkdir -p "$LOG_ROOT" "$OUT_DIR"
 SBATCH_FILE="$LOG_ROOT/$NAME.sbatch"
@@ -133,6 +147,22 @@ python build_deepeyes_data.py \\
     --image-mode $IMAGE_MODE \\
     --strict-template \\
     ${EXTRA[@]+"${EXTRA[@]}"}
+
+echo
+echo "=== P3's corpus verifier (independent witness + downscale distribution) ==="
+# Not gated on \$?: a failure here is a finding to read, not a reason to hide the rest.
+#
+# The thinklite shard is EXPECTED to fail with "no tools_kwargs" on every row. That is
+# the math split, the zoom tool is disabled on it, and this verifier reporting anything
+# else would mean the tool had leaked onto 23% of the corpus.
+for shard in $OUT_DIR/train_vstar_*.parquet $OUT_DIR/train_chart_*.parquet; do
+    echo "--- \$(basename \$shard)   (tool ON -- must pass)"
+    python $ZOOM_CFG verify "\$shard" --n 50 || true
+done
+for shard in $OUT_DIR/train_thinklite_*.parquet; do
+    echo "--- \$(basename \$shard)   (tool OFF -- must report 'no tools_kwargs' on EVERY row)"
+    python $ZOOM_CFG verify "\$shard" --n 50 || true
+done
 
 echo "=== output ==="
 ls -lh $OUT_DIR
