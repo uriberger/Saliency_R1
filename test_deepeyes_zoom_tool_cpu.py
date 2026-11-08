@@ -238,6 +238,22 @@ def main() -> int:
         f"rel1000 -> {right.size}, abs_original -> {wrong.size} (both succeed; nothing errors)",
     )
 
+    # The free diagnostic: which frames could these numbers have come from at all.
+    # A box beyond the view's extent cannot be post-smart_resize pixels; a box beyond
+    # 1000 cannot be a 0-1000 grid. Over a run this aggregate is the cheap P4.
+    p = ImageZoomInTool.frame_plausibility([1200, 900, 1500, 1100], (ORIG_W, ORIG_H), (view_w, view_h))
+    check(
+        p == {"rel1000": False, "abs_original": True, "abs_smartresize": False},
+        "frame_plausibility rules out the frames a box cannot have come from",
+        f"[1200,900,1500,1100] on {ORIG_W}x{ORIG_H}/{view_w}x{view_h} -> {p}",
+    )
+    p = ImageZoomInTool.frame_plausibility([200, 150, 800, 700], (ORIG_W, ORIG_H), (view_w, view_h))
+    check(
+        all(p.values()),
+        "a small box is plausible under all three, and says nothing",
+        f"[200,150,800,700] -> {p}",
+    )
+
     print()
     print("=" * 78)
     print("CASE 2  the floor is 32 px, one visual token, not Qwen2.5-VL's 28")

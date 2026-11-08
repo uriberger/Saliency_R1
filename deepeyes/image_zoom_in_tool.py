@@ -461,6 +461,30 @@ class ImageZoomInTool(BaseTool):
             return [x1 * W / vW, y1 * H / vH, x2 * W / vW, y2 * H / vH]
         raise AssertionError(f"unreachable frame {self.bbox_frame!r}")  # pragma: no cover
 
+    @staticmethod
+    def frame_plausibility(bbox_2d, original_size: tuple[int, int], view_size: tuple[int, int]) -> dict:
+        """Which frames the raw numbers could have come from, per call.
+
+        A box is "plausible" under a frame if it lies inside that frame's extent. This
+        decides nothing -- a box can be plausible under all three, and a box plausible
+        under only one can still be a bad box. It is a free diagnostic that turns the
+        smoke log into evidence: over a few hundred calls, a model emitting a 0-1000
+        grid is almost never plausible as abs_original on a 2000 px photo, and a model
+        emitting absolute pixels is almost never plausible as rel1000. That aggregate is
+        the cheap version of P4, available from any run, for nothing.
+        """
+        try:
+            x1, y1, x2, y2 = (float(v) for v in bbox_2d)
+        except Exception:
+            return {}
+        W, H = original_size
+        vW, vH = view_size
+        return {
+            "rel1000": all(0.0 <= v <= 1000.0 for v in (x1, y1, x2, y2)),
+            "abs_original": 0.0 <= x1 <= W and 0.0 <= x2 <= W and 0.0 <= y1 <= H and 0.0 <= y2 <= H,
+            "abs_smartresize": 0.0 <= x1 <= vW and 0.0 <= x2 <= vW and 0.0 <= y1 <= vH and 0.0 <= y2 <= vH,
+        }
+
     # --------------------------------------------- [3] the crop source
     def view_size_for(self, width: int, height: int) -> tuple[int, int]:
         """What `verl/utils/dataset/vision_utils.py::process_image` would have shown
@@ -780,7 +804,8 @@ class ImageZoomInTool(BaseTool):
             f"{TAG} call={n} frame={self.bbox_frame} raw={record.get('bbox_raw')} "
             f"-> converted={record.get('bbox_converted')} -> cropped={record.get('bbox_final')} "
             f"original={record.get('original_size')} view={record.get('view_size')} "
-            f"crop={record.get('crop_size')} status={record.get('status')}",
+            f"crop={record.get('crop_size')} status={record.get('status')} "
+            f"plausible={sorted(k for k, v in (record.get('plausible_frames') or {}).items() if v)}",
             flush=True,
         )
         if not self.log_dir:
@@ -881,6 +906,7 @@ class ImageZoomInTool(BaseTool):
             "view_size": list(view),
             "downscale": source.get("downscale"),
             "label": label,
+            "plausible_frames": self.frame_plausibility(bbox_raw, (image_width, image_height), view),
         }
 
         try:
