@@ -227,6 +227,15 @@ check("an UNCLOSED <answer> is invisible to the env, so the zoom happens",
 check("... while their format rule still scores it -1",
       s["format_ok_deepeyes"] is False)
 
+# STALLS: neither a closed answer nor a tool call. done=True, no zoom, and the judge is
+# handed the raw chain. Deferring the answer to turn 2 must NOT be counted as this.
+check("a bare chain with no tags at all stalls the episode",
+      P.score_record(rec("Okay, so the flag looks white."))["env_stall"] is True)
+check("a tool call with no answer DEFERS; it does not stall",
+      P.score_record(rec(call([450, 400, 550, 600])))["env_stall"] is False)
+check("a closed answer with no tool call does not stall either -- it answers",
+      P.score_record(rec("<answer> A </answer>"))["env_stall"] is False)
+
 
 # --------------------------------------------------------------------------------------
 print("\n7. truncation is OUR failure, not the model's, and is reported apart")

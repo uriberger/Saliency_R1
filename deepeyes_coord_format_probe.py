@@ -699,6 +699,13 @@ def score_record(rec):
         "answer_is_whole_completion": "<answer>" not in text,
         "answer_text_len": len(deepeyes_answer_text(text)),
         "acc_zeroed_by_length": len(deepeyes_answer_text(text)) >= 1000,
+        # The unambiguous case, and the one the cold-start recommendation rests on:
+        # NEITHER a closed <answer> NOR a tool call. `VisualToolBoxV2.execute` returns
+        # done=True on both of those misses, so the episode ENDS HERE, with no zoom and
+        # with the judge handed the whole chain as the answer. A model that merely
+        # defers its answer to turn 2 -- a tool call and no <answer> -- is NOT this, and
+        # must not be counted with it just because turn 1 carries no answer tag.
+        "env_stall": bool(box is None and not env_sees_answer(text)),
         "loose_bbox_only": loose is not None,
         "has_think": text.count("<think>") == 1 and text.count("</think>") == 1,
         "has_answer_tags": "<answer>" in text and "</answer>" in text,
@@ -766,6 +773,7 @@ def summarise(scored):
             _mean([s["answer_is_whole_completion"] for s in scored]),
         "acc_zeroed_by_length_rate": _mean([s["acc_zeroed_by_length"] for s in scored]),
         "median_answer_text_len": _median([s["answer_text_len"] for s in scored]),
+        "env_stall_rate": _mean([s["env_stall"] for s in scored]),
         "loose_bbox_only_rate": _mean([s["loose_bbox_only"] for s in scored]),
         "has_think_rate": _mean([s["has_think"] for s in scored]),
         "has_answer_tags_rate": _mean([s["has_answer_tags"] for s in scored]),
@@ -871,20 +879,28 @@ def run_report(args):
                   f"(n={c['n_untruncated']})")
 
     print("\nWHAT THE JUDGE IS HANDED -- the clause that actually costs a tagless model")
-    print(f"  {'model / arm':<24} {'no <answer> tag':>16} {'med answer chars':>17} "
-          f"{'acc forced to 0':>16}")
+    print(f"  {'model / arm':<24} {'STALLS':>8} {'no <answer>':>12} "
+          f"{'med chars':>10} {'acc->0':>8}")
     for m, a in keys:
         c = summary[f"{m}|{a}"]
-        print(f"  {m + ' / arm ' + a:<24} {c['answer_is_whole_completion_rate']:>15.1%} "
-              f"{c['median_answer_text_len']:>17.0f} "
-              f"{c['acc_zeroed_by_length_rate']:>15.1%}")
+        print(f"  {m + ' / arm ' + a:<24} {c['env_stall_rate']:>7.1%} "
+              f"{c['answer_is_whole_completion_rate']:>11.1%} "
+              f"{c['median_answer_text_len']:>10.0f} "
+              f"{c['acc_zeroed_by_length_rate']:>7.1%}")
     print("\n  `answer_text = predict_str.split(\"<answer>\")[-1].split(\"</answer>\")[0]`")
     print("  has no fallback. With no <answer> tag it is the WHOLE completion, so the")
     print("  judge grades a chain of thought against a one-phrase gold -- and past 1,000")
     print("  characters their anti-hack clause forces acc_reward = 0.0 outright.")
-    print("  READ THE LAST COLUMN AGAINST THE TOKEN BUDGET THIS RUN USED. Their config")
-    print("  allows 20,480 response tokens; a short budget truncates the very chains")
-    print("  that would trip the clause, so this is a FLOOR on the real rate.")
+    print("  STALLS    = neither a closed <answer> NOR a tool call. Their env returns")
+    print("              done=True on both misses, so the episode ENDS here with no")
+    print("              zoom and the judge holding the raw chain. This is the column")
+    print("              the cold-start argument rests on.")
+    print("  no<answer>= turn 1 carries no answer tag. NOT a failure on its own: a model")
+    print("              that calls the tool and defers its answer to turn 2 is doing")
+    print("              the right thing and scores 100% here. Read it beside STALLS.")
+    print("  acc->0    = answer_text >= 1000 chars. ONLY TURN 1 IS GENERATED HERE and")
+    print("              the budget was short; their config allows 20,480 response")
+    print("              tokens, so this is a FLOOR on the real rate, not an estimate.")
 
     print("\nCOORDINATE FRAME -- IoU against V*'s ground-truth boxes")
     for m, a in keys:
