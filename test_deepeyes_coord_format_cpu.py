@@ -185,6 +185,27 @@ check("and it is never scored for IoU", s["readings"] == {})
 
 
 # --------------------------------------------------------------------------------------
+print("\n6b. their ENV discards a zoom that shares a turn with a closed <answer>")
+# --------------------------------------------------------------------------------------
+both = call([450, 400, 550, 600]) + "  <answer> B </answer>"
+s = P.score_record(rec(both))
+check("the tool call is still parsed", s["tool_call_ok"] is True)
+check("but the env sees an answer first", s["env_sees_answer"] is True)
+check("so the zoom is discarded", s["env_zoom_discarded"] is True)
+check("and env_would_zoom is False -- this is what gates R_tool",
+      s["env_would_zoom"] is False)
+
+# Their extract_answer needs BOTH tags; the format rule counts the unclosed one. The two
+# disagree on exactly this string, and that disagreement is a real training condition.
+unclosed = call([450, 400, 550, 600]) + "  <answer> B"
+s = P.score_record(rec(unclosed))
+check("an UNCLOSED <answer> is invisible to the env, so the zoom happens",
+      s["env_would_zoom"] is True)
+check("... while their format rule still scores it -1",
+      s["format_ok_deepeyes"] is False)
+
+
+# --------------------------------------------------------------------------------------
 print("\n7. truncation is OUR failure, not the model's, and is reported apart")
 # --------------------------------------------------------------------------------------
 cut = rec("<think>I was still thinking when the budget ran", n_tok=320, budget=320)

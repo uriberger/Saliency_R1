@@ -388,6 +388,16 @@ def loose_bbox(text):
     return vals if len(vals) == 4 else None
 
 
+#: Their env's answer detector, verbatim from `VisualToolBoxV2.extract_answer`. It needs
+#: BOTH tags, so an unclosed `<answer>` is invisible to it -- which matters, because the
+#: FORMAT rule does count the unclosed one. The two disagree on the same string.
+ENV_ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
+
+
+def env_sees_answer(text):
+    return bool(ENV_ANSWER_RE.findall(text))
+
+
 def tag_structure_ok(text):
     """One `<think></think>` pair, closed by exactly one tool call or exactly one answer.
 
@@ -633,6 +643,15 @@ def score_record(rec):
         "tag_structure_ok": tag_structure_ok(text),
         "n_tool_calls": len(calls),
         "tool_call_ok": box is not None,
+        # What their ENV does with this turn, which is not what the reward's format rule
+        # does with it. `VisualToolBoxV2.execute` checks `extract_answer` FIRST and
+        # returns done=True on a hit -- so a turn carrying BOTH a tool call and a closed
+        # <answer> ends the episode and the zoom is silently discarded. No image is
+        # spliced, `count("<|vision_start|><|image_pad|>")` stays 0, and R_tool cannot
+        # fire however correct the answer is.
+        "env_sees_answer": env_sees_answer(text),
+        "env_zoom_discarded": bool(box is not None and env_sees_answer(text)),
+        "env_would_zoom": bool(box is not None and not env_sees_answer(text)),
         "loose_bbox_only": loose is not None,
         "has_think": text.count("<think>") == 1 and text.count("</think>") == 1,
         "has_answer_tags": "<answer>" in text and "</answer>" in text,
@@ -694,6 +713,8 @@ def summarise(scored):
         "truncated_rate": _mean([s["truncated"] for s in scored]),
         "tag_structure_ok": _mean([s["tag_structure_ok"] for s in scored]),
         "tool_call_rate": _mean([s["tool_call_ok"] for s in scored]),
+        "env_would_zoom_rate": _mean([s["env_would_zoom"] for s in scored]),
+        "env_zoom_discarded_rate": _mean([s["env_zoom_discarded"] for s in scored]),
         "loose_bbox_only_rate": _mean([s["loose_bbox_only"] for s in scored]),
         "has_think_rate": _mean([s["has_think"] for s in scored]),
         "has_answer_tags_rate": _mean([s["has_answer_tags"] for s in scored]),
@@ -765,23 +786,36 @@ def run_report(args):
 
     print("\nFORMAT, under DeepEyes' own prompt (first assistant turn, "
           f"temperature {args.temperature})")
-    print(f"  {'model / arm':<28} {'R_format ok':>12} {'(untrunc)':>10} {'tag struct':>11} "
-          f"{'tool call':>10} {'<think>':>8} {'<answer>':>9} {'trunc':>7} {'med tok':>8}")
+    print(f"  {'model / arm':<24} {'R_format':>9} {'tagstruct':>10} {'<think>':>8} "
+          f"{'<answer>':>9} {'toolcall':>9} {'ZOOMS':>7} {'discard':>8} {'trunc':>6} "
+          f"{'medtok':>7}")
     for m, a in keys:
         c = summary[f"{m}|{a}"]
-        print(f"  {m + ' / arm ' + a:<28} {c['format_ok_deepeyes']:>11.1%} "
-              f"{c['format_ok_untruncated']:>9.1%} "
-              f"{c['tag_structure_ok']:>10.1%} {c['tool_call_rate']:>9.1%} "
-              f"{c['has_think_rate']:>7.1%} {c['has_answer_tags_rate']:>8.1%} "
-              f"{c['truncated_rate']:>6.1%} {c['median_completion_tokens']:>8.0f}")
-    print("\n  R_format ok  = their literal rule: counts balance. A completion with NO")
-    print("                 tags passes it -- and never zooms. Read it next to the two")
-    print("                 columns on its right, never alone.")
-    print("  (untrunc)    = the same, over completions that were not cut off at the")
-    print("                 token budget. A truncated chain cannot close its tags, so")
-    print("                 that failure is the budget's, not the model's.")
-    print("  tool call    = a parseable <tool_call> with four numbers. This, not the")
-    print("                 format column, is what gates R_tool.")
+        print(f"  {m + ' / arm ' + a:<24} {c['format_ok_deepeyes']:>8.1%} "
+              f"{c['tag_structure_ok']:>9.1%} {c['has_think_rate']:>7.1%} "
+              f"{c['has_answer_tags_rate']:>8.1%} {c['tool_call_rate']:>8.1%} "
+              f"{c['env_would_zoom_rate']:>6.1%} {c['env_zoom_discarded_rate']:>7.1%} "
+              f"{c['truncated_rate']:>5.1%} {c['median_completion_tokens']:>7.0f}")
+    print("\n  R_format  = their literal rule: counts balance. A completion with NO tags")
+    print("              passes it -- and never zooms. Never read it alone.")
+    print("  tagstruct = one <think></think> pair closed by a tool call or an answer.")
+    print("  toolcall  = a parseable <tool_call> carrying four numbers.")
+    print("  ZOOMS     = a tool call that their ENV will actually execute. "
+          "`VisualToolBoxV2.execute`")
+    print("              checks <answer>...</answer> FIRST and returns done=True on a "
+          "hit, so a turn")
+    print("              carrying both ends the episode and the zoom is discarded. "
+          "This column,")
+    print("              not `toolcall`, is what gates R_tool.")
+    print("  discard   = that difference: a tool call thrown away by an answer in the "
+          "same turn.")
+    if any(summary[f"{m}|{a}"]["truncated_rate"] for m, a in keys):
+        print("\n  format_ok over the completions that were not cut off at the token "
+              "budget:")
+        for m, a in keys:
+            c = summary[f"{m}|{a}"]
+            print(f"    {m + ' / arm ' + a:<24} {c['format_ok_untruncated']:>8.1%} "
+                  f"(n={c['n_untruncated']})")
 
     print("\nCOORDINATE FRAME -- IoU against V*'s ground-truth boxes")
     for m, a in keys:
