@@ -113,6 +113,21 @@ TWO MORE THINGS THE LAUNCHER MUST SET, BOTH FOUND HERE
     unconditionally (:194). That one cannot be turned off from the data side; the
     duplicate-tool-block question is P7's and is recorded in the manifest.
 
+A SHARD CAN BE VALID PARQUET AND STILL UNREADABLE BY verl
+----------------------------------------------------------
+The first full build wrote a 2.03 GB chart shard that `pq.read_table` opens happily
+and `datasets.load_dataset("parquet", ...)` -- which is what
+`RLHFDataset._read_files_and_tokenize` calls -- cannot open at all:
+
+    pyarrow.lib.ArrowNotImplementedError:
+    Nested data conversions not implemented for chunked array outputs
+
+Over 2 GiB of binary in one scanned batch forces arrow to chunk the `images` column's
+child array, and nested columns cannot be chunked. `ROW_GROUP_SIZE` below is the fix
+and the comment there is the explanation. The reason `--verify` loads through
+`datasets` and not through pyarrow is precisely this: pyarrow's opinion of the file is
+not the one that decides whether training starts.
+
 THE ONE FIELD THIS SCRIPT REWRITES: `extra_info.index`
 -------------------------------------------------------
 In the release, `extra_info.index` is the **constant string "0" on all 11,031
@@ -491,12 +506,38 @@ def finalize_stats(stats: dict) -> dict:
     return out
 
 
-def write_parquet(rows, path: Path, schema):
+#: Rows per parquet row group. SMALL ON PURPOSE, and this is not a tuning knob.
+#:
+#: verl reads the corpus with `datasets.load_dataset("parquet", data_files=...)`
+#: (`rl_dataset.py:_read_files_and_tokenize`), which scans through pyarrow's dataset
+#: API. When one scanned batch holds more than 2 GiB of binary, arrow has to chunk the
+#: `images` column's child array, and nested columns cannot be chunked:
+#:
+#:     pyarrow.lib.ArrowNotImplementedError:
+#:     Nested data conversions not implemented for chunked array outputs
+#:
+#: Batches do not span row groups, so bounding the row group bounds the batch. At
+#: pyarrow's default (one row group for the whole table) the 2.03 GB chart shard was
+#: unreadable -- it wrote cleanly, and `datasets` and therefore verl could not open it.
+#: That is why `--verify` loads every shard through `datasets` rather than pyarrow: it
+#: is the only loader whose opinion matters.
+#:
+#: 512 rows is ~77 MB on the heaviest corpus (chart averages 150 KB a row), two orders
+#: of magnitude under the limit, and costs only a little footer metadata.
+ROW_GROUP_SIZE = 512
+
+
+def write_parquet(rows, path: Path, schema, row_group_size: int = ROW_GROUP_SIZE):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pylist(rows, schema=schema), path, compression="zstd")
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=schema),
+        path,
+        compression="zstd",
+        row_group_size=row_group_size,
+    )
     return path
 
 
@@ -531,10 +572,21 @@ def verify(out_dir: Path, hf_dir: Path, model: str, n_rows: int, strict_template
     files = sorted(out_dir.glob("*.parquet"))
     if not files:
         raise SystemExit(f"no parquet under {out_dir}")
-    ds = datasets.concatenate_datasets(
-        [datasets.load_dataset("parquet", data_files=str(f))["train"] for f in files]
-    )
-    check("all shards concatenate under one schema", True, f"{len(files)} files, {len(ds)} rows")
+    # Loaded the way verl loads it -- `datasets.load_dataset("parquet", ...)`, not
+    # `pq.read_table`. The two disagree: a shard with an oversized row group writes and
+    # reads back fine under pyarrow and raises ArrowNotImplementedError under datasets.
+    # See ROW_GROUP_SIZE.
+    parts = []
+    for f in files:
+        try:
+            parts.append(datasets.load_dataset("parquet", data_files=str(f))["train"])
+        except Exception as e:  # noqa: BLE001
+            check(f"datasets can load {f.name}", False, f"{type(e).__name__}: {e}")
+            return res
+    ds = datasets.concatenate_datasets(parts)
+    rg = {f.name: pq.ParquetFile(f).metadata.num_row_groups for f in files}
+    check("all shards load under datasets and concatenate", True,
+          f"{len(files)} files, {len(ds)} rows, row groups {rg}")
 
     # ---- 1, 2, 3: ONE pass over the rows ----------------------------------------
     # One pass on purpose: every `for r in ds` materializes 47k rows of image bytes out
