@@ -557,7 +557,8 @@ correct the estimate rather than carrying both forward.
 | editing `laser_fork/` instead of `deepeyes_fork/` | P0 | the LASER arm and any in-flight job change underneath it |
 | vLLM above 0.11.0 | P0 | corrupted Qwen3-VL grounding output (vllm#29595) — i.e. corrupted zoom boxes |
 | `max_turns`: 5 or 6 | P3 | an unstated fidelity difference from the paper — **settled: 5, meaning 4 tool calls**, following their code over the paper |
-| no `process_raw_image` in the fork | P3, P6 | DeepEyes keeps a second un-resized copy for the tool to crop; our `vision_utils.py` has only `process_image`, so there may be no original to crop and no original size to divide by |
+| ~~no `process_raw_image` in the fork~~ **resolved — not a trap** | P3, P6 | Raised because DeepEyes keeps a second un-resized copy and our `vision_utils.py` has only `process_image`. It does not apply: DeepEyes is on verl **0.2.0.dev0**, where tool state came from a dataloader column; verl **0.7** routes it through `extra_info.tools_kwargs`, which `RLHFDataset` passes through **untouched** (`rl_dataset.py:445,451`). Proved on a real 1000×700 row — prompt image 992×704, tool holds 1000×700. No fork change needed. The real cost is that bytes appear twice (4.84 → ~9.7 GB), avoidable by putting a *path* in `create_kwargs["image"]` |
+| a correctly-wired tool on a corpus that was capped | P6 | the zoom **upscales** and recovers nothing — indistinguishable from correct wiring without checking the downscale distribution. `python deepeyes/zoom_tool_config.py verify <parquet>` reports it; on geo3k it reads median 0.999, 9/16 rows ≤ 1.0 |
 | a turn carrying both `<tool_call>` and a closed `<answer>` | P5, P9 | their `VisualToolBoxV2.execute` checks `extract_answer` **first** and returns `done=True`, so the zoom is discarded — 26.0% of cold-start turns, 0.0% of Instruct. `tool_call_rate` overstates real tool use by more than half on some policies |
 
 ## 5. What does *not* need worrying about
