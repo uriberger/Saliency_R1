@@ -273,18 +273,39 @@ class Report(unittest.TestCase):
         self.assertEqual(gate.verdict(-4.0)[0], "STOP")
         self.assertEqual(gate.verdict(None)[0], "NO VERDICT")
 
-    def test_report_renders_from_harvested_units(self):
-        tmp = Path(tempfile.mkdtemp())
+    def _harvest(self, tmp):
+        """Units in the scale lmms-eval really writes: V* 0-100, HR-Bench 0-1."""
         (tmp / "units").mkdir()
-        for model, offsets in (("base", 0.0), ("coldstart", 0.05)):
-            for cap, value in zip(gate.CAPS, (0.40, 0.52, 0.61)):
+        for model, offsets in (("base", 0.0), ("coldstart", 5.0)):
+            for cap, value in zip(gate.CAPS, (40.0, 52.0, 61.0)):
                 (tmp / "units" / f"{model}_vstar_px{cap}.json").write_text(json.dumps(dict(
                     unit=f"{model}_vstar_px{cap}", model=model, cap=cap, tasks=["vstar_bench"],
                     metrics={"vstar_bench": value + offsets}, extras={}, minutes=3.0)))
             (tmp / "units" / f"{model}_vstarcrop_px640.json").write_text(json.dumps(dict(
                 unit=f"{model}_vstarcrop_px640", model=model, cap=640,
                 tasks=["vstar_bench_gtcrop"],
-                metrics={"vstar_bench_gtcrop": 0.70 + offsets}, extras={}, minutes=3.0)))
+                metrics={"vstar_bench_gtcrop": 70.0 + offsets}, extras={}, minutes=3.0)))
+
+    def test_the_two_scorers_are_on_different_scales(self):
+        """V* harvests as a percentage and HR-Bench as a fraction.
+
+        Scaling both by 100 is what made the first real report read +1832.5
+        points on a +18.3-point gap -- and still print PROCEED, because the
+        threshold is one-sided and a nonsense gap clears it.
+        """
+        tmp = Path(tempfile.mkdtemp())
+        self._harvest(tmp)
+        (tmp / "units" / "coldstart_hrbench_px640.json").write_text(json.dumps(dict(
+            unit="coldstart_hrbench_px640", model="coldstart", cap=640,
+            tasks=["hrbench4k_gate"], metrics={"hrbench4k_gate": 0.6205},
+            extras={"hrbench4k_gate": {"parse_fail": 0.0}}, minutes=29.3)))
+        data = gate.load_results(tmp)
+        self.assertAlmostEqual(data[("coldstart", "vstar_bench", 640)]["value"], 45.0, places=4)
+        self.assertAlmostEqual(data[("coldstart", "hrbench4k_gate", 640)]["value"], 62.05, places=4)
+
+    def test_report_renders_from_harvested_units(self):
+        tmp = Path(tempfile.mkdtemp())
+        self._harvest(tmp)
         call, gap = gate.report(tmp, markdown=str(tmp / "out.md"))
         self.assertEqual(call, "PROCEED")
         self.assertAlmostEqual(gap, 21.0, places=5)

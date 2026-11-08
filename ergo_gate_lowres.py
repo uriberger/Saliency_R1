@@ -142,6 +142,20 @@ TASK_METRIC = {
     "hrbench8k_gate": HRBENCH_METRIC,
 }
 
+# The two scorers do NOT agree on a scale, and a harvested unit keeps whatever
+# lmms-eval wrote. Upstream's `vstar_overall_acc` is already a percentage (V* at
+# 640 tokens harvests as 61.26); the generated HR-Bench scorer's `average` and
+# `parse_fail` are fractions (0.6205). Scaling the two the same way is how the
+# first real report printed a +1832.5-point gap and still called it PROCEED, so
+# the scale is normalised once, here, on the way in, and the report formats a
+# percentage it can trust.
+TASK_SCALE = {
+    "vstar_bench": 1.0,
+    "vstar_bench_gtcrop": 1.0,
+    "hrbench4k_gate": 100.0,
+    "hrbench8k_gate": 100.0,
+}
+
 # Pretty names for the report, in the order the table reads.
 TASK_LABEL = {
     "vstar_bench": "V*",
@@ -728,7 +742,8 @@ def load_results(out_dir):
         payload = json.loads(path.read_text())
         for task, value in payload["metrics"].items():
             out[(payload["model"], task, payload["cap"])] = dict(
-                value=value, extras=payload.get("extras", {}).get(task, {}),
+                value=value * TASK_SCALE.get(task, 100.0),
+                extras=payload.get("extras", {}).get(task, {}),
                 minutes=payload.get("minutes"))
     return out
 
@@ -771,12 +786,12 @@ def report(out_dir, markdown=None):
             cells = []
             for cap in CAPS:
                 entry = data.get((model, task, cap))
-                cells.append(f"{100*entry['value']:.1f}" if entry else "--")
+                cells.append(f"{entry['value']:.1f}" if entry else "--")
             crop = data.get((model, "vstar_bench_gtcrop", CROP_CAP)) if task == "vstar_bench" else None
-            crop_cell = f"{100*crop['value']:.1f}" if crop else ("--" if task == "vstar_bench" else "n/a")
+            crop_cell = f"{crop['value']:.1f}" if crop else ("--" if task == "vstar_bench" else "n/a")
             lo = data.get((model, task, min(CAPS)))
             hi = data.get((model, task, max(CAPS)))
-            gap = 100 * (hi["value"] - lo["value"]) if lo and hi else None
+            gap = hi["value"] - lo["value"] if lo and hi else None
             gaps[(model, task)] = gap
             gap_cell = f"{gap:+.1f}" if gap is not None else "--"
             lines.append(f"| {model} | {TASK_LABEL[task]} | " + " | ".join(cells)
