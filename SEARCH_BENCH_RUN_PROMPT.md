@@ -63,7 +63,7 @@ srun -A nvr_israel_rlop -p cpu_short -t 00:30:00 --pty bash -c '
   python test_search_benchmarks_cpu.py --lmms-eval'
 ```
 
-Expect `71 passed, 0 failed`. If the `--lmms-eval` half fails with a
+Expect `75 passed, 0 failed` (`59` without `--lmms-eval`). If the `--lmms-eval` half fails with a
 `ConnectionError` / `RetryError` about reaching the Hub, that is
 `docs/search-benchmarks.md` §6: export
 `LMMS_EVAL_DATASETS_CACHE=$HF_HOME/datasets` and tell me, because it means this
@@ -97,9 +97,12 @@ cache of — the 3.2 M runs.
 
 **Two things to watch and report rather than work around:**
 
-* **OOM.** HR-Bench 8K at native is 16,384 visual tokens per image and 65,536 ViT
-  patches. This has never been run; it is expected to fit on an 80 GB card but it
-  is untested. If it OOMs, say so — do **not** quietly lower `--max-pixels` and
+* **OOM.** Measured on row 0 of each benchmark, native is **15,876** visual tokens
+  for HR-Bench 4K and **16,274** for HR-Bench 8K, against 3,136 / 3,105 at 3.2 M —
+  so ~65,000 ViT patches and ~20 k of context with the 4,096-token generation cap.
+  It has never been run. It is expected to fit on an 80 GB card (flash/SDPA
+  attention never materialises the 65k² matrix) but that is an expectation, not a
+  measurement. If it OOMs, say so — do **not** quietly lower `--max-pixels` and
   produce a number that looks like a benchmark score. The fallback, if one is
   needed, is to report at 3.2 M *and label it*, which is what §3 already is.
 * **Wall clock.** `eval_mini/benchmarks.py` budgets 15–16 min per 100 documents at

@@ -27,8 +27,21 @@ suggest — measured off the rows, not read off the paper:
 | benchmark | rows | pixels | at the 2.1 M default | at 3.2 M | at 16.78 M |
 |---|---|---|---|---|---|
 | V\* | 191 | 3.4 MP median, 8.3 max | every image reduced | 89.5% reduced | **not resized at all** |
-| HR-Bench 4K | 800 | **16.3 MP** | ÷7.7 | ÷5.1 | **not resized at all** |
-| HR-Bench 8K | 800 | **38.8 MP** median, 59.0 max | ÷18.5 | ÷12.1 | ÷2.3 (the model's own limit) |
+| HR-Bench 4K | 800 | **16.3 MP** (4032×4032) | ÷7.7 | ÷5.1 | **not resized at all** |
+| HR-Bench 8K | 800 | **38.8 MP** median (4992×7680), 59.0 max | ÷18.5 | ÷12.1 | ÷2.3 (the model's own limit) |
+
+The same thing in the unit the model actually sees — one real row of each, through
+`qwen_vl_utils.smart_resize` at Qwen3-VL's 32 px merged patch:
+
+| benchmark | native | @2.1 M (lmms-eval default) | @3.2 M (every number we have) | @16.78 M (native) |
+|---|---|---|---|---|
+| V\* | 2000×1500 | 1664×1248, **2,028 tok** | 1984×1504, 2,914 tok | 1984×1504, **2,914 tok** |
+| HR-Bench 4K | 4032×4032 | 1440×1440, **2,025 tok** | 1792×1792, 3,136 tok | 4032×4032, **15,876 tok** |
+| HR-Bench 8K | 4992×7680 | 1152×1792, **2,016 tok** | 1440×2208, 3,105 tok | 3296×5056, **16,274 tok** |
+
+So the default throws away **87%** of HR-Bench 4K's tokens and the 3.2 M setting
+still throws away 80%. Whatever those two columns measure, it is not "can the
+model find a small thing in a large picture".
 
 Two caps sit on the `make_mini_tasks.py` → `run_bench_eval.sh` → `bench_eval.py`
 path, and only one of them is visible from this repo:
@@ -294,7 +307,7 @@ since August.
 | `bench_samples.py` | `dict_score` reads HR-Bench's `gpt_score` |
 | `run_bench_eval.sh` | `--search`; the `LMMS_EVAL_DATASETS_CACHE` pin |
 | `watch_bench_evals.sh`, `run_bench_baselines.sh` | `--search`, forwarded |
-| `test_search_benchmarks_cpu.py` | 71 checks; `--lmms-eval` adds the offline task construction |
+| `test_search_benchmarks_cpu.py` | 59 checks; `--lmms-eval` adds 16 more that construct the real tasks offline |
 | `SEARCH_BENCH_RUN_PROMPT.md` | the cross-cluster handoff |
 
 ## Sources

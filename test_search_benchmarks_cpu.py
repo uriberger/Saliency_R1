@@ -309,6 +309,40 @@ def test_real_tasks():
                 check(f"{name} all-{label} / scale", round(value / spec["scale"], 6), want)
 
 
+def test_the_cap_is_actually_off():
+    """What the model sees, in visual tokens, at each of the three settings.
+
+    The table is about resolution and every other check here is about plumbing,
+    so this is the one that says the plumbing achieved anything. Sizes are the
+    real ones, measured off row 0 of each benchmark; the arithmetic is Qwen's own
+    smart_resize at its 32 px merged patch, which is what process_vision_info
+    calls.
+    """
+    from qwen_vl_utils.vision_process import smart_resize
+
+    merge = 32
+
+    def tokens(w, h, max_pixels):
+        height, width = smart_resize(h, w, factor=merge,
+                                     min_pixels=256 * 32 * 32, max_pixels=max_pixels)
+        return (width // merge) * (height // merge)
+
+    print("what the cap costs, in visual tokens")
+    lmms_default = 2048 * 32 * 32
+    for name, (w, h), floor in (("V*", (2000, 1500), 1.4),
+                                ("HR-Bench 4K", (4032, 4032), 7.0),
+                                ("HR-Bench 8K", (4992, 7680), 7.0)):
+        at_default = tokens(w, h, lmms_default)
+        at_native = tokens(w, h, NATIVE_MAX_PIXELS)
+        check_true(f"{name}: native is >= {floor}x the default ({at_native} vs {at_default} tok)",
+                   at_native >= floor * at_default, f"{at_native / at_default:.2f}x")
+    # And the other direction: native must not EXCEED what the model can hold,
+    # or the processor would be asked for an input the backbone cannot embed.
+    check_true("native never exceeds the model's 16,384-token ceiling",
+               tokens(4992, 7680, NATIVE_MAX_PIXELS) <= 16384,
+               str(tokens(4992, 7680, NATIVE_MAX_PIXELS)))
+
+
 def test_spatialtree_missing_leaf():
     """The number the stratified sampler exists to prevent.
 
@@ -363,7 +397,8 @@ def main():
                    help="also generate against the real clone and construct the tasks")
     args = p.parse_args()
 
-    for test in (test_table, test_plan, test_profile_is_unchanged, test_reduction):
+    for test in (test_table, test_plan, test_profile_is_unchanged, test_reduction,
+                 test_the_cap_is_actually_off):
         test()
     if args.lmms_eval:
         test_generated_configs()
