@@ -21,11 +21,18 @@ Qwen3-VL*. That document is the decision; this one is the execution.
 > so everything GPU-bound runs on `cs-oci-ord-login-01` — a separate filesystem, so
 > branches travel through `origin`. See `DEEPEYES_GATE_RUN_PROMPT.md`.
 >
-> **Four claims in this document were wrong and are corrected inline below**, each marked
+> **Five claims in this document were wrong and are corrected inline below**, each marked
 > at the point of use: the `R_format = -1` penalty (Prompt 4, Prompt 9, §4), the
-> transferability of the vision-token counting trick (Prompt 5, §5), and §5's assurance
-> that identical token IDs make the processor discriminator safe. All four were the
-> silent-when-wrong kind. Prefer the corrections to the original text.
+> transferability of the vision-token counting trick (Prompt 5, §5), §5's assurance
+> that identical token IDs make the processor discriminator safe, and — the one that
+> changes what gets trained — **the recommendation to start from the cold start, which
+> measurement inverted** (Prompt 4, Prompt 9). All of them were the silent-when-wrong
+> kind. Prefer the corrections to the original text.
+>
+> **Two results are now measured rather than assumed**, both in Prompt 4: the coordinate
+> frame is **`rel1000`**, by a margin that is not close, which means DeepEyes' own tool
+> is wrong on every call for this backbone; and the start point is
+> **`Qwen/Qwen3-VL-8B-Instruct`**, not the cold start.
 
 **Do not port their fork, and do not clone verl.** Their release is frozen on verl
 0.2.0.dev0 / transformers 4.51.3 / vLLM 0.8.2, none of which can load Qwen3-VL. And
@@ -310,6 +317,43 @@ not a property of the method.
 
 ~1 h on one GPU. `coldstart_gate.py` is the precedent for the shape of this script.
 
+> **Measured 2026-11-07 — the paragraph above predicted the wrong direction and the
+> recommendation inverts.** 96 completions per model, their prompt, temperature 1.0:
+>
+> | model | `R_format` ok | zooms their env actually runs | episode stalls |
+> |---|---|---|---|
+> | **Qwen3-VL-8B-Instruct** | **100.0%** | **95.8%** | 0.8% |
+> | cold start | 75.0% | 42.7% | 15.6% |
+>
+> **Start DeepEyes from `Qwen/Qwen3-VL-8B-Instruct`, not from the cold start.** The
+> Instruct model is already a tool-calling model. The cold start's two epochs of
+> `<think>chain</think>` with the answer in the same turn are two epochs of pressure
+> *away* from the deferred answer this protocol needs. `build_coldstart_data.py:52`'s
+> "format 0.000" is about **LASER's four-tag format** and does not transfer to
+> DeepEyes' prompt — the premise of the paragraph above.
+>
+> So the paper's "no cold start needed" is, on this backbone, *correct for a reason the
+> paper did not have*: Qwen3-VL shipped with the agentic cold start already in it.
+>
+> Measured on `cpu_short` (no GPU hardware), so both arms carry a visual-token cap and
+> `max_new_tokens=320` against their 20,480; the ≥1000-char clause is therefore a
+> **floor** and the format column is the weaker of the two results. The coordinate
+> result below does not depend on any of that.
+
+> **Coordinate frame, measured the same day: `rel1000` wins, and it is not close.** 158
+> emitted boxes against V*'s ground truth (HR-Bench carries no boxes, so V* alone):
+>
+> | reading | mean IoU | touches target | mostly off-image |
+> |---|---|---|---|
+> | **`rel1000`** (`x·W/1000`) | **0.260** | **77.2%** | 0.0% |
+> | `abs_orig` (what DeepEyes' tool assumes) | 0.000 | 3.8% | 0.0% |
+> | `abs_resized` (Qwen2.5-VL's frame) | 0.003 | 8.2% | 31.0% |
+>
+> The invariance test settles it: halving the resolution the model sees moved the
+> emitted numbers by **1.03–1.04×** — invariant, therefore relative — while the
+> resized-frame reading moved 0.488×. **DeepEyes' `visual_toolbox_v2` reads `bbox_2d`
+> as absolute pixels and is therefore wrong on every call for this backbone.**
+
 ---
 
 ### Prompt 5 — the three reward functions
@@ -480,8 +524,11 @@ Branch: `run/deepeyes-smoke`
    steps or not at all.
 
 Then the real run. Their config: GRPO, **KL coefficient 0**, **80 steps**, 256 prompts
-× 16 rollouts, `max_response_length=20480`, `max_prompt_length=8192`, lr 1e-6. Start
-from the cold start unless P4 said otherwise.
+× 16 rollouts, `max_response_length=20480`, `max_prompt_length=8192`, lr 1e-6. ~~Start
+from the cold start unless P4 said otherwise.~~ **P4 said otherwise: start from
+`Qwen/Qwen3-VL-8B-Instruct`** — 100.0% on their format against the cold start's 75.0%,
+and 95.8% of its tool calls survive their env against 42.7%. See the measured block in
+Prompt 4.
 
 Expect **30–71 h on 8 A100s** (22–53 min/step), 4–9 chunked jobs. Multi-turn rollouts
 are latency-bound rather than FLOP-bound — 5 sequential generate rounds with
@@ -509,7 +556,9 @@ correct the estimate rather than carrying both forward.
 | the tool enabled on the ThinkLite math split | P6 | wrong composite on 23% of the corpus |
 | editing `laser_fork/` instead of `deepeyes_fork/` | P0 | the LASER arm and any in-flight job change underneath it |
 | vLLM above 0.11.0 | P0 | corrupted Qwen3-VL grounding output (vllm#29595) — i.e. corrupted zoom boxes |
-| `max_turns`: 5 or 6 | P3 | an unstated fidelity difference from the paper |
+| `max_turns`: 5 or 6 | P3 | an unstated fidelity difference from the paper — **settled: 5, meaning 4 tool calls**, following their code over the paper |
+| no `process_raw_image` in the fork | P3, P6 | DeepEyes keeps a second un-resized copy for the tool to crop; our `vision_utils.py` has only `process_image`, so there may be no original to crop and no original size to divide by |
+| a turn carrying both `<tool_call>` and a closed `<answer>` | P5, P9 | their `VisualToolBoxV2.execute` checks `extract_answer` **first** and returns `done=True`, so the zoom is discarded — 26.0% of cold-start turns, 0.0% of Instruct. `tool_call_rate` overstates real tool use by more than half on some policies |
 
 ## 5. What does *not* need worrying about
 
