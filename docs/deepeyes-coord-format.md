@@ -6,9 +6,20 @@ prompt**, character for character, on **Qwen3-VL-8B-Instruct** and on
 `checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged`.
 
 Both exist because neither announces itself when it is wrong. A misread coordinate frame
-crops the wrong region on every call while the loss curve stays healthy. A format rate
-near zero means `R_format = -1` on nearly every rollout while `R_tool`, which pays out
-only on a correct answer, never fires at all.
+crops the wrong region on every call while the loss curve stays healthy. A model that
+cannot hit their tag structure never zooms, so `R_tool` — 1.2 of a maximum 2.2, and the
+whole design of the method — never fires at all.
+
+**One correction to the brief before any number.** Prompt 4 states that `R_format` is
+"−1 on any tag mismatch", so a model at format 0.000 is *actively penalised on every
+rollout*. Their code does not do that. Every clause of `vl_agent.compute_score`'s
+`is_format_error` is a **count comparison**, so a completion with no tags at all balances
+0 == 0 and scores `R_format = 0.0`. It is not penalised; it is invisible. The −1 is for
+opening a tag and failing to close it.
+
+What a tagless model loses is its **accuracy**, and §5 measures that instead. This was
+found independently here and in Prompt 5 (`feat/deepeyes-rewards`), which transcribed
+their reward and tested it differentially against their own file.
 
 **The headline, in one sentence each.**
 

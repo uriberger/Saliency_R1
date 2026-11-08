@@ -61,22 +61,39 @@ it no longer reproduces the resolution verl will actually train at. Say which wa
 
 THE FORMAT QUESTION, AND THE TRAP IN IT
 
-`R_format` is **-1 on any tag mismatch**, and `vl_agent.compute_score` defines "mismatch"
-as COUNTS NOT BALANCING, not as the structure being present:
+Prompt 4 was briefed that `R_format` is "-1 on any tag mismatch", so that a model which
+cannot hit the tag structure is actively penalised on every rollout. **That is not what
+their code does**, and the difference changes the conclusion. `vl_agent.compute_score`
+defines "mismatch" as COUNTS NOT BALANCING:
 
     count("<think>") != count("</think>")                                   -> error
     count("<|vision_start|><|image_pad|>") != count("<|image_pad|><|vision_end|>")
     count("<answer>") != count("</answer>")   (after the last </think>)     -> error
     len(answer_text) >= 1000                                                -> error
 
-A completion with NO tags at all balances perfectly (0 == 0) and scores format 0.0, no
-penalty -- and also never zooms, so `R_tool` never fires and the arm is plain GRPO. A
-format rate measured against their literal rule therefore OVERSTATES how well the model
-has learned their protocol. This script reports both:
+A completion with NO tags at all balances perfectly (0 == 0) on the first three and
+scores `R_format = 0.0`, **not -1.0**. It is not penalised; it is invisible. The -1 is
+for opening a tag and failing to close it.
 
-    format_ok_deepeyes   their rule, verbatim -- what decides the -1
-    tag_structure_ok     one <think></think> pair AND a closing <tool_call> or <answer>
-    tool_call_rate       a parseable zoom call with four numbers -- what gates R_tool
+What a tagless model actually loses is its ACCURACY, through the fourth clause and the
+parse above it. `answer_text = predict_str.split("<answer>")[-1].split("</answer>")[0]`
+has no fallback, so with no tag it is the whole completion: the judge is handed a raw
+chain of thought to grade against a one-phrase gold, and past 1,000 characters
+`acc_reward` is forced to 0.0 and the format error is set as well. That is the real
+cold-start argument, and it is mechanically different from a format penalty.
+
+So this script reports five numbers, not one:
+
+    format_ok_deepeyes            their rule, verbatim -- what decides the -1
+    tag_structure_ok              one <think></think> pair AND a closing tool call or answer
+    tool_call_rate                a parseable zoom call with four numbers
+    env_would_zoom_rate           ... that their ENV will actually run (see below)
+    acc_zeroed_by_length_rate     the clause that kills a tagless model's accuracy
+
+`env_would_zoom_rate` is the one that gates `R_tool`, and it is not the tool-call rate.
+`VisualToolBoxV2.execute` checks `extract_answer` FIRST and returns `done=True` on a hit,
+so a turn carrying both a `<tool_call>` and a closed `<answer>` ends the episode and the
+zoom is discarded -- no image spliced, `R_tool` zero however correct the answer is.
 
 WHAT IT IS NOT: an accuracy measurement, and not a multi-turn rollout. Only the FIRST
 assistant turn is generated. The coordinate question is entirely a turn-1 question, and
@@ -189,6 +206,9 @@ def deepeyes_is_format_error(predict_str: str) -> bool:
     off on every rollout of an 80-step run.
     """
     is_format_error = False
+    # Every clause is a COUNT COMPARISON. 0 == 0 balances, so a completion with no tags
+    # at all is not a format error and scores 0.0 rather than -1.0. Only the last clause
+    # can bite a tagless model, and it bites through accuracy as well.
     if predict_str.count("<think>") != predict_str.count("</think>"):
         is_format_error = True
     if (predict_str.count("<|vision_start|><|image_pad|>")
@@ -197,11 +217,10 @@ def deepeyes_is_format_error(predict_str: str) -> bool:
     predict_no_think = predict_str.split("</think>")[-1].strip()
     if predict_no_think.count("<answer>") != predict_no_think.count("</answer>"):
         is_format_error = True
-    # Their own anti-judge-hacking clause, which doubles as a format error. It bites a
-    # long chain that never opens <answer>, because then `answer_text` is the WHOLE
-    # completion.
-    answer_text = predict_str.split("<answer>")[-1].split("</answer>")[0].strip()
-    if len(answer_text) >= 1000:
+    # Their anti-judge-hacking clause, which also forces `acc_reward = 0.0` upstream of
+    # this line. It is the ONE clause a tagless model can trip, and it trips through the
+    # answer parse: with no <answer> tag, `answer_text` is the whole completion.
+    if len(deepeyes_answer_text(predict_str)) >= 1000:
         is_format_error = True
     return is_format_error
 
@@ -224,6 +243,26 @@ def _upstream_string_consts(path: Path):
             if isinstance(t, ast.Name):
                 out[t.id] = node.value.value
     return out
+
+
+def deepeyes_answer_text(predict_str: str) -> str:
+    """What their judge is handed, character for character.
+
+    `vl_agent.compute_score`:
+
+        answer_text = predict_str.split("<answer>")[-1].split("</answer>")[0].strip()
+
+    There is no fallback. With NO `<answer>` tag anywhere, `split("<answer>")[-1]` is the
+    WHOLE COMPLETION, so the judge is asked to grade a raw chain of thought against a
+    one-phrase gold -- and if that chain runs past 1,000 characters, their anti-hack
+    clause forces `acc_reward = 0.0` and sets the format error as well.
+
+    This, not a format penalty, is what a tagless model actually loses. Their format rule
+    is a COUNT COMPARISON: zero `<answer>` against zero `</answer>` balances, so a
+    completion with no tags at all scores `R_format = 0.0`, not -1.0. The penalty is
+    real only for a model that opens a tag and does not close it.
+    """
+    return predict_str.split("<answer>")[-1].split("</answer>")[0].strip()
 
 
 def _check_prompt_matches_upstream():
@@ -652,6 +691,14 @@ def score_record(rec):
         "env_sees_answer": env_sees_answer(text),
         "env_zoom_discarded": bool(box is not None and env_sees_answer(text)),
         "env_would_zoom": bool(box is not None and not env_sees_answer(text)),
+        # What their JUDGE is handed. No `<answer>` tag means `split("<answer>")[-1]`
+        # returns the whole completion, so the grader sees a raw chain instead of an
+        # answer; past 1,000 characters their anti-hack clause then forces acc 0.0.
+        # This is the mechanism that costs a tagless model its reward -- not R_format,
+        # which scores a tagless completion 0.0 and not -1.0.
+        "answer_is_whole_completion": "<answer>" not in text,
+        "answer_text_len": len(deepeyes_answer_text(text)),
+        "acc_zeroed_by_length": len(deepeyes_answer_text(text)) >= 1000,
         "loose_bbox_only": loose is not None,
         "has_think": text.count("<think>") == 1 and text.count("</think>") == 1,
         "has_answer_tags": "<answer>" in text and "</answer>" in text,
@@ -715,6 +762,10 @@ def summarise(scored):
         "tool_call_rate": _mean([s["tool_call_ok"] for s in scored]),
         "env_would_zoom_rate": _mean([s["env_would_zoom"] for s in scored]),
         "env_zoom_discarded_rate": _mean([s["env_zoom_discarded"] for s in scored]),
+        "answer_is_whole_completion_rate":
+            _mean([s["answer_is_whole_completion"] for s in scored]),
+        "acc_zeroed_by_length_rate": _mean([s["acc_zeroed_by_length"] for s in scored]),
+        "median_answer_text_len": _median([s["answer_text_len"] for s in scored]),
         "loose_bbox_only_rate": _mean([s["loose_bbox_only"] for s in scored]),
         "has_think_rate": _mean([s["has_think"] for s in scored]),
         "has_answer_tags_rate": _mean([s["has_answer_tags"] for s in scored]),
@@ -796,8 +847,10 @@ def run_report(args):
               f"{c['has_answer_tags_rate']:>8.1%} {c['tool_call_rate']:>8.1%} "
               f"{c['env_would_zoom_rate']:>6.1%} {c['env_zoom_discarded_rate']:>7.1%} "
               f"{c['truncated_rate']:>5.1%} {c['median_completion_tokens']:>7.0f}")
-    print("\n  R_format  = their literal rule: counts balance. A completion with NO tags")
-    print("              passes it -- and never zooms. Never read it alone.")
+    print("\n  R_format  = their literal rule, which is a COUNT COMPARISON on every")
+    print("              clause. A completion with NO tags balances 0 == 0 and scores")
+    print("              0.0, NOT -1.0 -- it is not penalised, it is merely invisible.")
+    print("              The -1 is for opening a tag and not closing it.")
     print("  tagstruct = one <think></think> pair closed by a tool call or an answer.")
     print("  toolcall  = a parseable <tool_call> carrying four numbers.")
     print("  ZOOMS     = a tool call that their ENV will actually execute. "
@@ -816,6 +869,22 @@ def run_report(args):
             c = summary[f"{m}|{a}"]
             print(f"    {m + ' / arm ' + a:<24} {c['format_ok_untruncated']:>8.1%} "
                   f"(n={c['n_untruncated']})")
+
+    print("\nWHAT THE JUDGE IS HANDED -- the clause that actually costs a tagless model")
+    print(f"  {'model / arm':<24} {'no <answer> tag':>16} {'med answer chars':>17} "
+          f"{'acc forced to 0':>16}")
+    for m, a in keys:
+        c = summary[f"{m}|{a}"]
+        print(f"  {m + ' / arm ' + a:<24} {c['answer_is_whole_completion_rate']:>15.1%} "
+              f"{c['median_answer_text_len']:>17.0f} "
+              f"{c['acc_zeroed_by_length_rate']:>15.1%}")
+    print("\n  `answer_text = predict_str.split(\"<answer>\")[-1].split(\"</answer>\")[0]`")
+    print("  has no fallback. With no <answer> tag it is the WHOLE completion, so the")
+    print("  judge grades a chain of thought against a one-phrase gold -- and past 1,000")
+    print("  characters their anti-hack clause forces acc_reward = 0.0 outright.")
+    print("  READ THE LAST COLUMN AGAINST THE TOKEN BUDGET THIS RUN USED. Their config")
+    print("  allows 20,480 response tokens; a short budget truncates the very chains")
+    print("  that would trip the clause, so this is a FLOOR on the real rate.")
 
     print("\nCOORDINATE FRAME -- IoU against V*'s ground-truth boxes")
     for m, a in keys:

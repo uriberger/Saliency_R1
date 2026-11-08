@@ -65,6 +65,29 @@ check("a half-typed vision splice is",
 
 
 # --------------------------------------------------------------------------------------
+print("\n1b. the answer parse -- what a tagless model actually loses, which is NOT -1")
+# --------------------------------------------------------------------------------------
+# Prompt 4's brief said R_format is "-1 on any tag mismatch", so a model at format 0.000
+# is penalised on every rollout. Their code says otherwise, and these pin the difference.
+check("a tagless completion is not a format error at all",
+      P.deepeyes_is_format_error("The flag is red.") is False)
+check("with no <answer>, the judge is handed the WHOLE completion",
+      P.deepeyes_answer_text("Okay, so the flag looks white. The answer is A.")
+      == "Okay, so the flag looks white. The answer is A.")
+check("with tags, it is handed the answer",
+      P.deepeyes_answer_text("<think>x</think><answer> A </answer>") == "A")
+check("the last <answer> wins, as their split does",
+      P.deepeyes_answer_text("<answer>a</answer><answer>b</answer>") == "b")
+long_chain = "Okay, so " + "I need to look at the image. " * 50
+check("a long tagless chain is >= 1000 chars", len(long_chain) >= 1000)
+check("... so acc_reward is forced to 0.0 and the format error is set too",
+      P.deepeyes_is_format_error(long_chain) is True)
+check("a SHORT tagless chain costs nothing at all -- no penalty, no zero",
+      P.deepeyes_is_format_error("A.") is False
+      and P.deepeyes_answer_text("A.") == "A.")
+
+
+# --------------------------------------------------------------------------------------
 print("\n2. tag_structure_ok is strictly harder than their rule -- the reason both "
       "numbers are reported")
 # --------------------------------------------------------------------------------------
@@ -239,6 +262,18 @@ check("their rule passes all three, including the one with no protocol",
 check("tag_structure_ok passes two", close(cell["tag_structure_ok"], 2 / 3))
 check("the winning reading's mean IoU", close(cell["readings"]["rel1000"]["mean_iou"], 1.0))
 check("the cell records the arm's pixel cap", cell["proc_max_pixels"] == 327680)
+check("one of the three has no <answer> tag at all",
+      close(cell["answer_is_whole_completion_rate"], 2 / 3),
+      f"{cell['answer_is_whole_completion_rate']:.3f}")
+
+cell = P.summarise([P.score_record(r) for r in [
+    rec("Okay, so " + "I need to look at the image. " * 50),   # tagless and long
+    rec("<think>x</think><answer> A </answer>"),
+]])
+check("acc_zeroed_by_length_rate counts the long tagless chain",
+      close(cell["acc_zeroed_by_length_rate"], 0.5))
+check("... and their format rule half-agrees, for the same single reason",
+      close(cell["format_ok_deepeyes"], 0.5))
 
 
 # --------------------------------------------------------------------------------------
