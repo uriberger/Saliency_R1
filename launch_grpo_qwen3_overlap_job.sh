@@ -225,6 +225,32 @@ if [[ "$OVERLAP_METRIC" == "mean_in_v2" ]]; then
     [[ -z "${W_OVERLAP_SET:-}" ]] && W_OVERLAP=0.033
 fi
 
+# ---------- what an UNAPPLIED saliency reward scores, which is also per-metric ----------
+# A saliency reward returns None -> NaN when it did not APPLY to a completion: no
+# groundable observe step, every step dropped by --max_union_area, or --natural-only
+# masking the row. The trainer's `nansum` reads that as 0 and PENALISES the completion;
+# SELFSAL_IMPUTE_UNSCORED=1 imputes the group's mean instead and makes it neutral.
+#
+# Neither is right everywhere, and the deciding number is the metric's CHANCE LEVEL:
+#
+#   mean_in     chance 0.065 -> 0 costs ~2.1 sd.  Leave it PENALISED. The penalty is
+#               what keeps chains groundable; removing it is what collapsed completion
+#               length from 154-157 to 114-117 by step 1600 in the self-saliency
+#               release (its 9505050, four runs, seeds 42 and 7).
+#   mean_in_v2  chance 1.0   -> 0 costs ~9.5 sd, and 8489767 measured the result: a
+#               -1.86 mean advantage in answer-tied groups. IMPUTE.
+#   auroc       chance 0.5   -> same argument. IMPUTE.
+#
+# (mean_in and mean_in_v2 measured on the GLM head-selection scan, 2,864 steps at
+# L18H24, 2026-11-08.) An explicit SELFSAL_IMPUTE_UNSCORED in the environment wins, so
+# a deliberate experiment can have either on any metric.
+if [[ -z "${SELFSAL_IMPUTE_UNSCORED+x}" ]]; then
+    case "$OVERLAP_METRIC" in
+        mean_in) SELFSAL_IMPUTE_UNSCORED="" ;;   # unset -> nansum -> unapplied scores 0
+        *)       SELFSAL_IMPUTE_UNSCORED=1  ;;   # mean_in_v2, auroc, anything new
+    esac
+fi
+
 # ---------- naming: every swept HP appears in the model AND wandb name ----------
 N_HEADS=$(echo "$OVERLAP_HEADS" | awk -F, '{print NF}')
 SUFFIX="__wov${W_OVERLAP}_${N_HEADS}head_tr${TOKEN_REDUCTION}"
@@ -300,6 +326,7 @@ if ! $DIRECT; then
             ${OPENAI_API_KEY:+export OPENAI_API_KEY=$OPENAI_API_KEY;}
             ${OPENAI_BASE_URL:+export OPENAI_BASE_URL=$OPENAI_BASE_URL;}
             ${JUDGE_MODEL:+export JUDGE_MODEL=$JUDGE_MODEL;}
+            export SELFSAL_IMPUTE_UNSCORED=${SELFSAL_IMPUTE_UNSCORED};
             bash $SCRIPT_PATH --direct \
                 --num-gpus $NUM_GPUS \
                 --model $MODEL \
@@ -344,6 +371,10 @@ source "$REPO/setup_cuda_home.sh"
 bash "$REPO/check_cuda_home.sh" || exit 1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export DS_BUILD_OPS=0
+# Decided from --overlap-metric above, and exported here because the trainer reads it
+# from the environment. Empty is meaningful and is the mean_in case: Python's
+# os.environ.get returns "", which is falsy, so the trainer takes the `nansum` branch.
+export SELFSAL_IMPUTE_UNSCORED
 export HF_HOME
 export HF_HUB_OFFLINE=1
 export HF_TOKEN=${HF_TOKEN:-}

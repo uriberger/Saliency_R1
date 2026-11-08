@@ -148,4 +148,55 @@ a_answer_only = advantages(torch.stack([x_scored[:, 0], torch.zeros(G)], dim=1),
 check("fully-unscored group falls back to the answer-side advantage",
       advantages(x_masked, W), a_answer_only, tol=NEUTRAL)
 
+# ---------------------------------------------------------------------------
+# 12-17. THE SWITCH. `impute` above is no longer unconditional: the trainer picks it
+# only when SELFSAL_IMPUTE_UNSCORED is set, because the right answer depends on the
+# metric's CHANCE LEVEL. mean_in sits at ~0.065 and tolerates an unapplied reward being
+# scored 0 (~2.1 sd) -- and wants to, because that penalty is what keeps chains
+# groundable; removing it collapsed completion length from 154-157 to 114-117 by step
+# 1600 in the self-saliency release. mean_in_v2 sits at 1.0 (~9.5 sd) and does not.
+#
+# Checked on the SOURCE, not by importing the trainer, for the reason in the module
+# docstring: it only resolves inside trl_repo/, which a worktree must not touch.
+# ---------------------------------------------------------------------------
+print("\n-- the SELFSAL_IMPUTE_UNSCORED switch --")
+
+src = SRC.read_text()
+has_env = "os.environ.get(\"SELFSAL_IMPUTE_UNSCORED\")" in src
+check("trainer gates the weighted sum on SELFSAL_IMPUTE_UNSCORED", float(has_env), 1.0)
+check("the nansum branch is present (unapplied -> 0)",
+      float(".nansum(dim=1)" in src), 1.0)
+check("the impute branch is still present (unapplied -> neutral)",
+      float("impute_unscored_rewards(rewards_per_func, self.num_generations)" in src), 1.0)
+
+
+def weighted(rewards_per_func, weights, impute_on):
+    """Exactly the two branches the trainer now chooses between."""
+    w = torch.tensor(weights).unsqueeze(0)
+    if impute_on:
+        return (impute(rewards_per_func, G) * w).sum(dim=1)
+    return (rewards_per_func * w).nansum(dim=1)
+
+
+# A mean_in-shaped group: answer-tied, so the saliency term IS the whole advantage,
+# and completion 2 wrote no groundable observe step.
+MI_W = [1.0, 0.2]
+x = torch.tensor([[1.0, 0.060], [1.0, 0.040], [1.0, NAN], [1.0, 0.050]])
+
+r_imp = weighted(x, MI_W, True)
+check("impute: the unapplied completion deviates from its group by 0",
+      r_imp[2] - r_imp.mean(), 0.0, tol=NEUTRAL)
+
+r_nan = weighted(x, MI_W, False)
+penalty = (r_nan[2] - r_nan.mean()).item()
+check("nansum: the unapplied completion is PENALISED, not neutral",
+      float(penalty < -1e-4), 1.0)
+check("nansum: and penalised by exactly w_overlap x its groupmates' mean level",
+      -penalty, 0.2 * (0.060 + 0.040 + 0.050) / 3 * (3 / 4) + 0.2 * 0.0 * 0, tol=5e-3)
+
+# The scored completions must be untouched by the choice -- it only moves the masked row.
+check("the choice moves only the unapplied row, not its groupmates",
+      r_imp[[0, 1, 3]] - r_imp[[0, 1, 3]].mean(),
+      r_nan[[0, 1, 3]] - r_nan[[0, 1, 3]].mean(), tol=NEUTRAL)
+
 print("\nall reward-masking checks passed")

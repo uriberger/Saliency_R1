@@ -3172,8 +3172,37 @@ class GRPOTrainer(Trainer):
         # it, while its groupmates still score against each other. This is the "masked ->
         # neutral in the GRPO advantage" that overlap_rewards / grad_rewards /
         # glimpse_rewards already promise in their docstrings.
-        rewards = (impute_unscored_rewards(rewards_per_func, self.num_generations)
-                   * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+        #
+        # BUT NEUTRAL IS NOT FREE, AND THE RIGHT CHOICE DEPENDS ON THE METRIC.
+        #
+        # Under the imputation there is no longer any cost to writing few or ungroundable
+        # observe steps, and the policy stops writing them. Measured in the self-saliency
+        # release (its 9505050, four runs, seeds 42 and 7), completion length at step
+        # 1600 fell from the published 154-157 to 114-117, and reverting this one line
+        # recovered 143 with nothing else changed.
+        #
+        # So the choice is per-arm, and it is the metric's CHANCE LEVEL that decides it,
+        # because `nansum` scores an unapplied reward 0:
+        #
+        #   mean_in     chance 0.065, level 0.049  ->  0 costs ~2.1 sd.  TOLERABLE, and
+        #                                              the length pressure is wanted.
+        #   mean_in_v2  chance 1.0,   level ~1.27  ->  0 costs ~9.5 sd.  NOT tolerable;
+        #                                              measured -1.86 advantage above.
+        #   auroc       chance 0.5                 ->  NOT tolerable.
+        #
+        # (mean_in/mean_in_v2 measured on the GLM head-selection scan, 2,864 steps at
+        # L18H24, 2026-11-08; mean_in's ~0.05 is the same regime as self-saliency's phi,
+        # which that repo keeps on `nansum` deliberately.)
+        #
+        # SELFSAL_IMPUTE_UNSCORED carries the same name and the same sense as in
+        # self-saliency so the two trainers read identically. The per-arm default is set
+        # by `launch_grpo_qwen3_overlap_job.sh`, which is the layer that knows the metric.
+        if os.environ.get("SELFSAL_IMPUTE_UNSCORED"):
+            rewards = (impute_unscored_rewards(rewards_per_func, self.num_generations)
+                       * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+        else:
+            rewards = (rewards_per_func
+                       * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
