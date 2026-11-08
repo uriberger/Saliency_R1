@@ -187,8 +187,11 @@ started and reported afterwards.
 > **But the cold start produces the box and withholds only the tag.** Scored for a
 > bracketed box after `</think>` instead of inside `<zoom>` tags, the same rollouts
 > pass at **83.3%**. A parser accommodation — a deliberate, documented deviation from
-> ERGO — unblocks turn 1 for free. Turn 2's 0.0% `<answer>` rate does not go away
+> ERGO — would unblock turn 1 for free. Turn 2's 0.0% `<answer>` rate does not go away
 > either way. See *The number that changes the decision*.
+>
+> **DECIDED 2026-11-08: stay faithful to ERGO's `r_format`.** The parser is not being
+> loosened; the arm takes the two-turn cold start. See §9.
 
 Measured 2026-11-08 on `cs-oci-ord`, one A100-80GB inside interactive allocation
 `38208034`, temperature 1.0, 1280 visual tokens, `coord hint: 'none'`, and
@@ -440,6 +443,87 @@ budget is now checked against both of the processor's bounds at load time.
 **Nothing about format or boxes can be read off these two jobs.** 24 and 48 new tokens
 truncate every completion mid-sentence, `n` is 2, and the sampling is at temperature 1.0.
 The `FAIL` they print is the truncation, not the checkpoint.
+
+## 9. The decision: faithful to ERGO, so the two-turn cold start is on
+
+Taken 2026-11-08, with §7's numbers in hand. The gate found a cheaper route —
+accept a bare `[x1,y1,x2,y2]` after `</think>` and 83.3% of rollouts already pass —
+and **it is not being taken.** The arm stays as close to ERGO as possible, which
+means `parse_zoom_bbox_from_text` stays verbatim, `r_format` keeps its meaning, and
+the checkpoint is brought up to the format rather than the format down to the
+checkpoint.
+
+The cost is the one the build document named in advance: **+3–5 days, and it is the
+single largest line in this arm's budget.** What follows is what that actually
+involves, checked rather than estimated, so the number can be re-argued against
+facts.
+
+### The design fork resolves itself
+
+The obvious worry was which checkpoint to build on. Our existing cold start writes
+`<think>` (87.5%) and almost never tags a box (4.2%); vanilla Instruct tags a box on
+**95.8%** of rollouts, with the best box quality measured here (centre-hit 0.65,
+coverage 0.62), and never writes `<think>`. The evidence says our SFT is what
+suppressed the box, so building on top of it means fighting a prior that just
+demonstrated it overrides an explicit instruction.
+
+No choice is needed: `train/cold_start/qwen3_vl_8b_instruct_sft/train.yaml` already
+sets `model_name_or_path: Qwen/Qwen3-VL-8B-Instruct` and trains **LoRA rank 128**,
+merged afterwards. The existing cold start is itself a LoRA on the base. So an ERGO
+cold start is a *sibling* of it, not a continuation — same launcher, different data
+and output dir — and it inherits the backbone's intact box ability by construction.
+
+```fish
+bash launch_coldstart_job.sh --config train/cold_start/ergo_qwen3_vl_8b_sft/train.yaml
+```
+
+### The tags cost nothing to represent
+
+Checked on both tokenizers (identical, `vocab=151669`):
+
+| tag | tokens |
+|---|---|
+| `<think>` / `</think>` | **1 each** — 151667 / 151668, native to Qwen3-VL |
+| `<zoom>` / `</zoom>` | 3 each, ordinary text |
+| `<answer>` / `</answer>` | 3 each, ordinary text |
+
+So **no vocabulary resize and no added special tokens are needed** — unlike LASER's
+text recipe, which adds its four tags and resizes (`build_coldstart_data.py:52`).
+`<zoom>` is plain text that the base model already emits on 100% of rollouts, so
+tokenisation is not the obstacle and never was. It also explains the asymmetry in §7:
+`</think>` survives everywhere because it is a native token with Qwen3's own reasoning
+priors behind it, while `<answer>` and `<zoom>` are learned behaviours that an SFT can
+give or take away — and ours took one away.
+
+### The data is here
+
+- **`cold_data/Saliency-R1-cold`, the full 44 GB**, is staged on `cs-oci-ord`
+  (`saliency_r1_llava_cot_full` + `saliency_r1_mulberry_sft_full` with image trees).
+  An earlier note in this repo's history had it missing on this cluster; it is not.
+- **`cold_data/grpo_sets`** supplies the turn-1 boxes — `_boxes_abs` per row and
+  `union_bbox` (`build_grpo_sets.py:133`, `:362`).
+- Turn-1 targets must be written in **`rel1000`**, the frame §7 measured, not in the
+  post-`smart_resize` pixels ERGO's `map_box` assumes.
+
+### What the gate says the cold start has to teach
+
+Not grounding — the base model has that. Three specific things, in order of how much
+of the failure they own:
+
+1. **The `<zoom>` wrapper.** 91.7% of cold-start rollouts emit a box, 16.7% put a
+   `<zoom>` tag anywhere, 4.2% parse. This is the whole gap and it is pure format.
+2. **`<answer>` in turn 2.** 0.0%, at both generation caps, insensitive to budget —
+   our corpus suppresses the tag and the suppression is total. The base model is at
+   100%, so again this is something SFT removed, not something missing.
+3. **Box quality**, which SFT can only start: mean IoU 0.056 and centre-hit 0.50
+   against the base's 0.206 / 0.652. GRPO is what is supposed to improve this; the
+   cold start only has to get `r_format` off the floor so there is a gradient at all.
+
+**Re-estimate before committing the full 3–5 days.** The original 2–5k-row figure
+assumed teaching a model to ground a region. That is not the job — the job is format
+supervision on a capability that is already present, which is the cheap end of that
+range. A first pass at the low end, re-gated with `ergo_zoom_gate.py`, is the way to
+find out; the gate is the instrument for exactly this and now has a measured cost.
 
 ## Sources
 
