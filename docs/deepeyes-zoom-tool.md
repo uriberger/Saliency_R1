@@ -9,7 +9,7 @@ because of it (§6 — three of those will look like breakage if nobody says so 
 | `deepeyes/image_zoom_in_tool.py` | the tool. Tracked source; the copy that executes is in `deepeyes_fork/` |
 | `deepeyes/zoom_tool_config.py` | the tool YAML, the `create_kwargs` builder, and the turn budget |
 | `patch_deepeyes_zoom_tool.sh` | installs it into `deepeyes_fork/`; `--check` reports |
-| `test_deepeyes_zoom_tool_cpu.py` | 43 CPU checks against the **installed** copy |
+| `test_deepeyes_zoom_tool_cpu.py` | 48 CPU checks against the **installed** copy |
 | `deepeyes_zoom_agentloop_cpu.py` | the same tool inside the real `ToolAgentLoop`, via P2's harness |
 | `launch_deepeyes_zoom_agentloop_cpu_job.sh` | sends both to `cpu_short` |
 
@@ -28,15 +28,12 @@ On a 1600×1200 photo those two readings are about a factor of two apart in each
 dimension, and the failure is completely silent: a crop of the wrong region is a valid
 image, the vision tokens are well formed, the loss falls.
 
-### It is a switch, not a constant
+### It is a switch, not a constant — and P4 has now set it
 
-P4 (`deepeyes_coord_format_probe.py`) measures which frame Qwen3-VL actually emits
-under DeepEyes' prompt. **It has not reported** — it needs a GPU and this cluster has
-none; its CPU fallback was still running at the time of writing. So the frame is not
-hardcoded. It is one config key with three readings and **no default**:
+The frame is one config key with three readings and **no default**:
 
 ```yaml
-bbox_frame: rel1000          # (x/1000)*W, (y/1000)*H     Qwen3-VL cookbook
+bbox_frame: rel1000          # (x/1000)*W, (y/1000)*H     <-- MEASURED CORRECT
 bbox_frame: abs_original     # x, y                       DeepEyes' assumption
 bbox_frame: abs_smartresize  # (x/rW)*W,   (y/rH)*H       Qwen2.5-VL's frame
 ```
@@ -45,29 +42,28 @@ Unset or unrecognised raises at construction with the reason. P4's own spellings
 (`abs_orig`, `abs_resized`) are accepted as aliases, so its verdict can be pasted in
 without a translation step — a translation step is where a frame gets flipped.
 
-**When P4 reports, the change is one line in the tool config.** Nothing else moves.
+**P4 reported: `rel1000`, decisively.** Over 158 emitted boxes against V*'s ground
+truth:
 
-### Which one I would bet on, and why: `rel1000`
+| reading | mean IoU | touches target |
+|---|---|---|
+| **`rel1000`** | **0.260** | **77.2%** |
+| `abs_orig` | 0.000 | 3.8% |
+| `abs_resized` | 0.003 | 8.2% |
 
-Not baked in, but worth recording so the bet can be scored:
+and the invariance arm settles it independently: halving the resolution the model sees
+moved the emitted numbers by **1.03–1.04×** — i.e. invariant, therefore relative —
+while the resized-frame reading moved 0.488×.
 
-1. The vendor post-trained this convention in. The Qwen3-VL tech report describes
-   synthesising grounding traces and SFT-ing a "think → act → analyse → answer" visual
-   agent, and the cookbook that ships with it states 0–1000 relative. Qwen2.5-VL's
-   absolute-pixel frame was the odd one out between Qwen2-VL and Qwen3-VL, not a
-   family property.
-2. The DeepEyes arm starts from
-   `checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged`, whose SFT
-   corpus is not a grounding corpus. The base model's grounding prior survives it.
-3. The one argument the other way is DeepEyes' own system prompt, which carries the
-   literal example `{"bbox_2d": [10, 20, 100, 200]}`. Those numbers read as absolute
-   pixels, and a model that copies the example's magnitude would look like
-   `abs_original`. A single in-context example rarely overrides a post-trained output
-   convention — but this is exactly the kind of thing that makes measuring it the
-   right call rather than reading the docs.
-4. `abs_original` and `abs_smartresize` are nearly the same frame at Qwen3-VL's
-   default `max_pixels` of 16,777,216, because no real downscale happens. P4's arm B
-   exists to separate them and that is the only thing that can.
+So **DeepEyes' `visual_toolbox_v2`, which reads `bbox_2d` as absolute pixels, is wrong
+on every call for this backbone.** That is the single most valuable thing the
+switchable design bought: the number is now set by measurement rather than by whichever
+of the two plausible readings got typed first, and setting it was one line. Everything
+in §5 below was already passing under `rel1000`; nothing moved.
+
+Keep the key required. The default stays absent on purpose — the next backbone will
+have its own answer, and a default is how a measured fact becomes an inherited
+assumption.
 
 ### The frame is visible in the run, not assumed in a file
 
@@ -161,6 +157,74 @@ the default and `warn`/`off` exist for smoke data only.
 a corpus whose images are not meaningfully bigger than what the model already sees
 fails the run instead of quietly making the tool decoration. It is unset by default.
 
+### 3.1 Where the original comes from, given this fork has no `process_raw_image`
+
+P4 raised this and it is the right question: DeepEyes keeps a second un-resized copy
+in the **dataloader** — `process_raw_image` beside `process_image`, carried as an
+`origin_multi_modal_data` column, handed to the tool at `parallel_env.py:479` — and
+our fork's `vision_utils.py` has only `process_image`. If nothing upstream held
+un-resized pixels, the assertion in §3 would not be a guard, it would be a tripwire
+that fires on every call.
+
+**It is a guard. The second copy exists; verl 0.7 just keeps it somewhere else.**
+`RLHFDataset` passes the row's own `extra_info.tools_kwargs` through **untouched** —
+`rl_dataset.py:445` reads it out of `extra_info`, `:451` assigns it, and
+`process_image` never goes near it. The traced path for one row:
+
+```
+parquet row
+  .images[0] ──────────────── process_image() ─ smart_resize ─→ multi_modal_data["image"]
+                                                                 THE MODEL'S VIEW
+  .extra_info.tools_kwargs.image_zoom_in_tool.create_kwargs.image
+            (a SECOND copy of the same raw bytes, written by build_create_kwargs)
+    → rl_dataset.py:451        row_dict["tools_kwargs"] = tools_kwargs
+    → collate_fn               batch.non_tensor_batch["tools_kwargs"]
+    → agent_loop.py:380        kwargs = {k: v[i] for k, v in non_tensor_batch.items()}
+    → tool_agent_loop.py:125   tools_kwargs = kwargs.get("tools_kwargs", {})
+    → tool_agent_loop.py:443   tool.create(create_kwargs=...)
+    → load_image_unresized()   NO RESIZE ANYWHERE ON THIS PATH
+                                                                 THE CROP SOURCE
+```
+
+So `process_raw_image` is **not** needed and nothing in `deepeyes_fork/` had to change
+for it. Adding it would mean touching `vision_utils.py`, `rl_dataset.py`, `collate_fn`,
+the agent-loop batch plumbing and `ToolAgentLoop.run` — five files in a shared fork —
+to re-derive per batch what two lines in the data builder already carry.
+
+**Proved on real code, not read off it.** `test_deepeyes_zoom_tool_cpu.py` CASE 9 runs
+the real `RLHFDataset` with the real Qwen3-VL processor on a 1000×700 row:
+
+```
+images[0] (1000, 700) -> multi_modal_data (992, 704)     the prompt image IS resized
+create_kwargs survives with original_size [1000, 700]    tools_kwargs is NOT
+tool holds (1000, 700); model saw (992, 704)             two different images
+```
+
+and the agent-loop job's **A5** closes the same loop at the far end: decode the raw
+`images` column independently and check the sizes the tool logged are those.
+
+**The trade, stated.** The image bytes appear twice in the parquet, so the 47k corpus
+goes from 4.84 GB to roughly 9.7 GB. That is P6's cost to pay, and it is cheaper than
+five edits to a shared fork. If it ever becomes a problem the fix is to put a
+**path** in `create_kwargs["image"]` rather than a data URI — the loader already
+accepts paths, `file://` and `http(s)://` — not to re-plumb the dataloader.
+
+**The one-command check for the real corpus**, which is what P6 should run before the
+real run rather than discovering this at step 40:
+
+```fish
+python deepeyes/zoom_tool_config.py verify <parquet> --n 50
+```
+
+It checks three things per row against a *third* independent witness, the raw `images`
+column: that `create_kwargs.image` decodes — through the tool's own decoder — to the
+raw size, that the declared `original_size` matches both, and that the declared
+`view_size` is what the dataloader will really show at `image_patch_size=16`. It also
+reports the downscale distribution, which answers the question the assertions cannot:
+not *is this the original* but *is the original big enough for a zoom to recover
+anything*. A corpus at downscale 1.0 makes the tool decoration however correctly it is
+wired.
+
 ---
 
 ## 4. Fidelity: `max_turns` is **5**, meaning **4 tool calls**
@@ -202,6 +266,40 @@ rather than inferred.
 their code. If the paper's 6 is wanted instead, it is `max_assistant_turns=7` /
 `max_user_turns=6` — and say so, because it is not what their checkpoint saw.
 
+### 4 is a ceiling on *executed* calls, and it is not the number emitted
+
+P4 found that `VisualToolBoxV2.execute` checks `extract_answer` **first** and returns
+`done=True` if it finds a closed `<answer>`:
+
+```python
+answer = self.extract_answer(action_string)
+if answer:
+    return "", 0.0, True, {}        # episode over; any <tool_call> in the same turn
+action = self.extract_action(...)   # is never reached
+```
+
+So a turn carrying *both* a `<tool_call>` and a closed `<answer>` ends the episode and
+the zoom is **discarded**. P4 measured that at **26.0% of cold-start turns and 0.0% of
+Instruct turns** — i.e. it is a property of the policy we are actually starting from,
+not a rare edge case.
+
+Three consequences, none of which change code here:
+
+1. **"4 tool calls" is a ceiling on executions, not on emissions.** On the cold start,
+   expect the mean executed count to sit well below any count of emitted
+   `<tool_call>` blocks. Do not read a gap between the two as a bug.
+2. **verl behaves differently here, and more sensibly.** `ToolAgentLoop` has no
+   answer-first short-circuit: it runs the tool parser over the response and dispatches
+   whatever tool calls it finds (`tool_agent_loop.py:245,257`). So on our stack the
+   zoom in such a turn *is* executed and the episode continues. That is a deviation
+   from DeepEyes in our favour, and it should be stated rather than discovered — it
+   makes our `R_tool` fire on turns where theirs would not.
+3. **P5 should count executions, not emissions.** The build doc already says to derive
+   "a zoom happened" from verl's `num_turns` rather than from counting
+   `<|vision_start|><|image_pad|>` in the response string. This is a second reason:
+   `num_turns` counts what the loop actually did. For the tool-call *rate* in the
+   smoke, log both and report the gap.
+
 ---
 
 ## 5. Results
@@ -211,7 +309,7 @@ their code. If the paper's 6 is wanted instead, it is `max_assistant_turns=7` /
 ```fish
 conda activate deepeyes
 bash patch_deepeyes_zoom_tool.sh
-python test_deepeyes_zoom_tool_cpu.py          # 43/43
+python test_deepeyes_zoom_tool_cpu.py          # 48/48
 ```
 
 It imports `verl.tools.image_zoom_in_tool` — the copy inside `deepeyes_fork/` that a
@@ -225,18 +323,22 @@ floor and the refusal of a 28; out-of-bounds (clamped when overlapping, `-0.05` 
 not); degenerate (zero area, inverted, aspect > 100, malformed `bbox_2d`); the crop
 source (no resize on load, the resized copy rejected, a missing `original_size`
 rejected, resize instructions rejected, and the no-op demonstrated with the check
-off); the YAML path verl actually uses; and the raw-vs-converted log.
+off); the YAML path verl actually uses; the raw-vs-converted log; and **the supply
+path through the real `RLHFDataset` and the real Qwen3-VL processor** (§3.1), including
+`verify_zoom_corpus` passing on a correct corpus and failing on one built from the
+resized copy.
 
 ### Integration, through the real `ToolAgentLoop`, on `cpu_short`
 
 Job **7742599**, 4 rollouts of geo3k, wrapping P2's `deepeyes_agentloop_cpu.py`:
 
 ```
-41/41 unit checks
+48/48 unit checks
 A1 PASS  position_ids (4, 4, 6144), t!=h on 4/4, markers {'qwen3_vl': 1}
 A2 PASS  0.610 of the response masked; 4 vision spans, 0 leaking
 A3 PASS  2 grid rows per row, image_pad count == grid token count on 4/4
 A4 PASS  4 tool calls under frame rel1000, all ok
+A5 PASS  the tool held the RAW parquet image, not the one the model saw
 ```
 
 Worth reading off the log: geo3k's images are 250×258 and the view is 256×256, so the
@@ -255,9 +357,13 @@ Three of these will look like breakage if nobody says so.
    The fix is one keyword; after both branches land, P2's helper should just call
    `deepeyes/zoom_tool_config.py::build_tool_config`.
 2. **P6.** `extra_info.tools_kwargs[...]["create_kwargs"]` must now carry
-   `original_size` and `view_size` alongside `image`. Use `build_tools_kwargs`; it is
-   two lines and it is right by construction. `build_deepeyes_smoke_data.py` passes
-   only `image` and needs the same change.
+   `original_size` and `view_size` alongside `image`, built from the **raw** bytes.
+   Use `build_tools_kwargs`; it is two lines and it is right by construction.
+   `build_deepeyes_smoke_data.py` passes only `image` and needs the same change. Then
+   run `python deepeyes/zoom_tool_config.py verify <parquet> --n 50` on the output and
+   read the `downscale` block — see §3.1. This is also where the corpus doubles in
+   size (≈4.84 GB → ≈9.7 GB); if that is a problem, store a path rather than a data
+   URI, not a second dataloader column.
 3. **P5.** The tool returns `-0.05` on a malformed or unusable box, kept from verl's
    version. `ToolAgentLoop` collects those into `output.extra_fields["tool_rewards"]`
    (`tool_agent_loop.py:184`) and does **not** add them to the reward — it exposes

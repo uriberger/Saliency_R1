@@ -93,6 +93,39 @@ WHAT CHANGED FROM verl's VERSION, AND WHY EACH ONE IS SILENT WHEN WRONG
     construction. `crop_source_check: warn|off` downgrades this, and exists for
     smoke data only.
 
+    WHERE THE ORIGINAL COMES FROM, SINCE THIS FORK HAS NO `process_raw_image`.
+
+    DeepEyes kept the second un-resized copy in the DATALOADER: `process_raw_image`
+    alongside `process_image`, carried as an `origin_multi_modal_data` column, handed
+    to the tool by `parallel_env.py:479`. Our fork's `vision_utils.py` has no such
+    function, and it does not need one, because verl 0.7 moved per-trajectory tool
+    state somewhere else. The row's own `extra_info.tools_kwargs` is passed through
+    UNTOUCHED -- `rl_dataset.py:445,451` reads it out of `extra_info` and assigns it,
+    and `process_image` never goes near it:
+
+        parquet row
+          .images[0]                                -> process_image() -> smart_resize
+                                                       -> multi_modal_data["image"]
+                                                          THE MODEL'S VIEW
+          .extra_info.tools_kwargs
+               .image_zoom_in_tool.create_kwargs.image     (a SECOND copy of the
+                                                            same raw bytes)
+            -> rl_dataset.py:451   row_dict["tools_kwargs"] = tools_kwargs
+            -> collate_fn          -> batch.non_tensor_batch["tools_kwargs"]
+            -> agent_loop.py:380   kwargs = {k: v[i] for k, v in non_tensor_batch...}
+            -> tool_agent_loop.py:125,443   tool.create(create_kwargs=...)
+            -> load_image_unresized()        NO RESIZE ANYWHERE ON THIS PATH
+                                             THE TOOL'S CROP SOURCE
+
+    So the "second un-resized copy" exists; it lives in the parquet rather than being
+    re-derived per batch. Measured on the real path (job 7742605, geo3k through
+    RLHFDataset and ToolAgentLoop): the tool held 250x258 while the model saw 256x256.
+    Two different images, as intended.
+
+    The cost is that the image bytes appear twice in the parquet. That is the trade
+    P6 is making, and `zoom_tool_config.py::verify_zoom_corpus` is the one-command
+    check that it was actually made.
+
 ---------------------------------------------------------------------------
 FIDELITY: max_turns IS 5, MEANING 4 TOOL CALLS
 ---------------------------------------------------------------------------
@@ -168,6 +201,70 @@ DEFAULT_MERGE_SIZE = 2
 #: counts, not pixels: the pixel bounds are these times (patch*merge)**2.
 DEFAULT_VIEW_MIN_TOKENS = 4
 DEFAULT_VIEW_MAX_TOKENS = 16384
+
+
+def load_image_unresized(spec: Any, timeout: int = 30) -> Image.Image:
+    """Decode an image WITHOUT resizing it. The whole of change [3] is here.
+
+    verl's version called `qwen_vl_utils.fetch_image`, which ends in `image.resize(...)`.
+    DeepEyes' own dataloader keeps a second, un-resized copy (`process_raw_image`) for
+    exactly this reason and crops that; modern verl keeps it in the parquet row instead
+    (see `create`), and this is the decoder for it.
+
+    Accepts what `fetch_image` accepts minus the resize controls: a PIL image, a
+    `{"bytes": ...}` dict (what parquet round-trips), a local path, `file://`,
+    `data:image/...;base64,...`, or an http(s) URL.
+
+    Module-level, not a method, so that `deepeyes/zoom_tool_config.py::verify_zoom_corpus`
+    can check a corpus through the EXACT decode path the tool will use at train time.
+    A verifier with its own copy of this logic verifies its own copy.
+    """
+    if isinstance(spec, dict):
+        # `{"max_pixels": ...}` and friends are instructions to downsample. They are
+        # legitimate for the PROMPT image and fatal for the crop source, so refuse
+        # rather than silently honour or silently ignore them.
+        forbidden = sorted(k for k in ("max_pixels", "min_pixels", "resized_height", "resized_width") if k in spec)
+        if forbidden:
+            raise ValueError(
+                f"create_kwargs['image'] carries resize instructions {forbidden}. The zoom "
+                "tool must crop the ORIGINAL image; a crop of a downsampled image recovers "
+                "nothing and the arm becomes plain GRPO with a format penalty."
+            )
+        if "bytes" in spec and spec["bytes"] is not None:
+            img = Image.open(BytesIO(spec["bytes"]))
+        elif spec.get("image") is not None:
+            return load_image_unresized(spec["image"], timeout=timeout)
+        elif spec.get("path"):
+            img = Image.open(spec["path"])
+        else:
+            raise ValueError(f"unrecognised image spec dict with keys {sorted(spec)}")
+    elif isinstance(spec, Image.Image):
+        img = spec
+    elif isinstance(spec, bytes | bytearray):
+        img = Image.open(BytesIO(bytes(spec)))
+    elif isinstance(spec, str):
+        if spec.startswith("data:image"):
+            if "base64," not in spec:
+                raise ValueError("data: URI is not base64-encoded")
+            img = Image.open(BytesIO(base64.b64decode(spec.split("base64,", 1)[1])))
+        elif spec.startswith("file://"):
+            img = Image.open(spec[7:])
+        elif spec.startswith("http://") or spec.startswith("https://"):
+            import requests
+
+            with requests.get(spec, stream=True, timeout=timeout) as r:
+                r.raise_for_status()
+                img = Image.open(BytesIO(r.content))
+        else:
+            img = Image.open(spec)
+    else:
+        raise ValueError(f"unrecognised image spec of type {type(spec).__name__}")
+
+    img.load()
+    # `to_rgb`, not `.convert("RGB")`: it is what qwen_vl_utils uses for the prompt
+    # image, and it white-backgrounds RGBA instead of compositing onto black. The crop
+    # and the prompt image must not disagree about what a transparent pixel is.
+    return to_rgb(img)
 
 
 # Adapted from verl/tools/sandbox_fusion_tools.py
@@ -505,64 +602,9 @@ class ImageZoomInTool(BaseTool):
         return int(w_bar), int(h_bar)
 
     def _load_original_image(self, spec: Any) -> Image.Image:
-        """Decode an image WITHOUT resizing it. The whole of change [3] is here.
-
-        verl's version called `qwen_vl_utils.fetch_image`, which ends in
-        `image.resize(...)`. DeepEyes' own dataloader keeps a second, un-resized copy
-        (`process_raw_image`) for exactly this reason, and crops that.
-
-        Accepts what `fetch_image` accepts minus the resize controls: a PIL image, a
-        `{"bytes": ...}` dict (what parquet round-trips), a local path, `file://`,
-        `data:image/...;base64,...`, or an http(s) URL.
-        """
-        if isinstance(spec, dict):
-            # `{"max_pixels": ...}` and friends are instructions to downsample. They
-            # are legitimate for the PROMPT image and fatal for the crop source, so
-            # refuse rather than silently honour or silently ignore them.
-            forbidden = sorted(
-                k for k in ("max_pixels", "min_pixels", "resized_height", "resized_width") if k in spec
-            )
-            if forbidden:
-                raise ValueError(
-                    f"create_kwargs['image'] carries resize instructions {forbidden}. The zoom "
-                    "tool must crop the ORIGINAL image; a crop of a downsampled image recovers "
-                    "nothing and the arm becomes plain GRPO with a format penalty."
-                )
-            if "bytes" in spec and spec["bytes"] is not None:
-                img = Image.open(BytesIO(spec["bytes"]))
-            elif spec.get("image") is not None:
-                return self._load_original_image(spec["image"])
-            elif spec.get("path"):
-                img = Image.open(spec["path"])
-            else:
-                raise ValueError(f"unrecognised image spec dict with keys {sorted(spec)}")
-        elif isinstance(spec, Image.Image):
-            img = spec
-        elif isinstance(spec, bytes | bytearray):
-            img = Image.open(BytesIO(bytes(spec)))
-        elif isinstance(spec, str):
-            if spec.startswith("data:image"):
-                if "base64," not in spec:
-                    raise ValueError("data: URI is not base64-encoded")
-                img = Image.open(BytesIO(base64.b64decode(spec.split("base64,", 1)[1])))
-            elif spec.startswith("file://"):
-                img = Image.open(spec[7:])
-            elif spec.startswith("http://") or spec.startswith("https://"):
-                import requests
-
-                with requests.get(spec, stream=True, timeout=self.timeout) as r:
-                    r.raise_for_status()
-                    img = Image.open(BytesIO(r.content))
-            else:
-                img = Image.open(spec)
-        else:
-            raise ValueError(f"unrecognised image spec of type {type(spec).__name__}")
-
-        img.load()
-        # `to_rgb`, not `.convert("RGB")`: it is what qwen_vl_utils uses for the prompt
-        # image, and it white-backgrounds RGBA instead of compositing onto black. The
-        # crop and the prompt image must not disagree about what a transparent pixel is.
-        return to_rgb(img)
+        """See `load_image_unresized`. Kept as a method because `self.timeout` is the
+        only instance state it needs, and because the name is where you look."""
+        return load_image_unresized(spec, timeout=self.timeout)
 
     def _check_crop_source(self, img: Image.Image, create_kwargs: dict) -> dict:
         """Assert -- at runtime, fatally -- that what we are about to crop is the

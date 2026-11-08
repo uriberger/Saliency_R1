@@ -33,16 +33,28 @@ THE FIVE CASES docs/deepeyes-build-prompts.md Prompt 3 asks for
                                             cropping the already-resized copy must be
                                             shown to lose the detail
 
-plus three that guard the way the tool is wired rather than what it computes:
+plus four that guard the way the tool is wired rather than what it computes:
 
   6  bbox_frame has no default              unset and unrecognised both raise
   7  the YAML path verl actually uses       build_tool_config -> initialize_tools_from_config
   8  raw-vs-converted logging               the first N calls land in a JSONL
+  9  the SUPPLY path                        against the REAL RLHFDataset and the REAL
+                                            Qwen3-VL processor: the prompt image is
+                                            smart-resized, tools_kwargs is not, and the
+                                            tool ends up holding the un-resized one
+
+CASE 9 is the one that answers "where does the original come from, given this fork has
+no `process_raw_image`". DeepEyes kept the second un-resized copy in the DATALOADER;
+verl 0.7 routes per-trajectory tool state through `extra_info.tools_kwargs`, which
+`rl_dataset.py:445,451` passes through untouched. So the copy exists, it just lives in
+the parquet row. Case 9 proves that on real code rather than by reading it, and
+`zoom_tool_config.py::verify_zoom_corpus` is the same check for a real corpus.
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import sys
@@ -465,6 +477,111 @@ def main() -> int:
 
     print()
     print("=" * 78)
+    print("CASE 9  the SUPPLY path: does the original actually reach the tool?")
+    print("=" * 78)
+    # This fork has no `process_raw_image`, so the un-resized copy the tool crops is
+    # the one the data builder put in extra_info.tools_kwargs. That is a claim about
+    # RLHFDataset's behaviour, so check it against the real RLHFDataset and the real
+    # Qwen3-VL processor. No model weights, no GPU -- a processor is a config and a
+    # tokenizer.
+    try:
+        from omegaconf import OmegaConf
+
+        from verl.utils import hf_processor, hf_tokenizer
+        from verl.utils.dataset.rl_dataset import RLHFDataset
+
+        model_id = os.environ.get("DEEPEYES_TEST_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
+        proc = hf_processor(model_id, use_fast=True)
+        tok = hf_tokenizer(model_id)
+    except Exception as e:
+        proc = None
+        print(f"  SKIP  processor unavailable ({type(e).__name__}: {str(e)[:90]}); "
+              f"the agent-loop job covers this path on a compute node")
+
+    if proc is not None:
+        import datasets
+
+        with tempfile.TemporaryDirectory() as td:
+            src = make_image(1000, 700)
+            buf = io.BytesIO()
+            src.save(buf, format="PNG")
+            raw_bytes = buf.getvalue()
+            # The builder's two outputs, from the SAME raw bytes by two different paths:
+            # the `images` column the model is shown, and the tool's own copy.
+            rows_in = {
+                "data_source": ["synthetic"] * 2,
+                "prompt": [[{"role": "user", "content": "<image>\nWhat is in the box?"}]] * 2,
+                "images": [[{"bytes": raw_bytes, "path": None}]] * 2,
+                "agent_name": ["tool_agent"] * 2,
+                "reward_model": [{"style": "rule", "ground_truth": "x"}] * 2,
+                "extra_info": [
+                    {"index": i, "need_tools_kwargs": True,
+                     "tools_kwargs": ztc.build_tools_kwargs({"bytes": raw_bytes})}
+                    for i in range(2)
+                ],
+            }
+            pq = Path(td) / "supply.parquet"
+            datasets.Dataset.from_dict(rows_in).to_parquet(str(pq))
+
+            cfg = OmegaConf.create({
+                "image_key": "images", "max_prompt_length": 4096, "truncation": "error",
+                "filter_overlong_prompts": False, "return_raw_chat": True,
+                "return_multi_modal_inputs": False,
+                # 16, not verl's default 14. The whole point of §2.
+                "image_patch_size": 16, "cache_dir": td,
+            })
+            dset = RLHFDataset(data_files=[str(pq)], tokenizer=tok, config=cfg, processor=proc)
+            row = dset[0]
+
+            shown = row["multi_modal_data"]["image"][0].size
+            ckw = row["tools_kwargs"]["image_zoom_in_tool"]["create_kwargs"]
+            expected_view = view_of(src, max_tokens=16384)
+            check(
+                shown == expected_view and shown != src.size,
+                "RLHFDataset smart-resizes the PROMPT image, as it should",
+                f"images[0] {src.size} -> multi_modal_data {shown} (expected {expected_view})",
+            )
+            check(
+                sorted(ckw) == ["image", "original_size", "view_size"]
+                and tuple(ckw["original_size"]) == src.size,
+                "tools_kwargs passes through RLHFDataset untouched",
+                f"create_kwargs keys={sorted(ckw)} original_size={ckw['original_size']}",
+            )
+
+            t = build(bbox_frame="rel1000", view_max_tokens=16384)
+            iid, _ = run(t.create(create_kwargs=ckw))
+            held = t._instance_dict[iid]["image"]
+            run(t.release(iid))
+            check(
+                held.size == src.size and held.size != shown,
+                "the tool holds the ORIGINAL, not the image the model was shown",
+                f"tool holds {held.size}; model saw {shown}; raw bytes are {src.size}",
+            )
+
+            rep = ztc.verify_zoom_corpus(pq, n=2, image_patch_size=16)
+            check(rep["ok"] and rep["rows_checked"] == 2,
+                  "verify_zoom_corpus passes on a correctly built corpus",
+                  json.dumps(rep["downscale"]))
+
+            # ... and fails on the mistake it exists to catch: the builder storing the
+            # process_image output as the tool's copy.
+            bad = dict(rows_in)
+            bad["extra_info"] = [
+                {"index": i, "need_tools_kwargs": True,
+                 "tools_kwargs": ztc.build_tools_kwargs(src.resize(shown))}
+                for i in range(2)
+            ]
+            bad_pq = Path(td) / "supply_bad.parquet"
+            datasets.Dataset.from_dict(bad).to_parquet(str(bad_pq))
+            rep_bad = ztc.verify_zoom_corpus(bad_pq, n=2, image_patch_size=16)
+            check(
+                (not rep_bad["ok"]) and "NOT the raw image" in json.dumps(rep_bad["failures"]),
+                "verify_zoom_corpus catches a corpus built from the resized copy",
+                rep_bad["failures"][0]["why"] if rep_bad["failures"] else "no failure reported",
+            )
+
+    print()
+    print("=" * 78)
     n_fail = sum(1 for ok, _, _ in RESULTS if not ok)
     for ok, name, detail in RESULTS:
         if not ok:
@@ -480,4 +597,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     os.environ.setdefault("HF_HOME", "/home/uberger/scratch/cache/hf_cache")
+    # CASE 9 loads a processor (a config + a tokenizer, no weights). Offline by
+    # default so a node with no network reports a clean SKIP instead of hanging.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
     sys.exit(main())

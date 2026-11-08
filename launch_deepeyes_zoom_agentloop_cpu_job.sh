@@ -9,9 +9,13 @@
 #   - `bash patch_deepeyes_zoom_tool.sh` must have been run, or the fork still carries
 #     verl's tool: MIN_DIMENSION 28, no coordinate frame, and a create() that
 #     smart-resizes the image it is about to crop.
-#   - --frame. There is no default here and none in the tool. P4
-#     (deepeyes_coord_format_probe.py) measures which of the three is right; until it
-#     reports, every run of this states its assumption on the command line.
+#   - --frame. There is no default in the TOOL and there never will be; this script
+#     defaults to rel1000 because P4 measured it: over 158 emitted boxes against V*'s
+#     ground truth, rel1000 scored mean IoU 0.260 / 77.2% touch, against abs_orig
+#     0.000 / 3.8% and abs_resized 0.003 / 8.2% -- and halving the resolution the
+#     model sees moved the emitted numbers by 1.03-1.04x, i.e. invariant, i.e.
+#     relative. DeepEyes' own tool reads absolute pixels and is wrong here on every
+#     call. Pass --frame only to reproduce that.
 #
 # WHAT THE FIRST STEP SHOULD PRINT
 #       [DEEPEYES-ZOOM] ImageZoomInTool: bbox_frame=<yours> min_dimension=32

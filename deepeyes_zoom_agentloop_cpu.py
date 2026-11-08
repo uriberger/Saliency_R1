@@ -195,25 +195,67 @@ def main() -> int:
     records = []
     for p in sorted(zoom_log_dir.glob("zoom_calls.*.jsonl")):
         records += [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()]
-    ok = bool(records)
-    ok = ok and all(r.get("status") == "ok" for r in records)
-    ok = ok and all(r.get("frame") == args.frame for r in records)
+    # --- A4: the tool ran, under the frame we asked for, and converted ----------
+    a4 = bool(records)
+    a4 = a4 and all(r.get("status") == "ok" for r in records)
+    a4 = a4 and all(r.get("frame") == args.frame for r in records)
     if args.frame != "abs_original":
         # abs_original is the identity map; for the other two a converted box equal to
         # the raw one would mean the conversion silently did not happen.
-        ok = ok and all(r.get("bbox_converted") != r.get("bbox_raw") for r in records)
+        a4 = a4 and all(r.get("bbox_converted") != r.get("bbox_raw") for r in records)
+
+    # --- A5: it ran on the ORIGINAL ---------------------------------------------
+    # A4 says the tool ran; it does not say what it ran ON. This fork has no
+    # `process_raw_image`, so the un-resized copy comes from the parquet row's
+    # tools_kwargs. Decode the raw `images` column here, independently, and check the
+    # sizes the tool logged are those -- if RLHFDataset had somehow handed over the
+    # `process_image` copy instead, they would be the view's sizes.
+    import io as _io
+
+    import datasets
+    from PIL import Image
+
+    from deepeyes.zoom_tool_config import verify_zoom_corpus
+
+    ds_check = datasets.load_dataset("parquet", data_files=str(data), split="train")
+    raw_sizes = {
+        Image.open(_io.BytesIO(ds_check[i]["images"][0]["bytes"])).size
+        for i in range(min(len(ds_check), 64))
+    }
+    logged_sizes = {tuple(r["original_size"]) for r in records}
+    view_sizes = {tuple(r["view_size"]) for r in records}
+    corpus = verify_zoom_corpus(data, n=min(len(ds_check), 16))
+    a5 = bool(logged_sizes) and logged_sizes <= raw_sizes and corpus["ok"]
+
     print()
     print("=" * 74)
-    print(f"{'PASS' if ok else 'FAIL'}  A4_zoom_tool: {len(records)} tool calls logged under frame "
+    print(f"{'PASS' if a4 else 'FAIL'}  A4_zoom_tool: {len(records)} tool calls logged under frame "
           f"{args.frame}, all status=ok")
     for r in records[:4]:
         print("    " + json.dumps({k: r.get(k) for k in
                                    ("bbox_raw", "bbox_converted", "bbox_final", "original_size",
                                     "view_size", "crop_size", "downscale")}))
+    print("-" * 74)
+    print(f"{'PASS' if a5 else 'FAIL'}  A5_crop_source: the tool held the RAW parquet image, not the "
+          f"one the model saw")
+    print(f"    tool held      {sorted(logged_sizes)}")
+    print(f"    raw images[0]  {sorted(raw_sizes)}")
+    print(f"    model was shown{sorted(view_sizes)}"
+          + ("   <-- identical to the original; this corpus has no detail to recover"
+             if view_sizes == logged_sizes else ""))
+    print(f"    verify_zoom_corpus: ok={corpus['ok']} downscale={corpus['downscale']}")
+    if corpus.get("warning"):
+        print(f"    WARNING {corpus['warning']}")
     print("=" * 74)
-    (out / "zoom_tool_report.json").write_text(
-        json.dumps({"frame": args.frame, "n_calls": len(records), "pass": ok, "calls": records}, indent=2)
-    )
+
+    ok = a4 and a5
+    (out / "zoom_tool_report.json").write_text(json.dumps({
+        "frame": args.frame, "n_calls": len(records),
+        "A4_zoom_tool": a4, "A5_crop_source": a5, "pass": ok,
+        "tool_held_sizes": sorted(logged_sizes), "raw_image_sizes": sorted(raw_sizes),
+        "view_sizes": sorted(view_sizes), "verify_zoom_corpus": corpus,
+        "calls": records,
+    }, indent=2, default=str))
     print("NOTE: the tool call was SCRIPTED. This proves the tool's contract with")
     print("      ToolAgentLoop, not which frame Qwen3-VL emits -- that is P4.")
     return 0 if (rc == 0 and ok) else 1

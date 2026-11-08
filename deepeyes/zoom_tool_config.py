@@ -43,6 +43,20 @@ Modern verl spells the same budget with two keys rather than one
 `max_assistant_turns` alone reproduces their loop exactly -- the check runs AFTER the
 generate and BEFORE the tool call, same as theirs. `max_user_turns` is set to the
 implied 4 as a belt-and-braces bound; it binds at the same place.
+
+AND 4 IS A CEILING ON *EXECUTED* CALLS, NOT ON EMITTED ONES.
+
+Their `VisualToolBoxV2.execute` checks `extract_answer` FIRST and returns done=True, so
+a turn carrying both a <tool_call> and a closed <answer> ends the episode and the zoom
+is discarded. P4 measured that at 26.0% of cold-start turns and 0.0% of Instruct turns
+-- a property of the policy this arm actually starts from, not an edge case.
+
+verl's ToolAgentLoop has no such short-circuit: it runs the tool parser over the
+response and dispatches whatever it finds (tool_agent_loop.py:245,257), so on our stack
+that zoom IS executed and the episode continues. That is a deviation from DeepEyes, in
+our favour, and it belongs in the writeup rather than in a surprise. For P5 it is a
+second reason to derive "a zoom happened" from verl's `num_turns` rather than from
+counting vision tokens in the response string: num_turns counts what the loop did.
 """
 
 from __future__ import annotations
@@ -259,8 +273,147 @@ def build_tools_kwargs(raw_image: Any, **kwargs: Any) -> dict:
     return {TOOL_NAME: {"create_kwargs": build_create_kwargs(raw_image, **kwargs)}}
 
 
+# --------------------------------------------------------------------------------------
+# The corpus check. Run this on the REAL parquet before the real run.
+# --------------------------------------------------------------------------------------
+def verify_zoom_corpus(
+    parquet_path: str | Path,
+    n: int = 20,
+    image_key: str = "images",
+    image_patch_size: int = IMAGE_PATCH_SIZE,
+    merge_size: int = MERGE_SIZE,
+) -> dict:
+    """Does the ORIGINAL image actually reach the tool, on this corpus?
+
+    This fork has no `process_raw_image`: the un-resized copy the tool crops is the one
+    the data builder put in `extra_info.tools_kwargs[...].create_kwargs.image`, which
+    `RLHFDataset` passes through untouched. That is a claim about the DATA, so it is
+    checkable on the data, and this is the check. Three things per row, each of which
+    fails silently in production:
+
+      1 `create_kwargs.image` decodes -- through the TOOL's own decoder, not a copy of
+        it -- to exactly the size of the row's raw `images[0]`. If the builder stored
+        the `process_image` output instead, these differ and the zoom recovers nothing.
+      2 the declared `original_size` matches both. A builder that assigns both fields
+        from one already-processed variable is self-consistent and wrong; this catches
+        it because `images[0]` is a third, independent witness.
+      3 the declared `view_size` matches what the dataloader will actually show the
+        model at this `image_patch_size`. verl defaults that to 14; on Qwen3-VL it is
+        16, and a mismatch means the abs_smartresize frame is computed against the
+        wrong view.
+
+    It also reports the downscale distribution, which answers the question the
+    assertions cannot: not "is this the original" but "is the original big enough for
+    a zoom to recover anything". A corpus at downscale 1.0 makes the tool decoration
+    however correctly it is wired -- which is exactly what geo3k is.
+
+        python deepeyes/zoom_tool_config.py verify <parquet> [--n 50]
+    """
+    import statistics
+
+    import datasets
+
+    try:
+        # The tool's decoder, so this verifies the path rather than a reimplementation.
+        from verl.tools.image_zoom_in_tool import load_image_unresized
+    except Exception:  # pragma: no cover - a node without the patched fork
+        from PIL import Image as _Image
+
+        def load_image_unresized(spec, timeout=30):  # type: ignore[misc]
+            if isinstance(spec, dict) and spec.get("bytes") is not None:
+                return _Image.open(io.BytesIO(spec["bytes"])).convert("RGB")
+            if isinstance(spec, str) and spec.startswith("data:image"):
+                return _Image.open(
+                    io.BytesIO(base64.b64decode(spec.split("base64,", 1)[1]))
+                ).convert("RGB")
+            raise RuntimeError("verl is not importable and this spec needs its decoder")
+
+    ds = datasets.load_dataset("parquet", data_files=str(parquet_path), split="train")
+    rows = min(n, len(ds))
+    factor = image_patch_size * merge_size
+    failures: list[dict] = []
+    downscales: list[float] = []
+    n_lossless = 0
+
+    for i in range(rows):
+        row = ds[i]
+        where = {"row": i}
+        try:
+            ck = row["extra_info"]["tools_kwargs"][TOOL_NAME]["create_kwargs"]
+        except Exception:
+            failures.append({**where, "why": "no tools_kwargs[image_zoom_in_tool].create_kwargs"})
+            continue
+        for k in ("image", "original_size", "view_size"):
+            if ck.get(k) is None:
+                failures.append({**where, "why": f"create_kwargs has no {k!r}"})
+                break
+        else:
+            raw = load_image_unresized(row[image_key][0])
+            crop_src = load_image_unresized(ck["image"])
+            declared = tuple(int(v) for v in ck["original_size"])
+            stated_view = tuple(int(v) for v in ck["view_size"])
+            derived_view = smart_resize_wh(raw.width, raw.height, factor=factor)
+            if crop_src.size != raw.size:
+                failures.append({
+                    **where, "why": "create_kwargs.image is NOT the raw image",
+                    "crop_source": list(crop_src.size), "images[0]": list(raw.size),
+                })
+                continue
+            if declared != raw.size:
+                failures.append({
+                    **where, "why": "declared original_size != raw images[0] size",
+                    "declared": list(declared), "images[0]": list(raw.size),
+                })
+                continue
+            if stated_view != derived_view:
+                failures.append({
+                    **where, "why": f"stated view_size != smart_resize at factor {factor}",
+                    "stated": list(stated_view), "derived": list(derived_view),
+                    "hint": "data.image_patch_size must be 16 on Qwen3-VL; verl defaults it to 14",
+                })
+                continue
+            d = ((raw.width * raw.height) / float(max(stated_view[0] * stated_view[1], 1))) ** 0.5
+            downscales.append(d)
+            if d <= 1.0:
+                n_lossless += 1
+
+    report = {
+        "parquet": str(parquet_path),
+        "rows_checked": rows,
+        "rows_total": len(ds),
+        "image_patch_size": image_patch_size,
+        "ok": len(failures) == 0,
+        "n_failures": len(failures),
+        "failures": failures[:10],
+        "downscale": {
+            "min": round(min(downscales), 3) if downscales else None,
+            "median": round(statistics.median(downscales), 3) if downscales else None,
+            "max": round(max(downscales), 3) if downscales else None,
+            "rows_at_or_below_1.0": n_lossless,
+        },
+    }
+    if n_lossless and not failures:
+        report["warning"] = (
+            f"{n_lossless}/{len(downscales)} rows have the original no bigger than the view. "
+            f"On those rows a zoom recovers nothing the model did not already have, however "
+            f"correctly the tool is wired. Check the corpus, not the code."
+        )
+    return report
+
+
 if __name__ == "__main__":
     import json
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "verify":
+        ap = __import__("argparse").ArgumentParser(prog="zoom_tool_config.py verify")
+        ap.add_argument("parquet")
+        ap.add_argument("--n", type=int, default=20)
+        ap.add_argument("--image-patch-size", type=int, default=IMAGE_PATCH_SIZE)
+        a = ap.parse_args(sys.argv[2:])
+        rep = verify_zoom_corpus(a.parquet, n=a.n, image_patch_size=a.image_patch_size)
+        print(json.dumps(rep, indent=2))
+        raise SystemExit(0 if rep["ok"] else 1)
 
     print(json.dumps({
         "max_assistant_turns": MAX_ASSISTANT_TURNS,
