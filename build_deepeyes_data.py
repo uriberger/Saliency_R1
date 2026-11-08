@@ -478,6 +478,7 @@ def convert_source(
         "image_tokens_per_row": [],
         "image_bytes": [],
         "view_px": [],
+        "downscale": [],
         "prompt_roles": {},
         "prompt_chars": [],
         "rows_without_image_tag": 0,
@@ -534,6 +535,14 @@ def convert_source(
                 stats["pixels"].append(w * h)
                 stats["image_bytes"].append(len(b))
                 tokens += image_token_count(w, h)
+                if k == 0 and want_tool:
+                    # The headroom a zoom has on this row: how much bigger the original
+                    # is than what the model is shown. Computed even under --stats-only,
+                    # because it is the number that says whether the tool can recover
+                    # anything at all, and that question does not need a parquet.
+                    vw, vh = smart_resize_wh_local(w, h)
+                    stats["view_px"].append(vw * vh)
+                    stats["downscale"].append(((w * h) / float(max(vw * vh, 1))) ** 0.5)
                 if k == 0 and want_tool and not stats_only and image_mode != "none":
                     # original_size / view_size come from P3's builder, derived from the
                     # RAW bytes. Never from `w`/`h` above: reusing a variable that has
@@ -552,9 +561,13 @@ def convert_source(
                         # Swap in the file the raw bytes just went into -- same image,
                         # byte for byte, and the tool loads it without resizing.
                         create_kwargs["image"] = "file://" + str(p)
-                    stats["view_px"].append(
-                        create_kwargs["view_size"][0] * create_kwargs["view_size"][1]
-                    )
+                    if [vw, vh] != [int(v) for v in create_kwargs["view_size"]]:
+                        raise SystemExit(
+                            f"{name} row {i}: this file's smart_resize says {[vw, vh]} and "
+                            f"zoom_tool_config says {create_kwargs['view_size']}. Two "
+                            f"transcriptions of the same function have diverged; nothing "
+                            f"downstream can be trusted until they agree."
+                        )
             stats["image_tokens_per_row"].append(tokens)
 
             if not stats_only:
@@ -608,6 +621,10 @@ def finalize_stats(stats: dict) -> dict:
     # this to `pixels` is the headroom a zoom actually has; where it is 1.0 the tool is
     # decoration (which is what ImageZoomInTool.min_expected_downscale guards).
     out["view_px"] = summarize(stats["view_px"], "view_px") if stats["view_px"] else None
+    # sqrt(original_px / view_px). 1.0 means the model is already shown the whole
+    # image at native resolution and a crop recovers no pixel it did not have.
+    out["downscale"] = summarize(stats["downscale"], "downscale") if stats["downscale"] else None
+    out["rows_downscale_le_1"] = sum(1 for d in stats["downscale"] if d <= 1.0)
     out["n_images"] = {str(k): v for k, v in sorted(stats["n_images"].items())}
     return out
 
@@ -905,7 +922,7 @@ def main() -> int:
 
     all_stats, all_rows = {}, {}
     combined = {"pixels": [], "width": [], "height": [], "image_tokens_per_row": [],
-                "image_bytes": [], "prompt_chars": [], "view_px": []}
+                "image_bytes": [], "prompt_chars": [], "view_px": [], "downscale": []}
     for name, spec in SOURCES.items():
         src = hf_dir / spec["file"]
         if not src.exists():
@@ -924,7 +941,14 @@ def main() -> int:
             f"             data_source={list(st['data_source'])} env_name={list(st['env_name'])}\n"
             f"             pixels median={s['pixels']['median']:,} p99={s['pixels']['p99']:,}"
             f"  image tokens/row median={s['image_tokens_per_row']['median']:,}"
-            f" p99={s['image_tokens_per_row']['p99']:,}",
+            f" p99={s['image_tokens_per_row']['p99']:,}"
+            + (
+                f"\n             downscale (original/view) median={s['downscale']['median']:.3f} "
+                f"max={s['downscale']['max']:.3f}  "
+                f"rows<=1.0: {s['rows_downscale_le_1']:,}/{len(st['downscale']):,}"
+                if s.get("downscale")
+                else "\n             downscale: n/a (tool off on this split)"
+            ),
             flush=True,
         )
 
