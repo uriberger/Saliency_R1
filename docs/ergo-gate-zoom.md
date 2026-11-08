@@ -186,6 +186,8 @@ What exists and is verified:
 - `launch_ergo_zoom_gate_job.sh` — one GPU, ~2 h, `sbatch` or `submit_job`.
 - `craigwu/vstar_bench` fetched into `HF_HOME`: 191 rows, 191 ground-truth boxes, 0
   missing annotations.
+- The geometry, verified on the real models at the real budget: the pre-resize and the
+  processor agree exactly, `processor_resized_under_us = 0`. See the table below.
 
 ## 8. The blocker: this cluster has no GPUs
 
@@ -221,11 +223,24 @@ The same wall stands in front of Gate A (P1), which wants 8 GPUs for a benchmark
 
 ### What was validated without a GPU
 
-The end-to-end path — both `generate()` calls, both passes, the frame table, the JSON and
-the JSONL — was run on `cpu_short` at `--n 2 --max-new-tokens 48` against the real cold
-start and the real Instruct model (`--gpus 0` routes there and loads in float32, because
-torch's CPU bf16 is emulated on those nodes). That proves the plumbing, not the answer:
-an 8B model on CPU cannot produce 191 rows × 2 turns × 2 models in any useful time.
+The whole path — both `generate()` calls, both passes, the frame table, the verdict, the
+JSON and the JSONL — was run on `cpu_short` against the **real** cold start and the
+**real** Instruct model (`--gpus 0` routes there and loads in float32, because torch's CPU
+bf16 is emulated on those nodes). Two jobs:
+
+| | budget | what it proved |
+|---|---|---|
+| `outputs/ergo_gate_zoom/cpu_tiny` | `--vision-tokens 64 --n 2 --max-new-tokens 24` | the script completes end to end on both models, writes both files, and takes the no-boxes branch correctly: `winner_note` replaces the verdict instead of a frame being named from nothing |
+| `outputs/ergo_gate_zoom/cpu_smoke` | **the production geometry**, `--vision-tokens 1280 --n 2 --max-new-tokens 48` | **`processor_resized_under_us: 0`** — the pre-resize and the processor agree exactly at the budget the real run uses. 2000×1500 → 1312×992 = 1271 tokens; 2250×1500 → 1408×928 = 1276 |
+
+The `cpu_tiny` job is also where the processor-floor warning came from: 64 tokens is 65536
+px, which is exactly `size.shortest_edge`, so `smart_resize`'s rounding landed just under
+it and the processor upscaled 1 of the 2 images back. The assertion caught it, and the
+budget is now checked against both of the processor's bounds at load time.
+
+**Nothing about format or boxes can be read off these two jobs.** 24 and 48 new tokens
+truncate every completion mid-sentence, `n` is 2, and the sampling is at temperature 1.0.
+The `FAIL` they print is the truncation, not the checkpoint.
 
 ## Sources
 
