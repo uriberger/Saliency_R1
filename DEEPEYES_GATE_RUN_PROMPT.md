@@ -145,6 +145,32 @@ The launcher **refuses to submit into a GPU-less cluster** rather than queueing 
 job that never starts and never errors. If it refuses here, that is check 1 failing and I
 want to know.
 
+## Update 2026-11-08 — one arm is already measured, which narrows the job
+
+A sibling task (`feat/search-benchmarks`) discovered that three of these benchmarks had
+**already been scored at full split on every arm**, and reduced them. Our cold start:
+
+| | V\* | HR-4K | HR-8K |
+|---|---|---|---|
+| cold start | **79.6** | 76.9 | 72.9 |
+| published Qwen3-VL-8B-Thinking, no tool | 77.5 | 72.4 | 68.1 |
+
+**V\* 79.6 is a clean number** — V\*'s native 2000×1500 is 3.0 MP, under the 3.2 MP cap
+those runs used, so nothing was thrown away. The HR-Bench figures are *not* clean: they
+were capped at 3.2 MP against HR-4K's true 4032×4032 (16.3 MP), which discards ~80% of
+the tokens. Treat them as a floor.
+
+**What this does to §8.** The cold start at 79.6 sits *between* two pre-registered rows:
+above the ~78 that would let "DeepEyes-7B reproduces at 90.1 ± 2 **and** cold start below
+~78" fire, and below the ~85 that would settle it as a no-go outright. So neither row
+fires on our side, and **the decision now rests entirely on whether DeepEyes-7B actually
+reproduces 90.1**. That is the one arm nobody has measured.
+
+If the queue is tight, this is the argument for `--models deepeyes-7b --bench vstar`:
+~10 minutes, one arm, and it is the only remaining unknown. Run the full three arms if
+you can — the in-loop baselines are still worth having, since the numbers above were
+measured *without* the zoom loop — but do not skip `deepeyes-7b` for anything.
+
 ## Step 2 — read the result against the pre-registered table
 
 `docs/deepeyes-gate.md` §8 fixed these **before** the run, so the outcome is read rather
