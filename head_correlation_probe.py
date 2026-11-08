@@ -13,8 +13,14 @@ For every observe step of every case, and for EVERY (layer, head), the step's ma
 that head's attention over image patches, mean-reduced over the step's tokens (the
 trainer's token_reduction=mean), scored against the step's own per-step DINO union:
 
+    mean_in    = mean inside the union of the map / the map's PEAK    <- TRAINING DEFAULT
     mean_in_v2 = mean inside the union / mean over the whole map      (chance = 1.0)
     auroc      = P(in-box patch outranks out-box patch)               (chance = 0.5)
+
+`mean_in` is what `launch_grpo_qwen3_overlap_job.sh` trains by default, so it is scored
+here too: a pair selected only on the other two is selected under a different function
+from the one the reward optimises, and it cannot be recovered afterwards because the
+shards keep the derived metrics rather than the maps.
 
 Two correlation set-ups:
 
@@ -302,16 +308,27 @@ def scan_case(model, processor, fam, cap, case, image, device, answer_max_tokens
 # metrics, vectorised over (layer, head, step)
 # ---------------------------------------------------------------------------
 def metrics(maps, masks):
-    """maps [L,H,S,P], masks [S,P] bool -> (mean_in_v2, auroc), each [L,H,S].
+    """maps [L,H,S,P], masks [S,P] bool -> (mean_in, mean_in_v2, auroc), each [L,H,S].
 
     Average ranks for ties: attention maps have many near-identical near-zero
     patches, and argsort would break those arbitrarily and bias auroc.
+
+    `mean_in` IS THE TRAINING DEFAULT, and that is why it is scored here. It is the
+    launcher's `OVERLAP_METRIC=mean_in`, so a head pair chosen only on `mean_in_v2`
+    would be selected under a different function from the one the reward optimises.
+    The two share a numerator and differ in the denominator -- mean_in divides the
+    box mean by the map's PEAK, mean_in_v2 by its MEAN -- and that is exactly where
+    mean_in is known to be weak (a map that merely flattens scores higher without
+    attending the box any better), so agreement between them cannot be assumed.
+    It cannot be recovered after the fact either: the shards store the derived
+    metrics, not the maps, so `max` is gone once the scan has run.
     """
     from scipy.stats import rankdata
 
     Lc, Hc, Sc, P = maps.shape
     flat = maps.reshape(Lc * Hc * Sc, P).astype(np.float64)
     ranks = rankdata(flat, axis=-1)
+    mi = np.full(Lc * Hc * Sc, np.nan)
     v2 = np.full(Lc * Hc * Sc, np.nan)
     au = np.full(Lc * Hc * Sc, np.nan)
     for si in range(Sc):
@@ -322,10 +339,14 @@ def metrics(maps, masks):
         pos = np.arange(Lc * Hc) * Sc + si
         sub, rk = flat[pos], ranks[pos]
         mean_all = sub.mean(axis=1)
+        max_all = sub.max(axis=1)
         with np.errstate(invalid="ignore", divide="ignore"):
             v2[pos] = np.where(mean_all > 0, sub[:, m].mean(axis=1) / mean_all, np.nan)
+            # mean over the box of the max-normalised map; dividing the box mean by the
+            # scalar peak is the same thing and saves materialising the normalised map.
+            mi[pos] = np.where(max_all > 0, sub[:, m].mean(axis=1) / max_all, np.nan)
         au[pos] = (rk[:, m].sum(axis=1) - k * (k + 1) / 2.0) / (k * (P - k))
-    return v2.reshape(Lc, Hc, Sc), au.reshape(Lc, Hc, Sc)
+    return (mi.reshape(Lc, Hc, Sc), v2.reshape(Lc, Hc, Sc), au.reshape(Lc, Hc, Sc))
 
 
 # ---------------------------------------------------------------------------
@@ -356,8 +377,8 @@ def scan(args, device):
     prog = IV.Progress(out / "progress" / f"scan{args.shard:02d}.json", len(cases),
                        f"scan{args.shard}", args.log_every)
 
-    V2, AU, SH, NEG, MASS, ROW, STEP, COR, UNI, NPAT, NTOK, DSET = (
-        [], [], [], [], [], [], [], [], [], [], [], [])
+    MI, V2, AU, SH, NEG, MASS, ROW, STEP, COR, UNI, NPAT, NTOK, DSET = (
+        [], [], [], [], [], [], [], [], [], [], [], [], [])
     dropped = 0
     try:
         for case in cases:
@@ -378,7 +399,7 @@ def scan(args, device):
             steps = [case["steps"][i] for i in kept]
             masks = np.stack([IV.unb64u8(st["mask_q"], (gh, gw)).astype(bool).reshape(-1)
                               for st in steps])
-            v2, au = metrics(maps, masks)
+            mi, v2, au = metrics(maps, masks)
             # Box-free concentration, on the same maps in the same pass. This costs a
             # sort over the patch axis and nothing else, so it rides along free rather
             # than justifying a second 8-GPU scan of the same 1,157 cases.
@@ -398,6 +419,7 @@ def scan(args, device):
                 prog.tick()
                 continue
             for si, st in enumerate(steps):
+                MI.append(mi[:, :, si])
                 V2.append(v2[:, :, si])
                 AU.append(au[:, :, si])
                 SH.append(sh[:, :, si])
@@ -418,6 +440,7 @@ def scan(args, device):
         raise SystemExit("no steps scored")
     np.savez_compressed(
         dest,
+        mean_in=np.stack(MI).astype(np.float32),
         v2=np.stack(V2).astype(np.float32), auroc=np.stack(AU).astype(np.float32),
         sharp=np.stack(SH).astype(np.float32),
         neg_frac=np.stack(NEG).astype(np.float32),
@@ -658,6 +681,11 @@ def report(args):
     d = [np.load(f) for f in files]
     v2 = np.concatenate([x["v2"] for x in d])
     au = np.concatenate([x["auroc"] for x in d])
+    # `mean_in` rides along only in shards written after it was added. The published
+    # Qwen3-VL scan predates it, so an archive that lacks it drops off the metric menu
+    # rather than raising -- the same contract the covariates below already have.
+    have_mi = all("mean_in" in x.files for x in d)
+    mi = np.concatenate([x["mean_in"] for x in d]) if have_mi else None
     row = np.concatenate([x["row"] for x in d])
     cor = np.concatenate([x["correct"] for x in d])
     uni = np.concatenate([x["union"] for x in d])
@@ -737,7 +765,11 @@ def report(args):
     ccor = np.zeros(len(uniq))
     np.maximum.at(ccor, idx, cor)          # label is constant within a completion
     cagg = {}
-    for name, arr in (("mean_in_v2", v2), ("auroc", au)):
+    METRICS = ([("mean_in", mi)] if have_mi else []) + [("mean_in_v2", v2), ("auroc", au)]
+    if not have_mi:
+        print("   [note] these shards carry no `mean_in` column -- re-run --stage scan "
+              "--overwrite to score the launcher's default metric")
+    for name, arr in METRICS:
         s = np.zeros((len(uniq), Lc, Hc))
         n = np.zeros((len(uniq), Lc, Hc))
         np.add.at(s, idx, np.nan_to_num(arr, nan=0.0))
@@ -757,8 +789,7 @@ def report(args):
 
     sel_c = (uniq % 2 == 1)                # select on odd rows, confirm on even
     sel_s = (row % 2 == 1)
-    for name, sarr, carr in (("mean_in_v2", v2, cagg["mean_in_v2"]),
-                             ("auroc", au, cagg["auroc"])):
+    for name, sarr, carr in ((n, a, cagg[n]) for n, a in METRICS):
         for setup, X, y, sel, cv in (("step", sarr, cor, sel_s, covs),
                                      ("completion", carr, ccor, sel_c, ccov)):
             Z = [cv[k] for k in cov_names]
