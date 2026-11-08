@@ -29,10 +29,16 @@ Qwen3-VL*. That document is the decision; this one is the execution.
 > measurement inverted** (Prompt 4, Prompt 9). All of them were the silent-when-wrong
 > kind. Prefer the corrections to the original text.
 >
-> **Two results are now measured rather than assumed**, both in Prompt 4: the coordinate
+> **Three results are now measured rather than assumed.** In Prompt 4: the coordinate
 > frame is **`rel1000`**, by a margin that is not close, which means DeepEyes' own tool
 > is wrong on every call for this backbone; and the start point is
-> **`Qwen/Qwen3-VL-8B-Instruct`**, not the cold start.
+> **`Qwen/Qwen3-VL-8B-Instruct`**, not the cold start. In Prompt 6, the one that bears
+> hardest on whether to run at all: across **all 36,021 tool rows of their released
+> corpus the zoom's downscale is a median 1.000** — every image already fits under
+> Qwen3-VL's 16.8 MP cap, and under the 12.8 MP cap of the `qwen-vl-utils` *they*
+> pinned. **A zoom recovers no pixel the model did not already have, and that was true
+> for them too.** Read it with P1's gate: the headroom is small, and on the training
+> distribution the stated mechanism is not operating.
 
 **Do not port their fork, and do not clone verl.** Their release is frozen on verl
 0.2.0.dev0 / transformers 4.51.3 / vLLM 0.8.2, none of which can load Qwen3-VL. And
@@ -444,6 +450,41 @@ Check and report two things that are easy to get silently wrong:
 
 Send the conversion to `cpu_short` (50 GPU-free nodes, instant) rather than queueing
 behind a GPU allocation.
+
+> ### Measured 2026-11-07 — the zoom has no headroom on their own training corpus
+>
+> Requirement 2 above is satisfied, and it does not help. Measured on **all 36,021 tool
+> rows**, not a sample:
+>
+> | split | downscale median | max | rows at or below 1.0 |
+> |---|---|---|---|
+> | vstar | **1.000** | 1.066 | 12,530 / 22,362 |
+> | chart | **1.000** | 1.042 | 7,070 / 13,659 |
+>
+> Qwen3-VL's cap is 16,384 × 32² = **16.8 MP**; the largest image in the whole corpus is
+> **4.06 MP**. `smart_resize` therefore never shrinks anything here — it only rounds to
+> the 32 px grid, which is the entire 0.975–1.066 spread. **A zoom recovers no pixel the
+> model did not already have.**
+>
+> Three checks rule out this being our doing:
+>
+> 1. The output image bytes hash identical to the release, so nothing in our conversion
+>    capped them.
+> 2. DeepEyes pin `qwen-vl-utils==0.0.11`, whose cap is **12.8 MP** — also far above
+>    4.06 MP. **They trained at downscale ~1.0 too.**
+> 3. The only lever is lowering the *view* (`view_max_tokens`, or the dataloader's
+>    `max_pixels`), which is a deviation from DeepEyes and belongs in the launcher as a
+>    stated decision, not a silent one.
+>
+> This is a claim about the **training** corpus, and it sits oddly against the
+> **evaluation**: HR-Bench 8K images do exceed the cap, so the policy is trained where
+> zooming cannot recover detail and scored where it can. Whatever the method buys on
+> their training distribution, it is not resolution.
+>
+> **P9 must read the tool-call rate against this.** The build doc's Prompt 9 says a rate
+> near 0 means `R_tool` never fires and the run is plain GRPO. On this corpus a low rate
+> may instead be the policy being *correct* — there is nothing to zoom into. The two
+> readings are indistinguishable without this table.
 
 ---
 
