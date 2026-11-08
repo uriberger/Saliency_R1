@@ -4,11 +4,10 @@ Companion to [baseline-port-estimates.md](baseline-port-estimates.md) § *ERGO o
 Qwen3-VL* and to [ergo-build-prompts.md](ergo-build-prompts.md) § *Prompt 1*. This
 is the blocking gate: nothing in P5–P11 starts until it returns a number.
 
-**Status (2026-11-07): the accuracy grid has NOT run. There are no GPUs.** Every
-GPU partition on `oci-nrt-cs-001` reports `TotalNodes=0` and no node anywhere
-advertises a `gpu` GRES, so the 8-GPU job cannot be scheduled from here — see
-[*How to finish it*](#how-to-finish-it). What the gate *can* answer without a GPU,
-it does, and that turns out to be a good deal more than nothing.
+**Status (2026-11-08): RUN, and the verdict is PROCEED — `+18.3` points.** The V\*
+grid is complete for both models; HR-Bench is one unit of six. Measured on
+`cs-oci-ord`, 8×A100-80GB, inside interactive allocation `38208034`. See
+[Result](#result).
 
 ---
 
@@ -209,43 +208,36 @@ categories in runs, and the first 400 rows of each split are 320 `single` to 80
 
 ---
 
-## How to finish it
+## How it was run
 
-The hardware is the only thing missing. `oci-nrt-cs-001` lost every GPU node around
-2026-10-27; each GPU partition still reports `State=UP`, so it will *accept* an
-8-GPU job and park it at `Reason=PartitionConfig` — which reads exactly like
-ordinary queueing and is normally something to poll rather than resubmit. It is not
-queueing. The one-second test:
+`oci-nrt-cs-001` lost every GPU node around 2026-10-27 and still has none; each GPU
+partition there reports `State=UP` with `TotalNodes=0`, so it will *accept* an 8-GPU
+job and park it at `Reason=PartitionConfig` — which reads exactly like ordinary
+queueing and is normally something to poll rather than resubmit. It is not queueing.
+The one-second test, which `launch_ergo_gate_lowres_job.sh` now runs itself before
+submitting:
 
 ```fish
 sinfo -h -N -o "%G" | grep -ci gpu      # 0 means there is no GPU hardware to wait for
 ```
 
-`launch_ergo_gate_lowres_job.sh` now runs that test itself and **refuses to submit**
-rather than queueing into a partition with no nodes.
-
-Run it from `cs-oci-ord-login-01` ([[second-a100-cluster]]), which checks the repo
-out at the same absolute paths. The two clusters do **not** share a filesystem —
+The grid was run instead on **`cs-oci-ord`** ([[second-a100-cluster]]), where that
+same test returns 3601. The two clusters do **not** share a filesystem —
 `$HOME/scratch` is a per-cluster symlink into that cluster's own lustre mount — so
-the branch has to travel through `origin` first. From the central tree here:
+work travels through `origin`. Everything the run needs was already staged there: the
+17 GB cold start, `Qwen/Qwen3-VL-8B-Instruct`, `lmms-lab-encoder/vstar-bench` and
+`DreamMr/HR-Bench` in `HF_HOME`, and both conda envs. Check that before allocating,
+not after — the eval nodes run `HF_HUB_OFFLINE=1` on purpose, so a missing dataset is
+a `ConnectionError` on the first unit rather than a download.
+
+It was driven from an **interactive allocation** rather than `submit_job`, on seven
+of the eight cards (Gate B held the eighth). `--dry-run` prints the exact runner the
+batch path would have used; `outputs/logs/ergo_gate_lowres.interactive.sh` is that
+runner with `--num-gpus 7` and the allocation's real remaining minutes:
 
 ```fish
-git push origin probe/ergo-gate-lowres
+srun --jobid=$JOBID --overlap --ntasks=1 bash outputs/logs/ergo_gate_lowres.interactive.sh
 ```
-
-then there:
-
-```fish
-cd /home/uberger/scratch/research/saliency_r1
-git fetch origin; and git checkout probe/ergo-gate-lowres
-bash launch_ergo_gate_lowres_job.sh --name ergo-gate-lowres \
-    --out-dir outputs/ergo_gate_lowres --gpus 8 --duration 4
-```
-
-Check before launching that the cold start and the three datasets are in that
-cluster's HF cache; if not, the first unit fails on a `ConnectionError` rather than
-downloading, because the eval nodes have no network and `HF_HUB_OFFLINE=1` is
-pinned on purpose.
 
 Then, once it is done:
 
@@ -267,20 +259,72 @@ same command with two substitutions and two in a row is a config fault, not a fl
 
 Order is deliberate: **every V\* arm runs before any HR-Bench arm.** V* is 191
 documents against HR-Bench's 2×300 and it is the benchmark ERGO's Table 1 is quoted
-from, so a short allocation still returns the numbers the gate is decided on.
+from, so a short allocation still returns the numbers the gate is decided on. That
+ordering is what saved this run: the allocation expired with five HR-Bench units
+still owed and the verdict already decided.
 
-Everything else is already verified on CPU: `test_ergo_gate_lowres_cpu.py` is 24
-tests, all passing, and the task configs load through lmms-eval's own YAML
-constructor with all four tasks registering and building documents (V* + GT crop
-correctly emits two images, 2000×1500 and 155×157 on item 0).
+Measured cost, 7×A100-80GB: a V\* unit is **1.5–7.8 min** (the cold start's 4096-token
+cap makes it 2–4× the base model's), an HR-Bench unit is **29 min**. The 4 h the
+launcher asks for is right for 14 units; it is not generous.
+
+Everything else is verified on CPU: `test_ergo_gate_lowres_cpu.py` is 25 tests, all
+passing, and the task configs load through lmms-eval's own YAML constructor with all
+four tasks registering and building documents (V* + GT crop correctly emits two
+images, 2000×1500 and 155×157 on item 0).
 
 ---
 
 ## Result
 
-**Pending.** No accuracy number yet — see above.
+### VERDICT: PROCEED — +18.3 points
 
-What is already settled, and does not depend on the run:
+> `+18.3` points between 16384 and 640 visual tokens on V\*. ERGO's premise holds
+> on this backbone: there is accuracy for a crop to recover.
+
+Measured 2026-11-08 on `cs-oci-ord`, 8×A100-80GB (allocation `38208034`), 9 of 14
+units harvested. Accuracy, %:
+
+| model | benchmark | 640 tok | 1280 tok | 16384 tok | 640 + GT crop | **16384 − 640** |
+|---|---|---|---|---|---|---|
+| base | V* | 68.6 | 78.0 | 84.3 | 93.7 | **+15.7** |
+| base | HR-Bench 4K | — | — | — | n/a | — |
+| base | HR-Bench 8K | — | — | — | n/a | — |
+| coldstart | V* | 61.3 | 72.8 | 79.6 | 94.2 | **+18.3** |
+| coldstart | HR-Bench 4K | 62.0 | — | — | n/a | — |
+| coldstart | HR-Bench 8K | 54.0 | — | — | n/a | — |
+
+Read down each model's own column, not across — the two run under different prompts
+and token caps (see *Design notes*). Both columns clear the ≥ 10 threshold, and they
+agree with each other on the shape, which is the point of having the second one.
+
+**The resolution curve is monotone and steep on both models.** 61.3 → 72.8 → 79.6 on
+the cold start, 68.6 → 78.0 → 84.3 on vanilla Instruct. DeepStack and the backbone's
+`image_zoom_in_tool` post-training — the two specific reasons to expect a flat curve —
+did not flatten it.
+
+**The oracle arm is the stronger result.** At the *same* 640-token budget, handing the
+model the ground-truth crop scores **94.2** against the plain arm's **61.3**: `+32.9`
+points, where spending 25× the visual tokens buys only `+18.3`. A crop is worth
+roughly twice what the tokens are. That is ERGO's premise in one line, and it is the
+number P5–P11 are worth starting for.
+
+It also bounds the method from above. 94.2 is what a *perfect* box gets; ERGO's
+learned box cannot beat it, so the whole arm is competing for the band between 61.3
+and 94.2 on V\*, with the 16384 arm's 79.6 as the resolution-only baseline to beat.
+
+**Caveats that belong with the table:**
+
+- **The "16384-token" arm on V\* is really ~3.3k tokens.** Images are never enlarged
+  to meet a cap and V\*'s photos are 3 MP. It is a native-resolution arm. ERGO's own
+  16384 row has the same property, which is why theirs reads 77.0 and not 95.
+- **HR-Bench is one unit of six**, so it contributes no gap. Cold start at 640
+  tokens: 4K **62.0**, 8K **54.0**, `parse_fail` **0.0%** on both — the replaced
+  scorer read every answer, so the HR-Bench numbers that do arrive will be gradeable.
+- The gap is a between-arm difference on a paired 191-document set, not a
+  significance test. At n=191 a 18.3-point swing is far outside sampling noise; the
+  3-point decision boundary is not, and we did not land near it.
+
+### What is settled independently of the run
 
 - The caps are `N×32×32`, and the 16384 arm on V* is really ~3.3k tokens.
 - `max_pixels` is inert in the chat wrapper; `--force_simple` is mandatory, and
@@ -288,3 +332,31 @@ What is already settled, and does not depend on the run:
 - At 640 tokens the median V* target is 0.65 visual tokens and 58.6% of items are
   sub-token; the GT crop puts 272 tokens on the same region. The axis is physically
   real on this benchmark whatever the accuracy turns out to do.
+
+### A trap this run walked into
+
+`--report` scaled every harvested metric by 100, but lmms-eval's `vstar_overall_acc`
+is **already** a percentage while the gate's own HR-Bench scorer returns a fraction.
+The first real table therefore read `6125.7` for a 61.26 arm and announced a
+**+1832.5-point** gap — and still printed `PROCEED`, because the threshold is
+one-sided and a nonsense gap clears it exactly as well as a real one. The 24 CPU
+tests did not catch it because the fixtures encoded the same assumption (V\* as
+`0.40`). Fixed in `0c75436`: the scale is normalised once in `load_results`, the
+fixtures now use the scale lmms-eval really writes, and a 25th test pins the two
+scorers apart.
+
+### Still owed
+
+Five HR-Bench units — `coldstart` at 1280 and 16384, `base` at all three. Each costs
+**~29 min** on 7×A100 (600 documents: 300 per split × two splits), so ~2.5 h of
+8-GPU time. The gate **resumes**: harvested units are skipped, so this is a rerun of
+the same command, not a restart.
+
+```fish
+cd /home/uberger/scratch/research/saliency_r1
+bash outputs/logs/ergo_gate_lowres.interactive.sh      # inside a fresh allocation
+```
+
+Nothing about the PROCEED verdict is waiting on them — V\* is the benchmark the
+decision rule is written against and the benchmark ERGO's Table 1 is quoted from.
+HR-Bench would add a second, higher-resolution witness to the same curve.
