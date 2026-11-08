@@ -70,10 +70,14 @@ delete_merged_branch() {
     git branch -D "$1"
 }
 
+# awk must read to EOF rather than exit on the match: `main` is the first
+# worktree listed, so an early exit leaves git writing into a closed pipe, and
+# under `set -o pipefail` its SIGPIPE (141) becomes the status of the enclosing
+# assignment -- which `set -e` turns into a silent, output-free abort of `done`.
 worktree_of_branch() {
     git worktree list --porcelain | awk -v b="branch refs/heads/$1" '
         /^worktree /{ p = substr($0, 10) }
-        $0 == b     { print p; exit }'
+        $0 == b && !seen { print p; seen = 1 }'
 }
 
 fetch_origin() {
