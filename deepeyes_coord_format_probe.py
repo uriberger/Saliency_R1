@@ -37,11 +37,13 @@ frame the model actually saw and not this file's idea of it.
 
 TWO ARMS, BECAUSE IoU ALONE CANNOT SEPARATE ALL THREE
 
-Under Qwen3-VL's own processor defaults (`size.longest_edge = 16777216`, i.e. max_pixels
-16.7 MP) a V* photo is not downscaled at all, so `abs_resized` and `abs_orig` coincide to
-within the 32 px rounding and no IoU can tell them apart. Arm B forces a real downscale by
-capping max_pixels, which turns the question into an INVARIANCE test and answers it
-cleanly:
+The same prompt at two image resolutions. Arm A defaults to Qwen3-VL's own processor
+config (`size.longest_edge = 16777216`, i.e. max_pixels 16.7 MP), which is what verl's
+dataloader does -- neither DeepEyes' config nor our fork sets max_pixels anywhere -- and
+which does not downscale a V* photo at all. That makes arm A alone insufficient:
+`abs_resized` and `abs_orig` coincide to within the 32 px rounding and no IoU can tell
+them apart. Arm B caps max_pixels, which turns the question into an INVARIANCE test and
+answers it cleanly:
 
   * if the model emits a 0-1000 relative grid, the raw numbers barely move between arms;
   * if it emits post-resize absolute pixels, they shrink by the resize factor;
@@ -50,6 +52,12 @@ cleanly:
 
 So: arm A says relative-or-absolute (the IoU gap is ~a factor of two in each linear
 dimension, which IoU resolves decisively); arm B says which absolute frame.
+
+`--arm-a-max-pixels` exists for one reason and should be read as a compromise wherever it
+is non-zero: an 8B forward at V*'s native resolution costs minutes on a CPU, and when
+this was first run `oci-nrt-cs-001` had no GPU hardware at all. Capping BOTH arms keeps
+all three readings separable -- the two caps differ, so the resized frame differs -- but
+it no longer reproduces the resolution verl will actually train at. Say which was used.
 
 THE FORMAT QUESTION, AND THE TRAP IN IT
 
@@ -398,6 +406,23 @@ def tag_structure_ok(text):
 # --------------------------------------------------------------------------------------
 # Corpus
 # --------------------------------------------------------------------------------------
+def subsample(rows, n):
+    """At most `n` rows, EVENLY SPACED -- never the first n.
+
+    Two reasons it is not a head slice. V*'s two splits are concatenated, so the first 115
+    rows are all `direct_attributes` and a head slice silently drops `relative_position`
+    (whose GT is two boxes, and whose questions are the ones a zoom helps least). And arm
+    B runs on fewer rows than arm A, so the arm-to-arm invariance comparison is only
+    honest if arm B's rows are a SUBSET of arm A's. An integer stride gives that exactly
+    whenever one N is a multiple of the other; a float stride or a random sample does
+    not. The cost is that N is a ceiling, not a target: `--n 100` of 191 returns 96.
+    """
+    if not n or n >= len(rows):
+        return rows
+    step = max(1, round(len(rows) / float(n)))
+    return rows[::step][:n]
+
+
 def load_vstar(root: Path):
     """V* rows, exactly as `eval/eval_vstar.py` builds them, plus the GT boxes.
 
@@ -430,14 +455,36 @@ def load_vstar(root: Path):
 # --------------------------------------------------------------------------------------
 # Generation
 # --------------------------------------------------------------------------------------
-def _assert_arm_b_downscales(processor, image_path, proc_kw, patch, tag, min_ratio=1.2):
-    """Arm B must actually make the picture smaller, or it is arm A run twice.
+def arm_proc_kwargs(processor, arm, args):
+    """The processor keywords for one arm, from its own max_pixels cap.
 
-    The gate exists because the first attempt at this override passed `max_pixels` alone
-    and changed nothing: the grid came back identical and the "measurement" would have
-    reported two frames that are the same frame. Nothing in the output would have looked
-    wrong -- `abs_orig` and `abs_resized` would simply have tied, which is also what a
-    genuine result looks like under arm A.
+    0 means "the processor's own config", which on Qwen3-VL is max_pixels 16.7 MP, i.e.
+    no downscale on any V* photo. That is the right arm A when a GPU is available: it is
+    what verl's dataloader does, since neither the DeepEyes config nor our fork sets
+    max_pixels anywhere.
+
+    BOTH bounds are passed, and that is not optional. The fast image processor's
+    `_preprocess` only honours them under `if min_pixels is not None and max_pixels is
+    not None` -- pass `max_pixels` alone and the override is a SILENT NO-OP that leaves
+    the arms identical. That is what the first version of this did.
+    """
+    cap = args.arm_a_max_pixels if arm == "A" else args.arm_b_max_pixels
+    if not cap:
+        return {}
+    size = getattr(processor.image_processor, "size", None)
+    min_px = int(getattr(size, "shortest_edge", None) or size["shortest_edge"])
+    return {"min_pixels": min_px, "max_pixels": int(cap)}
+
+
+def _assert_arms_differ(processor, image_path, kw_a, kw_b, patch, tag, min_ratio=1.2):
+    """The two arms must see the picture at measurably different sizes.
+
+    Arm B is the ONLY thing that separates `abs_orig` from `abs_resized`, and it does
+    that by making the post-resize frame differ from arm A's. If the two caps resolve to
+    the same grid, the probe still runs, still prints a table, and still reports a tie
+    between those two readings -- which is also what a genuine arm-A result looks like.
+    So it is a hard stop, not a warning, and it is checked in BOTH arms' logs so either
+    one is sufficient evidence after the fact.
     """
     from PIL import Image
 
@@ -445,21 +492,22 @@ def _assert_arm_b_downscales(processor, image_path, proc_kw, patch, tag, min_rat
     text = ("<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>x<|im_end|>\n"
             "<|im_start|>assistant\n")
 
-    def grid(**kw):
+    def grid(kw):
         got = processor(text=[text], images=[img], return_tensors="pt",
                         add_special_tokens=False, **kw)
         return tuple(int(v) for v in got["image_grid_thw"][0][1:])
 
-    a_h, a_w = grid()
-    b_h, b_w = grid(**proc_kw)
+    a_h, a_w = grid(kw_a)
+    b_h, b_w = grid(kw_b)
     ratio = a_w / b_w if b_w else 0.0
-    print(f"[{tag}] arm-B gate: {img.size} -> arm A {(a_h * patch, a_w * patch)} "
-          f"vs arm B {(b_h * patch, b_w * patch)}  ({ratio:.3f}x linear)", flush=True)
+    print(f"[{tag}] arm gate: original {img.size} -> arm A {(a_h * patch, a_w * patch)} "
+          f"({a_h * a_w // 4} vision tokens) vs arm B {(b_h * patch, b_w * patch)} "
+          f"({b_h * b_w // 4} tokens)  ({ratio:.3f}x linear)", flush=True)
     if ratio < min_ratio:
         raise SystemExit(
-            f"deepeyes_coord_format_probe: arm B is not downscaling ({ratio:.3f}x < "
-            f"{min_ratio}). The processor is ignoring {proc_kw}, so arm B would be arm A "
-            "under a different name and the two absolute readings could never separate.")
+            f"deepeyes_coord_format_probe: the two arms resolve to the same frame "
+            f"({ratio:.3f}x < {min_ratio}), so abs_orig and abs_resized can never "
+            f"separate. kw_a={kw_a} kw_b={kw_b}")
 
 
 def run_generate(args):
@@ -480,9 +528,7 @@ def run_generate(args):
             except Exception:
                 pass
 
-    rows = load_vstar(VSTAR_ROOT)
-    if args.n:
-        rows = rows[: args.n]
+    rows = subsample(load_vstar(VSTAR_ROOT), args.n)
     rows = [r for i, r in enumerate(rows) if i % args.num_shards == args.shard]
     todo = [r for r in rows if r["uid"] not in done]
     print(f"[{tag}] {len(todo)} of {len(rows)} rows to do "
@@ -496,23 +542,14 @@ def run_generate(args):
         args.model, torch_dtype=torch.bfloat16, trust_remote_code=True,
         attn_implementation="sdpa").to(device).eval()
 
-    size = getattr(processor.image_processor, "size", None)
-    min_px = int(getattr(size, "shortest_edge", None) or size["shortest_edge"])
-    proc_kw = {}
-    if args.arm == "B":
-        # BOTH bounds, and this is not optional. The fast image processor's
-        # `_preprocess` only honours them under `if min_pixels is not None and
-        # max_pixels is not None` -- pass max_pixels alone and the override is a SILENT
-        # NO-OP that leaves arm B identical to arm A. Measured, not assumed:
-        # `_assert_arm_b_downscales` below refuses to run if it ever stops working.
-        proc_kw["min_pixels"] = min_px
-        proc_kw["max_pixels"] = args.arm_b_max_pixels
+    kw_a = arm_proc_kwargs(processor, "A", args)
+    kw_b = arm_proc_kwargs(processor, "B", args)
+    proc_kw = kw_a if args.arm == "A" else kw_b
     print(f"[{tag}] arm {args.arm}  proc_kw={proc_kw or '{}'}  "
-          f"default size={size}", flush=True)
+          f"default size={getattr(processor.image_processor, 'size', None)}", flush=True)
 
     patch = int(getattr(processor.image_processor, "patch_size", 16))
-    if args.arm == "B":
-        _assert_arm_b_downscales(processor, todo[0]["image_path"], proc_kw, patch, tag)
+    _assert_arms_differ(processor, todo[0]["image_path"], kw_a, kw_b, patch, tag)
     t0 = time.time()
     with sink.open("a") as fh:
         for i, row in enumerate(todo):
@@ -558,13 +595,19 @@ def run_generate(args):
                 "W": W, "H": H, "rW": rW, "rH": rH,
                 "n_prompt_tokens": int(inputs["input_ids"].shape[1]),
                 "n_completion_tokens": int(comp.shape[0]),
+                "max_new_tokens": args.max_new_tokens,
+                "proc_max_pixels": int(proc_kw.get("max_pixels", 0)),
                 "completion": completion,
             })
             fh.write(json.dumps(rec) + "\n")
             fh.flush()
-            if (i + 1) % 10 == 0:
-                el = time.time() - t0
-                print(f"[{tag}] {i + 1}/{len(todo)}  {el / (i + 1):.1f}s/row", flush=True)
+            # Every row, not every tenth. On a CPU a row is minutes, so a log that only
+            # speaks every ten of them cannot tell "slow" from "hung" until it is too
+            # late to re-size the job.
+            el = time.time() - t0
+            print(f"[{tag}] {i + 1}/{len(todo)}  {el / (i + 1):.1f}s/row  "
+                  f"prompt={rec['n_prompt_tokens']} out={rec['n_completion_tokens']}",
+                  flush=True)
     print(f"[{tag}] done in {(time.time() - t0) / 60:.1f} min -> {sink}", flush=True)
 
 
@@ -594,6 +637,14 @@ def score_record(rec):
         "has_think": text.count("<think>") == 1 and text.count("</think>") == 1,
         "has_answer_tags": "<answer>" in text and "</answer>" in text,
         "n_completion_tokens": rec.get("n_completion_tokens"),
+        "proc_max_pixels": rec.get("proc_max_pixels", 0),
+        # A completion cut off at the token budget cannot close its tags, so it reads as
+        # a format failure that is OURS, not the model's. Flagged rather than dropped:
+        # the rate is itself a number Prompt 9 needs (their config allows 20,480 response
+        # tokens, so a model that truncates here will not truncate there), and the report
+        # gives the format rate over the untruncated subset alongside the raw one.
+        "truncated": bool(rec.get("max_new_tokens")
+                          and rec.get("n_completion_tokens", 0) >= rec["max_new_tokens"]),
         "raw_bbox": box,
         "readings": {},
     }
@@ -631,9 +682,16 @@ def summarise(scored):
     """One (model, arm) cell of the report."""
     n = len(scored)
     boxed = [s for s in scored if s["tool_call_ok"]]
+    whole = [s for s in scored if not s["truncated"]]
     cell = {
         "n": n,
         "format_ok_deepeyes": _mean([s["format_ok_deepeyes"] for s in scored]),
+        # The same number over the completions that were allowed to finish. The honest
+        # one to quote when the token budget was tight, and the one to compare against a
+        # run whose budget was not.
+        "format_ok_untruncated": _mean([s["format_ok_deepeyes"] for s in whole]),
+        "n_untruncated": len(whole),
+        "truncated_rate": _mean([s["truncated"] for s in scored]),
         "tag_structure_ok": _mean([s["tag_structure_ok"] for s in scored]),
         "tool_call_rate": _mean([s["tool_call_ok"] for s in scored]),
         "loose_bbox_only_rate": _mean([s["loose_bbox_only"] for s in scored]),
@@ -641,6 +699,8 @@ def summarise(scored):
         "has_answer_tags_rate": _mean([s["has_answer_tags"] for s in scored]),
         "median_completion_tokens": _median(
             [s["n_completion_tokens"] for s in scored if s["n_completion_tokens"]]),
+        "proc_max_pixels": scored[0].get("proc_max_pixels", 0) if scored else 0,
+        "median_vision_tokens": _median([s["rW"] * s["rH"] / 1024.0 for s in scored]),
         "n_boxes": len(boxed),
         "readings": {},
     }
@@ -705,16 +765,21 @@ def run_report(args):
 
     print("\nFORMAT, under DeepEyes' own prompt (first assistant turn, "
           f"temperature {args.temperature})")
-    print(f"  {'model / arm':<34} {'R_format ok':>12} {'tag struct':>11} "
-          f"{'tool call':>10} {'<think>':>8} {'<answer>':>9}")
+    print(f"  {'model / arm':<28} {'R_format ok':>12} {'(untrunc)':>10} {'tag struct':>11} "
+          f"{'tool call':>10} {'<think>':>8} {'<answer>':>9} {'trunc':>7} {'med tok':>8}")
     for m, a in keys:
         c = summary[f"{m}|{a}"]
-        print(f"  {m + ' / arm ' + a:<34} {c['format_ok_deepeyes']:>11.1%} "
+        print(f"  {m + ' / arm ' + a:<28} {c['format_ok_deepeyes']:>11.1%} "
+              f"{c['format_ok_untruncated']:>9.1%} "
               f"{c['tag_structure_ok']:>10.1%} {c['tool_call_rate']:>9.1%} "
-              f"{c['has_think_rate']:>7.1%} {c['has_answer_tags_rate']:>8.1%}")
+              f"{c['has_think_rate']:>7.1%} {c['has_answer_tags_rate']:>8.1%} "
+              f"{c['truncated_rate']:>6.1%} {c['median_completion_tokens']:>8.0f}")
     print("\n  R_format ok  = their literal rule: counts balance. A completion with NO")
     print("                 tags passes it -- and never zooms. Read it next to the two")
     print("                 columns on its right, never alone.")
+    print("  (untrunc)    = the same, over completions that were not cut off at the")
+    print("                 token budget. A truncated chain cannot close its tags, so")
+    print("                 that failure is the budget's, not the model's.")
     print("  tool call    = a parseable <tool_call> with four numbers. This, not the")
     print("                 format column, is what gates R_tool.")
 
@@ -724,8 +789,10 @@ def run_report(args):
         if not c["readings"]:
             print(f"\n  {m} / arm {a}: no boxes emitted; nothing to score.")
             continue
-        print(f"\n  {m} / arm {a}   ({c['n_boxes']} boxes, "
-              f"median resized/original width = {c['median_rW_over_W']:.3f}, "
+        print(f"\n  {m} / arm {a}   ({c['n_boxes']} boxes, max_pixels="
+              f"{c['proc_max_pixels'] or 'processor default'}, "
+              f"median {c['median_vision_tokens']:.0f} vision tokens, "
+              f"resized/original width = {c['median_rW_over_W']:.3f}, "
               f"median raw max coord = {c['median_raw_max']:.0f})")
         print(f"    {'reading':<13} {'mean IoU':>9} {'med IoU':>8} {'IoU>=.5':>8} "
               f"{'covers GT':>10} {'off-image':>10} {'med area':>9}")
@@ -771,12 +838,18 @@ def main():
     ap.add_argument("--model-tag", default=None,
                     help="short name for the tables; defaults to the model dir's name")
     ap.add_argument("--arm", default="A", choices=("A", "B"),
-                    help="A = the processor's own caps; B = max_pixels forced down, "
-                         "which is what separates abs_orig from abs_resized")
+                    help="two image resolutions of the same prompt; the pair is what "
+                         "separates abs_orig from abs_resized")
+    ap.add_argument("--arm-a-max-pixels", type=int, default=0,
+                    help="0 = the processor's own config (16.7 MP on Qwen3-VL, so no "
+                         "downscale on a V* photo), which is what verl's dataloader "
+                         "does. Set it only to make the probe affordable on a CPU.")
     ap.add_argument("--arm-b-max-pixels", type=int, default=ARM_B_MAX_PIXELS)
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
-    ap.add_argument("--n", type=int, default=0, help="first N corpus rows (0 = all)")
+    ap.add_argument("--n", type=int, default=0,
+                    help="at most N corpus rows, evenly spaced (0 = all 191). Arm B's N "
+                         "must divide into arm A's row set, so use the same stride.")
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=1.0,
                     help="1.0 matches what GRPO rolls out at; 0 is greedy and "

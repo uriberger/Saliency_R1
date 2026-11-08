@@ -143,9 +143,11 @@ check("with no downscale, abs_orig and abs_resized are the SAME reading",
 # --------------------------------------------------------------------------------------
 print("\n5. the readings are separable -- the test the headline rests on")
 # --------------------------------------------------------------------------------------
-def rec(completion, W=2000, H=1000, rW=1000, rH=500, gt=((900, 400, 1100, 600),)):
+def rec(completion, W=2000, H=1000, rW=1000, rH=500, gt=((900, 400, 1100, 600),),
+        n_tok=42, budget=320):
     return {"uid": "t/0", "split": "direct_attributes", "model": "m", "arm": "B",
-            "W": W, "H": H, "rW": rW, "rH": rH, "n_completion_tokens": 42,
+            "W": W, "H": H, "rW": rW, "rH": rH, "n_completion_tokens": n_tok,
+            "max_new_tokens": budget, "proc_max_pixels": 327680,
             "gt_boxes": [list(g) for g in gt], "completion": completion}
 
 
@@ -183,7 +185,25 @@ check("and it is never scored for IoU", s["readings"] == {})
 
 
 # --------------------------------------------------------------------------------------
-print("\n7. the summary cell")
+print("\n7. truncation is OUR failure, not the model's, and is reported apart")
+# --------------------------------------------------------------------------------------
+cut = rec("<think>I was still thinking when the budget ran", n_tok=320, budget=320)
+check("a completion at the budget is flagged truncated",
+      P.score_record(cut)["truncated"] is True)
+check("... and their rule scores it a format error (unbalanced <think>)",
+      P.score_record(cut)["format_ok_deepeyes"] is False)
+check("one under the budget is not flagged",
+      P.score_record(rec("<think>a</think><answer>b</answer>", n_tok=319,
+                         budget=320))["truncated"] is False)
+cell = P.summarise([P.score_record(r) for r in [
+    cut, rec("<think>a</think><answer>b</answer>", n_tok=50, budget=320)]])
+check("truncated_rate", close(cell["truncated_rate"], 0.5))
+check("format_ok over everything", close(cell["format_ok_deepeyes"], 0.5))
+check("format_ok over the ones that finished", close(cell["format_ok_untruncated"], 1.0))
+
+
+# --------------------------------------------------------------------------------------
+print("\n8. the summary cell")
 # --------------------------------------------------------------------------------------
 cell = P.summarise([P.score_record(r) for r in [
     rec(call([450, 400, 550, 600])),
@@ -197,10 +217,11 @@ check("their rule passes all three, including the one with no protocol",
       close(cell["format_ok_deepeyes"], 1.0))
 check("tag_structure_ok passes two", close(cell["tag_structure_ok"], 2 / 3))
 check("the winning reading's mean IoU", close(cell["readings"]["rel1000"]["mean_iou"], 1.0))
+check("the cell records the arm's pixel cap", cell["proc_max_pixels"] == 327680)
 
 
 # --------------------------------------------------------------------------------------
-print("\n8. the prompt is theirs, faults included")
+print("\n9. the prompt is theirs, faults included")
 # --------------------------------------------------------------------------------------
 check("their trailing double-space survives", "**Example**:  \n" in P.SYSTEM_PROMPT)
 check("their `required: [bbox]` typo survives (the parameter is bbox_2d)",
