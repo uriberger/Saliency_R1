@@ -268,11 +268,12 @@ def load_zoom_tool_config():
     image, so a conversion that assigns both from one already-processed variable cannot
     pass. Hand-rolling the dict is the specific mistake it exists to make impossible.
 
-    THE FALLBACK IS TEMPORARY. `deepeyes/zoom_tool_config.py` is on branch
-    `feat/deepeyes-zoom-tool`, which is not merged yet, so this also looks in that
-    worktree. Once P3 lands on `main` the plain import succeeds and the second branch
-    can be deleted -- if it ever starts being the one that fires in a real run, that is
-    a sign the branches were merged in the wrong order, not something to work around.
+    `deepeyes/zoom_tool_config.py` is on `main` as of 2026-11-08. This used to carry a
+    fallback that also searched the unmerged `feat/deepeyes-zoom-tool` worktree; it was
+    removed when that branch landed. If the import below starts failing, the fix is to
+    restore the module, never to re-add a search path -- a conversion that silently
+    found some other copy of `build_create_kwargs` is exactly the failure this helper
+    exists to prevent.
     """
     try:
         from deepeyes.zoom_tool_config import build_create_kwargs, smart_resize_wh  # noqa: F401
@@ -283,25 +284,15 @@ def load_zoom_tool_config():
 
     import importlib.util
 
-    for cand in (
-        REPO / "deepeyes" / "zoom_tool_config.py",
-        REPO.parent.parent / ".worktrees" / "feat-deepeyes-zoom-tool" / "deepeyes" / "zoom_tool_config.py",
-        REPO / ".worktrees" / "feat-deepeyes-zoom-tool" / "deepeyes" / "zoom_tool_config.py",
-    ):
-        if cand.exists():
-            if cand != REPO / "deepeyes" / "zoom_tool_config.py":
-                print(f"NOTE: deepeyes.zoom_tool_config taken from the unmerged P3 worktree\n"
-                      f"      {cand}\n"
-                      f"      This path disappears when feat/deepeyes-zoom-tool lands on main.",
-                      flush=True)
-            spec = importlib.util.spec_from_file_location("deepeyes_zoom_tool_config", cand)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            return mod
+    cand = REPO / "deepeyes" / "zoom_tool_config.py"
+    if cand.exists():
+        spec = importlib.util.spec_from_file_location("deepeyes_zoom_tool_config", cand)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
     raise SystemExit(
-        "cannot find deepeyes/zoom_tool_config.py. It is P3's "
-        "(branch feat/deepeyes-zoom-tool) and owns build_create_kwargs, which is the "
-        "only supported way to produce create_kwargs.original_size / view_size."
+        f"cannot find {cand}. It owns build_create_kwargs, which is the only supported "
+        "way to produce create_kwargs.original_size / view_size."
     )
 
 #: Qwen3-VL geometry: patch 16, spatial merge 2 -> one visual token per 32x32 px.
