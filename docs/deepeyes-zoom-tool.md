@@ -330,7 +330,7 @@ resized copy.
 
 ### Integration, through the real `ToolAgentLoop`, on `cpu_short`
 
-Job **7742599**, 4 rollouts of geo3k, wrapping P2's `deepeyes_agentloop_cpu.py`:
+Job **7742614**, 4 rollouts of geo3k, wrapping P2's `deepeyes_agentloop_cpu.py`:
 
 ```
 48/48 unit checks
@@ -339,11 +339,19 @@ A2 PASS  0.610 of the response masked; 4 vision spans, 0 leaking
 A3 PASS  2 grid rows per row, image_pad count == grid token count on 4/4
 A4 PASS  4 tool calls under frame rel1000, all ok
 A5 PASS  the tool held the RAW parquet image, not the one the model saw
+     tool held       [(207,182), (250,258), (263,280), (353,310)]
+     raw images[0]   [(206,215), (207,182), ..., (543,250)]   <- all four are in here
+     model was shown [(192,192), (256,256), (256,288), (352,320)]
+     verify_zoom_corpus: ok=True downscale={min 0.952, median 0.999, max 1.016}
+     WARNING 9/16 rows have the original no bigger than the view.
 ```
 
-Worth reading off the log: geo3k's images are 250×258 and the view is 256×256, so the
-"zoom" **upscales** — `downscale` 0.99. geo3k is a stack proof, not a zoom corpus, and
-`min_expected_downscale` would reject it. That is the knob working.
+Two things worth reading off that. The four sizes the tool held are raw sizes from the
+parquet and **none of them is a size the model was shown** — §3.1, demonstrated rather
+than argued. And geo3k's median downscale is 0.999: on 9 of 16 rows the "zoom"
+*upscales*. geo3k is a stack proof, not a zoom corpus; `min_expected_downscale` would
+reject it outright and the corpus warning fires without being asked. That is the knob
+working, and it is exactly the check P6 needs to run on the real 47k.
 
 ---
 

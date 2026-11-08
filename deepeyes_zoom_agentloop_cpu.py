@@ -210,17 +210,19 @@ def main() -> int:
     # tools_kwargs. Decode the raw `images` column here, independently, and check the
     # sizes the tool logged are those -- if RLHFDataset had somehow handed over the
     # `process_image` copy instead, they would be the view's sizes.
-    import io as _io
-
     import datasets
-    from PIL import Image
+
+    # The tool's own decoder, not a copy of it -- and not an assumption about how the
+    # `images` column round-trips. A parquet written from a datasets.Dataset that had
+    # an Image feature decodes back to PIL; one written from plain dicts decodes to
+    # {"bytes": ...}. load_image_unresized takes either, which is why it exists.
+    from verl.tools.image_zoom_in_tool import load_image_unresized
 
     from deepeyes.zoom_tool_config import verify_zoom_corpus
 
     ds_check = datasets.load_dataset("parquet", data_files=str(data), split="train")
     raw_sizes = {
-        Image.open(_io.BytesIO(ds_check[i]["images"][0]["bytes"])).size
-        for i in range(min(len(ds_check), 64))
+        load_image_unresized(ds_check[i]["images"][0]).size for i in range(min(len(ds_check), 64))
     }
     logged_sizes = {tuple(r["original_size"]) for r in records}
     view_sizes = {tuple(r["view_size"]) for r in records}
