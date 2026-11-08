@@ -273,6 +273,23 @@ def test_judge_failure():
     check("an empty completion is 0.0 with no judge call spent on it",
           r["acc"] == 0.0 and not called and r["acc_source"] == float(DR.ACC_EMPTY))
 
+    # A gateway that is down for the WHOLE run is the failure that looks like success:
+    # every sample silently graded by the substring rule, reward curve intact. The
+    # per-sample metrics are the instrument; the alarm is what shouts in the log.
+    saved = dict(DR._alarm)
+    try:
+        DR._alarm.update({"n": 0, "degraded": 0, "fired": 0})
+        for _ in range(DR._ALARM_WINDOW):
+            DR.compute_score("vstar", CLEAN, "red", ei(2), judge_fn=judge_const(None))
+        check("a run-long judge outage trips the degraded-grading alarm",
+              DR._alarm["fired"] == 1, f"fired {DR._alarm['fired']}x")
+        DR._alarm.update({"n": 0, "degraded": 0, "fired": 0})
+        for _ in range(DR._ALARM_WINDOW):
+            DR.compute_score("vstar", CLEAN, "red", ei(2), judge_fn=judge_const(1.0))
+        check("a healthy judge does not trip it", DR._alarm["fired"] == 0)
+    finally:
+        DR._alarm.update(saved)
+
     # and the whole thing must never raise into the training step.
     r = DR.compute_score("vstar", CLEAN, "red", ei(4),
                          judge_fn=lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
@@ -498,9 +515,118 @@ def test_wiring():
     print(f"  {'PASS' if have_verl else 'SKIP'}  the 'deepeyes' reward manager "
           f"{'registered' if have_verl else 'needs verl+torch (run in the deepeyes env)'}")
     if have_verl:
+        from omegaconf import OmegaConf
+        from verl.trainer.ppo.reward import load_reward_manager
         from verl.workers.reward_manager import get_reward_manager_cls
         check("get_reward_manager_cls('deepeyes') resolves",
               get_reward_manager_cls("deepeyes") is DR.DeepEyesRewardManager)
+
+        # The claim being checked is the WHOLE wiring story: verl loads this file by
+        # path as `custom_module` (a second module object, since this test already
+        # imported it as deepeyes.rewards) and the manager name still resolves. If the
+        # idempotent-registration guard were missing, this raises
+        # "Reward manager deepeyes has already been registered".
+        cfg = OmegaConf.create({
+            "custom_reward_function": {"path": os.path.join(ROOT, "deepeyes", "rewards.py"),
+                                       "name": "compute_score", "reward_kwargs": {}},
+            "reward_model": {"reward_manager": "deepeyes", "sandbox_fusion": None},
+            "data": {"reward_fn_key": "data_source"}})
+
+        class _Tok:
+            def decode(self, ids, skip_special_tokens=False):
+                return ""
+
+        mgr = load_reward_manager(cfg, _Tok(), num_examine=0)
+        check("load_reward_manager builds it from custom_reward_function.path alone",
+              isinstance(mgr, DR.DeepEyesRewardManager))
+        check("a double load (direct import + verl's custom_module) does not raise",
+              sys.modules["custom_module"].__file__.endswith("deepeyes/rewards.py"))
+
+
+def test_manager():
+    """The manager is what the run executes, so register-only is not enough proof."""
+    print("\nmanager -- the registered 'deepeyes' manager against a real DataProto")
+    if DR.DeepEyesRewardManager is None:
+        print("  SKIP  needs verl+torch; run this file with the `deepeyes` env's python")
+        return
+    import numpy as np
+    import torch
+    from verl import DataProto
+
+    texts = [zoomed_completion(1), CLEAN, "<think> t </think> <answer> blue </answer>"]
+    turns = [4, 2, 4]
+    lens = [5, 4, 3]            # distinct, so the reward's POSITION is checked too
+
+    class Tok:
+        """Row index smuggled in token 0; the manager's only use of it is decode()."""
+        def decode(self, ids, skip_special_tokens=False):
+            i = int(ids[0])
+            if i >= len(texts):                 # the prompt side
+                return "prompt"
+            t = texts[i]
+            return t.replace(OBS, "") if skip_special_tokens else t
+
+    n, rlen = len(texts), 8
+    resp = torch.zeros(n, rlen, dtype=torch.long)
+    attn = torch.zeros(n, 3 + rlen, dtype=torch.long)
+    attn[:, :3] = 1
+    for i in range(n):
+        resp[i, 0] = i
+        attn[i, 3:3 + lens[i]] = 1
+    data = DataProto.from_dict(
+        tensors={"prompts": torch.full((n, 3), 9, dtype=torch.long),
+                 "responses": resp, "attention_mask": attn},
+        non_tensors={
+            "data_source": np.array(["vstar"] * n, dtype=object),
+            "reward_model": np.array([{"ground_truth": "red"}] * n, dtype=object),
+            "extra_info": np.array([{"question": EI["question"]}] * n, dtype=object),
+            "__num_turns__": np.array(turns, dtype=np.int32)})
+
+    saved = DR.judge_binary
+    DR.judge_binary = lambda q, g, a: 1.0 if str(a).strip().lower() == str(g).lower() else 0.0
+    try:
+        mgr = DR.DeepEyesRewardManager(tokenizer=Tok(), num_examine=0)
+        out = mgr(data, return_dict=True)
+    finally:
+        DR.judge_binary = saved
+
+    rt, extra = out["reward_tensor"], out["reward_extra_info"]
+    got = [rt[i, lens[i] - 1].item() for i in range(n)]
+    check("zoom+right=2.0, noZoom+right=0.8, zoom+wrong=0.0 straight off the manager",
+          all(abs(a - b) < 1e-6 for a, b in zip(got, [2.0, 0.8, 0.0])), f"{got}")
+    check("the reward sits on the LAST VALID response token of each row",
+          all(abs(rt[i].sum().item() - got[i]) < 1e-6 for i in range(n)))
+    check("it pulls the zoom from __num_turns__, not from the response text",
+          extra["zoomed"] == [1.0, 0.0, 1.0] and extra["turns_missing"] == [0.0] * n)
+    check("every extra key has exactly one entry per sample (np.array()d onto the batch)",
+          all(len(v) == n for v in extra.values()) and set(extra) == set(DR.SCORE_SCHEMA))
+    # The manager decodes WITHOUT skipping special tokens, which is DeepEyes' own
+    # naive.py:71 and what keeps their vision-balance clause live.
+    check("the manager's decode keeps the vision tokens (their format clause stays live)",
+          extra["answer_len"][0] == float(len("red")))
+
+
+def test_live_judge():
+    """OPT-IN. The one thing a mock cannot prove: that the gateway answers us.
+
+        python test_deepeyes_rewards_cpu.py --live-judge
+
+    Two calls, a few cents. Run it once before a training job rather than finding out
+    from a step whose judge_fallback is 1.0. It is NOT part of the default suite --
+    a reward test that needs a key and a network is a reward test nobody runs.
+    """
+    print("\nlive -- one real call to the NVIDIA gateway (opt-in)")
+    if not (os.environ.get("NVIDIA_API_KEY") or os.environ.get("OPENAI_API_KEY")):
+        print("  SKIP  no NVIDIA_API_KEY / OPENAI_API_KEY in the environment")
+        return
+    print(f"  model={os.environ.get('JUDGE_MODEL', 'azure/openai/gpt-4o-mini')} "
+          f"base={os.environ.get('OPENAI_BASE_URL', 'https://inference-api.nvidia.com')}")
+    yes = DR.judge_binary("What colour is the fire hydrant?", "red", "It is red.")
+    no = DR.judge_binary("What colour is the fire hydrant?", "red", "It is blue.")
+    check("the gateway grades a correct answer 1.0", yes == 1.0, f"got {yes}")
+    check("the gateway grades a wrong answer 0.0", no == 0.0, f"got {no}")
+    check("neither came back None (a None here means tier 2 carries the whole run)",
+          yes is not None and no is not None)
 
 
 if __name__ == "__main__":
@@ -515,7 +641,10 @@ if __name__ == "__main__":
     test_reasoning_route()
     test_batch()
     test_wiring()
+    test_manager()
     test_against_original()
+    if "--live-judge" in sys.argv:
+        test_live_judge()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: " + "; ".join(FAILURES))

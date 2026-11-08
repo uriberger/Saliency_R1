@@ -596,6 +596,43 @@ SCORE_SCHEMA: dict = {
 }
 
 
+#: THE ALARM. Tier 2 is a safety net, and a safety net that holds the whole run is a
+#: failure wearing a success's clothes: if the env vars never reached the ray actor,
+#: every sample 401s, every sample falls through to the offline grader, and the run
+#: completes with a plausible-looking reward curve graded by a substring match. The
+#: per-sample `judge_fallback` metric is the real instrument; this is the thing that
+#: shouts in the log so nobody has to be watching the right chart. Window, not total,
+#: so a bad patch late in a run still trips it.
+_ALARM_WINDOW = 256
+_ALARM_FRACTION = 0.5
+_alarm = {"n": 0, "degraded": 0, "fired": 0}
+_alarm_lock = threading.Lock()
+
+
+def _note_acc_source(source: int) -> None:
+    with _alarm_lock:
+        _alarm["n"] += 1
+        if source in (ACC_FALLBACK, ACC_UNKNOWN):
+            _alarm["degraded"] += 1
+        if _alarm["n"] < _ALARM_WINDOW:
+            return
+        frac, fired = _alarm["degraded"] / _alarm["n"], _alarm["fired"]
+        _alarm["n"] = _alarm["degraded"] = 0
+        if frac <= _ALARM_FRACTION:
+            return
+        _alarm["fired"] = fired + 1
+    print("\n" + "=" * 78 + "\n"
+          f"[deepeyes-reward] ALARM: {frac:.0%} of the last {_ALARM_WINDOW} samples "
+          "were NOT graded by the judge.\n"
+          "  R_acc is coming from the offline string grader, which is weaker and will\n"
+          "  quietly change what this arm optimises. Almost always this is the gateway:\n"
+          "    - NVIDIA_API_KEY / OPENAI_BASE_URL / JUDGE_MODEL did not reach the ray\n"
+          "      actor (runtime_env env_vars, not just the submitting shell), or\n"
+          "    - the gateway is down / rate-limiting.\n"
+          f"  Watch judge_fallback and judge_failed in the step metrics. (alarm #{fired + 1})\n"
+          + "=" * 78 + "\n", flush=True)
+
+
 def finalize(p: Pending, judged: Optional[float]) -> dict:
     """The composite, plus everything worth logging. `judged` is tier 1's verdict."""
     acc, source = p.acc, p.acc_source
@@ -613,6 +650,7 @@ def finalize(p: Pending, judged: Optional[float]) -> dict:
                       "flagging judge_failed=1; R_tool cannot pay out on it.",
                       flush=True)
 
+    _note_acc_source(source)
     fmt = FORMAT_PENALTY if p.format_error else 0.0
     if p.route == ROUTE_MATH:
         tool = 0.0
@@ -755,15 +793,21 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos=
 # file -- before :148 resolves config.reward_model.reward_manager. If that order ever
 # changes, the failure is a loud `ValueError: Unknown reward manager: deepeyes` at
 # startup rather than a silent wrong number, which is the right way round.
+#
+# The registration is also made IDEMPOTENT. verl loads this file under the module name
+# `custom_module`; anything else that imports it (a probe, a test, an eval script) gets
+# a SECOND module object with a second, identical class, and `register` raises
+# `ValueError: Reward manager deepeyes has already been registered` on a difference it
+# does not care about. Re-use the registry's entry instead, so load order cannot
+# decide whether a training job starts.
 try:
     import torch
     from collections import defaultdict as _defaultdict
 
     from verl import DataProto
-    from verl.workers.reward_manager import register as _register
     from verl.workers.reward_manager.abstract import AbstractRewardManager
+    from verl.workers.reward_manager.registry import REWARD_MANAGER_REGISTRY, register as _register
 
-    @_register("deepeyes")
     class DeepEyesRewardManager(AbstractRewardManager):
         """NaiveRewardManager's contract, with the judge calls pooled.
 
@@ -837,6 +881,12 @@ try:
             if return_dict:
                 return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
             return reward_tensor
+
+    _already = REWARD_MANAGER_REGISTRY.get("deepeyes")
+    if _already is None:
+        _register("deepeyes")(DeepEyesRewardManager)
+    else:
+        DeepEyesRewardManager = _already
 
 except ImportError:  # pragma: no cover - the CPU test runs without verl/torch
     DeepEyesRewardManager = None
