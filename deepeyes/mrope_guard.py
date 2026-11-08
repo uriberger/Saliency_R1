@@ -145,12 +145,18 @@ def assert_mrope_position_ids(position_ids, where: str) -> None:
 
 
 def _arm_dump() -> None:
+    """Dump NOW, and again at exit.
+
+    Dumping only at exit was not enough: the processes that matter are ray actors, and
+    a ray actor killed at the end of a rollout does not reliably run atexit handlers.
+    Announcements are rare (once per kind per process), so writing eagerly costs
+    nothing and makes the file exist while the job is still alive to read it.
+    """
     global _dumped
-    if _dumped:
-        return
-    _dumped = True
-    if os.environ.get("DEEPEYES_MROPE_DIR"):
+    if os.environ.get("DEEPEYES_MROPE_DIR") and not _dumped:
+        _dumped = True
         atexit.register(dump_counts)
+    dump_counts()
 
 
 def dump_counts() -> None:
