@@ -1,8 +1,8 @@
 # The DeepEyes zoom tool on Qwen3-VL
 
 Execution notes for [deepeyes-build-prompts.md](deepeyes-build-prompts.md) **Prompt 3**.
-What changed, what was decided, and the three things the next prompts have to do
-differently because of it.
+What changed, what was decided, and what the later prompts have to do differently
+because of it (§6 — three of those will look like breakage if nobody says so first).
 
 | file | what it is |
 |---|---|
@@ -258,10 +258,16 @@ Three of these will look like breakage if nobody says so.
    `original_size` and `view_size` alongside `image`. Use `build_tools_kwargs`; it is
    two lines and it is right by construction. `build_deepeyes_smoke_data.py` passes
    only `image` and needs the same change.
-3. **P7.** Set `data.image_patch_size=16`, `multi_turn.max_assistant_turns=5`,
+3. **P5.** The tool returns `-0.05` on a malformed or unusable box, kept from verl's
+   version. `ToolAgentLoop` collects those into `output.extra_fields["tool_rewards"]`
+   (`tool_agent_loop.py:184`) and does **not** add them to the reward — it exposes
+   them. DeepEyes' composite `0.8*R_acc + 0.2*R_format + 1.2*R_tool` has no such term,
+   so leave it out of the sum and log it: a rising rate of `-0.05` is the symptom of a
+   wrong `bbox_frame` that P9 would otherwise have to eyeball for.
+4. **P7.** Set `data.image_patch_size=16`, `multi_turn.max_assistant_turns=5`,
    `multi_turn.max_user_turns=4`, and a `bbox_frame` in the tool config. Point
    `log_dir` at the run's output directory and set `log_crops` to ~10 for the smoke.
-4. **P9.** The raw-vs-converted lines and the `plausible=` field are step 3 of the
+5. **P9.** The raw-vs-converted lines and the `plausible=` field are step 3 of the
    smoke checklist. If P4 still has not reported by then, aggregate `plausible_frames`
    over the smoke's tool calls — it will not be as good as P4's IoU, but it is
    decisive against a frame that is grossly wrong.
