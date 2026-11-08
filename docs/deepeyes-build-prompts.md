@@ -3,6 +3,30 @@
 Companion to [baseline-port-estimates.md](baseline-port-estimates.md) § *DeepEyes on
 Qwen3-VL*. That document is the decision; this one is the execution.
 
+> ## Status as of 2026-11-07 — read before running any prompt below
+>
+> The build ran. **P0, P1, P2, P3, P4, P5, P6 and P8 were executed; P7 and P9 are held.**
+>
+> **P1 (the headroom gate) returned NO-GO.** Three independent lines put the method's
+> gain on Qwen3-VL at ~+5 on V\*, not +18.9: the Qwen3-VL tech report §5.6 states the
+> absolute improvement from adding tools is *"consistently ~5 points across V\*"* within
+> the family; the +18.9 is measured from a Qwen2.5-VL-7B baseline our backbone has
+> already passed (Qwen3-VL-8B-Instruct measured at 74.0 on V\*); and ZoomEye gets
+> 90.6 training-free against DeepEyes' 90.1 in DeepEyes' *own* Table 1. See
+> [deepeyes-gate.md](deepeyes-gate.md), whose §8 pre-registers what would reopen it.
+> **Do not start the 80-step run off the back of this document alone.**
+>
+> **P2 (the engineering gate) passed**, on real code without a GPU, and the stack is
+> sound. The blocker is hardware, not the port: `oci-nrt-cs-001` has **zero GPU nodes**,
+> so everything GPU-bound runs on `cs-oci-ord-login-01` — a separate filesystem, so
+> branches travel through `origin`. See `DEEPEYES_GATE_RUN_PROMPT.md`.
+>
+> **Four claims in this document were wrong and are corrected inline below**, each marked
+> at the point of use: the `R_format = -1` penalty (Prompt 4, Prompt 9, §4), the
+> transferability of the vision-token counting trick (Prompt 5, §5), and §5's assurance
+> that identical token IDs make the processor discriminator safe. All four were the
+> silent-when-wrong kind. Prefer the corrections to the original text.
+
 **Do not port their fork, and do not clone verl.** Their release is frozen on verl
 0.2.0.dev0 / transformers 4.51.3 / vLLM 0.8.2, none of which can load Qwen3-VL. And
 verl at HEAD is the wrong target too: `image_zoom_in_tool.py` was deleted from
@@ -259,10 +283,23 @@ assume — Qwen3-VL's cookbook says 0–1000 relative, but what the model does u
 *their* prompt is the thing that matters.
 
 **Format.** `build_coldstart_data.py:52` records Qwen3-VL-8B-Instruct at **format
-0.000 under every prompt variant tried**. DeepEyes' `R_format` is **−1 on any tag
-mismatch**, so a model that cannot hit the tag structure is actively penalised on
-every rollout, and `R_tool` (which pays out only on a correct answer) never fires.
-Measure the tag-match rate under their prompt on both models.
+0.000 under every prompt variant tried**. Measure the tag-match rate under their prompt
+on both models.
+
+> **Corrected 2026-11-07, after P5 transcribed their `vl_agent.py` and tested it
+> differentially against their own file.** This paragraph used to read "`R_format` is
+> **−1 on any tag mismatch**, so a model that cannot hit the tag structure is actively
+> penalised on every rollout". **That is wrong.** Their check is a *count comparison*
+> per tag clause, so −1 fires on an genuine *imbalance* (two `<think>` against one
+> `</think>`), but a completion with **no tags at all** scores 0 == 0 on every clause
+> and gets **0.0, not −1.0**. A model at format 0.000 is not being penalised.
+>
+> The real argument for starting from the cold start is the **answer parse**, and it
+> bites through accuracy rather than format: with no tags, their
+> `split("<answer>")[-1]` returns the *whole completion*, which then trips their
+> ≥1000-character anti-hack guard — so a tagless model loses **both** `R_acc` and
+> `R_format`. Same recommendation, different and stronger mechanism. Both behaviours
+> are pinned in `test_deepeyes_rewards_cpu.py`.
 
 This is the argument for starting DeepEyes from
 `checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged` rather than from
@@ -286,7 +323,8 @@ is reference only). The composite is the whole trick:
 0.8*R_acc + 0.2*R_format + 1.2*R_tool
 
 R_tool   = 1 iff (at least one zoom happened AND R_acc > 0.5)
-R_format = -1 on any tag mismatch, else 0
+R_format = -1 on any tag mismatch, else 0      # a COUNT mismatch -- zero tags scores
+                                               # 0.0, not -1.0; see Prompt 4
 R_acc    = binary, from a judge
 ```
 
@@ -306,11 +344,21 @@ Two substitutions:
   caption-level deviation.
 - **"A zoom happened."** Their code detects this by counting
   `<|vision_start|><|image_pad|>` occurrences in the response string
-  (`vl_agent.py:199`). That trick does transfer — Qwen3-VL has identical vision token
-  IDs (`vision_start 151652`, `vision_end 151653`, `image_token 151655`) — but
-  **re-derive it from verl's `num_turns` metadata instead**. `tool_agent_loop.py`
-  already emits it, it cannot be fooled by a model that types the literal token text,
-  and it is the thing you actually want to log.
+  (`vl_agent.py:199`). **That trick is dead in this fork — it does not merely transfer
+  badly, it silently returns 0 forever.** Their `naive.py:71` decodes with no skip;
+  ours (`naive.py:79`) passes `skip_special_tokens=True`, and those ids are
+  `special=True` in the cold start's `tokenizer.json`. Both sides of the comparison are
+  0 on every rollout, so `R_tool` is identically 0 and the arm quietly degrades to plain
+  GRPO. (Corrected 2026-11-07; this entry previously said "that trick does transfer —
+  Qwen3-VL has identical vision token IDs". The token IDs *are* identical — `vision_start
+  151652`, `vision_end 151653`, `image_token 151655` — which is exactly why the failure
+  is invisible: nothing about the IDs is wrong, the tokens are gone before the count.)
+
+  So **re-derive it from verl's `num_turns` metadata**, which was already this entry's
+  recommendation and is now mandatory rather than preferred. `tool_agent_loop.py:180`
+  emits `num_turns` = user+assistant+1, so no-tool is 2 and each zoom adds 2:
+  `rounds = (num_turns - 1) // 2`. It cannot be fooled by a model that types the literal
+  token text, and it is the thing you actually want to log.
 
 Ship a CPU test asserting: the gate (zoom + wrong answer scores no tool bonus; no
 zoom + right answer scores no tool bonus; both scores 1.2), the −1 format penalty,
@@ -418,9 +466,14 @@ Branch: `run/deepeyes-smoke`
 1. **tool-call rate** — the fraction of rollouts that zoom at least once. If it is
    near 0, `R_tool` never fires and the run is plain GRPO with a format penalty.
    If it is 1.0 on every rollout, check that the conditional gate is actually gating.
-2. **format rate** — `R_format` is **−1** on mismatch, so a low format rate is not a
-   missing bonus, it is an active penalty on nearly every rollout. If P4's cold-start
-   recommendation was ignored, this is where it shows.
+2. **format rate** — a low format rate is not an active penalty (see the correction in
+   Prompt 4: a tagless completion scores `R_format` 0.0, not −1). It bites through
+   **accuracy** instead: no `<answer>` tag means the whole completion is parsed as the
+   answer, which trips their ≥1000-character anti-hack guard and zeroes `R_acc` — and
+   `R_tool`, which gates on `R_acc > 0.5`, then never fires either. So watch `R_acc` and
+   the tool-call rate together with the format rate; a format collapse shows up as all
+   three going flat at once. If P4's cold-start recommendation was ignored, this is
+   where it shows.
 3. **the logged raw-vs-converted boxes** from P3 — eyeball ten of them against the
    image. This is the only cheap check on the coordinate frame.
 4. **truncation at `max_response_length=20480`** and OOM. Both appear in the first few
@@ -451,7 +504,8 @@ correct the estimate rather than carrying both forward.
 | 0–1000 relative coordinates | P3, P4 | every crop lands in the wrong place; the loss curve stays healthy |
 | `MIN_DIMENSION = 28` on a 32 px grid | P3 | a sub-token floor; degenerate crops accepted |
 | cropping the resized image instead of the original | P3 | the method becomes a no-op; nothing to recover |
-| `R_format = -1` with format near 0 | P4, P9 | every rollout penalised, `R_tool` never fires, no signal |
+| format near 0 on a tagless model | P4, P9 | **not** a −1 penalty (that was this table's error until 2026-11-07) — the whole completion parses as the answer, trips their ≥1000-char guard, and zeroes `R_acc`; `R_tool` gates on `R_acc` so it never fires either |
+| `skip_special_tokens=True` eating the zoom detector | P5 | `R_tool` identically 0, arm silently degrades to plain GRPO with no error anywhere |
 | the tool enabled on the ThinkLite math split | P6 | wrong composite on 23% of the corpus |
 | editing `laser_fork/` instead of `deepeyes_fork/` | P0 | the LASER arm and any in-flight job change underneath it |
 | vLLM above 0.11.0 | P0 | corrupted Qwen3-VL grounding output (vllm#29595) — i.e. corrupted zoom boxes |
@@ -463,9 +517,25 @@ Verified against `checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_mer
 rather than assumed. Qwen3-VL uses the **identical ChatML scheme and identical vision
 token IDs** as Qwen2.5-VL — `vision_start 151652`, `vision_end 151653`,
 `image_token 151655`, `<|im_start|>` / `<|im_end|>`. So the hardcoded observation
-splice, the `<image>` → `<|vision_start|><|image_pad|><|vision_end|>` rewrite, and the
-token-counting tricks all transfer verbatim. This was the main worry going in; it is a
-non-issue. What does *not* transfer is geometry (patch-16 / merge-2, hence the 28→32
+splice and the `<image>` → `<|vision_start|><|image_pad|><|vision_end|>` rewrite
+transfer verbatim. This was the main worry going in; it is a non-issue.
+
+**Two exceptions found on 2026-11-07, both of which this section originally got wrong:**
+
+* **The token-counting tricks do _not_ transfer.** This section used to say they did.
+  Identical token IDs are not sufficient, because our `naive.py:79` decodes with
+  `skip_special_tokens=True` and strips them before any count happens — see the
+  correction in Prompt 5.
+* **Identical naming makes verl's processor discriminator lie.** Qwen3-VL's
+  `processor_config.json` declares `image_processor_type: "Qwen2VLImageProcessor"`, so
+  verl's recurring `"Qwen2VLImageProcessor" in <class name>` gate is **True for
+  Qwen3-VL** and cannot be used to tell the two apart. `rl_dataset.py:380` knows this and
+  branches on `Qwen3VLProcessor`; `agent_loop.py:504` — the multi-turn path every tool
+  rollout goes through — did not, and imported `qwen2_vl.get_rope_index` unconditionally.
+  P2 fixed it and added a tripwire. This is the same failure shape as DeepEyes' own
+  `parallel_env.py:282` in §4, arriving from the opposite direction.
+
+What does *not* transfer is geometry (patch-16 / merge-2, hence the 28→32
 above) and grounding coordinates (0–1000 relative, hence P4).
 
 ## Sources
