@@ -129,12 +129,22 @@ def metric_name(spec):
 def dict_score(value):
     """The 0-1 verdict inside one metric dict, whatever the task chose to call it.
 
-    Four shapes occur, and only the first says "score":
+    Five shapes occur, and only the first two say "score":
 
-        {"score": 0.0, ...}                       pope, mmstar, mme, p3's sample_*
+        {"score": 0.0, ...}                       pope, mmstar, mme, p3's sample_*,
+                                                  vstar_bench, spatialtreebench
+        {"gpt_score": 1, "cycle_category": 0, ...}  hrbench_4k / hrbench_8k
         {"pred_answer": "A", "answer": "A", ...}  mme-realworld
         {"parsed_pred": "E", "answer": "B", ...}  mmmu_pro
         {"scores": [false], "response": [...]}    mathvision
+
+    `gpt_score` is HR-Bench's own name for a 0/1 that has nothing to do with GPT
+    on most rows: its grader reads the option letter out of the text locally and
+    only falls through to a judge when it cannot. The field is the verdict either
+    way, which is why it is read here rather than left for the aggregate -- but
+    note that the HEADLINE `average` is the mean over cycle_category of the
+    per-cycle means, not the mean of these, so hrbench carries
+    item_decomposes=False and bench_samples says so.
 
     The last three are tasks that compare the prediction to the answer during
     AGGREGATION rather than per row, so the row carries the two strings and no
@@ -145,6 +155,8 @@ def dict_score(value):
     """
     if isinstance(value.get("score"), (int, float)) and not isinstance(value.get("score"), bool):
         return float(value["score"])
+    if isinstance(value.get("gpt_score"), (int, float)) and not isinstance(value.get("gpt_score"), bool):
+        return float(value["gpt_score"])
     for predicted, actual in (("pred_answer", "answer"), ("parsed_pred", "answer")):
         if predicted in value and actual in value:
             got, want = value[predicted], value[actual]

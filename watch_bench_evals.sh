@@ -17,7 +17,11 @@
 #
 # Usage:
 #   bash watch_bench_evals.sh --run-dir DIR [--num-gpus 1] [--every 100]
-#                             [--interval 60] [--duration 1] [--once]
+#                             [--interval 60] [--duration 1] [--once] [--search]
+#
+# --search adds V*, HR-Bench 4K/8K and spatialtreebench at native resolution, one
+# lmms-eval invocation each. They are not in bench/natural/mean and they roughly
+# double the wall clock, so this is for baselining an arm, not for a curve.
 #
 # Environment: PARTITION, OPENAI_API_KEY / NVIDIA_API_KEY, HF_TOKEN
 set -uo pipefail
@@ -59,6 +63,9 @@ declare -a TASK_N=()
 # fits an hour, and a job that cannot finish its own unit banks nothing and is
 # resubmitted forever. See plan_units() in eval_mini/benchmarks.py.
 BANK=auto
+# Add V*, HR-Bench 4K/8K and spatialtreebench, each in an invocation of its own at
+# its own resolution. Off by default: they are a baseline row, not a curve.
+SEARCH=false
 STEPS_FILTER=""
 INTERVAL=60
 # Ask for one hour, not the partition's 4h maximum. batch_singlenode caps jobs at
@@ -88,6 +95,10 @@ while [[ $# -gt 0 ]]; do
         --nonnatural-n) NONNATURAL_N="$2"; shift 2 ;;
         --task-n)       TASK_N+=("$2");    shift 2 ;;
         --bank)         BANK="$2";         shift 2 ;;
+        # Also score the four visual-search benchmarks. Forwarded verbatim; see
+        # run_bench_eval.sh for why they are off by default and why each needs an
+        # lmms-eval invocation of its own.
+        --search)       SEARCH=true;       shift ;;
         # Evaluate exactly these steps instead of every EVERY-th checkpoint. This
         # is how rerun_bench_evals.py asks for the checkpoints that already have a
         # result at another sample size, rather than everything on disk.
@@ -291,6 +302,7 @@ SIZE_ARGS=""
 [[ -n "$NONNATURAL_N" ]] && SIZE_ARGS+=" --nonnatural-n $NONNATURAL_N"
 for t in ${TASK_N[@]+"${TASK_N[@]}"}; do SIZE_ARGS+=" --task-n $t"; done
 [[ -n "$STEPS_FILTER" ]] && SIZE_ARGS+=" --steps $STEPS_FILTER"
+$SEARCH && SIZE_ARGS+=" --search"
 
 INNER_CMD="bash $SCRIPT_DIR/run_bench_eval.sh \
         --run-dir $RUN_DIR --num-gpus $NUM_GPUS --every $EVERY --bank $BANK$SIZE_ARGS \
@@ -339,6 +351,7 @@ echo "Watching:   $RUN_DIR"
 echo "Job name:   $JOB_NAME   ($NUM_GPUS GPUs, ${DURATION}h, $PARTITION)"
 echo "Submitting: $BACKEND   (from $(hostname))"
 echo "Benchmarks: $(python "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" --print-tasks natural | tr ',' ' ' | wc -w) natural + $(python "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" --print-tasks nonnatural | tr ',' ' ' | wc -w) non-natural, all self-scoring (no API key needed)"
+$SEARCH && echo "  + search: $(python "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" --print-tasks natural --on-demand | tr ',' '\n' | grep -E 'vstar|hrbench|spatialtree' | tr '\n' ' ')  (native resolution, one unit each; hrbench/spatialtree need an API key)"
 echo "Cadence:    $([[ -n "$STEPS_FILTER" ]] && echo "steps $STEPS_FILTER" || echo "every $EVERY steps")"
 echo "Profile:    $PROFILE   (banking per $BANK)"
 echo "Results:    $PROFILE_DIR/step-<N>.json"

@@ -66,12 +66,57 @@ Fields:
              (1003 rows of bare images, from the repo's assets/ and images.zip);
              the questions live only in data.jsonl. Dropping data_files to dodge
              the offline lookup would score a different dataset, quietly.
+    max_pixels
+             (optional) the input resolution this benchmark MUST be scored at, in
+             pixels, passed through as `--max-pixels`. See "the resolution trap"
+             below -- this is the single most consequential field in the table and
+             the one whose absence silently produces a number that looks like a
+             benchmark score and is not.
+    own_unit (optional, default True where `max_pixels` is set) this benchmark
+             cannot share an lmms-eval invocation with its neighbours, so it gets
+             a banking unit of its own. `--max-pixels` and `--model_args` are
+             per-INVOCATION and apply to every task in it, so two benchmarks
+             wanting different resolutions in one `--tasks a,b` call cannot both
+             be served; plan_units() refuses rather than picking one.
+    on_demand
+             (optional, default False) not part of the default plan. The four
+             visual-search benchmarks are here so that bench_eval.py can reduce
+             them and a baseline row has somewhere to live, but they are NOT run
+             on every checkpoint: at native resolution HR-Bench alone is ~4x the
+             cost of the whole natural suite, and a one-hour eval job that cannot
+             finish its own unit banks nothing. Ask for them with
+             `run_bench_eval.sh --search` (bench_eval.py --plan --on-demand).
 
-Every benchmark here scores itself: none calls an LLM judge, so the eval job needs
-no API key and cannot be skewed by one being absent or rate-limited. Three of the
-test benchmarks were left out for that reason, because all three fail *quietly* --
-the judge call errors, the item is scored wrong, and the benchmark simply reads
-low, which on a training curve is indistinguishable from a model that got worse:
+             An on-demand benchmark also does NOT define the sample profile --
+             see as_suite_n(). That is load-bearing: vstar_bench's split is 191
+             rows, so at the standard `--natural-n 300` the natural suite would
+             contain two different sizes, as_suite_n would report the pair as a
+             tuple, and every existing run's profile would silently rename from
+             `n300_100` to `n191-300_100` -- orphaning 339 step files and the
+             `bench_n300_100/*` WandB namespace.
+    split_n  (optional) the number of rows in the benchmark's test split, where
+             that is smaller than a sample profile might ask for. The sampler
+             returns a short split whole rather than padding it, so `wanted` has
+             to expect the short number or bench_eval.py's profile check refuses
+             the collect. Only vstar_bench needs it (191 rows); check_profile()
+             pre-registered this case and said it would be an explicit act.
+    stratify_json
+             (optional) `(column, prefix)`: balance the sample across a value
+             buried inside a JSON-encoded column, taking the deepest key whose
+             name starts with `prefix`. stratify_by cannot reach it because it
+             indexes `dataset[key]` directly. spatialtreebench needs it -- see
+             its entry.
+    needs_judge
+             (optional) this benchmark calls an LLM judge on some rows, so the
+             job needs OPENAI_API_KEY / NVIDIA_API_KEY and the number is only as
+             good as the gateway was that day. Recorded rather than forbidden,
+             because the alternative for spatialtreebench is not having it.
+
+Almost every benchmark here scores itself: it needs no API key and cannot be
+skewed by one being absent or rate-limited. Three of the test benchmarks were left
+out for that reason, because all three fail *quietly* -- the judge call errors, the
+item is scored wrong, and the benchmark simply reads low, which on a training curve
+is indistinguishable from a model that got worse:
 
     mathvista_testmini_cot   llm_as_judge_eval IS its primary metric
     dailyclue                exact/numeric/date shortcuts first, judges the rest
@@ -82,7 +127,62 @@ headline numbers are unaffected -- only the per-checkpoint monitor is narrower.
 mathvision_testmini looks like a fourth case but is not: it uses
 mathvision_process_results, while the judged function belongs to the
 mathvision_reason_* tasks.
+
+The two exceptions are flagged with `needs_judge` and are both on-demand:
+hrbench_4k/8k fall through to a judge only when they cannot read an option letter
+out of the text (their utils.py strips the <think> block first, which is what makes
+that rare), and spatialtreebench judges 374 of its 6,300 rows outright.
+
+---------------------------------------------------------------- the resolution trap
+
+The four visual-search benchmarks exist to test whether a model can find a small
+thing in a large picture. Scored at a reduced resolution they measure something
+else, and they do it without complaining:
+
+    V*               191 rows, median 3.4 MP, max 8.3 MP
+    HR-Bench 4K      800 rows, 16.3 MP   (NOT 3840x2160 -- the HF rows are larger)
+    HR-Bench 8K      800 rows, 38.8 MP median, up to 59.0 MP
+
+There are two caps on the path, and only one of them is obvious:
+
+ 1. `lmms_eval/models/simple/qwen3_vl.py:89` defaults `max_pixels` to
+    2048*32*32 = 2,097,152. This is the one that bites. It applies to every task
+    that does not ask for something else, and at 2.1 MP HR-Bench 8K is
+    downsampled ~18x and every single V* image is downsampled.
+ 2. `vlm_reasoning/scripts/slurm/launch_lmms_eval_job.sh` raises it to 3,211,264
+    for `--tasks mmerealworld|hrbench4k|hrbench8k|vstar_bench` -- matched against
+    the WHOLE --tasks string, so it never fires for a mini task (`vstar_bench_mini`)
+    and never fires for a combined invocation.
+
+So `max_pixels` below is set to 16,777,216, which is Qwen3-VL-8B-Instruct's own
+`preprocessor_config.json: size.longest_edge` -- i.e. no cap beyond the one the
+model itself imposes. At that setting V* and HR-Bench 4K are not resized at all,
+and HR-Bench 8K is reduced to the largest input the model can represent (16,384
+visual tokens). That is what "native resolution" can mean for this backbone.
+
+A third cap exists elsewhere and is NOT on this path, but is worth naming because
+it has already produced numbers that were read as benchmark scores: the Figure-1
+chain scans (`build_bench_candidates.py`, `--max-image-side 1024`) grade
+`hrbench4k_mini` / `vstar_mini` at a 1,024 px long side. Those are a valid
+ours-vs-coldstart signal under a fixed cap and nothing more. See
+docs/deepeyes-gate.md §3.
 """
+
+# Qwen3-VL-8B-Instruct's own ceiling, from its preprocessor_config.json
+# (`size.longest_edge`), i.e. 16384 visual tokens at its 32x32 px merged patch.
+# Passing this as --max-pixels means "do not cap below what the model can read",
+# which is the only defensible meaning of "native resolution" for a model whose
+# processor caps the input itself. It is NOT Qwen2.5-VL's 12,845,056 (16384*28*28)
+# -- that figure appears in launch_lmms_eval_job.sh's comments and belongs to the
+# previous generation's 28x28 patch.
+NATIVE_MAX_PIXELS = 16_777_216
+
+# MME-RealWorld's images are ~36 MP and the wrapper's default downsamples them
+# ~22x, which makes the model over-abstain. 3.2 M is the value the full test suite
+# has always used and the one its published 58.7 was replicated at; it is left
+# exactly where it was rather than raised to NATIVE_MAX_PIXELS, because every
+# mmerealworld number on every existing curve was measured there.
+MMERW_MAX_PIXELS = 3_211_264
 
 BENCHMARKS = {
     # --- natural imagery ---
@@ -92,7 +192,8 @@ BENCHMARKS = {
         group_by="question_id", stratify_by="category", item_decomposes=False),
     "mmerealworld": dict(
         suite="natural", yaml="mme_realworld/mme_realworld.yaml",
-        metric="mme_realworld_score,none", scale=1.0, in_mean=True),
+        metric="mme_realworld_score,none", scale=1.0, in_mean=True,
+        max_pixels=MMERW_MAX_PIXELS),
     "pope": dict(
         suite="natural", yaml="pope/pope.yaml",
         metric="pope_f1_score,none", scale=1.0, in_mean=True,
@@ -103,6 +204,79 @@ BENCHMARKS = {
     "mmstar": dict(
         suite="natural", yaml="mmstar/mmstar.yaml",
         metric="average,none", scale=1.0, in_mean=True),
+
+    # --- visual search: natural imagery, but on demand and at native resolution ---
+    #
+    # These four are the canonical visual-search benchmarks and the ones the
+    # DeepEyes / ERGO / Mini-o3 / Monet tables are headlined by. They are in this
+    # table so that bench_eval.py reduces them and a baseline row sits beside the
+    # arms, NOT so that they join the per-checkpoint curve: `in_mean=False` keeps
+    # `bench/natural/mean` the same four benchmarks it has always been (changing
+    # it would redefine the headline on 339 existing step files), and
+    # `on_demand=True` keeps them out of every routine one-hour eval job.
+    #
+    # `scale` is from a real results.json in each case -- vstar reports a
+    # PERCENTAGE while hrbench reports a fraction, and the yamls say nothing about
+    # either. Full-split r1-mode runs at 3.2 MP are on disk under
+    # vlm_reasoning/results/lmms_eval/ for every arm; see docs/search-benchmarks.md
+    # for the table they produce.
+    "vstar_bench": dict(
+        suite="natural", yaml="vstar_bench/vstar_bench.yaml",
+        metric="vstar_overall_acc,none", scale=100.0, in_mean=False,
+        on_demand=True, split_n=191, max_pixels=NATIVE_MAX_PIXELS),
+    # 71.2 is V*'s OVERALL figure and 73.9 is its direct_attributes sub-column;
+    # vstar_overall_acc is the former, which is also what DeepEyes' own
+    # judge_result.py pools. The two sub-metrics (vstar_direct_attributes_acc,
+    # vstar_relative_position_acc) are emitted as EMPTY LISTS by the overall task
+    # and are skipped by flatten()'s isinstance check, which is why they do not
+    # need an entry of their own.
+
+    # HR-Bench's headline `average` is the mean over cycle_category of the
+    # per-cycle means, not the row mean -- hence item_decomposes=False. Its rows
+    # carry `gpt_score` rather than `score`, which bench_samples.dict_score was
+    # taught to read.
+    "hrbench_4k": dict(
+        suite="natural", yaml="hrbench/hrbench4k.yaml",
+        metric="average,none", scale=1.0, in_mean=False,
+        on_demand=True, item_decomposes=False, needs_judge=True,
+        max_pixels=NATIVE_MAX_PIXELS),
+    "hrbench_8k": dict(
+        suite="natural", yaml="hrbench/hrbench8k.yaml",
+        metric="average,none", scale=1.0, in_mean=False,
+        on_demand=True, item_decomposes=False, needs_judge=True,
+        max_pixels=NATIVE_MAX_PIXELS),
+
+    # spatialtreebench is here because the build brief names it, and it comes
+    # with four caveats that have to travel with the number:
+    #
+    #  1. It is NOT the TreeBench of ERGO's table. lmms-eval's own README claims
+    #     the name `TreeBench` maps here, and that claim is wrong for this
+    #     purpose: ERGO reports HaochenWang/TreeBench (arXiv:2507.07999, <1k rows,
+    #     csv, image-only), while this task is LongfeiLi/SpatialTree-Bench
+    #     (arXiv:2512.20617, 6,300 rows, 8 GB of images+video). lmms-eval has no
+    #     task for the former. A row produced here must not be put in a TreeBench
+    #     column.
+    #  2. Its aggregate is a WEIGHTED TREE over 27 leaves, and a leaf the sample
+    #     missed scores 0 rather than being absent (`avg_leaf_scores.get(name, 0)`
+    #     in its utils.py). An unstratified 100-row draw would leave ~7 leaves
+    #     empty and read systematically low -- hence stratify_json, which balances
+    #     the draw over the deepest `spatree*` key inside `extra_info`. The leaf
+    #     is not a column, so stratify_by cannot reach it.
+    #  3. 374 of its 6,300 rows are scored by an LLM judge (`gpteval`), so it
+    #     needs an API key; without one those rows score 0 silently.
+    #  4. 814 of its rows are VIDEO (up to 32 decoded frames each), and 5,486 are
+    #     images. max_pixels does not govern video sampling, so it is deliberately
+    #     unset here and the benchmark still gets a unit of its own.
+    #
+    # The data is not staged: `video: True` in its yaml makes lmms-eval
+    # snapshot_download the repo and unzip images.zip + videos.zip (8.0 GB) into
+    # $HF_HOME/SpatialTreeBench/ on first use, which a compute node with
+    # HF_HUB_OFFLINE=1 cannot do. Stage it from a login node first.
+    "spatialtreebench": dict(
+        suite="natural", yaml="spatialtreebench/spatialtreebench.yaml",
+        metric="SpaTreeBench,none", scale=1.0, in_mean=False,
+        on_demand=True, item_decomposes=False, needs_judge=True, own_unit=True,
+        stratify_json=("extra_info", "spatree")),
 
     # --- non-natural imagery ---
     "algopuzzlevqa": dict(
@@ -141,6 +315,20 @@ SUITES = ("natural", "nonnatural")
 
 MINI_SUFFIX = "_mini"
 
+# lmms-eval's spelling of a benchmark, where it differs from this table's key.
+#
+# Two things made the keys differ, and both are worth keeping. First, the whole
+# FULL task has been run on every arm already, under lmms-eval's own name
+# (`hrbench4k`, 800 rows, in vlm_reasoning/results/lmms_eval/), and those files are
+# the baseline table -- without this map flatten() would skip every one of them,
+# because `hrbench4k` is not a key here. Second, the Figure-1 chain scans already
+# use the names `hrbench4k_mini`, `hrbench8k_mini` and `vstar_mini` for something
+# that is NOT a benchmark score (they are graded at --max-image-side 1024; see
+# docs/deepeyes-gate.md §3). Keeping our mini tasks at `hrbench_4k_mini` and
+# `vstar_bench_mini` means the two can never be confused in a filename, a WandB
+# key or a conversation.
+TASK_ALIASES = {"hrbench4k": "hrbench_4k", "hrbench8k": "hrbench_8k"}
+
 # How many documents each suite is scored on. This is the SAMPLE PROFILE, and it
 # is the one thing that must never be mixed within a curve: `bench/natural/mean`
 # at 100 documents per benchmark and the same key at 300 are two different
@@ -168,6 +356,14 @@ def as_suite_n(sample_n):
     reported as the sorted list of what was seen -- unequal, therefore unequal to
     any profile, therefore refused by whoever compares them. That is the intended
     outcome: a half-resampled suite is not a sample size.
+
+    On-demand benchmarks are excluded from that reduction. They are not part of
+    the default plan, so they are not part of what "this profile" means -- and
+    including them would be destructive rather than merely untidy: vstar_bench's
+    split is 191 rows, so at the standard `--natural-n 300` the natural suite
+    would hold {191, 300}, every run's profile would rename from `n300_100` to
+    `n191-300_100`, and 339 step files plus the `bench_n300_100/*` WandB
+    namespace would be orphaned by a benchmark nobody asked that job to run.
     """
     if not sample_n:
         return dict(DEFAULT_SUITE_N)
@@ -176,7 +372,8 @@ def as_suite_n(sample_n):
     out = {}
     for suite in SUITES:
         sizes = sorted({n for task, n in sample_n.items()
-                        if (BENCHMARKS.get(base_task(task)) or {}).get("suite") == suite})
+                        if (BENCHMARKS.get(base_task(task)) or {}).get("suite") == suite
+                        and not is_on_demand(task)})
         if not sizes:
             out[suite] = DEFAULT_SUITE_N[suite]
         elif len(sizes) == 1:
@@ -250,17 +447,29 @@ def task_sample_n(suite_n=None, overrides=None):
     spread evenly -- mmstar generates ~4x the tokens per document that pope does,
     so at n=300 it alone approaches a one-hour allocation -- and capping one task
     is a better answer than lengthening the job.
+
+    A benchmark whose split is shorter than the profile asks for is clamped to
+    its split (`split_n`). The sampler returns a short split whole rather than
+    padding it, so this is a statement of what WILL be scored -- and it has to be,
+    because bench_eval.py's profile check compares the two and refuses a collect
+    where they differ. An explicit override still wins, including one that asks
+    for more than the split holds, which then fails that check loudly.
     """
     suite_n = as_suite_n(suite_n or DEFAULT_SUITE_N)
     out = {}
     for task, spec in BENCHMARKS.items():
         value = suite_n[spec["suite"]]
-        out[f"{task}{MINI_SUFFIX}"] = value if not isinstance(value, tuple) else value[0]
+        value = value if not isinstance(value, tuple) else value[0]
+        split_n = spec.get("split_n")
+        out[f"{task}{MINI_SUFFIX}"] = min(value, split_n) if split_n else value
     for task, n in (overrides or {}).items():
-        name = task if task.endswith(MINI_SUFFIX) else f"{task}{MINI_SUFFIX}"
-        if base_task(name) not in BENCHMARKS:
+        # Normalised through base_task, so `--task-n hrbench4k=100` (lmms-eval's
+        # spelling) and `--task-n hrbench_4k_mini=100` both land on the one key
+        # the generated configs use. Accepting a spelling and then writing it
+        # verbatim would add an entry no config reads.
+        if base_task(task) not in BENCHMARKS:
             raise SystemExit(f"no such benchmark to override: {task}")
-        out[name] = int(n)
+        out[f"{base_task(task)}{MINI_SUFFIX}"] = int(n)
     return out
 
 
@@ -294,12 +503,30 @@ MODEL_LOAD_MINUTES = 1.5
 # counts no tokens for them and the per-task medians that do exist contradict the
 # suite total -- algopuzzlevqa's alone exceeds it. An even split of a number that
 # was actually observed is worth more than three precise figures and five zeros.
+#
+# The four visual-search figures are a MEASUREMENT TIMES A MULTIPLIER, and the
+# multiplier is the uncertain half. The measurement is `total_evaluation_time_seconds`
+# from the full-split r1-mode runs on the cold start in
+# vlm_reasoning/results/lmms_eval/coldstart_..._mnt4096_r1/, at 3.2 M pixels:
+# V* 328 s / 191 docs = 2.9 min per 100, HR-4K 2013 s / 800 = 4.2, HR-8K 2118 s /
+# 800 = 4.4. At NATIVE_MAX_PIXELS the pixels rise 1.0x for V* (its images are
+# already under 3.4 MP median and are then not resized at all), 5.1x for HR-4K and
+# 5.2x for HR-8K -- and the vision tower's attention is quadratic in patches, so
+# the pessimistic end is used until a real job replaces these.
+#
+# spatialtreebench has never been run, here or anywhere in this repo. Its 25.0 is
+# a placeholder sized off the non-natural rate plus video decoding, and it is
+# flagged rather than disguised: the first job that runs it should replace it.
 MINUTES_PER_100 = {
     "mme": 4.3,
     "mmerealworld": 9.1,
     "mmstar": 16.3,
     "pope": 3.5,
     "realworldqa": 4.9,
+    "vstar_bench": 4.0,
+    "hrbench_4k": 15.0,
+    "hrbench_8k": 16.0,
+    "spatialtreebench": 25.0,
 }
 NONNATURAL_MINUTES_PER_100 = 22.9 / 8
 
@@ -325,13 +552,38 @@ def estimate_minutes(tasks, sample_n=None, num_gpus=1, load=True):
     return minutes * SAFETY_FACTOR
 
 
-# MME-RealWorld's images are ~36 MP and the wrapper's default downsamples them
-# ~22x, which makes the model over-abstain. The test suite runs it at 3.2 M pixels
-# and so does this, which a combined invocation cannot do -- hence its own unit.
-MMERW_ARGS = "--max-pixels 3211264"
+# The tag a solo benchmark's banking unit carries under `--bank suite`. A banked
+# unit is keyed by its tag on disk (`bench_eval/[<profile>/]partial/step-N/<tag>.json`),
+# so mme-realworld keeps the `mmerw` it has always had rather than being renamed to
+# its task name and silently re-running work an in-flight job already paid for.
+# Everything else is named after itself.
+SUITE_UNIT_TAG = {"mmerealworld": "mmerw"}
 
 
-def plan_units(bank="auto", sample_n=None, num_gpus=1, window=0):
+def is_on_demand(task):
+    """Whether this benchmark is left out of the default plan. See the docstring."""
+    return bool((BENCHMARKS.get(base_task(task)) or {}).get("on_demand"))
+
+
+def needs_own_unit(task):
+    """Whether this benchmark cannot share an lmms-eval invocation.
+
+    True for anything carrying `max_pixels`, because the flag is per invocation
+    and applies to every task in it, and for anything that sets `own_unit`
+    outright. The whole reason mme-realworld has had a unit of its own since the
+    beginning is this and nothing else.
+    """
+    spec = BENCHMARKS.get(base_task(task)) or {}
+    return bool(spec.get("own_unit", spec.get("max_pixels")))
+
+
+def extra_args(task):
+    """The lmms-eval flags one benchmark needs, as a string for the shell plan."""
+    max_pixels = (BENCHMARKS.get(base_task(task)) or {}).get("max_pixels")
+    return f"--max-pixels {max_pixels}" if max_pixels else ""
+
+
+def plan_units(bank="auto", sample_n=None, num_gpus=1, window=0, on_demand=False):
     """The list of things a job can finish and bank, largest first.
 
     A unit is one lmms-eval invocation whose results are recorded the moment it
@@ -355,14 +607,28 @@ def plan_units(bank="auto", sample_n=None, num_gpus=1, window=0):
     nothing, and be resubmitted forever -- a checkpoint that never finishes and
     never says why. Deriving it from the measured cost removes the possibility.
 
+    A benchmark needing its own resolution is pulled out of its suite's unit and
+    given one of its own, under BOTH banking granularities. This is not an
+    optimisation: `--max-pixels` is per invocation, so a combined `--tasks a,b`
+    call can only be issued at one resolution, and putting V* in the same call as
+    pope would score V* at pope's resolution without saying so. That is exactly
+    the fault docs/deepeyes-gate.md §3 documents, one layer down.
+
+    `on_demand=False` (the default) leaves the visual-search benchmarks out
+    entirely, which is what every per-checkpoint job wants.
+
     Returns [(tag, [tasks], extra_args, minutes)].
     """
-    natural = [t for t in suite_tasks("natural") if base_task(t) != "mmerealworld"]
-    by_suite = [("natural", natural, ""),
-                ("mmerw", ["mmerealworld_mini"], MMERW_ARGS),
-                ("nonnatural", suite_tasks("nonnatural"), "")]
-    by_task = [(base_task(t), [t], MMERW_ARGS if base_task(t) == "mmerealworld" else "")
-               for t in suite_tasks("natural") + suite_tasks("nonnatural")]
+    wanted = {suite: suite_tasks(suite, on_demand=on_demand) for suite in SUITES}
+    solo = [t for suite in SUITES for t in wanted[suite] if needs_own_unit(t)]
+
+    by_suite = [(suite, [t for t in wanted[suite] if not needs_own_unit(t)], "")
+                for suite in SUITES]
+    by_suite = [u for u in by_suite if u[1]]
+    by_suite += [(SUITE_UNIT_TAG.get(base_task(t), base_task(t)), [t], extra_args(t))
+                 for t in solo]
+    by_task = [(base_task(t), [t], extra_args(t))
+               for suite in SUITES for t in wanted[suite]]
 
     if bank == "auto":
         groups = by_suite
@@ -376,16 +642,34 @@ def plan_units(bank="auto", sample_n=None, num_gpus=1, window=0):
     else:
         raise SystemExit(f"unknown banking unit: {bank!r} (auto | suite | task)")
 
+    # Belt and braces. Nothing above can build a unit whose tasks disagree about
+    # resolution, but a future edit could, and the failure mode is a benchmark
+    # scored at a neighbour's resolution with a results.json that looks perfectly
+    # normal. Refuse instead.
+    for tag, tasks, extra in groups:
+        resolutions = {(BENCHMARKS.get(base_task(t)) or {}).get("max_pixels") for t in tasks}
+        if len(resolutions) > 1:
+            raise SystemExit(
+                f"unit {tag!r} would score {', '.join(tasks)} in one lmms-eval "
+                f"invocation at {sorted(r or 0 for r in resolutions)} pixels. "
+                f"--max-pixels is per invocation; give each its own unit.")
+
     units = [(tag, tasks, extra, estimate_minutes(tasks, sample_n, num_gpus))
              for tag, tasks, extra in groups]
     return sorted(units, key=lambda u: -u[3])
 
 
-def suite_tasks(suite):
-    """Mini task names for one suite, in table order."""
-    return [f"{t}{MINI_SUFFIX}" for t, spec in BENCHMARKS.items() if spec["suite"] == suite]
+def suite_tasks(suite, on_demand=False):
+    """Mini task names for one suite, in table order.
+
+    On-demand benchmarks are omitted unless asked for -- they are in the table so
+    that bench_eval.py can reduce them, not so that every eval job runs them.
+    """
+    return [f"{t}{MINI_SUFFIX}" for t, spec in BENCHMARKS.items()
+            if spec["suite"] == suite and (on_demand or not spec.get("on_demand"))]
 
 
 def base_task(task):
-    """The real benchmark a mini task name refers to."""
-    return task[: -len(MINI_SUFFIX)] if task.endswith(MINI_SUFFIX) else task
+    """The real benchmark a task name refers to, mini or full, ours or lmms-eval's."""
+    name = task[: -len(MINI_SUFFIX)] if task.endswith(MINI_SUFFIX) else task
+    return TASK_ALIASES.get(name, name)
