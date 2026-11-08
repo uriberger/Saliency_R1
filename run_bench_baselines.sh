@@ -3,6 +3,7 @@
 # WandB as a horizontal reference line across the bench panels.
 #
 #   bash run_bench_baselines.sh [--dry-run] [--force] [--publish-only] [--no-publish]
+#                               [--search] [--only LABEL]
 #
 # Edit BASELINES and SPAN_RUN below. A baseline is a standalone model, not a
 # checkpoint: one number, not a curve. So it is not a point on the training run's
@@ -95,6 +96,7 @@ NATURAL_N=${NATURAL_N:-300}
 NONNATURAL_N=${NONNATURAL_N:-100}
 declare -a TASK_N=()
 BANK=${BANK:-auto}
+SEARCH=false
 # Restrict to some of BASELINES, by label. Repeatable.
 declare -a ONLY=()
 
@@ -127,6 +129,12 @@ while [[ $# -gt 0 ]]; do
         --nonnatural-n) NONNATURAL_N="$2"; shift 2 ;;
         --task-n)       TASK_N+=("$2");    shift 2 ;;
         --bank)         BANK="$2";         shift 2 ;;
+        # Add the four visual-search benchmarks (V*, HR-Bench 4K/8K,
+        # spatialtreebench) at native resolution. This is the flag that produces
+        # the baseline row a DeepEyes/ERGO/Mini-o3 row would sit next to; it is
+        # off by default because it roughly doubles the per-baseline cost and the
+        # scores do not enter bench/natural/mean.
+        --search)       SEARCH=true;       shift ;;
         # Score/publish only these labels, rather than all of BASELINES.
         --only)         ONLY+=("$2");      shift 2 ;;
         -h|--help)      sed -n '2,31p' "$0"; exit 0 ;;
@@ -141,6 +149,11 @@ PY_BIN=$(command -v python || command -v python3) || \
     { echo "error: no python on PATH" >&2; exit 2; }
 declare -a SIZE_ARGS=(--natural-n "$NATURAL_N" --nonnatural-n "$NONNATURAL_N")
 for t in ${TASK_N[@]+"${TASK_N[@]}"}; do SIZE_ARGS+=(--task-n "$t"); done
+# Kept apart from SIZE_ARGS on purpose: SIZE_ARGS is handed to make_mini_tasks.py
+# as well, and --search is not one of its flags. The two arrays answer different
+# questions -- "how many documents" and "which benchmarks".
+declare -a EVAL_ARGS=()
+if $SEARCH; then EVAL_ARGS+=(--search); fi
 SAMPLE_N_JSON=$("$PY_BIN" "$SCRIPT_DIR/eval_mini/make_mini_tasks.py" \
     "${SIZE_ARGS[@]}" --print-sample-n) || \
     { echo "error: could not resolve the sample sizes" >&2; exit 2; }
@@ -284,7 +297,8 @@ print(snapshot_download(sys.argv[1]))" "$MODEL" 2>/dev/null)
                     for kv in $ENVS; do export "${kv?}"; done
                 fi
                 bash "$SCRIPT_DIR/run_bench_eval.sh" --run-dir "$SHADOW" \
-                    --num-gpus "$NUM_GPUS" --min-minutes 0 --bank "$BANK" "${SIZE_ARGS[@]}"
+                    --num-gpus "$NUM_GPUS" --min-minutes 0 --bank "$BANK" \
+                    "${SIZE_ARGS[@]}" ${EVAL_ARGS[@]+"${EVAL_ARGS[@]}"}
             )
 
             # run_bench_eval.sh reports a suite that failed and moves on, so its exit

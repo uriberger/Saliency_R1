@@ -1,0 +1,992 @@
+#!/usr/bin/env python
+"""Which coordinate frame does Qwen3-VL emit a DeepEyes zoom box in, and can it hit the tags?
+
+    # one GPU, one model, one arm -- the shape every shard runs
+    python deepeyes_coord_format_probe.py --stage generate --out-dir DIR \\
+        --model checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged
+    python deepeyes_coord_format_probe.py --stage report --out-dir DIR
+
+    # the whole thing, sharded over a node
+    bash launch_deepeyes_coord_format.sh --out-dir DIR
+
+WHY THIS EXISTS
+
+`docs/deepeyes-build-prompts.md` Prompt 4. Two numbers that Prompt 3 (the zoom tool) and
+Prompt 5 (the rewards) both read, and that are expensive to discover late because neither
+announces itself: a wrong coordinate frame crops the wrong region on every call while the
+loss curve stays healthy, and a format rate near zero means `R_format = -1` on nearly
+every rollout while `R_tool` -- which pays out only on a correct answer -- never fires.
+
+THE COORDINATE QUESTION, AND WHY IT IS NOT SETTLED BY READING THE COOKBOOK
+
+DeepEyes' tool reads `bbox_2d` and crops the ORIGINAL image with it as absolute pixels
+(`visual_toolbox_v2.VisualToolBoxV2.reset` stores `origin_multi_modal_data` and takes
+`self.width/self.height` from it). That is right for Qwen2.5-VL. Qwen3-VL's cookbook says
+grounding output is a 0-1000 relative grid against the original image. Both are claims
+about a model under ITS OWN prompt; what the policy does under DEEPEYES' prompt is a third
+thing, and it is the only one that matters here. So this measures it.
+
+Three readings of the same four numbers, scored against V*'s ground-truth boxes:
+
+    rel1000      x * W/1000, y * H/1000           Qwen3-VL's documented grounding frame
+    abs_orig     x, y                             DeepEyes' tool's assumption
+    abs_resized  x * W/rW, y * H/rH               post-smart_resize pixels, Qwen2.5-VL's
+
+`rW, rH` are read back out of `image_grid_thw` rather than recomputed, so they are the
+frame the model actually saw and not this file's idea of it.
+
+TWO ARMS, BECAUSE IoU ALONE CANNOT SEPARATE ALL THREE
+
+The same prompt at two image resolutions. Arm A defaults to Qwen3-VL's own processor
+config (`size.longest_edge = 16777216`, i.e. max_pixels 16.7 MP), which is what verl's
+dataloader does -- neither DeepEyes' config nor our fork sets max_pixels anywhere -- and
+which does not downscale a V* photo at all. That makes arm A alone insufficient:
+`abs_resized` and `abs_orig` coincide to within the 32 px rounding and no IoU can tell
+them apart. Arm B caps max_pixels, which turns the question into an INVARIANCE test and
+answers it cleanly:
+
+  * if the model emits a 0-1000 relative grid, the raw numbers barely move between arms;
+  * if it emits post-resize absolute pixels, they shrink by the resize factor;
+  * if it emits original-image pixels, they also barely move -- but then `abs_orig`, not
+    `rel1000`, is the reading with the high IoU in BOTH arms.
+
+So: arm A says relative-or-absolute (the IoU gap is ~a factor of two in each linear
+dimension, which IoU resolves decisively); arm B says which absolute frame.
+
+`--arm-a-max-pixels` exists for one reason and should be read as a compromise wherever it
+is non-zero: an 8B forward at V*'s native resolution costs minutes on a CPU, and when
+this was first run `oci-nrt-cs-001` had no GPU hardware at all. Capping BOTH arms keeps
+all three readings separable -- the two caps differ, so the resized frame differs -- but
+it no longer reproduces the resolution verl will actually train at. Say which was used.
+
+THE FORMAT QUESTION, AND THE TRAP IN IT
+
+Prompt 4 was briefed that `R_format` is "-1 on any tag mismatch", so that a model which
+cannot hit the tag structure is actively penalised on every rollout. **That is not what
+their code does**, and the difference changes the conclusion. `vl_agent.compute_score`
+defines "mismatch" as COUNTS NOT BALANCING:
+
+    count("<think>") != count("</think>")                                   -> error
+    count("<|vision_start|><|image_pad|>") != count("<|image_pad|><|vision_end|>")
+    count("<answer>") != count("</answer>")   (after the last </think>)     -> error
+    len(answer_text) >= 1000                                                -> error
+
+A completion with NO tags at all balances perfectly (0 == 0) on the first three and
+scores `R_format = 0.0`, **not -1.0**. It is not penalised; it is invisible. The -1 is
+for opening a tag and failing to close it.
+
+What a tagless model actually loses is its ACCURACY, through the fourth clause and the
+parse above it. `answer_text = predict_str.split("<answer>")[-1].split("</answer>")[0]`
+has no fallback, so with no tag it is the whole completion: the judge is handed a raw
+chain of thought to grade against a one-phrase gold, and past 1,000 characters
+`acc_reward` is forced to 0.0 and the format error is set as well. That is the real
+cold-start argument, and it is mechanically different from a format penalty.
+
+So this script reports five numbers, not one:
+
+    format_ok_deepeyes            their rule, verbatim -- what decides the -1
+    tag_structure_ok              one <think></think> pair AND a closing tool call or answer
+    tool_call_rate                a parseable zoom call with four numbers
+    env_would_zoom_rate           ... that their ENV will actually run (see below)
+    acc_zeroed_by_length_rate     the clause that kills a tagless model's accuracy
+
+`env_would_zoom_rate` is the one that gates `R_tool`, and it is not the tool-call rate.
+`VisualToolBoxV2.execute` checks `extract_answer` FIRST and returns `done=True` on a hit,
+so a turn carrying both a `<tool_call>` and a closed `<answer>` ends the episode and the
+zoom is discarded -- no image spliced, `R_tool` zero however correct the answer is.
+
+WHAT IT IS NOT: an accuracy measurement, and not a multi-turn rollout. Only the FIRST
+assistant turn is generated. The coordinate question is entirely a turn-1 question, and
+in a real rollout the vision-token clause of the format rule is satisfied by construction
+because the tool splice, not the model, writes those tokens.
+
+Sampled at temperature 1.0 by default, not greedy, because that is what GRPO rolls out at
+and greedy overstates format compliance. `coldstart_gate.py` is the precedent for all of
+the above.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+import re
+import statistics
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent
+
+# --------------------------------------------------------------------------------------
+# Their prompt, verbatim.
+#
+# Copied from `eval/eval_vstar.py` in Visual-Agent/DeepEyes, which is character-identical
+# to `verl/workers/agent/envs/mm_process_engine/prompt.py:PROMPT.SYSTEM_PROMPT_V2` and
+# `.USER_PROMPT_V2` -- the pair the released 47k corpus was rolled out under. Using our
+# own paraphrase here would measure a prompt DeepEyes never ran, which is the one thing
+# this probe must not do. `_check_prompt_matches_upstream` re-reads both out of a local
+# clone when there is one and refuses to run if they have drifted.
+#
+# Note the two faults that are theirs and are kept: `"required":["bbox"]` names a
+# parameter that does not exist (the parameter is `bbox_2d`), and the trailing
+# double-spaces in USER_PROMPT_V2 are load-bearing only in the sense that they are what
+# the model was trained under.
+# --------------------------------------------------------------------------------------
+#
+# Written as a tuple of per-line literals, not a triple-quoted block, for one reason: the
+# last three lines END IN TWO SPACES in their source, and an editor or a pre-commit hook
+# that strips trailing whitespace would silently change the prompt. Inside quotes it
+# cannot be stripped by accident, and `_check_prompt_matches_upstream` catches it if it is
+# changed on purpose.
+SYSTEM_PROMPT = (
+    'You are a helpful assistant.\n'
+    '\n'
+    '# Tools\n'
+    'You may call one or more functions to assist with the user query.\n'
+    'You are provided with function signatures within <tools></tools> XML tags:\n'
+    '<tools>\n'
+    '{"type":"function","function":{"name":"image_zoom_in_tool","description":"Zoom in on a specific region of an image by cropping it based on a bounding box (bbox) and an optional object label.","parameters":{"type":"object","properties":{"bbox_2d":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4,"description":"The bounding box of the region to zoom in, as [x1, y1, x2, y2], where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner."},"label":{"type":"string","description":"The name or label of the object in the specified bounding box (optional)."}},"required":["bbox"]}}}\n'  # noqa: E501
+    '</tools>\n'
+    '\n'
+    '# How to call a tool\n'
+    'Return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n'  # noqa: E501
+    '<tool_call>\n'
+    '{"name": <function-name>, "arguments": <args-json-object>}\n'
+    '</tool_call>\n'
+    '\n'
+    '**Example**:  \n'
+    '<tool_call>  \n'
+    '{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [10, 20, 100, 200], "label": "the apple on the desk"}}  \n'  # noqa: E501
+    '</tool_call>'
+)
+
+USER_PROMPT = "\nThink first, call **image_zoom_in_tool** if needed, then answer. Format strictly as:  <think>...</think>  <tool_call>...</tool_call> (if tools needed)  <answer>...</answer> "  # noqa: E501
+
+USER_TEMPLATE = """Question: {question}
+Options: {options}
+""" + USER_PROMPT
+
+#: A clone of Visual-Agent/DeepEyes, reference only. Absent is fine -- the check is skipped
+#: with a warning rather than failing, because this probe has to run on a node with no
+#: network. Present and DIFFERENT is a hard stop.
+UPSTREAM = Path(os.environ.get("DEEPEYES_REF",
+                               "/home/uberger/scratch/deepeyes_ref/DeepEyes"))
+
+#: V* bench, as `eval/eval_vstar.py` expects it on disk: one .jpg and one .json per item,
+#: under two scored subdirectories. The .json carries `bbox` as [x, y, w, h] in ORIGINAL
+#: image pixels, which is the ground truth the three readings are scored against.
+VSTAR_SPLITS = ("direct_attributes", "relative_position")
+VSTAR_ROOT = Path(os.environ.get(
+    "VSTAR_BENCH_PATH",
+    "/home/uberger/scratch/cache/hf_cache/hub/datasets--craigwu--vstar_bench/"
+    "snapshots/d9ae62c903da0c98336e85c5ee89cd863b04b4da"))
+
+ABC = {0: "A", 1: "B", 2: "C", 3: "D", 4: "E", 5: "F"}
+
+#: The three candidate frames. Each maps an emitted box to ORIGINAL image pixels, which is
+#: the frame V*'s ground truth lives in.
+READINGS = ("rel1000", "abs_orig", "abs_resized")
+
+#: Arm B's cap. 2048 * 28 * 28 = 1,605,632 -- verl's and Qwen2.5-VL's classic default, and
+#: roughly a 1.5x linear downscale on a V* photo, which is far more than the 32 px
+#: rounding that separates `abs_orig` from `abs_resized` under arm A.
+ARM_B_MAX_PIXELS = 2048 * 28 * 28
+
+
+# --------------------------------------------------------------------------------------
+# Their format rule, verbatim.
+# --------------------------------------------------------------------------------------
+def deepeyes_is_format_error(predict_str: str) -> bool:
+    """`vl_agent.compute_score`'s `is_format_error`, line for line.
+
+    Reproduced rather than approximated: this boolean is the whole of `R_format`, and
+    `R_format` is -1, so a paraphrase that is 5% off reports a penalty rate that is 5%
+    off on every rollout of an 80-step run.
+    """
+    is_format_error = False
+    # Every clause is a COUNT COMPARISON. 0 == 0 balances, so a completion with no tags
+    # at all is not a format error and scores 0.0 rather than -1.0. Only the last clause
+    # can bite a tagless model, and it bites through accuracy as well.
+    if predict_str.count("<think>") != predict_str.count("</think>"):
+        is_format_error = True
+    if (predict_str.count("<|vision_start|><|image_pad|>")
+            != predict_str.count("<|image_pad|><|vision_end|>")):
+        is_format_error = True
+    predict_no_think = predict_str.split("</think>")[-1].strip()
+    if predict_no_think.count("<answer>") != predict_no_think.count("</answer>"):
+        is_format_error = True
+    # Their anti-judge-hacking clause, which also forces `acc_reward = 0.0` upstream of
+    # this line. It is the ONE clause a tagless model can trip, and it trips through the
+    # answer parse: with no <answer> tag, `answer_text` is the whole completion.
+    if len(deepeyes_answer_text(predict_str)) >= 1000:
+        is_format_error = True
+    return is_format_error
+
+
+def _upstream_string_consts(path: Path):
+    """Every module- or class-level `NAME = "literal"` in a file, as a dict.
+
+    Parsed rather than grepped because `prompt.py` carries a COMMENTED-OUT earlier
+    `SYSTEM_PROMPT_V2` directly above the live one, and a regex happily returns the dead
+    one -- which would let a drifted prompt pass this check.
+    """
+    out = {}
+    for node in ast.walk(ast.parse(path.read_text())):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not (isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            continue
+        for t in node.targets:
+            if isinstance(t, ast.Name):
+                out[t.id] = node.value.value
+    return out
+
+
+def deepeyes_answer_text(predict_str: str) -> str:
+    """What their judge is handed, character for character.
+
+    `vl_agent.compute_score`:
+
+        answer_text = predict_str.split("<answer>")[-1].split("</answer>")[0].strip()
+
+    There is no fallback. With NO `<answer>` tag anywhere, `split("<answer>")[-1]` is the
+    WHOLE COMPLETION, so the judge is asked to grade a raw chain of thought against a
+    one-phrase gold -- and if that chain runs past 1,000 characters, their anti-hack
+    clause forces `acc_reward = 0.0` and sets the format error as well.
+
+    This, not a format penalty, is what a tagless model actually loses. Their format rule
+    is a COUNT COMPARISON: zero `<answer>` against zero `</answer>` balances, so a
+    completion with no tags at all scores `R_format = 0.0`, not -1.0. The penalty is
+    real only for a model that opens a tag and does not close it.
+    """
+    return predict_str.split("<answer>")[-1].split("</answer>")[0].strip()
+
+
+def _check_prompt_matches_upstream():
+    """Refuse to run if the embedded prompt is not the one in the local clone.
+
+    Trailing whitespace and the `"required":["bbox"]` typo are part of the prompt. This is
+    the check that keeps a tidied copy from quietly becoming a different experiment.
+    """
+    ev = UPSTREAM / "eval" / "eval_vstar.py"
+    pr = UPSTREAM / "verl" / "workers" / "agent" / "envs" / "mm_process_engine" / "prompt.py"
+    if not ev.exists():
+        print(f"WARNING: no DeepEyes clone at {UPSTREAM}; the prompt is unverified. "
+              "Set DEEPEYES_REF to a clone to check it.", file=sys.stderr)
+        return
+    want = [(ev, "instruction_prompt_system", SYSTEM_PROMPT),
+            (ev, "USER_PROMPT_V2", USER_PROMPT)]
+    if pr.exists():
+        # Their eval script and their training env must also still agree with each other;
+        # if they diverge, which one we are measuring becomes a choice to make out loud.
+        want += [(pr, "SYSTEM_PROMPT_V2", SYSTEM_PROMPT),
+                 (pr, "USER_PROMPT_V2", USER_PROMPT)]
+    for path, name, embedded in want:
+        got = _upstream_string_consts(path).get(name)
+        if got is None:
+            raise SystemExit(f"deepeyes_coord_format_probe: no {name} in {path}")
+        if got != embedded:
+            raise SystemExit(
+                f"deepeyes_coord_format_probe: {name} in {path} is not the string this "
+                "file embeds. Measuring under a prompt DeepEyes never ran measures "
+                f"nothing.\n  upstream: {got!r}\n  here:     {embedded!r}")
+    # The format rule is transcribed too, so check the source it came from.
+    vl = UPSTREAM / "verl" / "utils" / "reward_score" / "vl_agent.py"
+    if vl.exists():
+        vsrc = vl.read_text()
+        for needle in ('count_vision_1 = predict_str.count("<|vision_start|><|image_pad|>")',
+                       'if len(answer_text) >= 1000:',
+                       'format_reward = -1.0 if is_format_error else 0.0'):
+            if needle not in vsrc:
+                raise SystemExit(
+                    f"deepeyes_coord_format_probe: {vl} no longer contains {needle!r}. "
+                    "Their format rule moved; update deepeyes_is_format_error to match "
+                    "rather than scoring the old one.")
+
+
+# --------------------------------------------------------------------------------------
+# Geometry
+# --------------------------------------------------------------------------------------
+def xywh_to_xyxy(b):
+    x, y, w, h = b
+    return [float(x), float(y), float(x) + float(w), float(y) + float(h)]
+
+
+def iou(a, b):
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    iw = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    ih = max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = iw * ih
+    aa = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+    ba = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+    union = aa + ba - inter
+    return inter / union if union > 0 else 0.0
+
+
+def covered(gt, box):
+    """Fraction of the GT box the emitted box contains.
+
+    Reported alongside IoU because a ZOOM box is allowed to be much bigger than its
+    target -- a crop that swallows the object is a success and an IoU of 0.2. If the two
+    metrics disagree about which reading wins, the frame question is not settled and the
+    disagreement belongs in the writeup rather than being averaged away.
+    """
+    gx0, gy0, gx1, gy1 = gt
+    bx0, by0, bx1, by1 = box
+    iw = max(0.0, min(gx1, bx1) - max(gx0, bx0))
+    ih = max(0.0, min(gy1, by1) - max(gy0, by0))
+    ga = max(0.0, gx1 - gx0) * max(0.0, gy1 - gy0)
+    return (iw * ih) / ga if ga > 0 else 0.0
+
+
+def convert(box, reading, W, H, rW, rH):
+    """An emitted [x1,y1,x2,y2] -> original-image pixels, under one reading."""
+    x0, y0, x1, y1 = (float(v) for v in box)
+    if reading == "rel1000":
+        return [x0 * W / 1000.0, y0 * H / 1000.0, x1 * W / 1000.0, y1 * H / 1000.0]
+    if reading == "abs_orig":
+        return [x0, y0, x1, y1]
+    if reading == "abs_resized":
+        return [x0 * W / rW, y0 * H / rH, x1 * W / rW, y1 * H / rH]
+    raise ValueError(reading)
+
+
+def out_of_frame(box, W, H):
+    """Fraction of the box's area that falls outside the image.
+
+    A reading that puts half of every box off the picture is wrong independently of any
+    ground truth, which makes this the one frame signal that survives a model whose boxes
+    are simply in the wrong PLACE.
+    """
+    x0, y0, x1, y1 = box
+    area = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    if area <= 0:
+        return 1.0
+    iw = max(0.0, min(x1, W) - max(x0, 0.0))
+    ih = max(0.0, min(y1, H) - max(y0, 0.0))
+    return 1.0 - (iw * ih) / area
+
+
+# --------------------------------------------------------------------------------------
+# Parsing what the model emitted
+# --------------------------------------------------------------------------------------
+TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+#: The loose fallback. Counted separately and never used for the IoU table: a model that
+#: writes the box but not the tags produces a number here and ZERO tool calls in verl,
+#: and conflating the two would hide exactly the failure Prompt 9 is told to watch for.
+LOOSE_BBOX_RE = re.compile(r"\"?bbox(?:_2d)?\"?\s*:\s*\[([^\]]*)\]")
+
+
+def parse_tool_calls(text):
+    """Every well-formed `<tool_call>` block, as dicts. Their `extract_action` is laxer.
+
+    `visual_toolbox_v2.execute` takes the LAST block and `json.loads` it; `eval_vstar.py`
+    takes the FIRST and `eval()`s it. We keep all of them and score the first, because the
+    first zoom is the one whose placement the method depends on.
+    """
+    out = []
+    for blob in TOOL_CALL_RE.findall(text):
+        blob = blob.strip()
+        for loader in (json.loads, ast.literal_eval):
+            try:
+                obj = loader(blob)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                out.append(obj)
+            break
+    return out
+
+
+def first_bbox(calls):
+    """The first four-number `bbox_2d` in a list of parsed tool calls, or None."""
+    for obj in calls:
+        args = obj.get("arguments") if isinstance(obj.get("arguments"), dict) else obj
+        for key in ("bbox_2d", "bbox"):
+            b = args.get(key) if isinstance(args, dict) else None
+            if isinstance(b, (list, tuple)) and len(b) == 4:
+                try:
+                    return [float(v) for v in b]
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
+def loose_bbox(text):
+    m = LOOSE_BBOX_RE.search(text)
+    if not m:
+        return None
+    try:
+        vals = [float(v.strip()) for v in m.group(1).split(",")]
+    except ValueError:
+        return None
+    return vals if len(vals) == 4 else None
+
+
+#: Their env's answer detector, verbatim from `VisualToolBoxV2.extract_answer`. It needs
+#: BOTH tags, so an unclosed `<answer>` is invisible to it -- which matters, because the
+#: FORMAT rule does count the unclosed one. The two disagree on the same string.
+ENV_ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
+
+
+def env_sees_answer(text):
+    return bool(ENV_ANSWER_RE.findall(text))
+
+
+def tag_structure_ok(text):
+    """One `<think></think>` pair, closed by exactly one tool call or exactly one answer.
+
+    The strict reading of their protocol, and the one that predicts whether `R_tool` can
+    ever fire. Their own rule (`deepeyes_is_format_error`) passes a bare untagged answer.
+    """
+    if text.count("<think>") != 1 or text.count("</think>") != 1:
+        return False
+    tail = text.split("</think>")[-1]
+    n_tool = len(TOOL_CALL_RE.findall(tail))
+    n_ans_open, n_ans_close = tail.count("<answer>"), tail.count("</answer>")
+    has_answer = n_ans_open == 1 and n_ans_close == 1
+    return bool(n_tool >= 1 or has_answer)
+
+
+# --------------------------------------------------------------------------------------
+# Corpus
+# --------------------------------------------------------------------------------------
+def subsample(rows, n):
+    """At most `n` rows, EVENLY SPACED -- never the first n.
+
+    Two reasons it is not a head slice. V*'s two splits are concatenated, so the first 115
+    rows are all `direct_attributes` and a head slice silently drops `relative_position`
+    (whose GT is two boxes, and whose questions are the ones a zoom helps least). And arm
+    B runs on fewer rows than arm A, so the arm-to-arm invariance comparison is only
+    honest if arm B's rows are a SUBSET of arm A's. An integer stride gives that exactly
+    whenever one N is a multiple of the other; a float stride or a random sample does
+    not. The cost is that N is a ceiling, not a target: `--n 100` of 191 returns 96.
+    """
+    if not n or n >= len(rows):
+        return rows
+    step = max(1, round(len(rows) / float(n)))
+    return rows[::step][:n]
+
+
+def load_vstar(root: Path):
+    """V* rows, exactly as `eval/eval_vstar.py` builds them, plus the GT boxes.
+
+    HR-Bench is NOT here on purpose: its parquet carries `index/question/A..D/answer/
+    category/image`, and no box. The coordinate half therefore rests on V* alone rather
+    than on a label we would have had to invent; the format half could use either and
+    does not need the extra 1,000 rows.
+    """
+    rows = []
+    for split in VSTAR_SPLITS:
+        d = root / split
+        if not d.is_dir():
+            raise SystemExit(f"deepeyes_coord_format_probe: no V* split at {d}")
+        for jpg in sorted(d.glob("*.jpg")):
+            meta = json.loads((d / (jpg.stem + ".json")).read_text())
+            opts = meta["options"]
+            option_str = "\n" + "".join(f"{ABC[i]}. {o}\n" for i, o in enumerate(opts))
+            rows.append({
+                "uid": f"{split}/{jpg.stem}",
+                "split": split,
+                "image_path": str(jpg),
+                "question": meta["question"],
+                "options": option_str,
+                "gt_boxes": [xywh_to_xyxy(b) for b in meta["bbox"]],
+                "target_object": meta.get("target_object", []),
+            })
+    return rows
+
+
+# --------------------------------------------------------------------------------------
+# Generation
+# --------------------------------------------------------------------------------------
+def arm_proc_kwargs(processor, arm, args):
+    """The processor keywords for one arm, from its own max_pixels cap.
+
+    0 means "the processor's own config", which on Qwen3-VL is max_pixels 16.7 MP, i.e.
+    no downscale on any V* photo. That is the right arm A when a GPU is available: it is
+    what verl's dataloader does, since neither the DeepEyes config nor our fork sets
+    max_pixels anywhere.
+
+    BOTH bounds are passed, and that is not optional. The fast image processor's
+    `_preprocess` only honours them under `if min_pixels is not None and max_pixels is
+    not None` -- pass `max_pixels` alone and the override is a SILENT NO-OP that leaves
+    the arms identical. That is what the first version of this did.
+    """
+    cap = args.arm_a_max_pixels if arm == "A" else args.arm_b_max_pixels
+    if not cap:
+        return {}
+    size = getattr(processor.image_processor, "size", None)
+    min_px = int(getattr(size, "shortest_edge", None) or size["shortest_edge"])
+    return {"min_pixels": min_px, "max_pixels": int(cap)}
+
+
+def _assert_arms_differ(processor, image_path, kw_a, kw_b, patch, tag, min_ratio=1.2):
+    """The two arms must see the picture at measurably different sizes.
+
+    Arm B is the ONLY thing that separates `abs_orig` from `abs_resized`, and it does
+    that by making the post-resize frame differ from arm A's. If the two caps resolve to
+    the same grid, the probe still runs, still prints a table, and still reports a tie
+    between those two readings -- which is also what a genuine arm-A result looks like.
+    So it is a hard stop, not a warning, and it is checked in BOTH arms' logs so either
+    one is sufficient evidence after the fact.
+    """
+    from PIL import Image
+
+    img = Image.open(image_path).convert("RGB")
+    text = ("<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>x<|im_end|>\n"
+            "<|im_start|>assistant\n")
+
+    def grid(kw):
+        got = processor(text=[text], images=[img], return_tensors="pt",
+                        add_special_tokens=False, **kw)
+        return tuple(int(v) for v in got["image_grid_thw"][0][1:])
+
+    a_h, a_w = grid(kw_a)
+    b_h, b_w = grid(kw_b)
+    ratio = a_w / b_w if b_w else 0.0
+    print(f"[{tag}] arm gate: original {img.size} -> arm A {(a_h * patch, a_w * patch)} "
+          f"({a_h * a_w // 4} vision tokens) vs arm B {(b_h * patch, b_w * patch)} "
+          f"({b_h * b_w // 4} tokens)  ({ratio:.3f}x linear)", flush=True)
+    if ratio < min_ratio:
+        raise SystemExit(
+            f"deepeyes_coord_format_probe: the two arms resolve to the same frame "
+            f"({ratio:.3f}x < {min_ratio}), so abs_orig and abs_resized can never "
+            f"separate. kw_a={kw_a} kw_b={kw_b}")
+
+
+def run_generate(args):
+    import torch
+    from PIL import Image
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    out_dir = Path(args.out_dir)
+    (out_dir / "raw").mkdir(parents=True, exist_ok=True)
+    tag = f"{args.model_tag}__{args.arm}__shard{args.shard}of{args.num_shards}"
+    sink = out_dir / "raw" / f"{tag}.jsonl"
+
+    done = set()
+    if sink.exists() and not args.overwrite:
+        for line in sink.read_text().splitlines():
+            try:
+                done.add(json.loads(line)["uid"])
+            except Exception:
+                pass
+
+    rows = subsample(load_vstar(VSTAR_ROOT), args.n)
+    rows = [r for i, r in enumerate(rows) if i % args.num_shards == args.shard]
+    todo = [r for r in rows if r["uid"] not in done]
+    print(f"[{tag}] {len(todo)} of {len(rows)} rows to do "
+          f"({len(done)} already in {sink.name})", flush=True)
+    if not todo:
+        return
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
+    model = AutoModelForImageTextToText.from_pretrained(
+        args.model, torch_dtype=torch.bfloat16, trust_remote_code=True,
+        attn_implementation="sdpa").to(device).eval()
+
+    kw_a = arm_proc_kwargs(processor, "A", args)
+    kw_b = arm_proc_kwargs(processor, "B", args)
+    proc_kw = kw_a if args.arm == "A" else kw_b
+    print(f"[{tag}] arm {args.arm}  proc_kw={proc_kw or '{}'}  "
+          f"default size={getattr(processor.image_processor, 'size', None)}", flush=True)
+
+    patch = int(getattr(processor.image_processor, "patch_size", 16))
+    _assert_arms_differ(processor, todo[0]["image_path"], kw_a, kw_b, patch, tag)
+    t0 = time.time()
+    with sink.open("a") as fh:
+        for i, row in enumerate(todo):
+            img = Image.open(row["image_path"]).convert("RGB")
+            W, H = img.size
+            prompt = USER_TEMPLATE.format(question=row["question"],
+                                          options=row["options"])
+            msgs = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": [{"type": "image"},
+                                             {"type": "text", "text": prompt}]},
+            ]
+            text = processor.apply_chat_template(msgs, tokenize=False,
+                                                 add_generation_prompt=True)
+            inputs = processor(text=[text], images=[img], return_tensors="pt",
+                               padding=True, padding_side="left",
+                               add_special_tokens=False, **proc_kw).to(device)
+            # The frame the model SAW, read back rather than recomputed. grid_thw counts
+            # patch-size units, so this is the post-smart_resize pixel size exactly.
+            gh, gw = (int(v) for v in inputs["image_grid_thw"][0][1:])
+            rH, rW = gh * patch, gw * patch
+
+            gen_kw = dict(max_new_tokens=args.max_new_tokens)
+            if args.temperature > 0:
+                gen_kw.update(do_sample=True, temperature=args.temperature, top_p=1.0)
+            else:
+                gen_kw.update(do_sample=False)
+            with torch.no_grad():
+                out = model.generate(**inputs, **gen_kw)
+            comp = out[0][inputs["input_ids"].shape[1]:]
+            completion = processor.tokenizer.decode(
+                comp, skip_special_tokens=False).strip()
+            # The literal special tokens matter to their format rule, but the end-of-turn
+            # marker is scaffolding rather than output.
+            for eot in ("<|im_end|>", "<|endoftext|>"):
+                completion = completion.replace(eot, "")
+            completion = completion.strip()
+
+            rec = dict(row)
+            rec.pop("options", None)
+            rec.update({
+                "model": args.model_tag, "arm": args.arm,
+                "W": W, "H": H, "rW": rW, "rH": rH,
+                "n_prompt_tokens": int(inputs["input_ids"].shape[1]),
+                "n_completion_tokens": int(comp.shape[0]),
+                "max_new_tokens": args.max_new_tokens,
+                "proc_max_pixels": int(proc_kw.get("max_pixels", 0)),
+                "completion": completion,
+            })
+            fh.write(json.dumps(rec) + "\n")
+            fh.flush()
+            # Every row, not every tenth. On a CPU a row is minutes, so a log that only
+            # speaks every ten of them cannot tell "slow" from "hung" until it is too
+            # late to re-size the job.
+            el = time.time() - t0
+            print(f"[{tag}] {i + 1}/{len(todo)}  {el / (i + 1):.1f}s/row  "
+                  f"prompt={rec['n_prompt_tokens']} out={rec['n_completion_tokens']}",
+                  flush=True)
+    print(f"[{tag}] done in {(time.time() - t0) / 60:.1f} min -> {sink}", flush=True)
+
+
+# --------------------------------------------------------------------------------------
+# Scoring and the report
+# --------------------------------------------------------------------------------------
+def score_record(rec):
+    """Everything derivable from one completion, with no model in the room.
+
+    Split out from generation so the report can be re-derived -- and the CPU test
+    exercised -- without a GPU.
+    """
+    text = rec["completion"]
+    calls = parse_tool_calls(text)
+    box = first_bbox(calls)
+    loose = loose_bbox(text) if box is None else None
+    W, H, rW, rH = rec["W"], rec["H"], rec["rW"], rec["rH"]
+
+    res = {
+        "uid": rec["uid"], "split": rec["split"], "model": rec["model"],
+        "arm": rec["arm"], "W": W, "H": H, "rW": rW, "rH": rH,
+        "format_ok_deepeyes": not deepeyes_is_format_error(text),
+        "tag_structure_ok": tag_structure_ok(text),
+        "n_tool_calls": len(calls),
+        "tool_call_ok": box is not None,
+        # What their ENV does with this turn, which is not what the reward's format rule
+        # does with it. `VisualToolBoxV2.execute` checks `extract_answer` FIRST and
+        # returns done=True on a hit -- so a turn carrying BOTH a tool call and a closed
+        # <answer> ends the episode and the zoom is silently discarded. No image is
+        # spliced, `count("<|vision_start|><|image_pad|>")` stays 0, and R_tool cannot
+        # fire however correct the answer is.
+        "env_sees_answer": env_sees_answer(text),
+        "env_zoom_discarded": bool(box is not None and env_sees_answer(text)),
+        "env_would_zoom": bool(box is not None and not env_sees_answer(text)),
+        # What their JUDGE is handed. No `<answer>` tag means `split("<answer>")[-1]`
+        # returns the whole completion, so the grader sees a raw chain instead of an
+        # answer; past 1,000 characters their anti-hack clause then forces acc 0.0.
+        # This is the mechanism that costs a tagless model its reward -- not R_format,
+        # which scores a tagless completion 0.0 and not -1.0.
+        "answer_is_whole_completion": "<answer>" not in text,
+        "answer_text_len": len(deepeyes_answer_text(text)),
+        "acc_zeroed_by_length": len(deepeyes_answer_text(text)) >= 1000,
+        # The unambiguous case, and the one the cold-start recommendation rests on:
+        # NEITHER a closed <answer> NOR a tool call. `VisualToolBoxV2.execute` returns
+        # done=True on both of those misses, so the episode ENDS HERE, with no zoom and
+        # with the judge handed the whole chain as the answer. A model that merely
+        # defers its answer to turn 2 -- a tool call and no <answer> -- is NOT this, and
+        # must not be counted with it just because turn 1 carries no answer tag.
+        "env_stall": bool(box is None and not env_sees_answer(text)),
+        "loose_bbox_only": loose is not None,
+        "has_think": text.count("<think>") == 1 and text.count("</think>") == 1,
+        "has_answer_tags": "<answer>" in text and "</answer>" in text,
+        "n_completion_tokens": rec.get("n_completion_tokens"),
+        "proc_max_pixels": rec.get("proc_max_pixels", 0),
+        # A completion cut off at the token budget cannot close its tags, so it reads as
+        # a format failure that is OURS, not the model's. Flagged rather than dropped:
+        # the rate is itself a number Prompt 9 needs (their config allows 20,480 response
+        # tokens, so a model that truncates here will not truncate there), and the report
+        # gives the format rate over the untruncated subset alongside the raw one.
+        "truncated": bool(rec.get("max_new_tokens")
+                          and rec.get("n_completion_tokens", 0) >= rec["max_new_tokens"]),
+        "raw_bbox": box,
+        "readings": {},
+    }
+    if box is None:
+        return res
+    # Scale-free summary of the raw numbers. This is what separates the two arms: a
+    # relative grid keeps `raw_long_frac` fixed when max_pixels moves, an absolute one
+    # does not.
+    res["raw_max"] = max(box)
+    res["raw_w"] = abs(box[2] - box[0])
+    res["raw_h"] = abs(box[3] - box[1])
+    for reading in READINGS:
+        conv = convert(box, reading, W, H, rW, rH)
+        gts = rec["gt_boxes"]
+        res["readings"][reading] = {
+            "box": [round(v, 1) for v in conv],
+            "iou": max(iou(g, conv) for g in gts),
+            "covered": max(covered(g, conv) for g in gts),
+            "oof": out_of_frame(conv, W, H),
+            "area_frac": (max(0.0, conv[2] - conv[0]) * max(0.0, conv[3] - conv[1]))
+                         / float(W * H),
+        }
+    return res
+
+
+def _mean(xs):
+    return statistics.mean(xs) if xs else 0.0
+
+
+def _median(xs):
+    return statistics.median(xs) if xs else 0.0
+
+
+def summarise(scored):
+    """One (model, arm) cell of the report."""
+    n = len(scored)
+    boxed = [s for s in scored if s["tool_call_ok"]]
+    whole = [s for s in scored if not s["truncated"]]
+    cell = {
+        "n": n,
+        "format_ok_deepeyes": _mean([s["format_ok_deepeyes"] for s in scored]),
+        # The same number over the completions that were allowed to finish. The honest
+        # one to quote when the token budget was tight, and the one to compare against a
+        # run whose budget was not.
+        "format_ok_untruncated": _mean([s["format_ok_deepeyes"] for s in whole]),
+        "n_untruncated": len(whole),
+        "truncated_rate": _mean([s["truncated"] for s in scored]),
+        "tag_structure_ok": _mean([s["tag_structure_ok"] for s in scored]),
+        "tool_call_rate": _mean([s["tool_call_ok"] for s in scored]),
+        "env_would_zoom_rate": _mean([s["env_would_zoom"] for s in scored]),
+        "env_zoom_discarded_rate": _mean([s["env_zoom_discarded"] for s in scored]),
+        "answer_is_whole_completion_rate":
+            _mean([s["answer_is_whole_completion"] for s in scored]),
+        "acc_zeroed_by_length_rate": _mean([s["acc_zeroed_by_length"] for s in scored]),
+        "median_answer_text_len": _median([s["answer_text_len"] for s in scored]),
+        "env_stall_rate": _mean([s["env_stall"] for s in scored]),
+        "loose_bbox_only_rate": _mean([s["loose_bbox_only"] for s in scored]),
+        "has_think_rate": _mean([s["has_think"] for s in scored]),
+        "has_answer_tags_rate": _mean([s["has_answer_tags"] for s in scored]),
+        "median_completion_tokens": _median(
+            [s["n_completion_tokens"] for s in scored if s["n_completion_tokens"]]),
+        "proc_max_pixels": scored[0].get("proc_max_pixels", 0) if scored else 0,
+        "median_vision_tokens": _median([s["rW"] * s["rH"] / 1024.0 for s in scored]),
+        "n_boxes": len(boxed),
+        "readings": {},
+    }
+    if boxed:
+        # The invariance statistic. Normalised by the ORIGINAL width so it is comparable
+        # across arms; under `rel1000` it should sit near (box width / image width) * 1000.
+        cell["median_raw_max"] = _median([s["raw_max"] for s in boxed])
+        cell["median_raw_w_over_W"] = _median([s["raw_w"] / s["W"] for s in boxed])
+        cell["median_rW_over_W"] = _median([s["rW"] / s["W"] for s in boxed])
+        for reading in READINGS:
+            r = [s["readings"][reading] for s in boxed]
+            cell["readings"][reading] = {
+                "mean_iou": _mean([x["iou"] for x in r]),
+                "median_iou": _median([x["iou"] for x in r]),
+                "iou_ge_0.5": _mean([x["iou"] >= 0.5 for x in r]),
+                "mean_covered": _mean([x["covered"] for x in r]),
+                "covered_ge_0.9": _mean([x["covered"] >= 0.9 for x in r]),
+                "mean_out_of_frame": _mean([x["oof"] for x in r]),
+                "mostly_off_image": _mean([x["oof"] > 0.5 for x in r]),
+                "median_area_frac": _median([x["area_frac"] for x in r]),
+            }
+    return cell
+
+
+def run_report(args):
+    out_dir = Path(args.out_dir)
+    raw = sorted((out_dir / "raw").glob("*.jsonl"))
+    if not raw:
+        raise SystemExit(f"deepeyes_coord_format_probe: nothing under {out_dir}/raw")
+
+    recs, seen = [], set()
+    for p in raw:
+        for line in p.read_text().splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            key = (r["model"], r["arm"], r["uid"])
+            if key in seen:
+                continue
+            seen.add(key)
+            recs.append(r)
+
+    scored = [score_record(r) for r in recs]
+    (out_dir / "scored.jsonl").write_text(
+        "".join(json.dumps(s) + "\n" for s in scored))
+
+    cells, keys = {}, []
+    for s in scored:
+        k = (s["model"], s["arm"])
+        if k not in cells:
+            cells[k] = []
+            keys.append(k)
+        cells[k].append(s)
+    summary = {f"{m}|{a}": summarise(v) for (m, a), v in cells.items()}
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+
+    W = 96
+    print("=" * W)
+    print("DeepEyes Prompt 4 -- coordinate frame and format rate, on V* "
+          f"({len(scored)} completions)")
+    print("=" * W)
+
+    print("\nFORMAT, under DeepEyes' own prompt (first assistant turn, "
+          f"temperature {args.temperature})")
+    print(f"  {'model / arm':<24} {'R_format':>9} {'tagstruct':>10} {'<think>':>8} "
+          f"{'<answer>':>9} {'toolcall':>9} {'ZOOMS':>7} {'discard':>8} {'trunc':>6} "
+          f"{'medtok':>7}")
+    for m, a in keys:
+        c = summary[f"{m}|{a}"]
+        print(f"  {m + ' / arm ' + a:<24} {c['format_ok_deepeyes']:>8.1%} "
+              f"{c['tag_structure_ok']:>9.1%} {c['has_think_rate']:>7.1%} "
+              f"{c['has_answer_tags_rate']:>8.1%} {c['tool_call_rate']:>8.1%} "
+              f"{c['env_would_zoom_rate']:>6.1%} {c['env_zoom_discarded_rate']:>7.1%} "
+              f"{c['truncated_rate']:>5.1%} {c['median_completion_tokens']:>7.0f}")
+    print("\n  R_format  = their literal rule, which is a COUNT COMPARISON on every")
+    print("              clause. A completion with NO tags balances 0 == 0 and scores")
+    print("              0.0, NOT -1.0 -- it is not penalised, it is merely invisible.")
+    print("              The -1 is for opening a tag and not closing it.")
+    print("  tagstruct = one <think></think> pair closed by a tool call or an answer.")
+    print("  toolcall  = a parseable <tool_call> carrying four numbers.")
+    print("  ZOOMS     = a tool call that their ENV will actually execute. "
+          "`VisualToolBoxV2.execute`")
+    print("              checks <answer>...</answer> FIRST and returns done=True on a "
+          "hit, so a turn")
+    print("              carrying both ends the episode and the zoom is discarded. "
+          "This column,")
+    print("              not `toolcall`, is what gates R_tool.")
+    print("  discard   = that difference: a tool call thrown away by an answer in the "
+          "same turn.")
+    if any(summary[f"{m}|{a}"]["truncated_rate"] for m, a in keys):
+        print("\n  format_ok over the completions that were not cut off at the token "
+              "budget:")
+        for m, a in keys:
+            c = summary[f"{m}|{a}"]
+            print(f"    {m + ' / arm ' + a:<24} {c['format_ok_untruncated']:>8.1%} "
+                  f"(n={c['n_untruncated']})")
+
+    print("\nWHAT THE JUDGE IS HANDED -- the clause that actually costs a tagless model")
+    print(f"  {'model / arm':<24} {'STALLS':>8} {'no <answer>':>12} "
+          f"{'med chars':>10} {'acc->0':>8}")
+    for m, a in keys:
+        c = summary[f"{m}|{a}"]
+        print(f"  {m + ' / arm ' + a:<24} {c['env_stall_rate']:>7.1%} "
+              f"{c['answer_is_whole_completion_rate']:>11.1%} "
+              f"{c['median_answer_text_len']:>10.0f} "
+              f"{c['acc_zeroed_by_length_rate']:>7.1%}")
+    print("\n  `answer_text = predict_str.split(\"<answer>\")[-1].split(\"</answer>\")[0]`")
+    print("  has no fallback. With no <answer> tag it is the WHOLE completion, so the")
+    print("  judge grades a chain of thought against a one-phrase gold -- and past 1,000")
+    print("  characters their anti-hack clause forces acc_reward = 0.0 outright.")
+    print("  STALLS    = neither a closed <answer> NOR a tool call. Their env returns")
+    print("              done=True on both misses, so the episode ENDS here with no")
+    print("              zoom and the judge holding the raw chain. This is the column")
+    print("              the cold-start argument rests on.")
+    print("  no<answer>= turn 1 carries no answer tag. NOT a failure on its own: a model")
+    print("              that calls the tool and defers its answer to turn 2 is doing")
+    print("              the right thing and scores 100% here. Read it beside STALLS.")
+    print("  acc->0    = answer_text >= 1000 chars. ONLY TURN 1 IS GENERATED HERE and")
+    print("              the budget was short; their config allows 20,480 response")
+    print("              tokens, so this is a FLOOR on the real rate, not an estimate.")
+
+    print("\nCOORDINATE FRAME -- IoU against V*'s ground-truth boxes")
+    for m, a in keys:
+        c = summary[f"{m}|{a}"]
+        if not c["readings"]:
+            print(f"\n  {m} / arm {a}: no boxes emitted; nothing to score.")
+            continue
+        print(f"\n  {m} / arm {a}   ({c['n_boxes']} boxes, max_pixels="
+              f"{c['proc_max_pixels'] or 'processor default'}, "
+              f"median {c['median_vision_tokens']:.0f} vision tokens, "
+              f"resized/original width = {c['median_rW_over_W']:.3f}, "
+              f"median raw max coord = {c['median_raw_max']:.0f})")
+        print(f"    {'reading':<13} {'mean IoU':>9} {'med IoU':>8} {'IoU>=.5':>8} "
+              f"{'covers GT':>10} {'off-image':>10} {'med area':>9}")
+        for reading in READINGS:
+            r = c["readings"][reading]
+            print(f"    {reading:<13} {r['mean_iou']:>9.3f} {r['median_iou']:>8.3f} "
+                  f"{r['iou_ge_0.5']:>7.1%} {r['covered_ge_0.9']:>9.1%} "
+                  f"{r['mostly_off_image']:>9.1%} {r['median_area_frac']:>8.3f}")
+
+    print("\n  covers GT = the converted crop contains >=90% of the target box. A zoom")
+    print("              box may legitimately be far bigger than its target, so this")
+    print("              and IoU can disagree; if they pick different winners, say so.")
+    print("  off-image = more than half the converted box falls outside the picture.")
+    print("              A frame-only signal: it needs no ground truth.")
+
+    # The invariance test, stated rather than left to be eyeballed.
+    print("\nARM A vs ARM B -- does the emitted number move when max_pixels does?")
+    models = sorted({m for m, _ in keys})
+    for m in models:
+        a_cell, b_cell = summary.get(f"{m}|A"), summary.get(f"{m}|B")
+        if not (a_cell and b_cell and a_cell.get("readings") and b_cell.get("readings")):
+            continue
+        ra, rb = a_cell["median_raw_max"], b_cell["median_raw_max"]
+        sa, sb = a_cell["median_rW_over_W"], b_cell["median_rW_over_W"]
+        print(f"  {m}: median raw max coord {ra:.0f} -> {rb:.0f} "
+              f"({rb / ra if ra else float('nan'):.3f}x) while the resized frame went "
+              f"{sa:.3f} -> {sb:.3f} of the original ({sb / sa if sa else float('nan'):.3f}x)")
+    print("  A ratio near 1.000 on the left means the numbers do not follow the "
+          "processor:\n  the model is emitting a frame-independent grid (rel1000, or "
+          "original pixels).\n  A ratio tracking the right-hand one means post-resize "
+          "absolute pixels.")
+
+    print(f"\nwrote {out_dir / 'summary.json'} and {out_dir / 'scored.jsonl'}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--stage", default="generate", choices=("generate", "report"))
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--model-tag", default=None,
+                    help="short name for the tables; defaults to the model dir's name")
+    ap.add_argument("--arm", default="A", choices=("A", "B"),
+                    help="two image resolutions of the same prompt; the pair is what "
+                         "separates abs_orig from abs_resized")
+    ap.add_argument("--arm-a-max-pixels", type=int, default=0,
+                    help="0 = the processor's own config (16.7 MP on Qwen3-VL, so no "
+                         "downscale on a V* photo), which is what verl's dataloader "
+                         "does. Set it only to make the probe affordable on a CPU.")
+    ap.add_argument("--arm-b-max-pixels", type=int, default=ARM_B_MAX_PIXELS)
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--num-shards", type=int, default=1)
+    ap.add_argument("--n", type=int, default=0,
+                    help="at most N corpus rows, evenly spaced (0 = all 191). Arm B's N "
+                         "must divide into arm A's row set, so use the same stride.")
+    ap.add_argument("--max-new-tokens", type=int, default=512)
+    ap.add_argument("--temperature", type=float, default=1.0,
+                    help="1.0 matches what GRPO rolls out at; 0 is greedy and "
+                         "overstates format compliance")
+    ap.add_argument("--overwrite", action="store_true")
+    args = ap.parse_args()
+
+    _check_prompt_matches_upstream()
+
+    if args.stage == "report":
+        return run_report(args)
+
+    if not args.model:
+        raise SystemExit("--model is required for --stage generate")
+    args.model_tag = args.model_tag or Path(args.model).name
+    run_generate(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,3245 @@
+{
+ "0": {
+  "bbox": [
+   [
+    564,
+    142,
+    155,
+    157
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_4690.jpg",
+  "target_object": [
+   "glove"
+  ]
+ },
+ "1": {
+  "bbox": [
+   [
+    1599,
+    935,
+    45,
+    163
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_86101.jpg",
+  "target_object": [
+   "dustpan"
+  ]
+ },
+ "10": {
+  "bbox": [
+   [
+    1332,
+    636,
+    21,
+    16
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_7428.jpg",
+  "target_object": [
+   "man's helmet"
+  ]
+ },
+ "100": {
+  "bbox": [
+   [
+    3225,
+    925,
+    36,
+    84
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_38669.jpg",
+  "target_object": [
+   "woman's handbag"
+  ]
+ },
+ "101": {
+  "bbox": [
+   [
+    2055,
+    1038,
+    25,
+    23
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_27986.jpg",
+  "target_object": [
+   "life buoy"
+  ]
+ },
+ "102": {
+  "bbox": [
+   [
+    1015,
+    1095,
+    50,
+    48
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_86882.jpg",
+  "target_object": [
+   "mailbox"
+  ]
+ },
+ "103": {
+  "bbox": [
+   [
+    587,
+    1305,
+    68,
+    56
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_70112.jpg",
+  "target_object": [
+   "lock"
+  ]
+ },
+ "104": {
+  "bbox": [
+   [
+    1958,
+    405,
+    97,
+    58
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_7668.jpg",
+  "target_object": [
+   "tent"
+  ]
+ },
+ "105": {
+  "bbox": [
+   [
+    1348,
+    789,
+    22,
+    17
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_7609.jpg",
+  "target_object": [
+   "bottle cap"
+  ]
+ },
+ "106": {
+  "bbox": [
+   [
+    980,
+    613,
+    12,
+    43
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_11370.jpg",
+  "target_object": [
+   "earring"
+  ]
+ },
+ "107": {
+  "bbox": [
+   [
+    1929,
+    811,
+    105,
+    52
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_1244.jpg",
+  "target_object": [
+   "apples"
+  ]
+ },
+ "108": {
+  "bbox": [
+   [
+    117,
+    723,
+    42,
+    44
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_51837.jpg",
+  "target_object": [
+   "swim ring"
+  ]
+ },
+ "109": {
+  "bbox": [
+   [
+    1872,
+    1287,
+    62,
+    49
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_58805.jpg",
+  "target_object": [
+   "tablecloth"
+  ]
+ },
+ "11": {
+  "bbox": [
+   [
+    416,
+    1171,
+    36,
+    45
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_5413.jpg",
+  "target_object": [
+   "woman's shirt"
+  ]
+ },
+ "110": {
+  "bbox": [
+   [
+    888,
+    1363,
+    18,
+    12
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_31451.jpg",
+  "target_object": [
+   "hat"
+  ]
+ },
+ "111": {
+  "bbox": [
+   [
+    317,
+    493,
+    40,
+    110
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_10885.jpg",
+  "target_object": [
+   "flag"
+  ]
+ },
+ "112": {
+  "bbox": [
+   [
+    1809,
+    1219,
+    176,
+    63
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_7683.jpg",
+  "target_object": [
+   "bench"
+  ]
+ },
+ "113": {
+  "bbox": [
+   [
+    2303,
+    422,
+    138,
+    121
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_9957.jpg",
+  "target_object": [
+   "plastic bucket"
+  ]
+ },
+ "114": {
+  "bbox": [
+   [
+    2583,
+    1227,
+    94,
+    58
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_10052.jpg",
+  "target_object": [
+   "plastic basin"
+  ]
+ },
+ "115": {
+  "bbox": [
+   [
+    1478,
+    386,
+    63,
+    121
+   ],
+   [
+    1778,
+    323,
+    150,
+    135
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_69962.jpg",
+  "target_object": [
+   "hand lamp",
+   "telephone"
+  ]
+ },
+ "116": {
+  "bbox": [
+   [
+    1353,
+    1069,
+    24,
+    18
+   ],
+   [
+    1621,
+    1080,
+    90,
+    37
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_19421.jpg",
+  "target_object": [
+   "red car",
+   "police car"
+  ]
+ },
+ "117": {
+  "bbox": [
+   [
+    136,
+    835,
+    91,
+    80
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_7228.jpg",
+  "target_object": [
+   "drum"
+  ]
+ },
+ "118": {
+  "bbox": [
+   [
+    1455,
+    1302,
+    117,
+    77
+   ],
+   [
+    684,
+    945,
+    150,
+    110
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_6183.jpg",
+  "target_object": [
+   "dog",
+   "motorcycle"
+  ]
+ },
+ "119": {
+  "bbox": [
+   [
+    1396,
+    879,
+    23,
+    45
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_41869.jpg",
+  "target_object": [
+   "cyclist"
+  ]
+ },
+ "12": {
+  "bbox": [
+   [
+    1137,
+    881,
+    88,
+    62
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_4460.jpg",
+  "target_object": [
+   "slippers"
+  ]
+ },
+ "120": {
+  "bbox": [
+   [
+    652,
+    855,
+    31,
+    34
+   ],
+   [
+    410,
+    840,
+    28,
+    42
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_79349.jpg",
+  "target_object": [
+   "baby stroller",
+   "person in orange"
+  ]
+ },
+ "121": {
+  "bbox": [
+   [
+    1922,
+    1011,
+    64,
+    77
+   ],
+   [
+    1035,
+    692,
+    71,
+    62
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_4137.jpg",
+  "target_object": [
+   "red backpack",
+   "clock"
+  ]
+ },
+ "122": {
+  "bbox": [
+   [
+    942,
+    660,
+    36,
+    72
+   ],
+   [
+    921,
+    493,
+    63,
+    48
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_28639.jpg",
+  "target_object": [
+   "bell",
+   "clock"
+  ]
+ },
+ "123": {
+  "bbox": [
+   [
+    1347,
+    1303,
+    46,
+    129
+   ],
+   [
+    164,
+    1199,
+    103,
+    44
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_5593.jpg",
+  "target_object": [
+   "orange luggage",
+   "purple umbrella"
+  ]
+ },
+ "124": {
+  "bbox": [
+   [
+    641,
+    901,
+    21,
+    32
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_31586.jpg",
+  "target_object": [
+   "dog"
+  ]
+ },
+ "125": {
+  "bbox": [
+   [
+    1484,
+    57,
+    208,
+    125
+   ],
+   [
+    1515,
+    254,
+    47,
+    96
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_52228.jpg",
+  "target_object": [
+   "shark doll",
+   "banana doll"
+  ]
+ },
+ "126": {
+  "bbox": [
+   [
+    1268,
+    929,
+    35,
+    37
+   ],
+   [
+    1529,
+    935,
+    32,
+    35
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_61121.jpg",
+  "target_object": [
+   "baby carriage",
+   "trash can"
+  ]
+ },
+ "127": {
+  "bbox": [
+   [
+    2625,
+    1002,
+    192,
+    76
+   ],
+   [
+    2388,
+    835,
+    80,
+    46
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_53509.jpg",
+  "target_object": [
+   "seesaw",
+   "red vehicle"
+  ]
+ },
+ "128": {
+  "bbox": [
+   [
+    1772,
+    1152,
+    144,
+    100
+   ],
+   [
+    1479,
+    984,
+    42,
+    103
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_10313.jpg",
+  "target_object": [
+   "umbrella",
+   "traffic light"
+  ]
+ },
+ "129": {
+  "bbox": [
+   [
+    1040,
+    971,
+    28,
+    41
+   ],
+   [
+    1974,
+    1002,
+    21,
+    24
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_23098.jpg",
+  "target_object": [
+   "cyclist",
+   "woman's handbag"
+  ]
+ },
+ "13": {
+  "bbox": [
+   [
+    233,
+    747,
+    57,
+    64
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_50442.jpg",
+  "target_object": [
+   "cart"
+  ]
+ },
+ "130": {
+  "bbox": [
+   [
+    124,
+    960,
+    20,
+    24
+   ],
+   [
+    648,
+    1262,
+    170,
+    84
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_7826.jpg",
+  "target_object": [
+   "wristband",
+   "dog"
+  ]
+ },
+ "131": {
+  "bbox": [
+   [
+    1863,
+    797,
+    23,
+    31
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_25747.jpg",
+  "target_object": [
+   "dog"
+  ]
+ },
+ "132": {
+  "bbox": [
+   [
+    1344,
+    942,
+    19,
+    20
+   ],
+   [
+    763,
+    766,
+    20,
+    59
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_40188.jpg",
+  "target_object": [
+   "soccer ball",
+   "water dispenser"
+  ]
+ },
+ "133": {
+  "bbox": [
+   [
+    875,
+    1231,
+    161,
+    112
+   ],
+   [
+    1723,
+    916,
+    97,
+    97
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_3194.jpg",
+  "target_object": [
+   "dog",
+   "scooter"
+  ]
+ },
+ "134": {
+  "bbox": [
+   [
+    1312,
+    823,
+    50,
+    73
+   ],
+   [
+    1443,
+    837,
+    45,
+    54
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_5156.jpg",
+  "target_object": [
+   "trash can",
+   "black chair"
+  ]
+ },
+ "135": {
+  "bbox": [
+   [
+    308,
+    381,
+    22,
+    33
+   ],
+   [
+    208,
+    400,
+    23,
+    50
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_69634.jpg",
+  "target_object": [
+   "person in blue",
+   "person with white trousers"
+  ]
+ },
+ "136": {
+  "bbox": [
+   [
+    1850,
+    702,
+    19,
+    35
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_24031.jpg",
+  "target_object": [
+   "dog"
+  ]
+ },
+ "137": {
+  "bbox": [
+   [
+    578,
+    1001,
+    95,
+    96
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_80084.jpg",
+  "target_object": [
+   "blue bench"
+  ]
+ },
+ "138": {
+  "bbox": [
+   [
+    847,
+    1051,
+    59,
+    88
+   ],
+   [
+    239,
+    787,
+    67,
+    72
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_3796.jpg",
+  "target_object": [
+   "dog",
+   "bicycle"
+  ]
+ },
+ "139": {
+  "bbox": [
+   [
+    1429,
+    688,
+    83,
+    35
+   ],
+   [
+    1193,
+    717,
+    80,
+    30
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_23264.jpg",
+  "target_object": [
+   "blue truck",
+   "white vehicle"
+  ]
+ },
+ "14": {
+  "bbox": [
+   [
+    509,
+    419,
+    185,
+    165
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_37675.jpg",
+  "target_object": [
+   "clock"
+  ]
+ },
+ "140": {
+  "bbox": [
+   [
+    254,
+    2150,
+    70,
+    92
+   ],
+   [
+    193,
+    2140,
+    27,
+    88
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_56362.jpg",
+  "target_object": [
+   "bucket",
+   "plunger"
+  ]
+ },
+ "141": {
+  "bbox": [
+   [
+    1209,
+    1053,
+    28,
+    83
+   ],
+   [
+    35,
+    1078,
+    21,
+    55
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_64554.jpg",
+  "target_object": [
+   "white statue",
+   "green statue"
+  ]
+ },
+ "142": {
+  "bbox": [
+   [
+    366,
+    248,
+    26,
+    61
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_31038.jpg",
+  "target_object": [
+   "man with green shorts"
+  ]
+ },
+ "143": {
+  "bbox": [
+   [
+    26,
+    1355,
+    39,
+    121
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_30441.jpg",
+  "target_object": [
+   "man with yellow cap"
+  ]
+ },
+ "144": {
+  "bbox": [
+   [
+    629,
+    962,
+    38,
+    50
+   ],
+   [
+    1465,
+    872,
+    113,
+    81
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_6887.jpg",
+  "target_object": [
+   "green handbag",
+   "blue umbrella"
+  ]
+ },
+ "145": {
+  "bbox": [
+   [
+    1518,
+    1015,
+    70,
+    70
+   ],
+   [
+    1676,
+    1047,
+    52,
+    47
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_59351.jpg",
+  "target_object": [
+   "shopping cart",
+   "dog"
+  ]
+ },
+ "146": {
+  "bbox": [
+   [
+    339,
+    1062,
+    147,
+    219
+   ],
+   [
+    776,
+    890,
+    35,
+    51
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_62287.jpg",
+  "target_object": [
+   "towel",
+   "switch"
+  ]
+ },
+ "147": {
+  "bbox": [
+   [
+    83,
+    89,
+    88,
+    40
+   ],
+   [
+    631,
+    16,
+    90,
+    38
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_34291.jpg",
+  "target_object": [
+   "silver vehicle",
+   "red vehicle"
+  ]
+ },
+ "148": {
+  "bbox": [
+   [
+    1487,
+    939,
+    125,
+    271
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_31784.jpg",
+  "target_object": [
+   "shovel"
+  ]
+ },
+ "149": {
+  "bbox": [
+   [
+    1065,
+    1169,
+    71,
+    119
+   ],
+   [
+    517,
+    1158,
+    96,
+    93
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_3053.jpg",
+  "target_object": [
+   "yellow trash can",
+   "motorcycle"
+  ]
+ },
+ "15": {
+  "bbox": [
+   [
+    1411,
+    1201,
+    41,
+    25
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_24546.jpg",
+  "target_object": [
+   "suitcase"
+  ]
+ },
+ "150": {
+  "bbox": [
+   [
+    20,
+    760,
+    68,
+    117
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_36787.jpg",
+  "target_object": [
+   "suitcase"
+  ]
+ },
+ "151": {
+  "bbox": [
+   [
+    1456,
+    983,
+    17,
+    24
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_25678.jpg",
+  "target_object": [
+   "red chair"
+  ]
+ },
+ "152": {
+  "bbox": [
+   [
+    636,
+    619,
+    75,
+    91
+   ],
+   [
+    734,
+    656,
+    95,
+    42
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_51681.jpg",
+  "target_object": [
+   "faucet",
+   "bowl"
+  ]
+ },
+ "153": {
+  "bbox": [
+   [
+    2638,
+    618,
+    33,
+    18
+   ],
+   [
+    114,
+    736,
+    54,
+    22
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_65804.jpg",
+  "target_object": [
+   "white truck",
+   "red truck"
+  ]
+ },
+ "154": {
+  "bbox": [
+   [
+    532,
+    1033,
+    43,
+    99
+   ],
+   [
+    794,
+    1073,
+    24,
+    57
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_62783.jpg",
+  "target_object": [
+   "telephone booth",
+   "pillar box"
+  ]
+ },
+ "155": {
+  "bbox": [
+   [
+    194,
+    700,
+    25,
+    40
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_64142.jpg",
+  "target_object": [
+   "motorcyclist"
+  ]
+ },
+ "156": {
+  "bbox": [
+   [
+    451,
+    1180,
+    27,
+    20
+   ],
+   [
+    313,
+    1189,
+    10,
+    15
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_24971.jpg",
+  "target_object": [
+   "baby carriage",
+   "cone"
+  ]
+ },
+ "157": {
+  "bbox": [
+   [
+    2970,
+    869,
+    71,
+    116
+   ],
+   [
+    2515,
+    1021,
+    19,
+    24
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_7626.jpg",
+  "target_object": [
+   "sky wheel",
+   "person on the horse"
+  ]
+ },
+ "158": {
+  "bbox": [
+   [
+    2069,
+    1127,
+    44,
+    83
+   ],
+   [
+    1701,
+    1136,
+    70,
+    161
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_58331.jpg",
+  "target_object": [
+   "pillar box",
+   "man with the cane"
+  ]
+ },
+ "159": {
+  "bbox": [
+   [
+    1324,
+    1416,
+    32,
+    40
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_57960.jpg",
+  "target_object": [
+   "motorcycle"
+  ]
+ },
+ "16": {
+  "bbox": [
+   [
+    1682,
+    1175,
+    28,
+    31
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_17.jpg",
+  "target_object": [
+   "little girl's shirt"
+  ]
+ },
+ "160": {
+  "bbox": [
+   [
+    2012,
+    909,
+    62,
+    47
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_83235.jpg",
+  "target_object": [
+   "blue luggage"
+  ]
+ },
+ "161": {
+  "bbox": [
+   [
+    675,
+    959,
+    50,
+    28
+   ],
+   [
+    837,
+    954,
+    39,
+    51
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_23575.jpg",
+  "target_object": [
+   "small red car",
+   "baby carriage"
+  ]
+ },
+ "162": {
+  "bbox": [
+   [
+    1151,
+    1305,
+    28,
+    29
+   ],
+   [
+    1938,
+    1275,
+    26,
+    35
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_24464.jpg",
+  "target_object": [
+   "woman with a backpack",
+   "person with a beanie"
+  ]
+ },
+ "163": {
+  "bbox": [
+   [
+    1195,
+    717,
+    33,
+    73
+   ],
+   [
+    1244,
+    746,
+    29,
+    82
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_4953.jpg",
+  "target_object": [
+   "kid with black shirt",
+   "kid with blue shirt"
+  ]
+ },
+ "164": {
+  "bbox": [
+   [
+    824,
+    1208,
+    32,
+    26
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_65606.jpg",
+  "target_object": [
+   "yellow car"
+  ]
+ },
+ "165": {
+  "bbox": [
+   [
+    46,
+    1039,
+    55,
+    45
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_87051.jpg",
+  "target_object": [
+   "green bucket"
+  ]
+ },
+ "166": {
+  "bbox": [
+   [
+    39,
+    967,
+    23,
+    53
+   ],
+   [
+    82,
+    976,
+    62,
+    38
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_45802.jpg",
+  "target_object": [
+   "blue bottle",
+   "carton"
+  ]
+ },
+ "167": {
+  "bbox": [
+   [
+    169,
+    1048,
+    26,
+    27
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_23298.jpg",
+  "target_object": [
+   "wheelchair"
+  ]
+ },
+ "168": {
+  "bbox": [
+   [
+    624,
+    1229,
+    15,
+    21
+   ],
+   [
+    569,
+    1206,
+    28,
+    47
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_69550.jpg",
+  "target_object": [
+   "dog",
+   "blue bicycle"
+  ]
+ },
+ "169": {
+  "bbox": [
+   [
+    1259,
+    751,
+    90,
+    15
+   ],
+   [
+    1445,
+    734,
+    36,
+    70
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_61594.jpg",
+  "target_object": [
+   "keyboard",
+   "guitar"
+  ]
+ },
+ "17": {
+  "bbox": [
+   [
+    1202,
+    1095,
+    128,
+    74
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_9230.jpg",
+  "target_object": [
+   "bicycle"
+  ]
+ },
+ "170": {
+  "bbox": [
+   [
+    2136,
+    1099,
+    76,
+    51
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_5613.jpg",
+  "target_object": [
+   "dog"
+  ]
+ },
+ "171": {
+  "bbox": [
+   [
+    627,
+    707,
+    41,
+    18
+   ],
+   [
+    989,
+    806,
+    23,
+    27
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_40977.jpg",
+  "target_object": [
+   "vehicle",
+   "blue umbrella"
+  ]
+ },
+ "172": {
+  "bbox": [
+   [
+    1112,
+    686,
+    21,
+    47
+   ],
+   [
+    1345,
+    831,
+    65,
+    31
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_79958.jpg",
+  "target_object": [
+   "steel ladder",
+   "wagon"
+  ]
+ },
+ "173": {
+  "bbox": [
+   [
+    1909,
+    610,
+    99,
+    33
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_5465.jpg",
+  "target_object": [
+   "red vehicle"
+  ]
+ },
+ "174": {
+  "bbox": [
+   [
+    1107,
+    693,
+    282,
+    149
+   ],
+   [
+    401,
+    738,
+    30,
+    35
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_77731.jpg",
+  "target_object": [
+   "slide",
+   "life buoy"
+  ]
+ },
+ "175": {
+  "bbox": [
+   [
+    634,
+    606,
+    38,
+    31
+   ],
+   [
+    1746,
+    786,
+    69,
+    48
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_29022.jpg",
+  "target_object": [
+   "green surfboard",
+   "purple umbrella"
+  ]
+ },
+ "176": {
+  "bbox": [
+   [
+    675,
+    723,
+    62,
+    227
+   ],
+   [
+    728,
+    760,
+    118,
+    215
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_71151.jpg",
+  "target_object": [
+   "broom",
+   "folded chair"
+  ]
+ },
+ "177": {
+  "bbox": [
+   [
+    1054,
+    1004,
+    15,
+    15
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_49792.jpg",
+  "target_object": [
+   "soccer ball"
+  ]
+ },
+ "178": {
+  "bbox": [
+   [
+    678,
+    870,
+    32,
+    42
+   ],
+   [
+    1819,
+    868,
+    44,
+    26
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_64257.jpg",
+  "target_object": [
+   "cyclist",
+   "baby carriage"
+  ]
+ },
+ "179": {
+  "bbox": [
+   [
+    1904,
+    906,
+    46,
+    54
+   ],
+   [
+    882,
+    899,
+    22,
+    62
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_86732.jpg",
+  "target_object": [
+   "bucket",
+   "cyclist"
+  ]
+ },
+ "18": {
+  "bbox": [
+   [
+    1505,
+    610,
+    85,
+    87
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_9611.jpg",
+  "target_object": [
+   "stool"
+  ]
+ },
+ "180": {
+  "bbox": [
+   [
+    904,
+    1165,
+    45,
+    46
+   ],
+   [
+    1014,
+    1195,
+    23,
+    51
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_34785.jpg",
+  "target_object": [
+   "yellow van",
+   "telephone booth"
+  ]
+ },
+ "181": {
+  "bbox": [
+   [
+    1593,
+    759,
+    24,
+    18
+   ],
+   [
+    1558,
+    714,
+    21,
+    23
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_46221.jpg",
+  "target_object": [
+   "red balloon",
+   "white balloon"
+  ]
+ },
+ "182": {
+  "bbox": [
+   [
+    1391,
+    749,
+    58,
+    50
+   ],
+   [
+    1463,
+    712,
+    74,
+    39
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_6531.jpg",
+  "target_object": [
+   "black vehicle",
+   "silver vehicle"
+  ]
+ },
+ "183": {
+  "bbox": [
+   [
+    297,
+    885,
+    41,
+    87
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_3222.jpg",
+  "target_object": [
+   "water bottle"
+  ]
+ },
+ "184": {
+  "bbox": [
+   [
+    3535,
+    763,
+    62,
+    114
+   ],
+   [
+    487,
+    763,
+    46,
+    82
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_33280.jpg",
+  "target_object": [
+   "scooter",
+   "cyclist"
+  ]
+ },
+ "185": {
+  "bbox": [
+   [
+    1417,
+    820,
+    23,
+    22
+   ],
+   [
+    1510,
+    666,
+    66,
+    176
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_53377.jpg",
+  "target_object": [
+   "volleyball",
+   "man with white cap"
+  ]
+ },
+ "186": {
+  "bbox": [
+   [
+    702,
+    387,
+    71,
+    101
+   ],
+   [
+    1457,
+    409,
+    86,
+    60
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_7621.jpg",
+  "target_object": [
+   "blue mask",
+   "black mask"
+  ]
+ },
+ "187": {
+  "bbox": [
+   [
+    932,
+    802,
+    23,
+    197
+   ],
+   [
+    1688,
+    888,
+    49,
+    31
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_42676.jpg",
+  "target_object": [
+   "street lamp",
+   "blue van"
+  ]
+ },
+ "188": {
+  "bbox": [
+   [
+    1166,
+    1060,
+    33,
+    31
+   ],
+   [
+    1227,
+    986,
+    31,
+    28
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_40555.jpg",
+  "target_object": [
+   "yellow umbrella",
+   "pink umbrella"
+  ]
+ },
+ "189": {
+  "bbox": [
+   [
+    671,
+    978,
+    20,
+    25
+   ],
+   [
+    570,
+    980,
+    26,
+    29
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_57152.jpg",
+  "target_object": [
+   "red stool",
+   "red suitcase"
+  ]
+ },
+ "19": {
+  "bbox": [
+   [
+    543,
+    1032,
+    46,
+    44
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_50451.jpg",
+  "target_object": [
+   "bucket"
+  ]
+ },
+ "190": {
+  "bbox": [
+   [
+    1901,
+    1187,
+    92,
+    110
+   ]
+  ],
+  "category": "relative_position",
+  "image": "relative_position/sa_78272.jpg",
+  "target_object": [
+   "white chair"
+  ]
+ },
+ "2": {
+  "bbox": [
+   [
+    661,
+    880,
+    73,
+    150
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_10997.jpg",
+  "target_object": [
+   "poster"
+  ]
+ },
+ "20": {
+  "bbox": [
+   [
+    877,
+    1234,
+    10,
+    25
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_65370.jpg",
+  "target_object": [
+   "shovel"
+  ]
+ },
+ "21": {
+  "bbox": [
+   [
+    846,
+    419,
+    73,
+    139
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_47397.jpg",
+  "target_object": [
+   "blue sail"
+  ]
+ },
+ "22": {
+  "bbox": [
+   [
+    1403,
+    723,
+    63,
+    32
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_10919.jpg",
+  "target_object": [
+   "SUV car"
+  ]
+ },
+ "23": {
+  "bbox": [
+   [
+    1160,
+    1055,
+    28,
+    74
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_26968.jpg",
+  "target_object": [
+   "pink-haired woman"
+  ]
+ },
+ "24": {
+  "bbox": [
+   [
+    221,
+    737,
+    107,
+    40
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_38155.jpg",
+  "target_object": [
+   "car"
+  ]
+ },
+ "25": {
+  "bbox": [
+   [
+    1861,
+    953,
+    45,
+    30
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_28073.jpg",
+  "target_object": [
+   "bicycle"
+  ]
+ },
+ "26": {
+  "bbox": [
+   [
+    1295,
+    80,
+    40,
+    53
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_5387.jpg",
+  "target_object": [
+   "parachute"
+  ]
+ },
+ "27": {
+  "bbox": [
+   [
+    108,
+    805,
+    46,
+    58
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_23893.jpg",
+  "target_object": [
+   "motorcycle"
+  ]
+ },
+ "28": {
+  "bbox": [
+   [
+    583,
+    1762,
+    28,
+    42
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_7018.jpg",
+  "target_object": [
+   "woman's jacket"
+  ]
+ },
+ "29": {
+  "bbox": [
+   [
+    939,
+    1014,
+    19,
+    11
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_6965.jpg",
+  "target_object": [
+   "man's cap"
+  ]
+ },
+ "3": {
+  "bbox": [
+   [
+    1825,
+    685,
+    31,
+    27
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_40973.jpg",
+  "target_object": [
+   "woman's scarf"
+  ]
+ },
+ "30": {
+  "bbox": [
+   [
+    719,
+    726,
+    21,
+    67
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_52155.jpg",
+  "target_object": [
+   "pet collar"
+  ]
+ },
+ "31": {
+  "bbox": [
+   [
+    806,
+    1076,
+    25,
+    28
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_30034.jpg",
+  "target_object": [
+   "telephone"
+  ]
+ },
+ "32": {
+  "bbox": [
+   [
+    43,
+    632,
+    26,
+    68
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_5674.jpg",
+  "target_object": [
+   "water bottle"
+  ]
+ },
+ "33": {
+  "bbox": [
+   [
+    1069,
+    980,
+    44,
+    18
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_5346.jpg",
+  "target_object": [
+   "man's cap"
+  ]
+ },
+ "34": {
+  "bbox": [
+   [
+    668,
+    822,
+    19,
+    19
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_39678.jpg",
+  "target_object": [
+   "helmet"
+  ]
+ },
+ "35": {
+  "bbox": [
+   [
+    170,
+    1318,
+    19,
+    32
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_11528.jpg",
+  "target_object": [
+   "woman's bikini"
+  ]
+ },
+ "36": {
+  "bbox": [
+   [
+    1356,
+    1073,
+    70,
+    33
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_4988.jpg",
+  "target_object": [
+   "flower"
+  ]
+ },
+ "37": {
+  "bbox": [
+   [
+    1372,
+    832,
+    44,
+    29
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_16306.jpg",
+  "target_object": [
+   "clock"
+  ]
+ },
+ "38": {
+  "bbox": [
+   [
+    410,
+    740,
+    109,
+    101
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_6422.jpg",
+  "target_object": [
+   "motorcycle"
+  ]
+ },
+ "39": {
+  "bbox": [
+   [
+    674,
+    1014,
+    20,
+    39
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_56573.jpg",
+  "target_object": [
+   "bag"
+  ]
+ },
+ "4": {
+  "bbox": [
+   [
+    1353,
+    305,
+    100,
+    153
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_33579.jpg",
+  "target_object": [
+   "woman with yellow backpack"
+  ]
+ },
+ "40": {
+  "bbox": [
+   [
+    0,
+    1007,
+    100,
+    91
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_4658.jpg",
+  "target_object": [
+   "motorcycle"
+  ]
+ },
+ "41": {
+  "bbox": [
+   [
+    500,
+    1276,
+    19,
+    14
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_13337.jpg",
+  "target_object": [
+   "man's cap"
+  ]
+ },
+ "42": {
+  "bbox": [
+   [
+    520,
+    1002,
+    64,
+    29
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_10204.jpg",
+  "target_object": [
+   "van"
+  ]
+ },
+ "43": {
+  "bbox": [
+   [
+    314,
+    920,
+    108,
+    50
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_43391.jpg",
+  "target_object": [
+   "car"
+  ]
+ },
+ "44": {
+  "bbox": [
+   [
+    270,
+    629,
+    50,
+    8
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_65476.jpg",
+  "target_object": [
+   "toothbrush"
+  ]
+ },
+ "45": {
+  "bbox": [
+   [
+    1738,
+    944,
+    20,
+    49
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_42562.jpg",
+  "target_object": [
+   "handbag"
+  ]
+ },
+ "46": {
+  "bbox": [
+   [
+    23,
+    896,
+    15,
+    9
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_30411.jpg",
+  "target_object": [
+   "man's cap"
+  ]
+ },
+ "47": {
+  "bbox": [
+   [
+    383,
+    1246,
+    22,
+    43
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_10415.jpg",
+  "target_object": [
+   "fire hydrant"
+  ]
+ },
+ "48": {
+  "bbox": [
+   [
+    566,
+    854,
+    246,
+    78
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_79105.jpg",
+  "target_object": [
+   "seesaw"
+  ]
+ },
+ "49": {
+  "bbox": [
+   [
+    495,
+    842,
+    24,
+    21
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_29744.jpg",
+  "target_object": [
+   "plastic stool"
+  ]
+ },
+ "5": {
+  "bbox": [
+   [
+    1544,
+    969,
+    127,
+    84
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_3568.jpg",
+  "target_object": [
+   "cart"
+  ]
+ },
+ "50": {
+  "bbox": [
+   [
+    304,
+    1111,
+    30,
+    28
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_80352.jpg",
+  "target_object": [
+   "motorcycle helmet"
+  ]
+ },
+ "51": {
+  "bbox": [
+   [
+    1776,
+    994,
+    8,
+    8
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_25212.jpg",
+  "target_object": [
+   "helmet"
+  ]
+ },
+ "52": {
+  "bbox": [
+   [
+    343,
+    779,
+    109,
+    212
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_19483.jpg",
+  "target_object": [
+   "luggage"
+  ]
+ },
+ "53": {
+  "bbox": [
+   [
+    1088,
+    1018,
+    51,
+    66
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_7081.jpg",
+  "target_object": [
+   "trash can"
+  ]
+ },
+ "54": {
+  "bbox": [
+   [
+    1749,
+    895,
+    53,
+    49
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_35748.jpg",
+  "target_object": [
+   "scooter"
+  ]
+ },
+ "55": {
+  "bbox": [
+   [
+    1766,
+    464,
+    29,
+    95
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_59482.jpg",
+  "target_object": [
+   "dress"
+  ]
+ },
+ "56": {
+  "bbox": [
+   [
+    344,
+    745,
+    32,
+    62
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_25835.jpg",
+  "target_object": [
+   "cyclist"
+  ]
+ },
+ "57": {
+  "bbox": [
+   [
+    1348,
+    1353,
+    46,
+    41
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_30179.jpg",
+  "target_object": [
+   "bicycle"
+  ]
+ },
+ "58": {
+  "bbox": [
+   [
+    1634,
+    1140,
+    27,
+    31
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_25219.jpg",
+  "target_object": [
+   "flag"
+  ]
+ },
+ "59": {
+  "bbox": [
+   [
+    1550,
+    1112,
+    44,
+    70
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_38195.jpg",
+  "target_object": [
+   "cyclist"
+  ]
+ },
+ "6": {
+  "bbox": [
+   [
+    1041,
+    174,
+    70,
+    156
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_9019.jpg",
+  "target_object": [
+   "candles"
+  ]
+ },
+ "60": {
+  "bbox": [
+   [
+    652,
+    1250,
+    63,
+    39
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_20519.jpg",
+  "target_object": [
+   "dog"
+  ]
+ },
+ "61": {
+  "bbox": [
+   [
+    615,
+    634,
+    61,
+    58
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_717.jpg",
+  "target_object": [
+   "dog"
+  ]
+ },
+ "62": {
+  "bbox": [
+   [
+    1826,
+    1251,
+    48,
+    41
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_66699.jpg",
+  "target_object": [
+   "motorcycle"
+  ]
+ },
+ "63": {
+  "bbox": [
+   [
+    1315,
+    1216,
+    115,
+    68
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_4020.jpg",
+  "target_object": [
+   "car"
+  ]
+ },
+ "64": {
+  "bbox": [
+   [
+    1403,
+    998,
+    65,
+    184
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_10225.jpg",
+  "target_object": [
+   "kid"
+  ]
+ },
+ "65": {
+  "bbox": [
+   [
+    1818,
+    391,
+    137,
+    295
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_80880.jpg",
+  "target_object": [
+   "broom"
+  ]
+ },
+ "66": {
+  "bbox": [
+   [
+    1283,
+    881,
+    39,
+    49
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_84131.jpg",
+  "target_object": [
+   "bucket"
+  ]
+ },
+ "67": {
+  "bbox": [
+   [
+    1091,
+    741,
+    50,
+    25
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_30935.jpg",
+  "target_object": [
+   "scarf"
+  ]
+ },
+ "68": {
+  "bbox": [
+   [
+    1648,
+    678,
+    29,
+    81
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_10033.jpg",
+  "target_object": [
+   "flag"
+  ]
+ },
+ "69": {
+  "bbox": [
+   [
+    1448,
+    343,
+    76,
+    122
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_10720.jpg",
+  "target_object": [
+   "oil painting"
+  ]
+ },
+ "7": {
+  "bbox": [
+   [
+    172,
+    218,
+    19,
+    25
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_33492.jpg",
+  "target_object": [
+   "Apple logo"
+  ]
+ },
+ "70": {
+  "bbox": [
+   [
+    1223,
+    643,
+    29,
+    18
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_38610.jpg",
+  "target_object": [
+   "dog"
+  ]
+ },
+ "71": {
+  "bbox": [
+   [
+    1146,
+    785,
+    25,
+    27
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_10701.jpg",
+  "target_object": [
+   "paraglider"
+  ]
+ },
+ "72": {
+  "bbox": [
+   [
+    1510,
+    1337,
+    26,
+    57
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_19272.jpg",
+  "target_object": [
+   "woman's dress"
+  ]
+ },
+ "73": {
+  "bbox": [
+   [
+    518,
+    897,
+    108,
+    111
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_7347.jpg",
+  "target_object": [
+   "cleaning cloth"
+  ]
+ },
+ "74": {
+  "bbox": [
+   [
+    308,
+    792,
+    36,
+    28
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_64897.jpg",
+  "target_object": [
+   "umbrella"
+  ]
+ },
+ "75": {
+  "bbox": [
+   [
+    23,
+    1132,
+    37,
+    28
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_28392.jpg",
+  "target_object": [
+   "backpack"
+  ]
+ },
+ "76": {
+  "bbox": [
+   [
+    1103,
+    1370,
+    23,
+    21
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_60786.jpg",
+  "target_object": [
+   "umbrella"
+  ]
+ },
+ "77": {
+  "bbox": [
+   [
+    638,
+    992,
+    54,
+    51
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_63876.jpg",
+  "target_object": [
+   "baby carriage"
+  ]
+ },
+ "78": {
+  "bbox": [
+   [
+    494,
+    891,
+    14,
+    30
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_16854.jpg",
+  "target_object": [
+   "watch"
+  ]
+ },
+ "79": {
+  "bbox": [
+   [
+    1150,
+    896,
+    101,
+    53
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_7065.jpg",
+  "target_object": [
+   "bus"
+  ]
+ },
+ "8": {
+  "bbox": [
+   [
+    2029,
+    1196,
+    45,
+    45
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_44097.jpg",
+  "target_object": [
+   "plastic stool"
+  ]
+ },
+ "80": {
+  "bbox": [
+   [
+    1507,
+    1146,
+    79,
+    42
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_55722.jpg",
+  "target_object": [
+   "flute"
+  ]
+ },
+ "81": {
+  "bbox": [
+   [
+    84,
+    793,
+    40,
+    46
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_26085.jpg",
+  "target_object": [
+   "flag"
+  ]
+ },
+ "82": {
+  "bbox": [
+   [
+    117,
+    1234,
+    8,
+    12
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_66657.jpg",
+  "target_object": [
+   "soda can"
+  ]
+ },
+ "83": {
+  "bbox": [
+   [
+    2278,
+    1010,
+    18,
+    35
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_31511.jpg",
+  "target_object": [
+   "handbag"
+  ]
+ },
+ "84": {
+  "bbox": [
+   [
+    1744,
+    920,
+    15,
+    48
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_68625.jpg",
+  "target_object": [
+   "straw"
+  ]
+ },
+ "85": {
+  "bbox": [
+   [
+    655,
+    1207,
+    119,
+    55
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_34040.jpg",
+  "target_object": [
+   "bus"
+  ]
+ },
+ "86": {
+  "bbox": [
+   [
+    2067,
+    1002,
+    10,
+    19
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_29509.jpg",
+  "target_object": [
+   "trash can"
+  ]
+ },
+ "87": {
+  "bbox": [
+   [
+    1967,
+    1225,
+    15,
+    20
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_41908.jpg",
+  "target_object": [
+   "guard's glove"
+  ]
+ },
+ "88": {
+  "bbox": [
+   [
+    909,
+    416,
+    178,
+    55
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_7429.jpg",
+  "target_object": [
+   "comb"
+  ]
+ },
+ "89": {
+  "bbox": [
+   [
+    223,
+    2057,
+    51,
+    45
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_55332.jpg",
+  "target_object": [
+   "electric rickshaw"
+  ]
+ },
+ "9": {
+  "bbox": [
+   [
+    1424,
+    740,
+    58,
+    37
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_39518.jpg",
+  "target_object": [
+   "tissue box"
+  ]
+ },
+ "90": {
+  "bbox": [
+   [
+    1045,
+    1043,
+    87,
+    116
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_17108.jpg",
+  "target_object": [
+   "truck"
+  ]
+ },
+ "91": {
+  "bbox": [
+   [
+    175,
+    473,
+    92,
+    76
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_4203.jpg",
+  "target_object": [
+   "chair"
+  ]
+ },
+ "92": {
+  "bbox": [
+   [
+    182,
+    1295,
+    26,
+    69
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_16825.jpg",
+  "target_object": [
+   "messenger bag"
+  ]
+ },
+ "93": {
+  "bbox": [
+   [
+    926,
+    1285,
+    23,
+    29
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_42585.jpg",
+  "target_object": [
+   "helmet"
+  ]
+ },
+ "94": {
+  "bbox": [
+   [
+    2137,
+    994,
+    57,
+    72
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_9877.jpg",
+  "target_object": [
+   "backpack"
+  ]
+ },
+ "95": {
+  "bbox": [
+   [
+    1415,
+    1045,
+    39,
+    15
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_11405.jpg",
+  "target_object": [
+   "watchband"
+  ]
+ },
+ "96": {
+  "bbox": [
+   [
+    1037,
+    757,
+    12,
+    11
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_66471.jpg",
+  "target_object": [
+   "bottle cap"
+  ]
+ },
+ "97": {
+  "bbox": [
+   [
+    1973,
+    1232,
+    59,
+    37
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_11290.jpg",
+  "target_object": [
+   "umbrella"
+  ]
+ },
+ "98": {
+  "bbox": [
+   [
+    1952,
+    1145,
+    64,
+    83
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_5281.jpg",
+  "target_object": [
+   "flag"
+  ]
+ },
+ "99": {
+  "bbox": [
+   [
+    292,
+    901,
+    26,
+    17
+   ]
+  ],
+  "category": "direct_attributes",
+  "image": "direct_attributes/sa_59664.jpg",
+  "target_object": [
+   "dog"
+  ]
+ }
+}

@@ -24,9 +24,9 @@ HERE = Path(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, str(HERE / "eval_mini"))
 sys.path.insert(0, str(HERE))
 
-from benchmarks import (DEFAULT_SUITE_N, as_suite_n, estimate_minutes,  # noqa: E402
-                        plan_units, profile_dir, profile_name, task_sample_n,
-                        wandb_prefix)
+from benchmarks import (BENCHMARKS, DEFAULT_SUITE_N, as_suite_n,  # noqa: E402
+                        estimate_minutes, plan_units, profile_dir, profile_name,
+                        task_sample_n, wandb_prefix)
 import bench_eval  # noqa: E402
 import bench_samples  # noqa: E402
 
@@ -98,12 +98,16 @@ def test_refuses_to_mix():
     hundred = {t: 100 for t in task_sample_n(DEFAULT_SUITE_N)}
     three = task_sample_n({"natural": 300, "nonnatural": 100})
 
-    # All five natural benchmarks complain, and only those: the non-natural half
-    # is asked for at the size it already has.
+    # Every natural benchmark complains, and only those: the non-natural half is
+    # asked for at the size it already has. Counted from the table rather than
+    # written out, because the natural suite has gained the four on-demand
+    # visual-search benchmarks and will gain more -- a literal here would turn
+    # every future addition into a test failure that says nothing.
+    natural = sum(1 for s in BENCHMARKS.values() if s["suite"] == "natural")
     check("100-document results into a 300 profile: refused",
-          len(bench_eval.check_profile(hundred, three)), 5)
+          len(bench_eval.check_profile(hundred, three)), natural)
     check("300-document results into a 100 profile: refused",
-          len(bench_eval.check_profile(three, hundred)), 5)
+          len(bench_eval.check_profile(three, hundred)), natural)
     check("matching sizes: accepted", bench_eval.check_profile(three, three), [])
     check("the non-natural half is unchanged, so it never complains",
           [p for p in bench_eval.check_profile(hundred, three) if "chartqa" in p], [])

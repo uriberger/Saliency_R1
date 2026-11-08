@@ -16,6 +16,7 @@ __pycache__/
 # Nested HuggingFace TRL clone — tracked as its own git repo, not a submodule.
 trl_repo
 trl_repo_nemotron
+trl_repo_ergo
 
 # Nested EASE (EasyR1/verl fork) clone — same deal as trl_repo.
 ease_repo
@@ -27,6 +28,7 @@ cold_data/Mulberry-SFT
 cold_data/Saliency-R1-cold
 cold_data/grpo_sets
 cold_data/ease
+cold_data/deepeyes
 cold_data/_verify_out*/
 checkpoint
 outputs
@@ -49,3 +51,6 @@ wandb/
 laser_repo
 laser_fork
 ease_repo
+
+# The DeepEyes arm's own verl clone (see docs/deepeyes-build-prompts.md Prompt 0).
+deepeyes_fork
