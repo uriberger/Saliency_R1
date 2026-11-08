@@ -78,7 +78,11 @@ rate, the format rates and the frame verdict are all measured on the same set.
 ## 4. The instrument
 
 `ergo_zoom_gate.py`, in the shape of `coldstart_gate.py` — a cheap check on the two
-mechanisms a reward depends on, not a quality metric. One GPU, ~1–2 h for both models.
+mechanisms a reward depends on, not a quality metric. One GPU — and **~6 h** for both
+models at the full 191 rows, measured, against the ~1–2 h originally estimated here:
+191 rows × 2 turns × 2 models is 764 generations and an A100-80GB does 2.2/min at this
+geometry. Nothing is written until the second model finishes, so the allocation has to
+cover the whole thing.
 
 ```fish
 bash launch_ergo_zoom_gate_job.sh \
@@ -174,22 +178,137 @@ started and reported afterwards.
 
 ## 7. Result
 
-**Not yet measured — the gate is built, tested and blocked on hardware.** See section 8.
+### VERDICT: FAIL — the cold start parses a `<zoom>` box on 4.2% of rollouts
 
-What exists and is verified:
+> **A two-turn ERGO cold start is needed before any GRPO run is worth starting.
+> That is +3–5 days and it is the single thing that blows this arm's budget.**
+> It has **not** been started.
 
-- `ergo_zoom_gate.py` — the instrument. 50 CPU tests in `test_ergo_zoom_gate_cpu.py`, all
-  passing, covering ERGO's parser verbatim, the two turns' format checks, the three frame
-  mappings, the IoU/coverage confound, the "a wrong frame is a valid rectangle" case, the
-  undecided-with-no-boxes case, the 28-vs-32 budget, and the prompt diff against the
-  clone.
-- `launch_ergo_zoom_gate_job.sh` — one GPU, ~2 h, `sbatch` or `submit_job`.
-- `craigwu/vstar_bench` fetched into `HF_HOME`: 191 rows, 191 ground-truth boxes, 0
-  missing annotations.
-- The geometry, verified on the real models at the real budget: the pre-resize and the
-  processor agree exactly, `processor_resized_under_us = 0`. See the table below.
+Measured 2026-11-08 on `cs-oci-ord`, one A100-80GB inside interactive allocation
+`38208034`, temperature 1.0, 1280 visual tokens, `coord hint: 'none'`, and
+`processor_resized_under_us = 0` on both models — so the frame table below is reading
+the pixels the model actually saw.
 
-## 8. The blocker: this cluster has no GPUs
+**Read the n first: this is n = 24, not 191.** See *Why n = 24* below. It is a
+complete run of the gate — both turns, both models, the frame table, `gate_sub24.json`
+and `completions_sub24.jsonl` — over a stratified quarter of the benchmark.
+
+| turn 1 | cold start | base Instruct | gate |
+|---|---|---|---|
+| `<zoom>` tag present | 8.3% | **100.0%** | |
+| **box parses, ERGO's own parser** | **4.2%** | **95.8%** | ≥ 60% |
+| box parses leniently | 79.2% | 95.8% | |
+| `<think>…</think>` exactly once | **66.7%** | **0.0%** | |
+| **joint turn-1 format** | **0.0%** | **0.0%** | |
+
+| turn 2 | cold start | base Instruct | gate |
+|---|---|---|---|
+| strict `<think>…</think><answer>…</answer>` | 0.0% | 0.0% | ≥ 60% |
+| lenient (one `<answer>` pair) | 0.0% | 0.0% | |
+| `<answer>` tags at all | 0.0% | **100.0%** | |
+| **both turns well-formed = `r_format`** | **0.0%** | **0.0%** | |
+| letter accuracy (context only) | 58.3% | 79.2% | |
+
+**The two models have exactly one half of the format each, and neither has both.**
+This is the thing `--reference` was made non-optional for, and it pays for itself
+here. The cold start writes `<think>` (66.7%) and almost never a box (4.2%). Vanilla
+Instruct writes a parseable box on **95.8%** of rollouts and never once writes
+`<think>` (0.0%). So:
+
+- **The box ability is in the backbone, and our cold start removed it.** That matches
+  the Qwen3-VL tech report's `image_zoom_in_tool` RL, and it is a completely different
+  problem from "this recipe cannot produce boxes" — which 4.2% alone could not have
+  distinguished. The two-turn cold start has to *add* `<zoom>` to a corpus that
+  already teaches `<think>` without destroying what the backbone came with.
+- **`r_format` is 0.0% on both models**, so on today's checkpoints every reward in a
+  GRPO group is 0, the group advantage is exactly 0, and the run trains nothing while
+  the loss curve looks ordinary. This is the failure the gate exists to find, and it
+  is present.
+- The 4.2%-strict vs 79.2%-lenient gap is the diagnosis, not noise: the cold start
+  *does* emit four numbers on most rows, just not inside `<zoom>` tags. The fix is
+  format supervision, not a capability transplant.
+
+### The coordinate frame: `rel1000`, decided on the base model
+
+The cold start parsed **1** box, so its frame table is undecided and printed
+`DISAGREEMENT`, as designed. The base model parsed **23**, and they are unambiguous:
+
+| frame | n | mean IoU | GT coverage | centre-hit | centre-err |
+|---|---|---|---|---|---|
+| **rel1000** | 23 | **0.206** | **0.617** | **0.652** | **0.110** |
+| resized | 23 | 0.0102 | 0.194 | 0.174 | 0.161 |
+| original | 23 | 0.0000 | 0.000 | 0.000 | 0.258 |
+
+**`rel1000` wins by +0.196 mean IoU and all three statistics agree** — no
+`DISAGREEMENT` warning, which is the condition section 5 set for taking the frame
+seriously. The structural evidence agrees too: 0 of 23 boxes exceed 1000, median max
+coordinate 775, largest 999 — a distribution pressed right up against a 0–1000 grid.
+
+**So ERGO's `map_box` must not be ported unchanged.** Qwen3-VL emits the 0–1000
+relative grid its documentation describes; Qwen2.5-VL's post-`smart_resize` pixel
+reading scores 20× worse on IoU and misses the target centre 83% of the time. This
+was the first row of the build document's trap table and it is now measured rather
+than assumed.
+
+**ERGO's γ = 0.6 is non-binding on this backbone.** Median crop area is **1.14%** of
+the image on the base model and **0.02%** on the cold start; **100%** of crops are
+under γ on both. `r_box` would fire on every rollout and carry no signal at all. It
+is not harmful, but it is not doing the work the paper's ablation gives it credit
+for, and the TCE reward is effectively `r_region` alone here.
+
+### Why n = 24
+
+The plan budgeted ~2 h for 191 rows × 2 turns × 2 models. Measured throughput on an
+A100-80GB at the production geometry was **2.2 generations/min**, which puts the full
+764-generation gate at **~5.8 h** — and `ergo_zoom_gate.py` writes nothing until both
+models finish, so a full run inside a 75-minute window returns *zero*, not a partial.
+The full run was started, got to `turn1 ...40/191 parsed 3`, and was stopped.
+
+The subset is **14 `direct_attributes` + 10 `relative_position`** — proportional to
+V\*'s real 115/76 split — and evenly strided inside each category.
+`load_vstar`'s own `--n` is `rows[:n]`, which on a category-ordered `test_questions.jsonl`
+would have produced an all-`direct_attributes` sample; the stratified file lives at
+`outputs/ergo_gate_zoom/vstar_sub24/` and the runner is
+`outputs/logs/ergo_gate_zoom.sub24.sh`.
+
+**What n = 24 does and does not support.** The decision this gate drives is one
+threshold, 60%, and 4.2% is nowhere near it: a 1/24 rate has a 95% Wilson interval of
+roughly 0.7–21%, entirely below the gate. The aborted full run independently saw
+3/40 = 7.5% strict on a different, larger slice. The two agree, and the verdict does
+not depend on which is right. By the same token the base model's 95.8% and the
+`rel1000` margin are not close calls either.
+
+What n = 24 **cannot** carry: the frame verdict rests on 23 boxes from one model, the
+cold start's frame is simply undecided, and the crop-area medians are indicative.
+Rerun the full 191 — it is one GPU for ~6 h, and it now has a measured cost rather
+than an estimate — before any of those get quoted as settled.
+
+### Also verified
+
+- `ergo_zoom_gate.py` — 50 CPU tests in `test_ergo_zoom_gate_cpu.py`, all passing.
+- `craigwu/vstar_bench` fetched into `cs-oci-ord`'s `HF_HOME`: 191 rows, 191
+  ground-truth boxes, 0 missing annotations. It was **absent** on that cluster and
+  had to be staged from the login node; the lmms-eval mirror that *was* present
+  carries no boxes and would not have worked.
+- The geometry on the real models at the real budget: `processor_resized_under_us = 0`.
+
+## 8. Where it ran, and the cluster that could not run it
+
+Section 7 was produced on **`cs-oci-ord`**, from an interactive allocation rather
+than `submit_job`. `--dry-run` prints the runner the batch path would have submitted;
+`outputs/logs/ergo_gate_zoom.sub24.sh` is that runner pinned to one card with
+`CUDA_VISIBLE_DEVICES=0` and pointed at the stratified subset:
+
+```fish
+srun --jobid=$JOBID --overlap --ntasks=1 bash outputs/logs/ergo_gate_zoom.sub24.sh
+```
+
+**To redo it at the full 191 rows, budget ~6 h on one GPU**, not the ~2 h this
+document estimated before the run, and drop `--vstar-root` to get the whole
+benchmark. Gate B does **not** resume and writes nothing until both models finish, so
+a short allocation returns nothing at all — give it the whole window or cut `n`.
+
+### The cluster that could not run it
 
 As of 2026-11-07, `oci-nrt-cs-001` has **no GPU hardware at all**:
 
@@ -208,18 +327,21 @@ processors requested than permitted"** at *any* `--cpus-per-task`, including non
 reads like a QoS cap and is not one.
 
 The launcher now runs that one-second check before submitting and refuses with the move
-instead of parking a job forever. **To get section 7's numbers:**
+instead of parking a job forever. The same wall stood in front of Gate A (P1); both gates
+were moved to `cs-oci-ord` and both ran there on 2026-11-08.
+
+One correction to what this section used to promise. *"Nothing needs copying — the second
+cluster checks this repo out at the same absolute paths"* is true of the **repo** and of
+`checkpoint/`, and false of `HF_HOME`. The two clusters' `$HOME/scratch` are different
+Lustre mounts behind identical paths, and `craigwu/vstar_bench` was **not** staged on
+`cs-oci-ord` — only the lmms-eval mirror, which ships no boxes. Under `HF_HUB_OFFLINE=1`
+that is a `SystemExit` on the first row, inside the allocation. Stage it from the login
+node before allocating:
 
 ```fish
-ssh cs-oci-ord-login-01
-cd /home/uberger/scratch/research/saliency_r1/.worktrees/probe-ergo-gate-zoom
-bash launch_ergo_zoom_gate_job.sh
+set -x HF_HOME /home/uberger/scratch/cache/hf_cache
+python -c "from huggingface_hub import snapshot_download as s; print(s('craigwu/vstar_bench', repo_type='dataset'))"
 ```
-
-Nothing needs copying — the second cluster checks this repo out at the same absolute
-paths, and `checkpoint/` and `HF_HOME` resolve on both. ~2 h on one card for both models.
-
-The same wall stands in front of Gate A (P1), which wants 8 GPUs for a benchmark sweep.
 
 ### What was validated without a GPU
 
