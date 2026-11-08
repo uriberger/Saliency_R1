@@ -24,22 +24,38 @@ advertises a `gpu` GRES. Only the eight `cpu_*` partitions have hardware. That i
 hardware outage, not the `(PartitionConfig)` scheduling churn we have seen before. We
 moved rather than waited.
 
-**The two clusters share the filesystem.** `/home/uberger/scratch/research/saliency_r1`
-and the origin cluster's `/lustre/fs1/.../users/uberger/research/saliency_r1` are the
-same inode. So nothing needs copying — not the repo, not `outputs/`, not `HF_HOME`,
-not the conda envs. Everything below is already where it needs to be.
+**The two clusters do _not_ share a filesystem.** Both check the repo out at the same
+absolute path, which makes it look like they do, but `$HOME/scratch` is a **per-cluster
+symlink into that cluster's own lustre mount**. Nothing written on `oci-nrt-cs-001` is
+visible here. This is recorded in `docs/ergo-gate-lowres.md`, where it already broke one
+set of handoff instructions.
+
+Three consequences, and they are the whole reason Step 0 exists:
+
+1. **The branch has to travel through `origin`.** It cannot be read across.
+2. **Gitignored artifacts are not here** unless this cluster already had them —
+   `checkpoint/`, `outputs/`, `cold_data/` and `HF_HOME` are all per-cluster.
+3. **The eval compute nodes have no network** and `HF_HUB_OFFLINE=1` is pinned on
+   purpose, so anything missing from this cluster's HF cache fails the first unit with a
+   `ConnectionError` instead of downloading. Pre-stage from a **login** node.
 
 ## Where the harness lives
 
-The gate was built on branch **`probe/deepeyes-gate`**, which is **not merged**. Its
-worktree is a full checkout and is visible from here:
+The gate was built on branch **`probe/deepeyes-gate`** on the origin cluster. It must be
+pushed there and fetched here:
 
-```
-.worktrees/probe-deepeyes-gate/
+```fish
+# there (oci-nrt-cs-001), from the central tree -- I will have done this already
+git push origin probe/deepeyes-gate
+
+# here
+git fetch origin
+git log --oneline origin/probe/deepeyes-gate -2   # expect 0b39687 and 06ad1d4
+./worktree.sh new probe/deepeyes-gate-ord          # or check the branch out directly
 ```
 
-Run from that directory. If the branch has since been merged to `main`, the repo root
-works instead — check with `git log --oneline -3` before assuming either way.
+If `git fetch` does not show that branch, **stop and tell me** — it means the push did
+not happen and there is nothing here to run.
 
 ## Do not run python on the login node
 
@@ -59,35 +75,52 @@ exit on their own. Compute nodes have `ulimit -v unlimited`. This is recorded in
 
 ## Step 0 — preflight, before anything is submitted
 
-Four checks. **Stop and tell me if any fails** rather than working around it.
+**Stop and tell me if any of these fails** rather than working around it. Everything
+below was staged on the *other* cluster and none of it is guaranteed here.
 
 ```fish
 # 1. are there GPUs here at all, and how many
 sinfo -o "%.20P %.10l %.6D %.6t %.14G" | grep -i gpu
 sinfo -h -N -o "%G" | grep -ci gpu          # must NOT be 0
 
-# 2. the harness is present
-ls .worktrees/probe-deepeyes-gate/launch_deepeyes_gate_job.sh
+# 2. the harness arrived (see above -- it travels through origin)
+git log --oneline origin/probe/deepeyes-gate -2     # expect 0b39687, 06ad1d4
 
-# 3. the three model arms and the benchmark data are staged (all already true)
-du -sh $HF_HOME/hub/models--ChenShawn--DeepEyes-7B          # expect ~16G
-ls -d $HF_HOME/hub/datasets--craigwu--vstar_bench $HF_HOME/hub/datasets--DreamMr--HR-Bench
-ls -lh outputs/deepeyes_gate/data/                          # hr_bench_{4k,8k}.tsv + manifest.json
+# 3. the cold start -- 17 GB, and the ONLY artifact that cannot be re-downloaded
+du -sh checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged
 
-# 4. the judge key
+# 4. this cluster's HF cache (NOT the other cluster's)
+echo $HF_HOME
+du -sh $HF_HOME/hub/models--ChenShawn--DeepEyes-7B          # 16 GB, re-downloadable
+ls -d $HF_HOME/hub/models--Qwen--Qwen3-VL-8B-Instruct \
+      $HF_HOME/hub/datasets--craigwu--vstar_bench \
+      $HF_HOME/hub/datasets--DreamMr--HR-Bench
+
+# 5. the judge key
 set -x NVIDIA_API_KEY (cat ~/.config/nvidia/api_key)
 ```
 
-`HF_HOME` should already be `/home/uberger/scratch/cache/hf_cache`. The compute nodes run
-`HF_HUB_OFFLINE=1`, so nothing downloads at run time — that is why the staging matters.
+**What to do about each gap:**
 
-`build_deepeyes_eval_data.py` has **already been run**; re-running it is a no-op and is
-only needed if `outputs/deepeyes_gate/data/` is missing.
+| missing | fix |
+|---|---|
+| `ChenShawn/DeepEyes-7B`, `Qwen3-VL-8B-Instruct`, `vstar_bench`, `HR-Bench` | re-download from a **login** node (it has network; compute nodes do not). Cheaper than copying. |
+| `outputs/deepeyes_gate/data/*.tsv` (6.2 GB) | **regenerate, do not copy** — `build_deepeyes_eval_data.py` rebuilds them from the HR-Bench parquet in ~5 min on `cpu_short`, and also clones and patches their repo. |
+| the 17 GB cold start checkpoint | **this is the one real copy.** It is not on any hub. If it is absent, tell me before copying 17 GB across clusters — dropping the `coldstart` arm and running `--models deepeyes-7b,qwen3vl-8b` still answers most of §8, and I would rather make that trade deliberately. |
+
+Then, once the gaps are closed:
+
+```fish
+# CPU, ~5 min, cpu_short. Patches their clone and converts HR-Bench parquet -> TSV.
+python build_deepeyes_eval_data.py --out-dir outputs/deepeyes_gate/data
+```
+
+Remember the login-node rule above: send even this through `srun`.
 
 ## Step 1 — run the gate
 
 ```fish
-cd .worktrees/probe-deepeyes-gate
+cd .worktrees/probe-deepeyes-gate-ord    # the worktree you made in Step 0
 set -x NVIDIA_API_KEY (cat ~/.config/nvidia/api_key)
 bash launch_deepeyes_gate_job.sh --name deepeyes-gate --duration 4
 ```
