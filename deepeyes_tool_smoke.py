@@ -49,56 +49,22 @@ from pathlib import Path
 TAG = "[DEEPEYES-MROPE]"
 
 
-def build_tool_config(path: Path) -> Path:
-    """The ImageZoomInTool entry, with the schema copied from the tool's own docstring.
+def build_tool_config(path: Path, *, bbox_frame: str) -> Path:
+    """Delegate to `deepeyes/zoom_tool_config.py`, which owns this config.
 
-    `max_pixels`/`min_pixels` are NOT set: P3 owns the geometry (28 -> 32) and a
-    stack proof must not quietly introduce a resize, which is the one thing that
-    would turn the whole method into a no-op.
+    This used to hand-roll the `tools:` block with the schema copied from the tool's
+    own docstring. That stopped being safe once P3 made `bbox_frame` a required,
+    defaultless key: two copies of a config drift, and the copy that drifts silently
+    is the one in the stack proof, which is the thing you reach for when you are
+    already confused about whether the stack works.
+
+    `max_pixels`/`min_pixels` are still not set, for the original reason -- a stack
+    proof must not quietly introduce a resize, which is the one thing that would turn
+    the whole method into a no-op.
     """
-    import yaml
+    from deepeyes.zoom_tool_config import build_tool_config as _build
 
-    cfg = {
-        "tools": [
-            {
-                "class_name": "verl.tools.image_zoom_in_tool.ImageZoomInTool",
-                "config": {"type": "native", "num_workers": 8, "rate_limit": 32},
-                "tool_schema": {
-                    "type": "function",
-                    "function": {
-                        "name": "image_zoom_in_tool",
-                        "description": (
-                            "Zoom in on a specific region of an image by cropping it based on a "
-                            "bounding box (bbox) and an optional object label."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "bbox_2d": {
-                                    "type": "array",
-                                    "items": {"type": "number"},
-                                    "minItems": 4,
-                                    "maxItems": 4,
-                                    "description": (
-                                        "The bounding box of the region to zoom in, as "
-                                        "[x1, y1, x2, y2], where (x1, y1) is the top-left corner "
-                                        "and (x2, y2) is the bottom-right corner."
-                                    ),
-                                },
-                                "label": {
-                                    "type": "string",
-                                    "description": "The name or label of the object in the bbox (optional).",
-                                },
-                            },
-                            "required": ["bbox_2d"],
-                        },
-                    },
-                },
-            }
-        ]
-    }
-    path.write_text(yaml.safe_dump(cfg, sort_keys=False))
-    return path
+    return Path(_build(path, bbox_frame=bbox_frame))
 
 
 def env_vars() -> dict:
@@ -135,6 +101,11 @@ def main() -> int:
     # dataset, the batch. Being able to run that on a login node is how a typo in a
     # config key stops costing an 8-GPU allocation to discover.
     ap.add_argument("--dry-run", action="store_true", help="build config and batch, then stop")
+    # No default, matching the tool itself. P4 measured rel1000 for Qwen3-VL-8B
+    # (mean IoU 0.260 against 0.000 for the absolute reading), but a stack proof that
+    # picks the frame for you is how a measured fact becomes an inherited assumption.
+    ap.add_argument("--frame", required=True, choices=["rel1000", "abs_original", "abs_smartresize"],
+                    help="coordinate frame for bbox_2d; rel1000 is what P4 measured for Qwen3-VL")
     args = ap.parse_args()
 
     out = Path(args.out_dir).resolve()
@@ -159,7 +130,8 @@ def main() -> int:
     verl_dir = Path(verl.__file__).parent
     print(f"verl: {verl_dir}")
 
-    tool_config_path = build_tool_config(out / "image_zoom_in_tool_config.yaml")
+    tool_config_path = build_tool_config(out / "image_zoom_in_tool_config.yaml",
+                                         bbox_frame=args.frame)
 
     with initialize_config_dir(config_dir=str(verl_dir / "trainer/config"), version_base=None):
         config = compose(config_name="ppo_trainer")

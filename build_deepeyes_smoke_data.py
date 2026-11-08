@@ -41,6 +41,8 @@ import json
 import os
 from pathlib import Path
 
+from deepeyes.zoom_tool_config import build_tools_kwargs
+
 # Upstream verl's instruction block, copied verbatim from
 # examples/data_preprocess/geo3k.py so the prompt is theirs and not ours.
 INSTRUCTION_FOLLOWING = (
@@ -140,15 +142,13 @@ def main() -> int:
                 "answer": example["answer"],
                 "question": problem,
                 "need_tools_kwargs": True,
-                "tools_kwargs": {
-                    "image_zoom_in_tool": {
-                        # ImageZoomInTool.create() reads create_kwargs["image"] and
-                        # pushes it through qwen_vl_utils.fetch_image, which accepts a
-                        # PIL image, a path, a URL or a data: URI. The bytes dict is
-                        # what survives parquet, so we hand it a data URI instead.
-                        "create_kwargs": {"image": _data_uri(img)},
-                    }
-                },
+                # `build_tools_kwargs` is the only supported way to produce this. It
+                # derives `original_size` and `view_size` from the RAW image by two
+                # deliberately different computations, which is what lets the tool
+                # refuse to crop an already-smart-resized copy. Hand-rolling the dict
+                # (this used to pass only `image`) is the specific mistake it exists
+                # to make impossible, and the tool now rejects the short form.
+                "tools_kwargs": build_tools_kwargs(img),
             },
         }
 
@@ -167,14 +167,6 @@ def main() -> int:
     print(json.dumps(manifest, indent=2))
     print(f"wrote -> {out}")
     return 0
-
-
-def _data_uri(img) -> str:
-    import base64
-
-    buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
 if __name__ == "__main__":
