@@ -422,9 +422,16 @@ def main():
     sizes = ", ".join(f"{suite}={suite_n[suite]}" for suite in SUITES)
     print(f"wrote {written} mini task configs + minisample.py to {out_dir}", file=sys.stderr)
     print(f"  {sizes}, seed {args.seed}   (profile {profile_name(suite_n)})", file=sys.stderr)
+    # Two different reasons a task can differ from its suite's size, and they are
+    # not the same news. "--task-n mmstar=200" is a decision somebody made; "V*
+    # only has 191 rows" is a fact about the benchmark. Printing both as
+    # "override" would make the second look like a mistake in the command line.
     for task, n in sorted(sample_n.items()):
-        if n != suite_n[BENCHMARKS[base_task(task)]["suite"]]:
-            print(f"  override: {task} = {n}", file=sys.stderr)
+        spec = BENCHMARKS[base_task(task)]
+        if n == suite_n[spec["suite"]]:
+            continue
+        why = "whole split" if n == spec.get("split_n") else "override"
+        print(f"  {why}: {task} = {n}", file=sys.stderr)
 
 
 if __name__ == "__main__":
