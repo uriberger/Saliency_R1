@@ -41,21 +41,21 @@ Three consequences, and they are the whole reason Step 0 exists:
 
 ## Where the harness lives
 
-The gate was built on branch **`probe/deepeyes-gate`** on the origin cluster. It must be
-pushed there and fetched here:
+**It is on `main`.** The whole DeepEyes build was merged and pushed on 2026-11-08, so
+there is no branch to chase:
 
 ```fish
-# there (oci-nrt-cs-001), from the central tree -- I will have done this already
-git push origin probe/deepeyes-gate
-
-# here
-git fetch origin
-git log --oneline origin/probe/deepeyes-gate -2   # expect 0b39687 and 06ad1d4
-./worktree.sh new probe/deepeyes-gate-ord          # or check the branch out directly
+git pull
+git log --oneline -1          # expect 2a0ac89 or later
+ls launch_deepeyes_gate_job.sh build_deepeyes_eval_data.py deepeyes/zoom_tool_config.py
 ```
 
-If `git fetch` does not show that branch, **stop and tell me** — it means the push did
-not happen and there is nothing here to run.
+Run from the repo root. (An earlier version of this file told you to fetch
+`probe/deepeyes-gate`; that branch still exists on `origin` at `0b39687` but is now an
+ancestor of `main`, so ignore it.)
+
+If `git pull` leaves you below `2a0ac89`, **stop and tell me** — it means you are on a
+different remote or a stale checkout, and there is nothing here to run.
 
 ## Do not run python on the login node
 
@@ -83,8 +83,9 @@ below was staged on the *other* cluster and none of it is guaranteed here.
 sinfo -o "%.20P %.10l %.6D %.6t %.14G" | grep -i gpu
 sinfo -h -N -o "%G" | grep -ci gpu          # must NOT be 0
 
-# 2. the harness arrived (see above -- it travels through origin)
-git log --oneline origin/probe/deepeyes-gate -2     # expect 0b39687, 06ad1d4
+# 2. the harness arrived (it is on main; just pull)
+git log --oneline -1                                 # expect 2a0ac89 or later
+ls launch_deepeyes_gate_job.sh deepeyes/zoom_tool_config.py
 
 # 3. the cold start -- 17 GB, and the ONLY artifact that cannot be re-downloaded
 du -sh checkpoint/coldstart_qwen3_vl_8b_instruct_sft_epoch2_lr5e5_merged
@@ -120,7 +121,7 @@ Remember the login-node rule above: send even this through `srun`.
 ## Step 1 — run the gate
 
 ```fish
-cd .worktrees/probe-deepeyes-gate-ord    # the worktree you made in Step 0
+# from the repo root -- the harness is on main, no worktree needed to *run* it
 set -x NVIDIA_API_KEY (cat ~/.config/nvidia/api_key)
 bash launch_deepeyes_gate_job.sh --name deepeyes-gate --duration 4
 ```
