@@ -70,6 +70,38 @@ Two resolution facts the launcher needs, and `stats.json` reports both:
     analytically on the patch-16 / merge-2 grid (32 px per token). That second number
     is what `data.max_prompt_length` has to hold, not the first.
 
+AND THE THIRD FACT, WHICH IS THE UNCOMFORTABLE ONE
+---------------------------------------------------
+`stats.json` also reports `downscale` = sqrt(original_px / view_px), per split, over
+every tool row. Measured on the full corpus:
+
+    vstar   median 1.000, max 1.066, 12,530 / 22,362 rows at or below 1.0
+    chart   median 1.000, max 1.042,  7,070 / 13,659 rows at or below 1.0
+
+**The model is already shown these images at native resolution.** Qwen3-VL's pixel cap
+is 16,384 tokens x 32^2 = 16,777,216 px and the largest image in the whole corpus is
+4,064,256 px -- 24% of the cap -- so `smart_resize` never shrinks anything here. It
+only rounds to the 32 px grid, which is the entire 0.975-1.066 spread.
+
+So a zoom on this corpus recovers **no pixel the model did not already have**. Whatever
+the tool buys, it is not detail: it is isolation and token re-allocation.
+
+Three things follow, and none of them is "the conversion is wrong":
+
+  * It is not a cap we applied. The image bytes are byte-identical to the release and
+    `--verify` hashes them to prove it; the finding survives that check passing.
+  * It is not a Qwen3-VL artifact either. DeepEyes pin `qwen-vl-utils==0.0.11`
+    (`requirements_deepeyes.txt:230`), whose cap is 16,384 x 28^2 = 12,845,056 px --
+    also far above 4.06 MP. They trained at downscale ~1.0 too. The property belongs
+    to their corpus, not to our port.
+  * The only lever is to LOWER the view, not to raise the images. Dropping
+    `view_max_tokens` (equivalently the dataloader's `max_pixels`) would give the zoom
+    real headroom -- and would be a deviation from DeepEyes, to be decided and stated
+    in the launcher, not smuggled in here.
+
+P9 should read the tool-call rate against this. A near-zero rate on a corpus with no
+headroom is the policy being right, not the plumbing being broken.
+
 WHERE THE ORIGINAL IMAGE GOES, AND THE THREE FIELDS THE TOOL DEMANDS
 ---------------------------------------------------------------------
 `tool_agent_loop.py:444` hands `tools_kwargs[tool_name]["create_kwargs"]` straight to

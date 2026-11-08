@@ -53,15 +53,21 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default=str(REPO / "cold_data" / "deepeyes" / "verl"))
     ap.add_argument("--model", default="Qwen/Qwen3-VL-8B-Instruct")
-    ap.add_argument("--rows", type=int, default=4, help="rows read per shard")
+    ap.add_argument("--rows", type=int, default=8, help="rows read per shard")
     ap.add_argument("--max-prompt-length", type=int, default=16384)
+    # The val shard by default: it is carved from the same rows by the same code and
+    # holds all three data_sources in 35 MB, where the train shards are 4.5 GB and
+    # `datasets` copies every byte into its cache to read eight rows.
+    ap.add_argument("--glob", default="val_*.parquet", help="use 'train_*.parquet' for the heavy run")
+    ap.add_argument("--cache-dir", default="/tmp/verl_rlhf_cache",
+                    help="RLHFDataset copies each parquet here before reading it")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir).resolve()
-    shards = sorted(data_dir.glob("train_*.parquet"))
+    shards = sorted(data_dir.glob(args.glob))
     if not shards:
-        raise SystemExit(f"no train_*.parquet under {data_dir} -- run build_deepeyes_data.py")
+        raise SystemExit(f"no {args.glob} under {data_dir} -- run build_deepeyes_data.py")
 
     from hydra import compose, initialize_config_dir
 
@@ -74,9 +80,15 @@ def main() -> int:
     print(f"verl    : {verl_dir}")
     print(f"shards  : {[s.name for s in shards]}\n", flush=True)
 
+    from omegaconf import OmegaConf
+
     with initialize_config_dir(config_dir=str(verl_dir / "trainer/config"), version_base=None):
         config = compose(config_name="ppo_trainer")
 
+    # `data.cache_dir` is read by RLHFDataset (`config.get("cache_dir", ...)`) but is not
+    # declared in the config schema, so hydra's struct mode rejects it. On the command
+    # line it needs `+data.cache_dir=...`; here it needs this.
+    OmegaConf.set_struct(config, False)
     d = config.data
     d.max_prompt_length = args.max_prompt_length
     d.image_key = "images"
@@ -87,6 +99,7 @@ def main() -> int:
     # every image onto 28 px tiles -- see build_deepeyes_data.py's module docstring.
     d.image_patch_size = 16
     d.tool_config_path = None
+    d.cache_dir = args.cache_dir
 
     tokenizer = hf_tokenizer(args.model)
     processor = hf_processor(args.model, use_fast=True)
@@ -185,13 +198,17 @@ def main() -> int:
     d14 = config.data.copy()
     d14.image_patch_size = 14
     ds14 = RLHFDataset(data_files=[str(shards[0])], tokenizer=tokenizer, config=d14, processor=processor)
-    r14 = ds14[0]
-    shown14 = (r14.get("multi_modal_data", {}).get("image") or [None])[0]
-    patch14 = {
-        "image_patch_size": 14,
-        "shown": list(shown14.size) if shown14 else None,
-        "declared_view_size": [int(v) for v in ck_of(r14).get("view_size") or []],
-    }
+    patch14 = {"image_patch_size": 14, "shown": None, "declared_view_size": None}
+    for j in range(min(args.rows * 8, len(ds14))):
+        r14 = ds14[j]
+        want14 = [int(v) for v in ck_of(r14).get("view_size") or []]
+        if not want14:
+            continue  # a math row has no view_size to disagree with
+        shown14 = (r14.get("multi_modal_data", {}).get("image") or [None])[0]
+        patch14 = {"image_patch_size": 14, "row": j,
+                   "shown": list(shown14.size) if shown14 else None,
+                   "declared_view_size": want14}
+        break
     print(f"\n  with verl's default data.image_patch_size=14 the dataloader shows "
           f"{patch14['shown']} while the data declares {patch14['declared_view_size']} "
           f"-- the tool would reject every call.")
