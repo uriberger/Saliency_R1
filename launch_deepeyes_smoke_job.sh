@@ -137,8 +137,86 @@ PARTITION=${PARTITION_OVERRIDE:-${PARTITION:-$(SR1_JOB_HOURS=$DURATION sr1_pick_
 ACCOUNT=${ACCOUNT:-nvr_israel_rlop}
 CONDA_ENV=${CONDA_ENV:-deepeyes}
 
-sr1_find_submit_job || [[ $DRY_RUN -eq 1 ]] || {
-    echo "ERROR: submit_job not found under the cluster-interface paths." >&2; exit 1; }
+# ---------------------------------------------------------------------------
+# IS THERE ANY GPU HARDWARE AT ALL? Ask before queueing, because a partition with no
+# nodes is not a queue -- it accepts the job and never schedules it, and the job sits
+# there looking like contention. On 2026-11-07 every GPU partition on oci-nrt-cs-001
+# reported `Nodes=(null) TotalNodes=0` (backfill, batch_block1, batch_large,
+# batch_long, batch_short, batch_singlenode, interactive, sniff-gpu-nodes), while the
+# eight cpu_* partitions had 50 nodes each. One scontrol call tells a dead partition
+# from a busy one; park nothing.
+LIVE=""
+for p in ${PARTITION//,/ }; do
+    n=$(scontrol show partition "$p" 2>/dev/null | grep -o 'TotalNodes=[0-9]*' | head -1 | cut -d= -f2)
+    [ -n "${n:-}" ] && [ "$n" -gt 0 ] 2>/dev/null && LIVE="${LIVE:+$LIVE,}$p"
+done
+if [ -z "$LIVE" ]; then
+    echo "==========================================================================" >&2
+    echo "NO GPU HARDWARE. Every partition in '$PARTITION' has TotalNodes=0 on"       >&2
+    echo "$(hostname). This cluster currently has no GPU nodes at all; only the"      >&2
+    echo "cpu_* partitions have hardware. Submitting would park the job forever."     >&2
+    echo                                                                              >&2
+    echo "  sinfo -a -o '%P %D'    # count nodes per partition"                       >&2
+    echo                                                                              >&2
+    echo "What CAN run here today, and answers A1/A2/A3 on the real agent-loop code:" >&2
+    echo "  bash launch_deepeyes_agentloop_cpu_job.sh --name deepeyes-p2-cpu"         >&2
+    echo "  python test_deepeyes_rope_cpu.py"                                         >&2
+    echo "Pass --partition <name> to override if you know better."                    >&2
+    echo "==========================================================================" >&2
+    [[ $DRY_RUN -eq 1 ]] || exit 1
+fi
+[ -n "$LIVE" ] && PARTITION="$LIVE"
+
+# ---------------------------------------------------------------------------
+# WHICH SUBMITTER. The repo's launchers all use the ADLR `submit_job` wrapper, and on
+# 2026-11-07 it cannot run on this cluster at all: its NSS config roots every path at
+# `/scratch/fsw/portfolios/adlr/...` and there is no `/scratch` on the login node OR on
+# the compute nodes (checked on cpu-0010), so it dies at
+#     ERROR: Request to mount path that does not exist: /scratch
+# before reaching sbatch. Plain sbatch works, and everything this job needs -- conda,
+# the fork, the HF cache -- is on /lustre and runs bare-metal. Prefer the wrapper when
+# it is usable so the house convention still holds wherever it does.
+SUBMITTER="${SUBMITTER:-auto}"
+if [ "$SUBMITTER" = auto ]; then
+    if [ -d /scratch ] && sr1_find_submit_job; then SUBMITTER=submit_job; else SUBMITTER=sbatch; fi
+fi
+[ "$SUBMITTER" = submit_job ] && { sr1_find_submit_job || [[ $DRY_RUN -eq 1 ]] || {
+    echo "ERROR: submit_job not found under the cluster-interface paths." >&2; exit 1; }; }
+
+# ---------------------------------------------------------------------------
+# SUBMITTING FROM A vscode LOGIN NODE. Two shims, both for the same reason: the
+# ADLR cluster-interface identifies the cluster from $HOSTNAME, and
+# `oci-nrt-cs-001-vscode-01` is not a name it knows.
+#
+#   1. detect_system.sh's case arm is `oci-nrt-slurm-1-*`. No arm matches a vscode
+#      node, so it exits with
+#          ERROR: Unable to determine target cluster system from host name ...
+#      which reads like a broken launcher and is not one. Spoofing HOSTNAME for the
+#      duration of the submit_job call selects the correct arm -- which is also where
+#      NSS_CONFIGFILE and CLUSTER_NAME come from, so this is the one-line fix rather
+#      than setting three variables by hand.
+#
+#   2. That arm then resolves ADLR_PYTHON through the NSS config's
+#      NSSSUB_ADLR_UTILS_ENV_ROOT, which is `/scratch/fsw/portfolios/adlr/...`.
+#      There is no /scratch on this node at all, so submit_job dies on its shebang
+#      line with "No such file or directory". detect_system.sh honours a PRE-SET
+#      ADLR_PYTHON (`if [ -z "${ADLR_PYTHON:-}" ]`), and the same interpreter exists
+#      under /lustre/fs1, so point at that.
+#
+# This belongs in cluster_env.sh next to sr1_find_submit_job eventually -- every
+# launcher in the repo hits it from here, and the other DeepEyes prompts will. It is
+# local to this file for now because cluster_env.sh is shared with live sessions and a
+# probe should not be the thing that edits it.
+SUBMIT_HOSTNAME="$(hostname)"
+case "$SUBMIT_HOSTNAME" in
+    oci-nrt-cs-*vscode*) SUBMIT_HOSTNAME="oci-nrt-slurm-1-login-01" ;;
+esac
+if [ -z "${ADLR_PYTHON:-}" ] && [ ! -x "/scratch/fsw/portfolios/adlr/projects/adlr_other_infra/python/latest/bin/python" ]; then
+    for p in /lustre/fs1/portfolios/adlr/projects/adlr_other_infra/python/latest/bin/python \
+             /lustre/fsw/portfolios/adlr/projects/adlr_other_infra/python/latest/bin/python; do
+        [ -x "$p" ] && { export ADLR_PYTHON="$p"; break; }
+    done
+fi
 
 LOG_ROOT="$REPO/outputs/logs"
 mkdir -p "$LOG_ROOT" "$OUT_DIR"
@@ -192,14 +270,38 @@ echo "  4. verl's 'step:1 - ... timing_s/step:...'  -- THE number P2 is asked fo
 echo "  5. stage tool: A1/A2/A3 PASS lines and the decoded rollouts under them"
 echo "=========================================================================="
 
+echo "Submitter : $SUBMITTER"
 [[ $DRY_RUN -eq 1 ]] && { echo "[dry-run] not submitting."; exit 0; }
 
-submit_job \
-    --account "$ACCOUNT" \
-    --partition "$PARTITION" \
-    --name "$NAME" \
-    --gpu "$GPUS" \
-    --duration "$DURATION" \
-    --outfile "$LOG_ROOT/$NAME.%j.out" \
-    --logroot "$LOG_ROOT" \
-    -c "bash $RUNNER"
+if [ "$SUBMITTER" = submit_job ]; then
+    env HOSTNAME="$SUBMIT_HOSTNAME" submit_job \
+        --account "$ACCOUNT" \
+        --partition "$PARTITION" \
+        --name "$NAME" \
+        --gpu "$GPUS" \
+        --duration "$DURATION" \
+        --outfile "$LOG_ROOT/$NAME.%j.out" \
+        --logroot "$LOG_ROOT" \
+        -c "bash $RUNNER"
+else
+    SB="$LOG_ROOT/$NAME.sbatch"
+    {
+        echo "#!/bin/bash"
+        echo "#SBATCH --account=$ACCOUNT"
+        echo "#SBATCH --job-name=$NAME"
+        echo "#SBATCH --partition=$PARTITION"
+        echo "#SBATCH --nodes=1"
+        echo "#SBATCH --ntasks=1"
+        echo "#SBATCH --gpus-per-node=$GPUS"
+        echo "#SBATCH --cpus-per-task=32"
+        echo "#SBATCH --time=${DURATION}:00:00"
+        echo "#SBATCH --output=$LOG_ROOT/$NAME.%j.out"
+        # Ray writes thousands of small files; keep them off the shared filesystem.
+        echo 'export RAY_TMPDIR=/tmp/ray_$SLURM_JOB_ID'
+        echo 'mkdir -p "$RAY_TMPDIR"'
+        echo "bash $RUNNER"
+    } > "$SB"
+    chmod +x "$SB"
+    echo "sbatch script: $SB"
+    sbatch "$SB"
+fi
