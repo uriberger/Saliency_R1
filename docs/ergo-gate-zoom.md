@@ -180,9 +180,15 @@ started and reported afterwards.
 
 ### VERDICT: FAIL — the cold start parses a `<zoom>` box on 4.2% of rollouts
 
-> **A two-turn ERGO cold start is needed before any GRPO run is worth starting.
-> That is +3–5 days and it is the single thing that blows this arm's budget.**
-> It has **not** been started.
+> **Under ERGO's own parser, a two-turn cold start is needed before any GRPO run is
+> worth starting. That is +3–5 days and it is the single thing that blows this arm's
+> budget.** It has **not** been started.
+>
+> **But the cold start produces the box and withholds only the tag.** Scored for a
+> bracketed box after `</think>` instead of inside `<zoom>` tags, the same rollouts
+> pass at **83.3%**. A parser accommodation — a deliberate, documented deviation from
+> ERGO — unblocks turn 1 for free. Turn 2's 0.0% `<answer>` rate does not go away
+> either way. See *The number that changes the decision*.
 
 Measured 2026-11-08 on `cs-oci-ord`, one A100-80GB inside interactive allocation
 `38208034`, temperature 1.0, 1280 visual tokens, `coord hint: 'none'`, and
@@ -227,6 +233,77 @@ Instruct writes a parseable box on **95.8%** of rollouts and never once writes
 - The 4.2%-strict vs 79.2%-lenient gap is the diagnosis, not noise: the cold start
   *does* emit four numbers on most rows, just not inside `<zoom>` tags. The fix is
   format supervision, not a capability transplant.
+
+### The 512-token cap was hiding half the signal — but not the failure
+
+The run above gave **both** models `--max-new-tokens 512`. That is right for vanilla
+Instruct (median turn-1 88 tokens, never truncates) and wrong for the cold start,
+which `ergo_gate_lowres` deliberately gives **4096** because the r1 system prompt
+produces long chains. 5/24 of the cold start's turn-1 completions came back exactly
+at the cap and 8/24 had no `</think>` at all. Re-measured on the same 24 rows with
+only the cap changed:
+
+| cold start, turn 1 | cap 512 | cap 2048 |
+|---|---|---|
+| `<think>…</think>` exactly once | 66.7% | **87.5%** |
+| emits a box *somewhere* | 79.2% | **91.7%** |
+| `<zoom>` tag present | 8.3% | 16.7% |
+| **box parses, ERGO's strict parser** | **4.2%** | **4.2%** |
+| turn-2 `<answer>` tags at all | 0.0% | **0.0%** |
+
+**The cap was suppressing the think block and the box. It was not causing the
+failure.** Strict parse is identical at 4.2%, and turn-2 `<answer>` is exactly 0.0%
+at both caps — completely insensitive to the generation budget. So the two headline
+numbers in this document stand, and the diagnosis is now sharper rather than
+different: the cold start **produces the box and withholds the tag.**
+
+### The number that changes the decision
+
+ERGO's parser requires `<zoom>[x1,y1,x2,y2]</zoom>`. Score instead for a bracketed
+four-number list **after the closing `</think>`** — the shape the cold start actually
+emits, e.g. `… The answer should be latex. </think> [329, 84, 539, 225]`:
+
+| parser | cap 512 | cap 2048 | gate |
+|---|---|---|---|
+| ERGO strict, `<zoom>` tags | 4.2% | 4.2% | 60% |
+| **bracketed box after `</think>`** | 50.0% | **83.3%** | 60% |
+| four numbers anywhere | 79.2% | 91.7% | |
+
+**At the correct generation cap a tail parser clears the gate** — 20/24, whose 95%
+Wilson interval is roughly 64–93%, with the lower bound still above 60. That is the
+difference between a port decision and a +3–5 day cold start, so it is worth stating
+precisely what it does and does not buy.
+
+What it buys: a parseable, croppable box on most rollouts, so `r_format` is not
+structurally 0 and GRPO has a gradient to work with.
+
+What it does not buy: **box quality**. Under `rel1000` the cold start's boxes score
+mean IoU **0.056** and centre-hit **0.50**, against the base model's **0.206** and
+**0.652**. (Note the IoU/centre divergence between the two caps — 0.18→0.06 IoU while
+centre-hit rises 0.40→0.50 — which is the crop-size confound §5 warns about, not a
+regression: the longer-cap boxes are larger, so they cover the target more often and
+overlap it less.) And it does nothing at all for turn 2, which is 0.0% at both caps.
+
+**This is a deliberate deviation from ERGO and must be taken as one.** Their
+`r_format` is what teaches the policy the tag; loosening the parser means the tag is
+never learned. That is defensible — the reward exists so the trainer can crop, not to
+enforce angle brackets — but it is a change to the method, it belongs in the writeup,
+and it should not be made silently inside a regex.
+
+### An operational constraint found the hard way
+
+**Gate B OOMs on an 80 GB card at `--max-new-tokens 4096 --batch-size 4`**, in the
+**turn-2** loop (`ergo_zoom_gate.py:606`), after turn 1 has completed — and since the
+gate writes only at the end, that is the whole run lost. Turn 2 is the expensive
+turn: its prompt carries *both* images (~2560 visual tokens against turn 1's ~1280)
+plus the entire turn-1 completion, so the sequence reaches ~7800,
+`sdpa_attention_forward` falls back to the math kernel, and it materialises a
+`batch × heads × seq × seq` tensor — 15.65 GiB in one allocation.
+
+`--max-new-tokens 2048 --batch-size 2` with
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` peaks at ~25 GB and completes.
+**The full-191 rerun must use those settings**, and the ~6 h estimate in §4 assumes
+batch 4 — at batch 2 budget proportionally more.
 
 ### The coordinate frame: `rel1000`, decided on the base model
 
