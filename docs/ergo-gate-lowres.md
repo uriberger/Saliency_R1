@@ -4,10 +4,9 @@ Companion to [baseline-port-estimates.md](baseline-port-estimates.md) § *ERGO o
 Qwen3-VL* and to [ergo-build-prompts.md](ergo-build-prompts.md) § *Prompt 1*. This
 is the blocking gate: nothing in P5–P11 starts until it returns a number.
 
-**Status (2026-11-08): RUN, and the verdict is PROCEED — `+18.3` points.** The V\*
-grid is complete for both models; HR-Bench is one unit of six. Measured on
-`cs-oci-ord`, 8×A100-80GB, inside interactive allocation `38208034`. See
-[Result](#result).
+**Status (2026-11-08): RUN and COMPLETE — 14/14 units, verdict PROCEED, `+18.3`
+points.** All three benchmarks, both models, all three caps, plus the oracle crop
+arm. Measured on `cs-oci-ord`, 8×A100-80GB. See [Result](#result).
 
 ---
 
@@ -58,7 +57,7 @@ pass `image_patch_size=16`, so 32 is the factor the resize actually uses.
 | HR-Bench 4K | 625 | 1225 | 15876 | 4032×4032 |
 | HR-Bench 8K | 620 | 1232 | 16274 | 7680×4992 |
 
-Two things to carry into the table when it exists:
+Two things that belong with the table:
 
 - **The 16384 arm on V\* is 3.3k tokens, not 16k.** An image is never *enlarged* to
   meet a cap, and V*'s photos are 3 MP. The top arm is "native resolution", and
@@ -111,7 +110,7 @@ this wrapper: that constant belongs to `ChatMixin`, which the omni wrappers use 
 
 ---
 
-## What the gate can say without a GPU
+## What the gate could say before it ran
 
 The accuracy table answers *whether* the penalty exists. Arithmetic answers whether
 it *can*, and that half needs no hardware: a visual token is 32×32 pixels of the
@@ -150,7 +149,7 @@ than the method it stands in for.
 
 ---
 
-## Design notes that will matter when it runs
+## Design notes
 
 **V\*'s boxes are not in either HF release.** `lmms-lab-encoder/vstar-bench` and
 `craigwu/vstar_bench` both expose only `(image, text, category, question_id, label)`.
@@ -263,7 +262,7 @@ from, so a short allocation still returns the numbers the gate is decided on. Th
 ordering is what saved this run: the allocation expired with five HR-Bench units
 still owed and the verdict already decided.
 
-Measured cost, 7×A100-80GB: a V\* unit is **1.5–7.8 min** (the cold start's 4096-token
+Measured cost, 7×A100-80GB: a V* unit is **1.5-7.8 min** (the cold start's 4096-token
 cap makes it 2–4× the base model's), an HR-Bench unit is **29 min**. The 4 h the
 launcher asks for is right for 14 units; it is not generous.
 
@@ -281,21 +280,33 @@ images, 2000×1500 and 155×157 on item 0).
 > `+18.3` points between 16384 and 640 visual tokens on V\*. ERGO's premise holds
 > on this backbone: there is accuracy for a crop to recover.
 
-Measured 2026-11-08 on `cs-oci-ord`, 8×A100-80GB (allocation `38208034`), 9 of 14
-units harvested. Accuracy, %:
+Measured 2026-11-08 on `cs-oci-ord`, 8×A100-80GB, **14/14 units**, 145 min of unit
+time across two interactive allocations. Accuracy, %:
 
 | model | benchmark | 640 tok | 1280 tok | 16384 tok | 640 + GT crop | **16384 − 640** |
 |---|---|---|---|---|---|---|
 | base | V* | 68.6 | 78.0 | 84.3 | 93.7 | **+15.7** |
-| base | HR-Bench 4K | — | — | — | n/a | — |
-| base | HR-Bench 8K | — | — | — | n/a | — |
+| base | HR-Bench 4K | 65.1 | 67.2 | 75.6 | n/a | **+10.4** |
+| base | HR-Bench 8K | 53.8 | 58.2 | 72.9 | n/a | **+19.1** |
 | coldstart | V* | 61.3 | 72.8 | 79.6 | 94.2 | **+18.3** |
-| coldstart | HR-Bench 4K | 62.0 | — | — | n/a | — |
-| coldstart | HR-Bench 8K | 54.0 | — | — | n/a | — |
+| coldstart | HR-Bench 4K | 62.0 | 65.3 | 74.9 | n/a | **+12.8** |
+| coldstart | HR-Bench 8K | 54.0 | 55.7 | 71.7 | n/a | **+17.6** |
 
 Read down each model's own column, not across — the two run under different prompts
-and token caps (see *Design notes*). Both columns clear the ≥ 10 threshold, and they
-agree with each other on the shape, which is the point of having the second one.
+and token caps (see *Design notes*). **All six gaps clear the ≥ 10 threshold**, on
+three benchmarks and two checkpoints, which is a good deal more agreement than the
+decision rule needed.
+
+`parse_fail` is **0.0%** on all twelve HR-Bench arms, so none of this is a grading
+artifact — the replaced scorer read every answer it was given. That column existed
+because we have shipped two grading accidents before (LogicVista, MathVision); it
+earns its place by being boring here.
+
+**HR-Bench 8K penalises downsampling hardest**, as it should: its images are
+7680×4992, so 640 tokens throws away the most. +19.1 / +17.6 against 4K's +10.4 /
++12.8. The axis scales with how much resolution there is to lose, which is the
+behaviour ERGO's premise predicts and the opposite of what a flat-curve backbone
+would show.
 
 **The resolution curve is monotone and steep on both models.** 61.3 → 72.8 → 79.6 on
 the cold start, 68.6 → 78.0 → 84.3 on vanilla Instruct. DeepStack and the backbone's
@@ -312,17 +323,47 @@ It also bounds the method from above. 94.2 is what a *perfect* box gets; ERGO's
 learned box cannot beat it, so the whole arm is competing for the band between 61.3
 and 94.2 on V\*, with the 16384 arm's 79.6 as the resolution-only baseline to beat.
 
+### The whole penalty lives in the `single` category
+
+HR-Bench splits into `single` (one object) and `cross` (relating two), and the gate's
+scorer reports both. They behave completely differently, and the gate was not built
+to find this:
+
+| 640 → 16384 | `single` | `cross` |
+|---|---|---|
+| base, 4K | 0.694 → **0.921** (+22.7) | 0.608 → 0.591 (**−1.7**) |
+| base, 8K | 0.513 → **0.859** (+34.6) | 0.558 → 0.595 (+3.7) |
+| coldstart, 4K | 0.638 → **0.895** (+25.7) | 0.598 → 0.602 (+0.4) |
+| coldstart, 8K | 0.580 → **0.861** (+28.1) | 0.496 → 0.571 (+7.5) |
+
+**Resolution buys +23 to +35 points on `single` and approximately nothing on
+`cross`** — one arm even goes backwards. This is a direct, and not obviously good,
+read on ERGO: the method is **one** crop per question. On a `single` item that is the
+right shape and the headroom is enormous. On a `cross` item the evidence is in two
+places, and a single bounding box either contains both — in which case it is close to
+the whole image and buys nothing — or it drops one.
+
+So the honest reading of the HR-Bench rows is that ERGO's mechanism is aimed at the
+half of the benchmark where there is room, and the `cross` half may be structurally
+out of reach for a single-crop method. V\* has the same split (`direct_attributes`
+115 / `relative_position` 76) and is worth re-cutting the same way before any claim
+is written. **This is a result about the method's ceiling, not a defect in the gate**,
+and it did not change the PROCEED verdict — but it should shape which number the paper
+leads with.
+
 **Caveats that belong with the table:**
 
 - **The "16384-token" arm on V\* is really ~3.3k tokens.** Images are never enlarged
   to meet a cap and V\*'s photos are 3 MP. It is a native-resolution arm. ERGO's own
   16384 row has the same property, which is why theirs reads 77.0 and not 95.
-- **HR-Bench is one unit of six**, so it contributes no gap. Cold start at 640
-  tokens: 4K **62.0**, 8K **54.0**, `parse_fail` **0.0%** on both — the replaced
-  scorer read every answer, so the HR-Bench numbers that do arrive will be gradeable.
-- The gap is a between-arm difference on a paired 191-document set, not a
-  significance test. At n=191 a 18.3-point swing is far outside sampling noise; the
-  3-point decision boundary is not, and we did not land near it.
+  HR-Bench does not have this problem — 4032² and 7680×4992 both exceed 16384 tokens,
+  so its top arm is a real 16k arm and its gaps are the cleaner ones.
+- The gaps are between-arm differences on paired sets (V\* 191 documents, HR-Bench
+  2×300 seeded), not significance tests. The smallest, HR-Bench 4K base at +10.4,
+  sits closest to a threshold; every other gap is far outside sampling noise and
+  none of them land near the 3-point boundary.
+- HR-Bench is subsampled to 300 per split from 800, prefix-stable, so raising it
+  later adds documents and moves none.
 
 ### What is settled independently of the run
 
@@ -345,18 +386,16 @@ tests did not catch it because the fixtures encoded the same assumption (V\* as
 fixtures now use the scale lmms-eval really writes, and a 25th test pins the two
 scorers apart.
 
-### Still owed
+### Nothing owed
 
-Five HR-Bench units — `coldstart` at 1280 and 16384, `base` at all three. Each costs
-**~29 min** on 7×A100 (600 documents: 300 per split × two splits), so ~2.5 h of
-8-GPU time. The gate **resumes**: harvested units are skipped, so this is a rerun of
-the same command, not a restart.
+14/14. The resume path was exercised for real: the first allocation expired with five
+HR-Bench units outstanding, and rerunning the identical command in a second
+allocation skipped all nine harvested units by name and ran only the five owed, then
+exited 0 instead of 17. That is the behaviour the design promised and it cost nothing
+to confirm.
 
-```fish
-cd /home/uberger/scratch/research/saliency_r1
-bash outputs/logs/ergo_gate_lowres.interactive.sh      # inside a fresh allocation
-```
-
-Nothing about the PROCEED verdict is waiting on them — V\* is the benchmark the
-decision rule is written against and the benchmark ERGO's Table 1 is quoted from.
-HR-Bench would add a second, higher-resolution witness to the same curve.
+One cut is worth adding later: V\* re-scored by category, to see whether
+`direct_attributes` / `relative_position` splits the way HR-Bench's
+`single` / `cross` does. The per-item samples are already on disk under
+`outputs/ergo_gate_lowres/units/*/` (V\* arms ran with `--log_samples`), so it needs
+no GPU.
