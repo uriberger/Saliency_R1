@@ -109,13 +109,87 @@ passed only `max_pixels` and changed nothing at all.
 
 > *(filled from the run)*
 
-## 6. What this means for Prompts 3, 5 and 9
+## 6. The third thing, which Prompt 4 did not ask for
+
+Their **env** and their **reward** read the same completion differently, and the
+difference decides whether `R_tool` can fire at all.
+
+`verl/workers/agent/envs/mm_process_engine/visual_toolbox_v2.py:VisualToolBoxV2.execute`
+opens with:
+
+```python
+answer = self.extract_answer(action_string)      # re.findall(r'<answer>(.*?)</answer>')
+if answer:
+    return "", 0.0, True, {}                     # done. the tool call is never read.
+action = self.extract_action(action_string)
+```
+
+So a turn that carries **both** a `<tool_call>` and a closed `<answer>` ends the episode
+without zooming. No image is spliced into the response, so
+`count("<|vision_start|><|image_pad|>")` stays 0, so
+`tool_reward = 1.0 if count_vision_1 > 0 and acc_reward > 0.5` is 0 — however correct the
+answer is. The zoom is discarded silently.
+
+That is not hypothetical under this prompt: both models answer in the turn they call the
+tool. §5's `ZOOMS` column is the tool-call rate **after** this filter, and it is the one
+to quote.
+
+The two readers also disagree about an *unclosed* `<answer>`. `extract_answer` needs both
+tags and ignores it, so the env proceeds to the tool call and the zoom happens.
+`compute_score` counts `<answer>` against `</answer>` and marks the imbalance, so the same
+completion takes `R_format = -1`. A turn ending `<answer> B` with no close therefore zooms
+**and** is penalised.
+
+## 7. What this means for Prompts 3, 5 and 9
 
 > *(filled from the run)*
 
-## 7. How it was run, and the compromise in it
+## 8. How it was run, and the compromise in it
 
-> *(filled from the run)*
+**There were no GPUs.** On 2026-11-07 `oci-nrt-cs-001` had no GPU hardware at all — every
+GPU partition reported `TotalNodes=0`, `Nodes=(null)` and no node advertised a `gpu`
+GRES, a state it had been in since 2026-10-30. A GPU job submitted into that sits at
+`Reason=PartitionConfig` indefinitely and looks exactly like ordinary queueing. The
+one-line test:
+
+```fish
+sinfo -h -N -o "%G" | grep -ci gpu     # 0 means there is nothing to queue behind
+```
+
+So the probe ran on `cpu_short` — 8 nodes, 96 cores each, one worker per node, ~4 h of
+wall clock for what a single A100 would have done in under an hour.
+`launch_deepeyes_coord_format_job.sh` is the GPU launcher and is the one to use the
+moment GPUs return; it writes the same JSONL into the same directory and
+`--stage report` reduces either.
+
+Two compromises follow from that, and both are visible in the numbers:
+
+1. **Both arms carry a pixel cap** — arm A at 1,280 visual tokens, arm B at 320 — where
+   the GPU design gives arm A the processor's own config. One row at V\*'s native
+   resolution (3,290 visual tokens, 3.3k-token prompt) did not finish in 20 minutes on 32
+   cores. The three readings stay separable because the two caps differ by 2.0x linear,
+   which is all the coordinate question needs. What is lost is that arm A is no longer
+   the resolution verl will train at. Nothing in §4 depends on it: the frame the model
+   emits in was identical at both resolutions, which is the whole content of the
+   invariance test.
+2. **`max_new_tokens = 320`**, against their config's 20,480. Truncation is reported as
+   its own column, and `format_ok` is given over the untruncated subset as well.
+
+The 2.0x arm separation is asserted, not assumed. The override that creates it is a
+silent no-op if the processor ignores it — the fast image processor only honours
+`min_pixels`/`max_pixels` when **both** are passed, and the first version of this probe
+passed only `max_pixels` and changed nothing. A gate refuses to run below 1.2x, and every
+worker log carries the line:
+
+```
+arm gate: original (2250, 1500) -> arm A (928, 1376) (1247 vision tokens)
+                                vs arm B (448, 672) (294 tokens)  (2.048x linear)
+```
+
+`test_deepeyes_coord_format_cpu.py` covers the scoring half on CPU with no model: the
+three conversions, their format rule case by case, the tool-call parser, the env's
+answer-first behaviour, and — the one that makes the headline trustworthy — a box planted
+in each of the three frames in turn, which the probe must read back as that frame.
 
 ## Sources
 
