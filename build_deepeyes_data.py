@@ -517,7 +517,10 @@ def convert_source(
         "rows_without_image": 0,
     }
 
-    if image_dir is not None:
+    # Only the tool splits get an image directory. Creating one for ThinkLite leaves an
+    # empty `images/thinklite/` behind, which reads like the tool was meant to be on
+    # there and somebody forgot -- the exact confusion trap 1 is about.
+    if image_dir is not None and want_tool:
         image_dir.mkdir(parents=True, exist_ok=True)
 
     pf = pq.ParquetFile(src)
