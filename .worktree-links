@@ -73,3 +73,10 @@ laser_fork
 # the LASER arm and any in-flight LASER job are importing. Shared exactly like
 # laser_fork: editing it from a worktree edits it for every session.
 deepeyes_fork
+
+# DeepEyes' RL corpus: the ChenShawn/DeepEyes-Datasets-47k snapshot re-routed into a
+# verl parquet by build_deepeyes_data.py, plus the pre-resize original images the zoom
+# tool crops from (cold_data/deepeyes/verl/images/). ~10 GB; shared for the same reason
+# cold_data/laser is -- one copy is enough, and a worktree deletion must not take it.
+# Two sessions running the build at once will clobber each other; pass --out-dir.
+cold_data/deepeyes

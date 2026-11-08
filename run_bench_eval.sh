@@ -32,6 +32,13 @@
 #   --bank suite              natural / mme-realworld / non-natural, three units
 #   --bank task               one unit per benchmark, thirteen of them
 #
+# --search adds the four visual-search benchmarks (V*, HR-Bench 4K/8K,
+# spatialtreebench), each as a unit of its own because each needs its own input
+# resolution and --max-pixels is per lmms-eval invocation. They are off by default:
+# at native resolution HR-Bench alone outweighs the whole natural suite, and they
+# are meant for baselining an arm rather than for the per-checkpoint curve. Their
+# scores land under bench/natural/<task> and are NOT in bench/natural/mean.
+#
 # Suite banking is right at 100 documents and wrong above it: the natural suite
 # at 300 is ~105 minutes and can never finish inside a one-hour allocation, so it
 # would be started, killed and repeated forever, banking nothing. Task banking
@@ -58,10 +65,11 @@
 #   bash run_bench_eval.sh --run-dir CKPT_DIR [--num-gpus 1] [--every 100]
 #                          [--natural-n 300] [--nonnatural-n 100]
 #                          [--task-n mmstar=200] [--bank task] [--steps 100,200]
-#                          [--job-minutes 60] [--alloc-minutes 60]
+#                          [--search] [--job-minutes 60] [--alloc-minutes 60]
 #
 # Environment:
-#   OPENAI_API_KEY / NVIDIA_API_KEY   needed by mathvista's llm_as_judge metric
+#   OPENAI_API_KEY / NVIDIA_API_KEY   needed by mathvista's llm_as_judge metric,
+#                                     and by hrbench/spatialtreebench under --search
 #   HF_TOKEN
 set -uo pipefail
 
@@ -84,6 +92,12 @@ NATURAL_N=""
 NONNATURAL_N=""
 declare -a TASK_N=()
 BANK=auto
+# Also run the on-demand visual-search benchmarks -- V*, HR-Bench 4K/8K,
+# spatialtreebench. Off by default and deliberately so: each has to run in an
+# lmms-eval invocation of its own at native resolution (see the resolution trap in
+# eval_mini/benchmarks.py), which at n=300 is more wall clock than the whole
+# natural suite. They are for baselining an arm, not for watching a curve.
+SEARCH=false
 # Explicit list of steps to evaluate. Overrides the `% EVERY` rule, which is what
 # lets rerun_bench_evals.sh ask for exactly the checkpoints that already have a
 # result rather than every checkpoint on disk.
@@ -126,6 +140,7 @@ while [[ $# -gt 0 ]]; do
         --nonnatural-n)    NONNATURAL_N="$2";    shift 2 ;;
         --task-n)          TASK_N+=("$2");       shift 2 ;;
         --bank)            BANK="$2";            shift 2 ;;
+        --search)          SEARCH=true;          shift ;;
         --steps)           STEPS_FILTER="$2";    shift 2 ;;
         --no-harvest)      HARVEST=false;        shift ;;
         --min-minutes)     MIN_MINUTES="$2";     shift 2 ;;
@@ -165,6 +180,26 @@ RUN_DIR=$(cd "$RUN_DIR" && pwd)
 # the one both suites are now built to load under. 0 would only buy connection
 # attempts that must fail.
 export HF_HUB_OFFLINE=1
+
+# And pin the `datasets` build cache to the shared one, because offline the two
+# settings are not independent.
+#
+# lmms-eval's _resolve_hf_datasets_cache_dir() treats $HF_HOME/datasets as unsafe
+# for file locks when it sits on a remote filesystem -- which /lustre is -- and
+# silently redirects the cache to node-local scratch (`/tmp/lmms_eval_hf_datasets/$USER`
+# when /tmp has 1 GB free). On a fresh node that directory holds nothing, so
+# `datasets` falls through to the hub, and with HF_HUB_OFFLINE=1 that is a
+# ConnectionError wrapped in a tenacity RetryError -- before the first document,
+# for EVERY benchmark, not just the new ones. Reproduced on this login node for
+# pope_mini and realworldqa_mini as well as the search four.
+#
+# It has not bitten the compute nodes so far (evals ran four days after the
+# upstream merge that added the redirect, so their /tmp must fail the writable or
+# 1 GB test), but "so far" is doing the work in that sentence and the second
+# cluster is a different machine. LMMS_EVAL_DATASETS_CACHE is consulted first and
+# unconditionally, so setting it removes the branch. Every build these jobs read
+# is already in this directory and has been shared across jobs since August.
+export LMMS_EVAL_DATASETS_CACHE=${LMMS_EVAL_DATASETS_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/datasets}
 
 BENCH_DIR="$RUN_DIR/bench_eval"
 TASK_DIR="$BENCH_DIR/tasks"
@@ -229,6 +264,9 @@ PLAN_MINUTES=$JOB_MINUTES
 WINDOW=0
 (( PLAN_MINUTES > 0 )) && WINDOW=$(( PLAN_MINUTES - SAFETY_MARGIN ))
 
+declare -a PLAN_ARGS=()
+if $SEARCH; then PLAN_ARGS+=(--on-demand); fi
+
 declare -a UNIT_TAG=() UNIT_TASKS=() UNIT_MINUTES=() UNIT_EXTRA=() CLAMPED=()
 while IFS=$'\t' read -r tag tasks minutes extra; do
     [[ -n "$tag" ]] || continue
@@ -251,6 +289,7 @@ while IFS=$'\t' read -r tag tasks minutes extra; do
     UNIT_TAG+=("$tag"); UNIT_TASKS+=("$tasks")
     UNIT_MINUTES+=("$need"); UNIT_EXTRA+=("$extra")
 done < <(python "$SCRIPT_DIR/bench_eval.py" --plan --bank "$BANK" \
+             ${PLAN_ARGS[@]+"${PLAN_ARGS[@]}"} \
              --sample-n "$SAMPLE_N_JSON" --num-gpus "$NUM_GPUS" --window "$WINDOW")
 (( ${#UNIT_TAG[@]} > 0 )) || { echo "error: could not plan the units" >&2; exit 1; }
 

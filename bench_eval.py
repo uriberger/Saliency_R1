@@ -201,9 +201,28 @@ def do_collect(args):
     for suite in SUITES:
         mean = metrics.get(f"bench/{suite}/mean")
         n = metrics.get(f"bench/{suite}/n_benchmarks")
-        expected = sum(1 for s in BENCHMARKS.values() if s["suite"] == suite)
+        # What this job was supposed to produce, not what the table could hold.
+        # An on-demand benchmark counts only once it is actually present: the
+        # visual-search four are in the natural suite but out of the default plan,
+        # and counting them unconditionally would print "[4 benchmark(s) missing]"
+        # under every routine eval from now on -- a permanent false alarm, which is
+        # worse than no alarm because it trains the reader to ignore the line.
+        expected = sum(1 for task, s in BENCHMARKS.items()
+                       if s["suite"] == suite
+                       and (not s.get("on_demand")
+                            or f"bench/{suite}/{task}" in metrics))
         if mean is None:
-            print(f"  {suite:11s} MISSING -- no benchmark of this suite produced results")
+            # Two different things, and they must not read as one. A search-only
+            # collect produces three benchmarks and no mean, because none of them
+            # is in_mean -- that is the design, not a failure. A suite that
+            # produced nothing at all is a failure.
+            if n:
+                named = sorted(t for t in BENCHMARKS
+                               if f"bench/{suite}/{t}" in metrics)
+                print(f"  {suite:11s} no mean -- {int(n)} benchmark(s) scored, none of them "
+                      f"in the suite average ({', '.join(named)})")
+            else:
+                print(f"  {suite:11s} MISSING -- no benchmark of this suite produced results")
             continue
         short = "" if int(n) == expected else f"   [{expected - int(n)} benchmark(s) missing]"
         print(f"  {suite:11s} mean {mean:.4f} over {int(n)}/{expected} benchmarks{short}")
@@ -377,7 +396,8 @@ def do_plan(args):
     from benchmarks import plan_units
 
     sample_n = json.loads(args.sample_n) if args.sample_n else None
-    for tag, tasks, extra, minutes in plan_units(args.bank, sample_n, args.num_gpus, args.window):
+    for tag, tasks, extra, minutes in plan_units(args.bank, sample_n, args.num_gpus,
+                                                 args.window, on_demand=args.on_demand):
         print(f"{tag}\t{','.join(tasks)}\t{minutes:.0f}\t{extra}")
 
 
@@ -391,6 +411,11 @@ def main():
                    help="the unit a job banks progress in; auto sizes it to --window (--plan)")
     p.add_argument("--window", type=int, default=0,
                    help="usable minutes in the allocation, for --bank auto (--plan)")
+    p.add_argument("--on-demand", action="store_true",
+                   help="also plan the on-demand visual-search benchmarks (V*, HR-Bench, "
+                        "spatialtreebench). Each gets a unit of its own at its own "
+                        "resolution; they are left out by default because at native "
+                        "resolution they cost ~4x the natural suite (--plan)")
     p.add_argument("--num-gpus", type=int, default=1, help="allocation size, for the estimate (--plan)")
     p.add_argument("--carried-from", metavar="DIR",
                    help="print {unit: profile} for the reused banked units in DIR")
