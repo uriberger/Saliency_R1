@@ -747,8 +747,10 @@ def report(args):
     if unknown:
         raise SystemExit(f"--controls {unknown}: known covariates are {sorted(covs)} "
                          "(`alen` additionally needs --cases-dir)")
-    (v2, au, row, cor, uni), keep = apply_union_cap(args.max_union, uni,
-                                                    (v2, au, row, cor, uni))
+    # `mi` rides in the same tuple so it is subset identically; apply_union_cap passes
+    # None through untouched, so this is also correct for an archive without the column.
+    (mi, v2, au, row, cor, uni), keep = apply_union_cap(args.max_union, uni,
+                                                        (mi, v2, au, row, cor, uni))
     covs = {k: v[keep] for k, v in covs.items()}
     if not keep.all():
         print(f"\n--max-union {args.max_union}: {int(keep.sum())}/{N} steps and "
